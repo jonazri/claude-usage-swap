@@ -6,11 +6,49 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-05-18 — decision — **ARCH DECISION** — Direct Anthropic OAuth usage API, not ccusage, as the daemon's signal source](#2026-05-18-decision-arch-decision-direct-anthropic-oauth-usage-api-not-ccusage-as-the-daemon-s-signal-source)
 - [2026-05-18 — decision — **ARCH DECISION** — Lift cux patterns in Python, do not fork the Go binary](#2026-05-18-decision-arch-decision-lift-cux-patterns-in-python-do-not-fork-the-go-binary)
 - [2026-05-18 — decision — v0.1 scope = Phase 1 (foundations) + Phase 2 (new-session rotation) only — hot-swap deferred](#2026-05-18-decision-v0-1-scope-phase-1-foundations-phase-2-new-session-rotation-only-hot-swap-deferred)
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-05-18 — decision — **ARCH DECISION** — Direct Anthropic OAuth usage API, not ccusage, as the daemon's signal source
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #architecture #api #ccusage #oauth
+
+### What I would have asked you
+> Should the daemon use `ccusage --json` (a popular external tool) or directly call `https://api.anthropic.com/api/oauth/usage` (the same endpoint Claude Code itself uses) to determine each account's percentage-of-cap?
+
+### What I decided
+Direct OAuth API. Implemented as `poll_account_usage(account_name)` in cus.py, lifted from cux's `internal/usage/usage.go:84-135` pattern (headers: `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`, `Accept: application/json`).
+
+### Why
+- **ccusage doesn't track Anthropic plan caps as percentages.** It counts raw tokens. The `tokenLimitStatus.percentUsed` field only exists if you pass `--token-limit <N>`, where N is YOUR specification of the limit — which is the very thing we're trying to learn. Per-research agent verification 2026-05-18.
+- **The OAuth API returns `utilization` directly** (0.0-100.0 per window: `five_hour`, `seven_day`, `seven_day_sonnet`, `seven_day_opus`). Exactly what we need, no math.
+- **Same endpoint Claude Code itself uses** for `/usage`. If Claude Code works, this API works — stability is no worse than the rest of CC.
+- **No external dependencies.** ccusage requires Node.js + a separate install. The direct API call is `urllib.request` + stdlib `json`.
+- Verified live on rayi's `default` account 2026-05-18: 5h=57.0%, 7d=34.0%. Endpoint responsive.
+
+### Walk-back path
+1. If the OAuth API endpoint changes (Anthropic rev's the path or beta header) and our tool stops returning data: shim in ccusage as a fallback signal source. The `poll_account_usage()` function is the only seam to change; everything downstream (state machine, decision engine) consumes parsed `AccountUsage` objects.
+2. The beta header is env-var-overridable (`CUS_USAGE_BETA`) so a small change can land without a code edit.
+3. ccusage support could be added as a parallel `poll_account_usage_via_ccusage(account_name)` function with a `signal_source: oauth_api | ccusage | both` config knob.
+4. No code rollback needed — the daemon and decision engine are independent of the polling implementation.
+
+### Flags for follow-up
+- If 5h/7d windows ever return 0% utilization spuriously (e.g. account was rate-limited and API got confused), we may get into a "swap to empty account" loop. Tier-2 / Tier-3 logic (Phases 4-5) plus 429 reactive (Phase 5) should catch this.
+- Token-expired state (401 from API) is captured as `token_expired: true` per account. Daemon refuses to swap TO an expired-token account but doesn't refuse to swap FROM one. Worth thinking about whether expired-token-on-active means we're stuck.
+
+### Walk-back path
+1. If OAuth API endpoint changes: shim ccusage as fallback in `poll_account_usage()`. Single function to modify; downstream code consumes parsed AccountUsage.
+2. Beta header overridable via `CUS_USAGE_BETA` env var — small endpoint changes land without code edit.
+3. Add `signal_source: oauth_api | ccusage` config knob for explicit user choice.
+
+---
+
 
 ## 2026-05-18 — decision — **ARCH DECISION** — Lift cux patterns in Python, do not fork the Go binary
 
