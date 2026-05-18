@@ -4,7 +4,34 @@ Auto-rotate Claude Code OAuth accounts based on usage thresholds.
 
 Single-file Python tool that watches `ccusage --json` and swaps the active OAuth identity (the 471-byte `.credentials.json` + two keys in `~/.claude.json`) when accounts approach their 5-hour or weekly cap. Per-account progressive thresholds (50% → 75% → 90% → force) yield natural load-balancing across an N-account pool.
 
-**Status: planning + Phase 1 in progress.** See [`docs/plans/2026-05-18-claude-usage-swap.md`](docs/plans/2026-05-18-claude-usage-swap.md) for the build plan.
+**Status: Phase 1 (foundations) shipped.** See [`docs/plans/2026-05-18-claude-usage-swap.md`](docs/plans/2026-05-18-claude-usage-swap.md) for the build plan.
+
+## Usage (Phase 1 — manual swap only)
+
+```bash
+# Discover existing ~/.claude/ + ~/.claude-*/ config dirs and import each
+# as an account into ~/claude-accounts/. Idempotent.
+python3 cus.py init --dry-run    # preview
+python3 cus.py init              # commit
+
+# Inspect
+python3 cus.py list              # accounts + their OAuth identities
+python3 cus.py status            # active + per-account usage state
+
+# Atomically swap the active account
+python3 cus.py switch merkos --dry-run    # preview the swap plan
+python3 cus.py switch merkos              # commit the swap
+
+# Each `claude` invocation after the swap uses the new account.
+# Existing sessions keep their already-loaded credentials until restart.
+```
+
+System requirements: Python 3.11+, `click`, `pyyaml`. The shebang uses
+`uv run --script` so PEP 723 inline dependencies resolve automatically
+when `uv` is installed; otherwise `python3 cus.py` works as long as
+click + pyyaml are available system-wide.
+
+
 
 ## Why
 
