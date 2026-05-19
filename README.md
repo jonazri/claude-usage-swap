@@ -1,174 +1,268 @@
-# claude-usage-swap
+# claude-usage-swap (`cus`)
 
-Auto-rotate Claude Code OAuth accounts based on usage thresholds.
+Auto-rotate Claude Code OAuth accounts based on usage thresholds. Single-file Python, Linux-only, ~2000 LOC.
 
-Single-file Python tool that watches `ccusage --json` and swaps the active OAuth identity (the 471-byte `.credentials.json` + two keys in `~/.claude.json`) when accounts approach their 5-hour or weekly cap. Per-account progressive thresholds (50% → 75% → 90% → force) yield natural load-balancing across an N-account pool.
+When one of your Claude Pro/Max accounts approaches its 5-hour or weekly cap, `cus` swaps the active credentials to a different account — atomically, with optional hot-swap of in-flight tmux sessions so conversations preserve via `claude --resume`.
 
-**Status: all 6 phases shipped (v0.1).** See [`docs/plans/2026-05-18-claude-usage-swap.md`](docs/plans/2026-05-18-claude-usage-swap.md) for the build plan.
+> **Status:** v0.1, ready to use. Production-tested on the author's setup. No external maintainers; PRs welcome.
 
-## Storage layout (post-migration)
+## What problem this solves
 
-Each account lives in its own `CLAUDE_CONFIG_DIR`-compatible dir under `~/claude-accounts/`:
+Claude Code's 5-hour and weekly caps are per-account. If you have multiple accounts (work + personal, or multiple plans), the manual workaround is:
 
-```
-~/claude-accounts/
-  config.yaml                     # editable: thresholds, strategy, hot_swap, locks
-  state.json                      # runtime: active, per-account usage, swap history
-  SOS.md                          # written by daemon if human action needed
-  daemon.log                      # daemon stdout/stderr
-  inbox.md                        # autonomous decisions worth user review
-  account-default/                # a full CLAUDE_CONFIG_DIR
-    .credentials.json             # OAuth tokens, 0600
-    .claude.json                  # account-bound state (userID, oauthAccount, etc.)
-    meta.yaml                     # priority, locked_sessions, oauth_email, ts
-    projects/ → ~/.claude/projects/    # symlink — shared history across accounts
-    plugins/  → ~/.claude/plugins/     # symlink
-    agents/, skills/, commands/, memory/, hooks/, scripts/  # symlinks if present
-  account-merkos/
-    ...
-  account-<your-new-one>/
-    ...
-```
+1. `/exit` your sessions
+2. `export CLAUDE_CONFIG_DIR=~/.claude-account2/`
+3. Relaunch with `claude --resume <id>`
 
-The live `~/.claude/` is the "currently active" mount point that Claude Code reads from when no `CLAUDE_CONFIG_DIR` is set. Swap = copy `.credentials.json` + account-bound keys from `account-<target>/` into `~/.claude/`. No more ad-hoc `~/.claude-<name>/` dirs going forward.
+Across many concurrent sessions and many machines, this gets old. `cus` automates it:
 
-## Adding accounts
+- Polls each account's usage via the same Anthropic OAuth endpoint Claude Code itself uses for `/usage`
+- Per-account progressive thresholds (50% → 75% → 90% → force) yield natural load-balancing across an N-account pool
+- Atomic two-file swap (`.credentials.json` + a couple of keys in `~/.claude.json`) — no env-var threading
+- Optional hot-swap of live sessions in tmux panes (pause-message injection → `/exit` → `claude --resume <id> "Continue."`)
+- SOS subsystem surfaces conditions requiring human action via `cus sos` CLI, `~/claude-accounts/SOS.md`, Claude Code statusLine, and `notify-send`
 
-```bash
-# Add a new account: creates ~/claude-accounts/account-<name>/ and prints
-# the exact login command.
-python3 cus.py add work
+## Existing tools, and why this one
 
-# Output:
-#   Created /home/rayi/claude-accounts/account-work
-#   To log in to this account, run:
-#     CLAUDE_CONFIG_DIR=/home/rayi/claude-accounts/account-work/ claude
-#   After logging in, register it:
-#     python3 ~/repos/claude-usage-swap/cus.py init --force && cus poll
+`cus` exists because no single tool does *all* of: per-account progressive thresholds + tmux-aware hot-swap + `CLAUDE_CONFIG_DIR`-style file swap + N-account pool. Closest competitors:
 
-# Re-login an existing account (e.g. when SOS says tokens expired):
-python3 cus.py relogin merkos
+- [cux](https://github.com/inulute/cux) — Go wrapper, in-place credential keystore swap (single global threshold). Methodology lifted; reimplemented in Python without the keystore manipulation (unnecessary on Linux).
+- [AIMUX](https://github.com/Digital-Threads/aimux) — manual `CLAUDE_CONFIG_DIR` profile switcher; no auto-rotation.
+- [teamclaude](https://github.com/KarpelesLab/teamclaude), [ccflare](https://github.com/snipeship/claude-balancer) — proxy-based, different architecture.
+- [ccusage](https://ccusage.com) — usage display only; doesn't switch.
 
-# Or use --exec to immediately launch claude under that dir:
-python3 cus.py add work --exec
-python3 cus.py relogin merkos --exec
-```
+## Installation
 
-## Usage
+### Requirements
+
+- Linux (macOS / Windows out of scope for v1 — see [Architecture](docs/ARCHITECTURE.md))
+- Python 3.11+
+- `click` and `pyyaml` (system-wide or via `uv`)
+- `tmux` (only needed for hot-swap of live sessions)
+- One or more Claude Pro/Max accounts
+
+### Steps
 
 ```bash
-# Phase 1 — discover existing config dirs, import as accounts
-python3 cus.py init --dry-run             # preview
-python3 cus.py init                       # commit
+# 1. Clone
+git clone https://github.com/rayistern/claude-usage-swap ~/repos/claude-usage-swap
+cd ~/repos/claude-usage-swap
 
-# Inspect
-python3 cus.py list                       # accounts + OAuth identities
-python3 cus.py status                     # active + usage + locks + live sessions
-python3 cus.py config                     # effective config (defaults merged)
-python3 cus.py statusline                 # one-line summary (for CC statusLine)
+# 2. Discover existing Claude config dirs, migrate to managed layout
+python3 cus.py init
 
-# Manual swap
-python3 cus.py switch merkos --dry-run    # preview the plan
-python3 cus.py switch merkos              # commit
+# 3. Verify
+python3 cus.py list             # accounts found + their OAuth identities
+python3 cus.py poll             # one-shot usage poll
+python3 cus.py status           # current state
 
-# Phase 2 — auto-rotation daemon
-python3 cus.py poll                       # one-shot usage poll via OAuth API
-python3 cus.py daemon --once              # single poll-decide-act cycle
-python3 cus.py daemon --once --no-execute # decide but don't actually swap
-python3 cus.py daemon                     # run forever (foreground)
+# 4. Install Claude Code hooks (lifecycle events the daemon needs)
+python3 cus.py hooks install
 
-# Phase 2 — hook installation (signature-keyed, won't clobber other tools)
-python3 cus.py hooks list                 # current state
-python3 cus.py hooks install              # install enabled hooks
-python3 cus.py hooks uninstall            # remove cus entries
+# 5. Run as a systemd --user service (survives reboot)
+python3 cus.py init-systemd --enable
 
-# Phase 6 — operator controls
-python3 cus.py pin %12 default            # pin tmux pane %12 to default account
-python3 cus.py unpin %12                  # remove pin
-python3 cus.py init-systemd --enable      # systemd --user unit + start
+# 6. (Optional) Wire the statusline into Claude Code
+# Edit ~/.claude/settings.json and add:
+# "statusLine": {"type": "command", "command": "python3 /full/path/to/cus.py statusline"}
 ```
-
-## SOS — when human action is needed
-
-`cus sos` (or just run the daemon — it does the same checks) surfaces conditions requiring you to step in:
-
-- OAuth token expired on any account — concrete `CLAUDE_CONFIG_DIR=... claude` re-login command provided.
-- All accounts blocked (token expired / rate limited / poll error) — daemon can't proceed.
-- Active account over threshold AND no swap target available.
-- Stale usage data (no fresh poll in >4 cycles) — daemon may be down.
-- Daemon pid recorded but process gone — needs restart.
-
-Channels:
-
-1. **Claude Code statusLine** — shows `🚨 cus SOS: <summary>` when conditions exist. Wired into `~/.claude/settings.json` automatically by `cus init` if no existing statusLine is present.
-2. **`cus sos` CLI** — exit code 1 + printed actions when conditions exist; exit 0 + "All clear" otherwise.
-3. **`~/claude-accounts/SOS.md`** — written by the daemon (and by `cus sos`) when conditions exist; deleted when clear. Cat this file anytime to see what's needed.
-4. **Desktop notification** via `notify-send` when conditions *change* (no spam — only fires on signature changes).
-
-## Phases (all shipped)
-
-1. **Foundations** — `cus init/list/status/switch`. Surgical 2-file swap (`.credentials.json` whole-file + `userID`+`oauthAccount` keys in `.claude.json`).
-2. **Auto-rotation daemon** — `cus daemon` polls OAuth usage API per-account, progressive thresholds (50→75→90→force), strategy picker (lowest_usage / drain / strict_priority / round_robin), `SessionStart`/`Stop`/`PostToolUseFailure`/`PreToolUse`/`SubagentStop` hooks.
-3. **Hot-swap Tier 1** (wait-for-Stop) — enabled by `hot_swap.enabled: true`. Live sessions paused at next turn boundary, swap, relaunched with `--resume`.
-4. **Tier 2** (pause-message injection) — at `tier_2_at_pct` (default 75), daemon injects a pause-message into the running TUI via `tmux send-keys` and waits for the resulting Stop.
-5. **Tier 3** (force interrupt + 429 reactive) — at `tier_3_at_pct` (default 90), Escape sent via tmux to interrupt running tools; shell context logged to `~/claude-accounts/inbox.md`. `PostToolUseFailure` hook detects 429 substring-match for immediate reactive swap.
-6. **Operator controls** — `cus pin/unpin` for per-pane lock, `never_restart_patterns` for whitelist, `cus statusline` for Claude Code statusLine integration, `cus init-systemd` for `systemctl --user` setup.
-
-## Config (`~/claude-accounts/config.yaml`)
-
-Generated by `cus init`. Everything overridable; defaults documented in `cus.py:DEFAULT_CONFIG`. Run `python3 cus.py config` to dump the effective merged config.
-
-Key knobs:
-- `poll_interval_seconds` (default 300)
-- `strategy: lowest_usage | drain | strict_priority | round_robin`
-- `thresholds.steps: [50, 75, 90]` — progressive per-account ladder
-- `thresholds.reset_below_pct: 50` — reset ladder when both windows below this
-- `hot_swap.enabled: false` — Phase 3+ opt-in
-- `hot_swap.{tier_2_at_pct, tier_3_at_pct, pause_message, wake_up_message}`
-- `hot_swap.cache_bust_window_seconds: 300` — defer Tier 1 if last msg < this old
-- `subagent_skip.{enabled, defer_below_tier}`
-- `reactive.enabled: true` — 429 reactive swap
-- `session_locks.{pinned, never_restart_patterns}`
-
-## System requirements
-
-Python 3.11+, `click`, `pyyaml`, `tmux` (only needed for Phase 3+ hot-swap of tmux'd sessions). The shebang uses `uv run --script` with PEP 723 inline metadata so `uv run cus.py` resolves deps automatically; or just `python3 cus.py` if click+pyyaml are system-wide.
-
-## Walk-back
-
-Everything is reversible. See `inbox.md` for the load-bearing autonomous decisions with their concrete walk-back paths.
-
-- Manual swap: `cus switch <previous-name>` restores prior state.
-- Daemon-driven swap: same — every entry in `swap_history` (in `state.json`) is reversible by swapping back.
-- Hooks: `cus hooks uninstall` removes our entries from `~/.claude/settings.json`. Other tools' entries are untouched (signature-keyed).
-- Storage: `~/claude-accounts/` is purely additive; deleting it removes nothing from `~/.claude/`.
-- systemd unit: `systemctl --user disable cus.service` + delete the unit file.
-
-
-
-## Why
-
-Manual workaround for Claude Code's 5h / weekly cap is friction: `/exit` the session, change `CLAUDE_CONFIG_DIR`, relaunch with `--resume`. Doing it across many concurrent sessions and many machines is even worse. This tool automates the rotation.
-
-Existing tools solve adjacent problems but not this exact one:
-- [cux](https://github.com/inulute/cux) — auto-rotation, but in-place credential keystore swap with single global threshold. Overengineered for Linux (no OS keystore involvement on Linux).
-- [AIMUX](https://github.com/Digital-Threads/aimux) — multi-account profile manager, but manual swap only.
-- [teamclaude](https://github.com/KarpelesLab/teamclaude), [ccflare](https://github.com/snipeship/claude-balancer) — proxy-based architectures, different shape.
-
-This tool fills the gap: file-copy swap (not env-var, not keystore) + progressive per-account thresholds + tmux-aware hot-swap (Phase 3+).
 
 ## Quick reference
 
-| File | What |
-|---|---|
-| [`docs/plans/2026-05-18-claude-usage-swap.md`](docs/plans/2026-05-18-claude-usage-swap.md) | Build plan: 6 phases, parallelism map, open questions |
-| [`docs/journal/2026-05-18-claude-usage-swap-planning.md`](docs/journal/2026-05-18-claude-usage-swap-planning.md) | Planning session narrative |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Verified file layout, swap algorithm, state machine |
-| [`inbox.md`](inbox.md) | Agent decisions made autonomously during planning |
+```bash
+cus init                      # discover + migrate accounts (idempotent)
+cus init --force              # refresh stale credential snapshots
+cus list                      # accounts + OAuth identities
+cus status                    # active + per-account state + live sessions
+cus sos                       # exit 1 + actions if anything needs you
+cus statusline                # one-line summary (for CC statusLine)
+cus config                    # effective merged config
 
-## Scope (v1)
+cus poll                      # one-shot usage poll
+cus daemon                    # foreground loop (or use systemd)
+cus daemon --once             # single cycle and exit
+cus daemon --once --no-execute # dry-run (decide, don't swap)
 
-- Linux only. macOS/Windows out of scope.
-- OAuth (Pro/Max) accounts only. API-key/Bedrock/Vertex out of scope.
-- One active account at a time per machine (in-place file swap precludes concurrent multi-account; use AIMUX for that).
-- Per-machine state (no cross-machine coordination).
+cus switch <name>             # manual atomic swap
+cus switch <name> --dry-run   # preview
+
+cus add <name>                # create a new account dir
+cus add <name> --exec         # ... and launch claude under it
+cus relogin <name>            # print login command for token-expired account
+cus relogin <name> --exec     # ... and launch claude under it
+
+cus pin <pane> <account>      # pin a tmux pane to an account (never swap)
+cus unpin <pane>              # remove pin
+
+cus hooks install/uninstall/list
+cus init-systemd --enable     # install + start systemd --user service
+```
+
+## How a swap actually happens
+
+Three levels of aggressiveness, controlled by `config.yaml`:
+
+### Level 3: auto-swap for new sessions (default; `hot_swap.enabled: false`)
+
+When an account crosses its threshold step, the daemon:
+1. Copies `~/.claude/.credentials.json` and account-bound keys of `~/.claude.json` into `~/claude-accounts/account-<current>/` (preserves any token refresh)
+2. Copies the same files *from* `~/claude-accounts/account-<target>/` *into* the live `~/.claude/` location
+3. Updates `state.json` with swap history
+
+In-flight Claude sessions keep using whatever creds they loaded at start. New `claude` invocations after the swap use the new account.
+
+### Level 4: hot-swap of live sessions (`hot_swap.enabled: true`)
+
+Adds tier-graded behavior. When threshold is crossed:
+
+- **Tier 1** (first step, default 50%): wait for the session's next `Stop` hook (turn boundary). Defer if cache is still warm (last message < 5 min ago — swap would burn cache rebuild).
+- **Tier 2** (default 75%): inject "please pause, we're swapping accounts" via `tmux send-keys` to make Claude wrap up gracefully. Then proceed as Tier 1.
+- **Tier 3** (default 90%): send `Escape` to interrupt running tools. Log shell context to `~/claude-accounts/inbox.md` for your review. Then swap.
+
+After the swap, the daemon:
+1. Sends `/exit` to the tmux pane (via `tmux send-keys`)
+2. Relaunches in the same pane with `cd <cwd> && claude --resume <session-id> "Continue."`
+3. The conversation continues from where it left off, now under the new account
+
+### Reactive swap (any level)
+
+The `PostToolUseFailure` hook substring-matches `rate_limit | usage limit | overloaded_error` in tool error bodies. On a hit, the daemon swaps immediately without waiting for the next poll.
+
+## Progressive thresholds (the novel bit)
+
+Each account has its own `next_swap_at_pct` field. Starts at 50; climbs through `[75, 90, force]` each time we swap *out* of it. Reset to 50 when both windows drop below `reset_below_pct`.
+
+Result: account A swapped out at 50%; we drain B until 50%; back to A but it's still at ~50%, so it doesn't trip again until 75%; etc. Naturally load-balances across the pool instead of hammering A → swap → A → swap.
+
+## SOS — when human action is needed
+
+The daemon can't fix everything autonomously. When tokens expire, all accounts hit cap, or the daemon itself crashes, it surfaces an SOS through four channels:
+
+- **`cus sos` CLI** — exit 1 + printed actions; exit 0 = all clear
+- **`~/claude-accounts/SOS.md`** — written every cycle when conditions exist, deleted when clear
+- **Claude Code statusLine** — shows `🚨 cus SOS: <reason>` instead of the normal `cus:<account>...`
+- **`notify-send` desktop notification** — fires on signature changes (no spam)
+
+Conditions checked:
+- OAuth token expired on any account → `cus relogin <name>`
+- All accounts blocked → re-login or wait
+- Active over threshold with no swap target → add another account
+- Stale poll (>4 cycles missed) → daemon may be down
+- Daemon pid recorded but process gone → restart
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the full catalog with recipes.
+
+## Storage layout
+
+```
+~/claude-accounts/
+  config.yaml                     # operator config (edit this)
+  state.json                      # runtime state (don't edit while daemon running)
+  SOS.md                          # current SOS conditions (or absent if clear)
+  inbox.md                        # autonomous decisions (Tier 3 force-interrupts)
+  daemon.log                      # daemon stdout/stderr
+  account-default/                # a full CLAUDE_CONFIG_DIR
+    .credentials.json
+    .claude.json
+    meta.yaml
+    projects/ → ~/.claude/projects/   # symlinks for shared state
+    plugins/, agents/, skills/, commands/, memory/, hooks/, scripts/ (symlinks)
+  account-merkos/
+    ...
+```
+
+Each `account-<name>/` directory is a fully-functional `CLAUDE_CONFIG_DIR`. To log into a new account: `CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/ claude` (or use `cus add <name>` to create + launch in one step).
+
+The live `~/.claude/` is the "currently active" mount point that Claude Code reads from when no env var is set. Swap = copy from `account-<target>/` into `~/.claude/`.
+
+## Config reference
+
+`~/claude-accounts/config.yaml`:
+
+```yaml
+accounts:
+  - name: default
+    priority: 1
+  - name: merkos
+    priority: 1
+
+poll_interval_seconds: 300       # daemon polls every N seconds
+
+strategy: lowest_usage           # lowest_usage | drain | strict_priority | round_robin
+
+thresholds:
+  steps: [50, 75, 90]            # progressive ladder
+  five_hour: true
+  seven_day: true
+  reset_below_pct: 50
+
+hot_swap:
+  enabled: true                  # false = level 3 (new sessions only)
+  tier_2_at_pct: 75
+  tier_3_at_pct: 90
+  pause_message: "please pause your current thought — we're swapping accounts..."
+  wake_up_message: "Continue where you left off."
+  cache_bust_window_seconds: 300
+  mid_turn_idle_seconds: 30
+  stop_wait_timeout_seconds: 300
+  pause_response_timeout_seconds: 120
+
+subagent_skip:
+  enabled: true
+  defer_below_tier: 3            # tier_3 force proceeds regardless
+
+reactive:
+  enabled: true                  # detect 429s via PostToolUseFailure hook
+
+session_locks:
+  pinned: {}                     # {pane_or_session_id: account_name}
+  never_restart_patterns: []     # regex list
+
+hooks:
+  install_session_start: true
+  install_stop: true
+  install_post_tool_use_failure: true
+  install_pre_tool_use: true
+  install_subagent_stop: true
+```
+
+Run `cus config` to see the effective merged config.
+
+## Documentation
+
+- [docs/RUNBOOK.md](docs/RUNBOOK.md) — day-to-day operations
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — SOS catalog + common issues
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — file layout, swap algorithm, state machine
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) — PR / development guide
+- [docs/plans/](docs/plans/) — original build plan (AVC methodology)
+- [docs/journal/](docs/journal/) — session-scoped writeups
+- [inbox.md](inbox.md) — load-bearing autonomous decisions with walk-back paths
+
+## Walk-back / uninstall
+
+Everything is reversible:
+
+```bash
+systemctl --user disable --now cus.service
+cus hooks uninstall                            # removes our hook entries from settings.json
+# Manually remove "statusLine" key from ~/.claude/settings.json (or restore from .bak)
+mv ~/claude-accounts ~/claude-accounts.removed # purely additive; doesn't touch ~/.claude/
+```
+
+Conversation history, plugins, agents, etc. live in `~/.claude/` and are never modified by `cus`.
+
+## Limitations
+
+- **Linux only.** macOS Keychain handling is non-trivial; out of scope for v1.
+- **OAuth (Pro/Max) accounts only.** API-key / Bedrock / Vertex auth not supported.
+- **One active account at a time per machine.** The file-copy swap model precludes concurrent multi-account on one machine. Use AIMUX if you need that.
+- **Cross-machine coordination not implemented.** If you run `cus daemon` on multiple machines, they don't coordinate — two daemons could pick the same swap target.
+- **No SessionEnd hook in Claude Code** — session liveness is inferred from JSONL transcript mtime + Stop hook recency. Long-idle sessions may be wrongly marked dead.
+
+## License
+
+MIT (see [LICENSE](LICENSE)).
+
+## Credits
+
+Methodology lifted from [cux](https://github.com/inulute/cux). Anthropic OAuth usage endpoint contract verified live against the same API Claude Code uses for `/usage`.

@@ -1,0 +1,180 @@
+# Runbook — day-to-day `cus` operations
+
+This is the reference for operating `cus` after initial setup. Quick lookup by what you want to do.
+
+## Daily check: are things healthy?
+
+```bash
+cus sos           # exit 0 = all clear; non-zero + printed actions if not
+cus status        # current account, per-account usage, live sessions, recent swaps
+```
+
+If `cus sos` prints anything, follow the printed action. The daemon also writes `~/claude-accounts/SOS.md` and (when `notify-send` is installed) fires a desktop notification on signature change.
+
+The Claude Code statusLine at the bottom of every TUI shows `cus:<account> 5h:NN% 7d:NN% nxt:NN%` normally, or `🚨 cus SOS: <reason>` when action is needed.
+
+## Adding a new account
+
+```bash
+cus add <name>            # creates ~/claude-accounts/account-<name>/, prints login command
+cus add <name> --exec     # same, but immediately launches `claude` under the new dir
+```
+
+After `cus add work --exec`, Claude Code opens with `CLAUDE_CONFIG_DIR=~/claude-accounts/account-work/`. Do the interactive `/login` flow (a URL appears; open it in a browser; paste back the code). Exit when done.
+
+Then:
+
+```bash
+cus init --force          # discover + register the new account
+cus poll                  # confirm it returns valid usage data
+```
+
+The daemon picks it up on its next cycle. No restart needed.
+
+## Re-logging an account whose tokens expired
+
+When `cus sos` reports `OAuth token expired`:
+
+```bash
+cus relogin <name>            # prints the exact login command
+cus relogin <name> --exec     # immediately launches claude under that dir
+```
+
+After login + `/exit`:
+
+```bash
+cus poll                      # refreshes state.json
+cus sos                       # should report "All clear"
+```
+
+## Manual swap (override the daemon's decision)
+
+```bash
+cus switch <name>             # atomic swap to <name>
+cus switch <name> --dry-run   # preview the file-level changes
+```
+
+Swaps are reversible — `cus switch <previous>` rewinds.
+
+## Pinning a session to an account
+
+Some sessions you want kept on a specific account (long-running autonomous work, etc.):
+
+```bash
+cus pin %12 default           # pin tmux pane %12 to default; daemon never swaps it
+cus pin <session-id> merkos   # pin a specific session-id
+cus unpin %12                 # remove the pin
+```
+
+Pin config lives in `~/claude-accounts/config.yaml` under `session_locks.pinned`. Edit directly if you prefer.
+
+## Whitelist patterns (never restart these panes)
+
+In `~/claude-accounts/config.yaml`:
+
+```yaml
+session_locks:
+  never_restart_patterns:
+    - "babysitter:.*"           # regex matched against tmux pane's pane_current_command
+    - "long-running-.*"
+```
+
+Matching panes are skipped during hot-swap (the daemon doesn't `/exit` and relaunch them).
+
+## Starting / stopping the daemon
+
+If installed via systemd (`cus init-systemd --enable`):
+
+```bash
+systemctl --user status cus.service    # current state
+systemctl --user stop cus.service      # pause
+systemctl --user start cus.service     # resume
+systemctl --user restart cus.service   # reload config.yaml
+systemctl --user disable cus.service   # remove from boot
+journalctl --user -u cus.service -f    # tail logs
+```
+
+Without systemd:
+
+```bash
+cus daemon                             # foreground (Ctrl-C to stop)
+cus daemon --once                      # single cycle and exit
+cus daemon --once --no-execute         # decide but don't actually swap (dry-run)
+```
+
+The daemon writes its logs to `~/claude-accounts/daemon.log` either way.
+
+## Tuning thresholds + strategy
+
+Edit `~/claude-accounts/config.yaml`. Common changes:
+
+| What you want | Edit |
+|---|---|
+| Poll less aggressively | `poll_interval_seconds: 600` (10 min) |
+| Don't swap until 75%+ | `thresholds.steps: [75, 90]` |
+| Try to "drain" one account before falling back | `strategy: drain` |
+| Disable hot-swap (level 3 only — auto-rotate new sessions, leave live ones alone) | `hot_swap.enabled: false` |
+| Inject pause-message at 50% instead of 75% | `hot_swap.tier_2_at_pct: 50` |
+| Never swap mid-subagent | `subagent_skip.defer_below_tier: 100` (effectively always defer) |
+
+Restart the daemon after editing: `systemctl --user restart cus.service`. (`cus daemon` re-reads config on every cycle, so no restart needed if running foreground — but systemd-managed processes don't pick up config changes until restart.)
+
+## Checking what's currently configured
+
+```bash
+cus config                # effective merged config (defaults + your overrides)
+cus list                  # all configured accounts with OAuth identities
+cus hooks list            # which Claude Code hooks are installed
+```
+
+## Updating to a new version
+
+```bash
+cd ~/repos/claude-usage-swap
+git pull
+systemctl --user restart cus.service
+```
+
+If the update changed config schema, `cus config` will show the new fields (with defaults). Edit `config.yaml` if you want to override.
+
+## Uninstalling
+
+```bash
+systemctl --user disable --now cus.service
+cus hooks uninstall
+# Remove statusLine entry from ~/.claude/settings.json (or restore from .bak)
+# Optional: rm ~/.config/systemd/user/cus.service
+# Optional: rm -rf ~/claude-accounts/  (purely additive; doesn't touch ~/.claude/)
+```
+
+The repo itself can be removed by `rm -rf ~/repos/claude-usage-swap`. None of the actual Claude credentials live in the repo — they're all under `~/claude-accounts/` (which is per-machine, not versioned).
+
+## State files reference
+
+Inside `~/claude-accounts/`:
+
+| File | What |
+|---|---|
+| `config.yaml` | Operator config — edit this |
+| `state.json` | Runtime state (active account, per-account thresholds, swap history). Edit only when daemon stopped. |
+| `SOS.md` | Latest SOS conditions (daemon updates each cycle; absent when clear) |
+| `inbox.md` | Autonomous decisions the daemon made (e.g. force-interrupts at Tier 3) |
+| `daemon.log` | Daemon stdout/stderr |
+| `daemon.pid` | Running daemon's PID (used by SOS to detect stale process) |
+| `sessions.log` | One line per session start (SessionStart hook) |
+| `stops.log` | One line per turn end (Stop hook) |
+| `429.log` | Rate-limit detections (PostToolUseFailure hook) |
+| `tool_use.log` | Tool-call start/stop signals (PreToolUse + SubagentStop hooks) |
+| `account-<name>/` | Per-account `CLAUDE_CONFIG_DIR` — `.credentials.json` + `.claude.json` + `meta.yaml` + symlinks |
+
+## Quick reference: SOS conditions
+
+| Condition | What it means | Action |
+|---|---|---|
+| `OAuth token expired` | Cached tokens for that account are too old | `cus relogin <name>` → follow login flow → `cus poll` |
+| `All accounts blocked` | Every account is rate-limited or expired | Re-login expired ones; wait for rate-limited ones to cool down |
+| `Active at NN% and no swap target available` | Current account over threshold, all others blocked | Add another account (`cus add <name>`) or wait |
+| `Stale usage data for: <names>` | No fresh poll in >4 cycles | Daemon may be down: `systemctl --user status cus.service` |
+| `Daemon pid <N> recorded but process is gone` | Daemon crashed/killed; pid file stale | Restart daemon; then `rm ~/claude-accounts/daemon.pid` if needed |
+
+See `docs/TROUBLESHOOTING.md` for deeper recovery procedures.
