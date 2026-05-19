@@ -93,11 +93,26 @@ TOOL_USE_LOG = ACCOUNTS_DIR / "tool_use.log"
 DAEMON_LOG = ACCOUNTS_DIR / "daemon.log"
 DAEMON_PID = ACCOUNTS_DIR / "daemon.pid"
 INBOX_MD = ACCOUNTS_DIR / "inbox.md"
+SOS_MD = ACCOUNTS_DIR / "SOS.md"
+LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
 
 # Hook scripts ship in <repo>/hooks/. Daemon installs them into ~/.claude/settings.json
 # at user request via `cus hooks install`. Source paths discovered relative to cus.py.
 HOOKS_SRC_DIR = Path(__file__).resolve().parent / "hooks"
 HOOK_SETTINGS_KEY = "cus"  # signature key in settings.json so we don't clobber other tools
+
+# Inside ~/claude-accounts/account-<name>/:
+#   - .credentials.json    valid OAuth payload (Claude Code reads this when
+#                          CLAUDE_CONFIG_DIR points at this dir)
+#   - .claude.json         per-account config — minimally has userID + oauthAccount
+#   - meta.yaml            our metadata (priority, locked_sessions, ts)
+#   - projects/ → ~/.claude/projects/  (symlink — shared history)
+#   - plugins/ → ~/.claude/plugins/    (symlink — shared)
+#   - agents/, skills/, commands/, memory/ → likewise symlinked when present
+#
+# Each account dir is a VALID CLAUDE_CONFIG_DIR. To log in to an account,
+# `CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/ claude /login`.
+SHARED_SYMLINK_SUBDIRS = ["projects", "plugins", "agents", "skills", "commands", "memory", "hooks", "scripts"]
 
 # The full list of keys that are tied to OAuth identity — verified empirically
 # against the user's two config dirs (2026-05-18). All other keys in
@@ -226,22 +241,45 @@ def now_iso() -> str:
 def discover_config_dirs() -> list[tuple[str, Path]]:
     """Return [(account_name, config_dir_path), ...] for all on-machine accounts.
 
-    A Claude config dir is identified by the presence of `.credentials.json`
-    inside it. The canonical live config is `~/.claude/`; auxiliary dirs
-    follow the naming convention `~/.claude-<name>/`.
+    Priority order:
+      1. `~/claude-accounts/account-*/` — managed accounts (post-migration)
+      2. The live `~/.claude/` — always registered as "default" unless an
+         entry already exists in our managed dir
+      3. Sibling `~/.claude-<name>/` dirs — legacy ad-hoc accounts
+         (registered for one-time migration, then user can delete the dir)
+
+    Managed accounts take precedence: if both `~/claude-accounts/account-merkos/`
+    and `~/.claude-merkos/` exist, the managed one wins.
     """
     found: list[tuple[str, Path]] = []
-    if (CLAUDE_DIR / ".credentials.json").exists():
+    seen: set[str] = set()
+
+    # 1. Managed accounts (post-migration)
+    if ACCOUNTS_DIR.exists():
+        for p in sorted(ACCOUNTS_DIR.glob("account-*")):
+            if not p.is_dir():
+                continue
+            if not (p / ".credentials.json").exists() and not (p / "credentials.json").exists():
+                continue
+            name = p.name.removeprefix("account-")
+            found.append((name, p))
+            seen.add(name)
+
+    # 2. Live ~/.claude/ — register as "default" if not already present
+    if "default" not in seen and (CLAUDE_DIR / ".credentials.json").exists():
         found.append(("default", CLAUDE_DIR))
+        seen.add("default")
+
+    # 3. Legacy sibling dirs
     for p in sorted(HOME.glob(".claude-*")):
-        if not p.is_dir():
-            continue
-        if not (p / ".credentials.json").exists():
+        if not p.is_dir() or not (p / ".credentials.json").exists():
             continue
         name = p.name.removeprefix(".claude-")
-        if name in ("merkos",):  # explicit; future: any sibling dir
-            pass
+        if name in seen:
+            continue
         found.append((name, p))
+        seen.add(name)
+
     return found
 
 
@@ -345,12 +383,36 @@ class AccountUsage:
         return cls()
 
 
-def _read_access_token(account_name: str) -> str | None:
-    """Read the OAuth access_token from the storage-side credentials.json.
+def account_creds_path(account_name: str) -> Path:
+    """Canonical path to an account's OAuth credentials file.
 
-    Returns None if the file is missing or unparseable.
+    After the unified-tree migration, this is ~/claude-accounts/account-<name>/.credentials.json
+    (dot-prefixed; matches Claude Code's CLAUDE_CONFIG_DIR layout). Falls
+    back to the pre-migration credentials.json for backward-compat.
     """
-    creds_path = ACCOUNTS_DIR / f"account-{account_name}" / "credentials.json"
+    new_path = ACCOUNTS_DIR / f"account-{account_name}" / ".credentials.json"
+    old_path = ACCOUNTS_DIR / f"account-{account_name}" / "credentials.json"
+    if new_path.exists():
+        return new_path
+    return old_path
+
+
+def account_claude_json_path(account_name: str) -> Path:
+    """Canonical path to an account's .claude.json.
+
+    Post-migration: ~/claude-accounts/account-<name>/.claude.json. Pre-migration
+    fallback: claude-identity.json (which only has account-bound keys).
+    """
+    new_path = ACCOUNTS_DIR / f"account-{account_name}" / ".claude.json"
+    old_path = ACCOUNTS_DIR / f"account-{account_name}" / "claude-identity.json"
+    if new_path.exists():
+        return new_path
+    return old_path
+
+
+def _read_access_token(account_name: str) -> str | None:
+    """Read the OAuth access_token from the account dir."""
+    creds_path = account_creds_path(account_name)
     if not creds_path.exists():
         return None
     try:
@@ -358,6 +420,78 @@ def _read_access_token(account_name: str) -> str | None:
         return creds.get("claudeAiOauth", {}).get("accessToken")
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def migrate_account_dir(account_dir: Path) -> dict:
+    """Migrate a single account dir from old layout to new (CLAUDE_CONFIG_DIR-compatible).
+
+    Idempotent: if already in new layout, returns {"action": "already_migrated"}.
+
+    Old layout (cus v0.1):
+      account-X/credentials.json          (OAuth, 0600)
+      account-X/claude-identity.json      ({userID, oauthAccount})
+      account-X/meta.yaml
+
+    New layout (CLAUDE_CONFIG_DIR-compatible):
+      account-X/.credentials.json          (OAuth, 0600)
+      account-X/.claude.json               (account-bound keys)
+      account-X/projects/ → ~/.claude/projects/
+      account-X/plugins/, agents/, skills/, commands/, memory/  (symlinked)
+      account-X/meta.yaml                  (unchanged)
+
+    Returns {"action": "migrated" | "already_migrated" | "no_op", "details": [...]}.
+    """
+    details: list[str] = []
+    new_creds = account_dir / ".credentials.json"
+    old_creds = account_dir / "credentials.json"
+    new_cj = account_dir / ".claude.json"
+    old_identity = account_dir / "claude-identity.json"
+
+    if new_creds.exists() and new_cj.exists():
+        # Verify shared symlinks too
+        for sub in SHARED_SYMLINK_SUBDIRS:
+            link = account_dir / sub
+            target = CLAUDE_DIR / sub
+            if not link.exists() and target.exists():
+                link.symlink_to(target)
+                details.append(f"added missing symlink {link.name} → {target}")
+        return {"action": "already_migrated" if not details else "patched_symlinks", "details": details}
+
+    # 1. Rename credentials.json → .credentials.json (preserving 0600)
+    if old_creds.exists() and not new_creds.exists():
+        os.rename(old_creds, new_creds)
+        os.chmod(new_creds, 0o600)
+        details.append("renamed credentials.json → .credentials.json")
+
+    # 2. Promote claude-identity.json → .claude.json
+    identity: dict = {}
+    if old_identity.exists():
+        try:
+            identity = read_json(old_identity)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not new_cj.exists():
+        # If identity is empty (e.g. brand-new dir with no prior data), write
+        # an empty {} so Claude Code has something valid to read.
+        write_json(new_cj, identity)
+        details.append("created .claude.json from claude-identity.json")
+    if old_identity.exists():
+        old_identity.unlink()
+        details.append("removed legacy claude-identity.json")
+
+    # 3. Symlink shared subdirs to ~/.claude/ for history/plugin/skill sharing
+    for sub in SHARED_SYMLINK_SUBDIRS:
+        link = account_dir / sub
+        target = CLAUDE_DIR / sub
+        if link.exists():
+            continue
+        if not target.exists():
+            continue  # don't create dangling links
+        link.symlink_to(target)
+        details.append(f"symlinked {sub} → {target}")
+
+    return {"action": "migrated", "details": details}
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -534,6 +668,10 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
 
     Shared between the CLI `cus switch` command and the daemon's auto-swap.
     Caller is responsible for any preflight (hot-swap orchestration, etc.).
+
+    Reads from + writes to the post-migration layout (.credentials.json +
+    .claude.json inside each account-* dir). Pre-migration storage is
+    auto-migrated on first read via migrate_account_dir().
     """
     state = load_state()
     if target_name not in state["accounts"]:
@@ -545,28 +683,43 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     target_dir = ACCOUNTS_DIR / f"account-{target_name}"
     current_dir = ACCOUNTS_DIR / f"account-{current}"
 
-    if not (target_dir / "credentials.json").exists():
-        raise FileNotFoundError(f"{target_dir}/credentials.json missing — re-run `cus init`")
-    if not (target_dir / "claude-identity.json").exists():
-        raise FileNotFoundError(f"{target_dir}/claude-identity.json missing — re-run `cus init`")
+    # Auto-migrate if dir is in old layout
+    migrate_account_dir(target_dir)
+    migrate_account_dir(current_dir)
+
+    target_creds = target_dir / ".credentials.json"
+    target_cj = target_dir / ".claude.json"
+    if not target_creds.exists():
+        raise FileNotFoundError(f"{target_creds} missing — re-run `cus init --force`")
+    if not target_cj.exists():
+        raise FileNotFoundError(f"{target_cj} missing — re-run `cus init --force`")
 
     try:
         live_cj = read_json(CLAUDE_JSON)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"{CLAUDE_JSON} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
 
-    # Save current identity + creds back to current's storage
+    # Save current identity + creds back to current's storage. We update the
+    # ENTIRE .claude.json in the source dir (not just account-bound keys)
+    # so that any per-account state Claude writes there persists.
     current_identity = {k: live_cj[k] for k in ACCOUNT_BOUND_KEYS if k in live_cj}
-    write_json(current_dir / "claude-identity.json", current_identity)
-    shutil.copy2(CREDS_JSON, current_dir / "credentials.json")
-    os.chmod(current_dir / "credentials.json", 0o600)
+    # Read existing per-account .claude.json (if any), overlay current account-bound keys
+    if (current_dir / ".claude.json").exists():
+        existing = read_json(current_dir / ".claude.json")
+    else:
+        existing = {}
+    existing.update(current_identity)
+    write_json(current_dir / ".claude.json", existing)
+    shutil.copy2(CREDS_JSON, current_dir / ".credentials.json")
+    os.chmod(current_dir / ".credentials.json", 0o600)
 
-    # Merge target identity + replace creds
-    target_identity = read_json(target_dir / "claude-identity.json")
+    # Merge target's account-bound keys into live ~/.claude.json
+    target_account_cj = read_json(target_cj)
+    target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
     for k, v in target_identity.items():
         live_cj[k] = v
     write_json(CLAUDE_JSON, live_cj)
-    shutil.copy2(target_dir / "credentials.json", CREDS_JSON)
+    shutil.copy2(target_creds, CREDS_JSON)
     os.chmod(CREDS_JSON, 0o600)
 
     # Update state with progressive-threshold bookkeeping
@@ -787,6 +940,179 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         if u.seven_day and u.seven_day.resets_at:
             acct["seven_day_resets_at"] = u.seven_day.resets_at
     return state
+
+
+# --------------------------------------------------------------------------
+# SOS diagnostics — surfaces conditions requiring human action
+# --------------------------------------------------------------------------
+
+@dataclass
+class SOSCondition:
+    """One thing that needs human action. Severity drives statusline color."""
+    severity: str  # "urgent" (red) | "warning" (yellow)
+    summary: str   # one-line headline
+    action: str    # concrete next step
+    affected: str  # account name or "daemon" or "system"
+
+
+def _relogin_command_for(account_name: str, source_dir: str | None = None) -> str:
+    """Return the exact shell command to re-login a given account.
+
+    Prefers the managed-tree location (`~/claude-accounts/account-<name>/`)
+    over legacy `~/.claude-<name>/` ad-hoc dirs. If the managed dir doesn't
+    exist yet, this still returns the managed-dir command — running it
+    creates the dir.
+    """
+    if account_name == "default":
+        # default = live ~/.claude/, no env var needed
+        return "claude /login"
+    managed = ACCOUNTS_DIR / f"account-{account_name}"
+    return f"CLAUDE_CONFIG_DIR={managed}/ claude"
+
+
+def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
+    """Scan state + system for conditions requiring human intervention.
+
+    Returns a list of SOSCondition. Empty list = all clear.
+
+    Conditions checked:
+      1. Any account with token_expired=true → re-login needed.
+      2. Active account over threshold AND no swap target available.
+      3. All accounts blocked (token_expired / rate_limited / poll_error).
+      4. Stale poll — no successful poll in the last N minutes.
+      5. Daemon supposedly running (pid file exists) but process dead.
+      6. SwapStored credentials never refreshed and active is over threshold
+         (hint to run `cus init --force`).
+    """
+    if state is None:
+        state = load_state() if STATE_JSON.exists() else {"active": None, "accounts": {}}
+    if config is None:
+        config = load_config()
+    out: list[SOSCondition] = []
+    accounts = state.get("accounts", {})
+
+    # Condition 1: token expired anywhere
+    for name, acct in accounts.items():
+        if acct.get("token_expired"):
+            cmd = _relogin_command_for(name)
+            out.append(SOSCondition(
+                severity="urgent",
+                summary=f"{name}: OAuth token expired",
+                action=f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll",
+                affected=name,
+            ))
+
+    # Condition 2 + 3: targets available?
+    valid = [n for n, a in accounts.items() if not a.get("token_expired") and not a.get("rate_limited") and not a.get("poll_error")]
+    active = state.get("active")
+    if active and active in accounts:
+        active_acct = accounts[active]
+        threshold = active_acct.get("next_swap_at_pct", 50)
+        cur_pct = max(active_acct.get("current_5h_pct", 0), active_acct.get("current_7d_pct", 0))
+
+        if not valid:
+            out.append(SOSCondition(
+                severity="urgent",
+                summary="All accounts blocked",
+                action="Re-login any TOKEN_EXPIRED accounts (see above). For RATE_LIMITED accounts, wait for cooldown (5h or 7d window reset).",
+                affected="system",
+            ))
+        elif cur_pct >= threshold:
+            # Active is over its threshold step. Are there any UNBLOCKED others?
+            targets = [n for n in valid if n != active]
+            if not targets:
+                out.append(SOSCondition(
+                    severity="urgent",
+                    summary=f"{active} at {cur_pct:.0f}% (≥{threshold}%) and no other account available",
+                    action="Add another Claude account (run `claude /login` with CLAUDE_CONFIG_DIR=~/.claude-newname/) or wait for cooldown.",
+                    affected=active,
+                ))
+
+    # Condition 4: stale poll
+    poll_freshness_seconds = config.get("poll_interval_seconds", 300) * 4  # 4 cycles of staleness = real problem
+    now = datetime.now(timezone.utc)
+    stale_accounts: list[str] = []
+    for name, acct in accounts.items():
+        last_poll = acct.get("last_poll_ts")
+        if not last_poll:
+            continue
+        try:
+            ts = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
+            if (now - ts).total_seconds() > poll_freshness_seconds:
+                stale_accounts.append(name)
+        except ValueError:
+            continue
+    if stale_accounts and any(accounts.keys()) and accounts.get(list(accounts.keys())[0], {}).get("last_poll_ts"):
+        out.append(SOSCondition(
+            severity="warning",
+            summary=f"Stale usage data for: {', '.join(stale_accounts)} (no fresh poll in >{poll_freshness_seconds // 60} min)",
+            action="Daemon may be down. Check: `systemctl --user status cus.service` or restart `python3 ~/repos/claude-usage-swap/cus.py daemon`.",
+            affected="daemon",
+        ))
+
+    # Condition 5: daemon pid file exists but process is gone
+    if DAEMON_PID.exists():
+        try:
+            pid = int(DAEMON_PID.read_text().strip())
+            try:
+                os.kill(pid, 0)  # signal 0 = "are you there"
+            except ProcessLookupError:
+                out.append(SOSCondition(
+                    severity="warning",
+                    summary=f"Daemon pid {pid} recorded but process is gone",
+                    action="Restart: `systemctl --user restart cus.service` or `python3 ~/repos/claude-usage-swap/cus.py daemon`. Then `rm ~/claude-accounts/daemon.pid` if stale.",
+                    affected="daemon",
+                ))
+        except (ValueError, OSError):
+            pass
+
+    return out
+
+
+def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
+    """Write or remove SOS.md and (optionally) fire desktop notification.
+
+    Idempotent: writes the same content given the same conditions. To avoid
+    notify-send spam, we hash the conditions and only fire if it changed
+    since the last notification.
+    """
+    if not conditions:
+        if SOS_MD.exists():
+            SOS_MD.unlink()
+        return
+
+    SOS_MD.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# SOS — claude-usage-swap needs you", f"", f"_Updated {now_iso()}_", f""]
+    for c in conditions:
+        lines.append(f"## [{c.severity.upper()}] {c.summary}")
+        lines.append("")
+        lines.append(c.action)
+        lines.append("")
+    atomic_write_bytes(SOS_MD, ("\n".join(lines) + "\n").encode())
+
+    # Desktop notification — only when SOS hash changes (avoid spam every poll)
+    signature = "|".join(f"{c.severity}:{c.summary}" for c in conditions)
+    prev_sig = ""
+    if LAST_NOTIFY.exists():
+        try:
+            prev_sig = read_json(LAST_NOTIFY).get("signature", "")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if signature != prev_sig:
+        write_json(LAST_NOTIFY, {"signature": signature, "ts": now_iso()})
+        if shutil.which("notify-send"):
+            urgent = [c for c in conditions if c.severity == "urgent"]
+            title = "🚨 cus SOS" if urgent else "⚠ cus warning"
+            body = conditions[0].summary
+            if len(conditions) > 1:
+                body += f" (and {len(conditions) - 1} more)"
+            try:
+                subprocess.run(
+                    ["notify-send", "-u", "critical" if urgent else "normal", "-a", "cus", title, body],
+                    check=False, capture_output=True, timeout=5,
+                )
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
 
 
 def maybe_reset_thresholds(state: dict, config: dict) -> None:
@@ -1365,29 +1691,59 @@ def init(dry_run: bool, force: bool) -> None:
     imported = 0
     skipped = 0
     refreshed = 0
+    migrated = 0
 
     for name, src_dir in candidates:
         dst = ACCOUNTS_DIR / f"account-{name}"
+
+        # If src_dir IS dst (already in managed location), just migrate to new layout
+        if src_dir == dst:
+            migration = migrate_account_dir(dst)
+            if migration["action"] in ("migrated", "patched_symlinks"):
+                migrated += 1
+                click.echo(f"  migrated {name} -> {dst} ({len(migration['details'])} changes)")
+            elif force:
+                # Force refresh: re-read creds + identity from this dir (no-op if same)
+                refreshed += 1
+            continue
+
         if dst.exists() and not force:
-            click.echo(f"  skip {name}: {dst} already exists (use --force to refresh)")
+            click.echo(f"  skip {name}: {dst} already exists (use --force to refresh from {src_dir})")
             skipped += 1
             continue
         existed = dst.exists()
 
         dst.mkdir(parents=True, exist_ok=True)
 
-        # 1. Credentials — whole-file copy with 0600 permissions
+        # 1. Credentials — copy from source to .credentials.json (new layout)
         src_creds = src_dir / ".credentials.json"
-        dst_creds = dst / "credentials.json"
+        dst_creds = dst / ".credentials.json"
         shutil.copy2(src_creds, dst_creds)
         os.chmod(dst_creds, 0o600)
 
-        # 2. Identity — surgical extract of just the account-bound keys
-        identity: dict = {}
-        cj_path = claude_json_for_config_dir(src_dir)
-        if cj_path is not None:
-            identity = extract_identity(cj_path)
-        write_json(dst / "claude-identity.json", identity)
+        # 2. .claude.json — copy source's .claude.json (or extract identity if not available)
+        src_cj = claude_json_for_config_dir(src_dir)
+        dst_cj = dst / ".claude.json"
+        if src_cj is not None and src_cj.exists():
+            # Copy the whole .claude.json; per-account state is fine to duplicate
+            shutil.copy2(src_cj, dst_cj)
+            identity = extract_identity(dst_cj)
+        else:
+            identity = {}
+            write_json(dst_cj, identity)
+
+        # 3. Symlink shared subdirs to ~/.claude/ so projects/plugins/etc. are shared
+        for sub in SHARED_SYMLINK_SUBDIRS:
+            link = dst / sub
+            target = CLAUDE_DIR / sub
+            if not link.exists() and target.exists():
+                link.symlink_to(target)
+
+        # Clean up any legacy files if we somehow co-exist with old layout
+        for legacy in ("credentials.json", "claude-identity.json"):
+            legacy_path = dst / legacy
+            if legacy_path.exists():
+                legacy_path.unlink()
 
         # 3. Meta — preserve user-edited fields (priority, locked_sessions),
         # refresh the system-managed fields. Only happens on --force refresh.
@@ -1446,8 +1802,8 @@ def init(dry_run: bool, force: bool) -> None:
         click.echo(f"  wrote {CONFIG_YAML}")
 
     click.echo()
-    click.echo(f"Done. Imported {imported}, refreshed {refreshed}, skipped {skipped}.")
-    if (imported or refreshed) and any(n == "default" for n, _ in candidates):
+    click.echo(f"Done. Imported {imported}, migrated {migrated}, refreshed {refreshed}, skipped {skipped}.")
+    if (imported or refreshed or migrated) and any(n == "default" for n, _ in candidates):
         click.echo("Live ~/.claude/ is registered as 'default' (the currently-active account).")
 
 
@@ -1699,6 +2055,19 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         click.echo("Not initialized. Run `cus init` first.")
         sys.exit(1)
 
+    # Daemon writes its pid so `cus sos` can detect "pid recorded but gone"
+    try:
+        DAEMON_PID.write_text(str(os.getpid()))
+    except OSError:
+        pass
+
+    def _emit_sos_after(state: dict, config: dict) -> None:
+        conditions = diagnose(state, config)
+        maybe_write_sos(conditions, state)
+        if conditions:
+            for c in conditions:
+                click.echo(f"  [{c.severity.upper()}] {c.summary}")
+
     def one_cycle() -> None:
         state = load_state()
         config = load_config()
@@ -1752,7 +2121,9 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             for name, acct in state["accounts"].items():
                 marker = " *" if name == state["active"] else "  "
                 te = " (TOKEN_EXPIRED)" if acct.get("token_expired") else ""
-                click.echo(f"  {marker}{name}: 5h={acct.get('current_5h_pct', 0):.1f}%, 7d={acct.get('current_7d_pct', 0):.1f}%, next={acct.get('next_swap_at_pct', 50)}%{te}")
+                rl = " (RATE_LIMITED)" if acct.get("rate_limited") else ""
+                click.echo(f"  {marker}{name}: 5h={acct.get('current_5h_pct', 0):.1f}%, 7d={acct.get('current_7d_pct', 0):.1f}%, next={acct.get('next_swap_at_pct', 50)}%{te}{rl}")
+            _emit_sos_after(state, config)
             return
 
         click.echo(f"  swap decision: {state['active']} -> {decision.target} (tier {decision.tier})")
@@ -1774,6 +2145,8 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         else:
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
             click.echo(f"    swapped (new sessions only — live sessions unaffected)")
+
+        _emit_sos_after(load_state(), config)
 
     if once:
         one_cycle()
@@ -1886,14 +2259,28 @@ def unpin(pane_or_session: str) -> None:
 def statusline_cmd() -> None:
     """One-line summary for Claude Code statusline integration.
 
-    Output format: `<account> 5h:NN% 7d:NN%` with color flags if over threshold.
-    Configure in ~/.claude/settings.json:
+    Output format: `<account> 5h:NN% 7d:NN%` or `🚨 SOS: <action>` when
+    human action is needed. Configure in ~/.claude/settings.json:
       "statusLine": {"type": "command", "command": "python3 /path/to/cus.py statusline"}
     """
     if not STATE_JSON.exists():
-        click.echo("cus: not init")
+        click.echo("cus: not init (run `cus init`)")
         return
     state = read_json(STATE_JSON)
+    config = load_config()
+
+    # SOS takes priority — if human action is needed, surface it loudly
+    conditions = diagnose(state, config)
+    urgent = [c for c in conditions if c.severity == "urgent"]
+    if urgent:
+        click.echo(f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md")
+        return
+    warning = [c for c in conditions if c.severity == "warning"]
+    if warning:
+        click.echo(f"⚠ cus: {warning[0].summary}")
+        return
+
+    # Normal output
     active = state.get("active", "?")
     acct = state.get("accounts", {}).get(active, {})
     fh = acct.get("current_5h_pct", 0)
@@ -1905,6 +2292,133 @@ def statusline_cmd() -> None:
     elif max(fh, sd) >= nx * 0.8:
         flag = " · "
     click.echo(f"cus:{active}{flag}5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
+
+
+@cli.command(name="sos")
+@click.option("--quiet", is_flag=True, help="No output if all clear (for scripting).")
+def sos_cmd(quiet: bool) -> None:
+    """Check for conditions requiring human action.
+
+    Exit code 0 = all clear, 1 = action needed.
+
+    Prints each condition with its severity, summary, and concrete next
+    step. Conditions checked: token expired, all accounts blocked, active
+    over threshold with no target, stale poll, daemon dead.
+
+    Also writes ~/claude-accounts/SOS.md (or removes it if clear) so the
+    next time you `cat` that file you see what's needed. Fires notify-send
+    desktop notification on signature changes (if installed). The daemon
+    does this too on every cycle.
+    """
+    state = load_state() if STATE_JSON.exists() else {"active": None, "accounts": {}}
+    conditions = diagnose(state)
+    maybe_write_sos(conditions, state)
+
+    if not conditions:
+        if not quiet:
+            click.echo("✓ All clear — no human action needed.")
+        sys.exit(0)
+
+    click.echo("🚨 SOS — human action needed:\n")
+    for c in conditions:
+        prefix = "[URGENT]" if c.severity == "urgent" else "[WARNING]"
+        click.echo(f"  {prefix} {c.summary}")
+        for line in c.action.split("\n"):
+            click.echo(f"    {line}")
+        click.echo()
+    click.echo(f"Also written to: {SOS_MD}")
+    sys.exit(1)
+
+
+@cli.command(name="add")
+@click.argument("name")
+@click.option("--exec", "exec_flag", is_flag=True, help="Immediately exec `claude` under the new dir.")
+def add_cmd(name: str, exec_flag: bool) -> None:
+    """Create a new account dir and print the login command.
+
+    Usage: `cus add work` creates ~/claude-accounts/account-work/ as a
+    valid CLAUDE_CONFIG_DIR, symlinks shared subdirs to ~/.claude/, and
+    prints the exact command to log in.
+
+    After login, run `cus poll` to register the new account in state.json.
+    """
+    if not name.replace("-", "").replace("_", "").isalnum():
+        click.echo(f"Bad name '{name}' — use alphanumeric + dashes/underscores only.")
+        sys.exit(1)
+    if name == "default":
+        click.echo("'default' is reserved for the live ~/.claude/ dir.")
+        sys.exit(1)
+    dst = ACCOUNTS_DIR / f"account-{name}"
+    if dst.exists():
+        click.echo(f"{dst} already exists — use `cus relogin {name}` to refresh tokens.")
+        sys.exit(1)
+
+    dst.mkdir(parents=True)
+    # Minimum-viable CLAUDE_CONFIG_DIR: empty .claude.json, no .credentials.json
+    # (Claude /login will write it). Symlink shared dirs.
+    write_json(dst / ".claude.json", {})
+    for sub in SHARED_SYMLINK_SUBDIRS:
+        link = dst / sub
+        target = CLAUDE_DIR / sub
+        if target.exists():
+            link.symlink_to(target)
+
+    # meta.yaml with sensible defaults
+    write_yaml(dst / "meta.yaml", {
+        "name": name,
+        "source_dir": str(dst),
+        "oauth_email": "unknown (run /login)",
+        "oauth_account_uuid": "unknown",
+        "priority": 1,
+        "locked_sessions": [],
+        "imported_ts": now_iso(),
+    })
+
+    cmd = _relogin_command_for(name)
+    click.echo(f"Created {dst}")
+    click.echo()
+    click.echo(f"To log in to this account, run:")
+    click.echo(f"  {cmd}")
+    click.echo()
+    click.echo(f"After logging in, register it in state.json:")
+    click.echo(f"  python3 ~/repos/claude-usage-swap/cus.py init --force && python3 ~/repos/claude-usage-swap/cus.py poll")
+
+    if exec_flag:
+        click.echo()
+        click.echo("Launching claude now...")
+        env = os.environ.copy()
+        env["CLAUDE_CONFIG_DIR"] = str(dst)
+        os.execvpe("claude", ["claude"], env)
+
+
+@cli.command(name="relogin")
+@click.argument("name")
+@click.option("--exec", "exec_flag", is_flag=True, help="Immediately exec `claude` under the account dir.")
+def relogin_cmd(name: str, exec_flag: bool) -> None:
+    """Print the command to re-login an existing account (refresh OAuth tokens).
+
+    Run this when `cus sos` reports a token expired for a given account.
+    After the re-login, `cus poll` to update state.
+    """
+    dst = ACCOUNTS_DIR / f"account-{name}"
+    if name != "default" and not dst.exists():
+        click.echo(f"Unknown account '{name}'. Run `cus list` to see configured accounts.")
+        sys.exit(1)
+    cmd = _relogin_command_for(name)
+    click.echo(f"To re-login {name}, run:")
+    click.echo(f"  {cmd}")
+    click.echo()
+    click.echo(f"After logging in:")
+    click.echo(f"  python3 ~/repos/claude-usage-swap/cus.py poll")
+    if exec_flag:
+        click.echo()
+        click.echo("Launching claude now...")
+        env = os.environ.copy()
+        if name == "default":
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            env["CLAUDE_CONFIG_DIR"] = str(dst)
+        os.execvpe("claude", ["claude"], env)
 
 
 @cli.command(name="init-systemd")

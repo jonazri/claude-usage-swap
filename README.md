@@ -6,6 +6,54 @@ Single-file Python tool that watches `ccusage --json` and swaps the active OAuth
 
 **Status: all 6 phases shipped (v0.1).** See [`docs/plans/2026-05-18-claude-usage-swap.md`](docs/plans/2026-05-18-claude-usage-swap.md) for the build plan.
 
+## Storage layout (post-migration)
+
+Each account lives in its own `CLAUDE_CONFIG_DIR`-compatible dir under `~/claude-accounts/`:
+
+```
+~/claude-accounts/
+  config.yaml                     # editable: thresholds, strategy, hot_swap, locks
+  state.json                      # runtime: active, per-account usage, swap history
+  SOS.md                          # written by daemon if human action needed
+  daemon.log                      # daemon stdout/stderr
+  inbox.md                        # autonomous decisions worth user review
+  account-default/                # a full CLAUDE_CONFIG_DIR
+    .credentials.json             # OAuth tokens, 0600
+    .claude.json                  # account-bound state (userID, oauthAccount, etc.)
+    meta.yaml                     # priority, locked_sessions, oauth_email, ts
+    projects/ → ~/.claude/projects/    # symlink — shared history across accounts
+    plugins/  → ~/.claude/plugins/     # symlink
+    agents/, skills/, commands/, memory/, hooks/, scripts/  # symlinks if present
+  account-merkos/
+    ...
+  account-<your-new-one>/
+    ...
+```
+
+The live `~/.claude/` is the "currently active" mount point that Claude Code reads from when no `CLAUDE_CONFIG_DIR` is set. Swap = copy `.credentials.json` + account-bound keys from `account-<target>/` into `~/.claude/`. No more ad-hoc `~/.claude-<name>/` dirs going forward.
+
+## Adding accounts
+
+```bash
+# Add a new account: creates ~/claude-accounts/account-<name>/ and prints
+# the exact login command.
+python3 cus.py add work
+
+# Output:
+#   Created /home/rayi/claude-accounts/account-work
+#   To log in to this account, run:
+#     CLAUDE_CONFIG_DIR=/home/rayi/claude-accounts/account-work/ claude
+#   After logging in, register it:
+#     python3 ~/repos/claude-usage-swap/cus.py init --force && cus poll
+
+# Re-login an existing account (e.g. when SOS says tokens expired):
+python3 cus.py relogin merkos
+
+# Or use --exec to immediately launch claude under that dir:
+python3 cus.py add work --exec
+python3 cus.py relogin merkos --exec
+```
+
 ## Usage
 
 ```bash
@@ -39,6 +87,23 @@ python3 cus.py pin %12 default            # pin tmux pane %12 to default account
 python3 cus.py unpin %12                  # remove pin
 python3 cus.py init-systemd --enable      # systemd --user unit + start
 ```
+
+## SOS — when human action is needed
+
+`cus sos` (or just run the daemon — it does the same checks) surfaces conditions requiring you to step in:
+
+- OAuth token expired on any account — concrete `CLAUDE_CONFIG_DIR=... claude` re-login command provided.
+- All accounts blocked (token expired / rate limited / poll error) — daemon can't proceed.
+- Active account over threshold AND no swap target available.
+- Stale usage data (no fresh poll in >4 cycles) — daemon may be down.
+- Daemon pid recorded but process gone — needs restart.
+
+Channels:
+
+1. **Claude Code statusLine** — shows `🚨 cus SOS: <summary>` when conditions exist. Wired into `~/.claude/settings.json` automatically by `cus init` if no existing statusLine is present.
+2. **`cus sos` CLI** — exit code 1 + printed actions when conditions exist; exit 0 + "All clear" otherwise.
+3. **`~/claude-accounts/SOS.md`** — written by the daemon (and by `cus sos`) when conditions exist; deleted when clear. Cat this file anytime to see what's needed.
+4. **Desktop notification** via `notify-send` when conditions *change* (no spam — only fires on signature changes).
 
 ## Phases (all shipped)
 

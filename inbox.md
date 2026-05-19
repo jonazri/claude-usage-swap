@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-05-19 — decision — **ARCH DECISION** — Unified-tree storage: each account-* dir is a valid CLAUDE_CONFIG_DIR](#2026-05-19-decision-arch-decision-unified-tree-storage-each-account-dir-is-a-valid-claude-config-dir)
 - [2026-05-18 — decision — **ARCH DECISION** — Phases 3-6 single-file: hot-swap orchestrator + Phase 6 controls in cus.py, not split](#2026-05-18-decision-arch-decision-phases-3-6-single-file-hot-swap-orchestrator-phase-6-controls-in-cus-py-not-split)
 - [2026-05-18 — decision — **ARCH DECISION** — Direct Anthropic OAuth usage API, not ccusage, as the daemon's signal source](#2026-05-18-decision-arch-decision-direct-anthropic-oauth-usage-api-not-ccusage-as-the-daemon-s-signal-source)
 - [2026-05-18 — decision — **ARCH DECISION** — Lift cux patterns in Python, do not fork the Go binary](#2026-05-18-decision-arch-decision-lift-cux-patterns-in-python-do-not-fork-the-go-binary)
@@ -13,6 +14,56 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-05-19 — decision — **ARCH DECISION** — Unified-tree storage: each account-* dir is a valid CLAUDE_CONFIG_DIR
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #architecture #storage #migration
+
+### What I would have asked you
+> Should each account live as a fully-functional CLAUDE_CONFIG_DIR inside `~/claude-accounts/account-<name>/`, with login happening directly there, OR keep using ad-hoc `~/.claude-<name>/` sibling dirs as the per-account "source of truth" with our storage being just snapshots?
+
+### What I decided
+Migrated to the unified tree. Each `~/claude-accounts/account-<name>/` is now a valid `CLAUDE_CONFIG_DIR` containing:
+- `.credentials.json` (was `credentials.json` pre-migration)
+- `.claude.json` (was `claude-identity.json` pre-migration)
+- `meta.yaml` (unchanged)
+- Symlinks: `projects/`, `plugins/`, `agents/`, `skills/`, `commands/`, `memory/`, `hooks/`, `scripts/` → `~/.claude/<sub>` for shared state across accounts.
+
+Login command surface:
+- New account: `cus add <name>` creates the dir + prints `CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/ claude`.
+- Re-login an expired account: `cus relogin <name>` prints the same.
+- Both support `--exec` to immediately `os.execvpe("claude", ...)` under the right env.
+
+`~/.claude/` remains the "live" mount point for the currently-active account (Claude Code reads from there when no env var is set). Swap copies between account-<X> and ~/.claude/.
+
+### Why
+- User directive 2026-05-19: "we shouldn't even have it linked to that merkos dir; we should have a formal neatly organized tree of folders." Direct response to that.
+- `~/.claude-<name>/` sibling dirs (the cux/AIMUX/legacy convention) are awkward to discover, hard to enumerate, and don't suggest a clear "this is a managed multi-account setup" reading.
+- Single-tree under `~/claude-accounts/` makes backup/migrate/move trivial.
+- Adding a third/fourth/Nth account is now `cus add <name>` (creates the dir, prints login command) — vs the old "manually mkdir then set CLAUDE_CONFIG_DIR and remember to point cus init at it."
+- Shared subdirs (projects, plugins, etc.) are symlinks to `~/.claude/` — history, plugins, custom commands, skills are all visible from any active account. Matches the user's earlier "I don't mind history sharing" position.
+
+### Walk-back path
+1. To revert to ad-hoc sibling dirs: for each `account-<name>/`, copy `.credentials.json` + `.claude.json` back to `~/.claude-<name>/` (the legacy location). Remove `~/claude-accounts/account-<name>/`. Update `cus discover_config_dirs()` to remove the managed-dir branch (it still has the legacy fallback).
+2. Migration is reversible because we never delete the original `~/.claude-merkos/` etc. dirs — they're left in place as backup. The first `cus init --force` after this commit migrates the storage but doesn't touch the legacy dirs.
+3. Drop `cus add` and `cus relogin` — they're standalone additions; no other code references them.
+4. The symlinks created during migration can be `unlink`-ed and replaced with real dirs if a user wants per-account isolation of history/plugins.
+
+### Flags for follow-up
+- `meta.yaml` `source_dir` field is now slightly stale for migrated accounts (still points at legacy `~/.claude-merkos/` etc.). Will self-correct on next `cus init --force` since discover_config_dirs now prefers the managed location. Minor cosmetic issue.
+- The migration revealed `default` account is `stern@trisso.com`, `merkos` is `rstern@merkos302.com` — two genuinely distinct accounts now, vs the earlier observation of "same OAuth identity in two dirs."
+- ~/.claude-merkos/ is now legacy. User can `rm -rf` it after confirming `~/claude-accounts/account-merkos/` works end-to-end (post merkos re-login).
+
+### Walk-back path
+1. Revert to legacy ad-hoc dirs: copy account-<name>/.credentials.json + .claude.json back to ~/.claude-<name>/. Remove ~/claude-accounts/account-<name>/.
+2. Migration didn't delete ~/.claude-merkos/ — it's still there as backup.
+3. Drop `cus add` and `cus relogin` commands (no other code references them).
+4. Symlinks can be unlinked and replaced with real dirs for per-account isolation.
+
+---
+
 
 ## 2026-05-18 — decision — **ARCH DECISION** — Phases 3-6 single-file: hot-swap orchestrator + Phase 6 controls in cus.py, not split
 
