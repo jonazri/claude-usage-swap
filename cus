@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# cus — claude-usage-swap shim
+# Resolves to `python3 /path/to/cus.py` so users can run `cus <command>`
+# anywhere on their PATH instead of `python3 ~/repos/claude-usage-swap/cus.py`.
+# Install: `cus install` creates a symlink in ~/bin/ or ~/.local/bin/.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Follow symlinks so installed-in-~/bin pointer back to the source works
+REAL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+exec python3 "$REAL_DIR/cus.py" "$@"

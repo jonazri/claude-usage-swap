@@ -2204,10 +2204,73 @@ def hooks_list_cmd() -> None:
         click.echo(f"  {event:<30} {status}")
 
 
+CONFIG_EXPLAIN_MAP: dict[str, str] = {
+    "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
+    "poll_interval_seconds": "How often the daemon calls Anthropic's OAuth usage endpoint per account. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 300 (5 min) is the recommended default.",
+    "strategy": "Swap target picker. `lowest_usage` picks the account with the lowest 7d util (cux's 'balanced'). `drain` deplete-current. `strict_priority` respects priority order. `round_robin` cycles by name.",
+    "thresholds": "Progressive per-account thresholds. `steps: [50, 75, 90]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
+    "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
+    "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 defer when subagent active; Tier 3 (force) proceeds regardless.",
+    "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
+    "session_locks": "Per-session pinning. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
+    "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
+    "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
+}
+
+
 @cli.command()
-def config() -> None:
-    """Print effective config (defaults merged with config.yaml)."""
+@click.option("--edit", "edit_flag", is_flag=True, help="Open ~/claude-accounts/config.yaml in $EDITOR.")
+@click.option("--explain", "explain_flag", is_flag=True, help="Annotated listing: each setting + description + current value.")
+@click.option("--path", "path_flag", is_flag=True, help="Print the config file path and exit.")
+def config(edit_flag: bool, explain_flag: bool, path_flag: bool) -> None:
+    """Show, edit, or explain configuration.
+
+    Default: print effective merged config (defaults + user overrides from
+    ~/claude-accounts/config.yaml).
+
+    Flags:
+      --edit       Open the user config file in $EDITOR (default: vi)
+      --explain    Annotated listing of every setting with current value + description
+      --path       Print the file path and exit (useful for: `vim $(cus config --path)`)
+    """
+    if path_flag:
+        click.echo(CONFIG_YAML)
+        return
+
+    if edit_flag:
+        if not CONFIG_YAML.exists():
+            click.echo(f"Config file doesn't exist yet at {CONFIG_YAML}. Run `cus init` first.")
+            sys.exit(1)
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+        try:
+            subprocess.run([editor, str(CONFIG_YAML)], check=True)
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            click.echo(f"Failed to open editor '{editor}': {e}")
+            sys.exit(1)
+        click.echo(f"Saved. If the daemon is running, restart it to pick up changes:")
+        click.echo("  systemctl --user restart cus.service")
+        return
+
     cfg = load_config()
+
+    if explain_flag:
+        click.echo(click.style("Effective config settings (current value + description):", bold=True))
+        click.echo(f"Config file: {CONFIG_YAML}")
+        click.echo(f"Edit with:   cus config --edit")
+        click.echo()
+        for key, desc in CONFIG_EXPLAIN_MAP.items():
+            cur = cfg.get(key, "<not set>")
+            click.echo(click.style(f"{key}:", bold=True, fg="cyan"))
+            click.echo(f"  description: {desc}")
+            if isinstance(cur, (dict, list)):
+                rendered = yaml.safe_dump(cur, default_flow_style=False).rstrip()
+                indented = "\n".join("    " + line for line in rendered.split("\n"))
+                click.echo(f"  current value:\n{indented}")
+            else:
+                click.echo(f"  current value: {cur}")
+            click.echo()
+        return
+
     click.echo(yaml.safe_dump(cfg, sort_keys=True, default_flow_style=False))
 
 
@@ -2419,6 +2482,270 @@ def relogin_cmd(name: str, exec_flag: bool) -> None:
         else:
             env["CLAUDE_CONFIG_DIR"] = str(dst)
         os.execvpe("claude", ["claude"], env)
+
+
+@cli.command(name="install")
+@click.option("--skip-hooks", is_flag=True, help="Don't install Claude Code hooks.")
+@click.option("--skip-statusline", is_flag=True, help="Don't wire the statusLine in ~/.claude/settings.json.")
+@click.option("--skip-systemd", is_flag=True, help="Don't install/enable the systemd --user service.")
+@click.option("--skip-wrapper", is_flag=True, help="Don't symlink ~/bin/cus.")
+@click.option("--force", is_flag=True, help="Pass --force to init (refresh stale credential snapshots).")
+def install_cmd(skip_hooks: bool, skip_statusline: bool, skip_systemd: bool, skip_wrapper: bool, force: bool) -> None:
+    """One-command setup: init + hooks + statusline + systemd + ~/bin/cus.
+
+    Idempotent. Re-run safely; skipped/already-done steps are reported.
+    Use --skip-* to opt out of individual pieces.
+
+    After running this, you can:
+      cus status              # see what's happening
+      cus add <name>          # add another account
+      cus relogin <name>      # refresh an expired account's token
+    """
+    click.echo(click.style("=== claude-usage-swap installation ===", bold=True))
+    click.echo()
+
+    # 1. Init
+    click.echo(click.style("[1/5] Discover and import accounts...", bold=True))
+    ctx = click.get_current_context()
+    ctx.invoke(init, dry_run=False, force=force)
+    click.echo()
+
+    # 2. Hooks
+    if not skip_hooks:
+        click.echo(click.style("[2/5] Install Claude Code hooks...", bold=True))
+        cfg = load_config()
+        result = install_hooks(cfg)
+        for event, status in result.items():
+            click.echo(f"  {event:<30} {status}")
+    else:
+        click.echo(click.style("[2/5] Skipped hook install (--skip-hooks).", bold=True))
+    click.echo()
+
+    # 3. StatusLine wiring
+    if not skip_statusline:
+        click.echo(click.style("[3/5] Wire statusLine in ~/.claude/settings.json...", bold=True))
+        settings_path = CLAUDE_DIR / "settings.json"
+        if settings_path.exists():
+            settings = read_json(settings_path)
+            if "statusLine" in settings:
+                click.echo(f"  statusLine already configured; leaving untouched:")
+                click.echo(f"    {json.dumps(settings['statusLine'])}")
+                click.echo(f"  To replace: edit {settings_path} manually.")
+            else:
+                cus_py_path = Path(__file__).resolve()
+                settings["statusLine"] = {
+                    "type": "command",
+                    "command": f"python3 {cus_py_path} statusline",
+                }
+                # Backup before write
+                backup = settings_path.with_suffix(f".json.bak.pre-cus-statusline-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+                shutil.copy2(settings_path, backup)
+                write_json(settings_path, settings)
+                click.echo(f"  Added statusLine → {cus_py_path} statusline")
+                click.echo(f"  Backup at: {backup}")
+        else:
+            click.echo(f"  {settings_path} doesn't exist yet. Run Claude Code at least once first.")
+    else:
+        click.echo(click.style("[3/5] Skipped statusLine wiring (--skip-statusline).", bold=True))
+    click.echo()
+
+    # 4. systemd unit
+    if not skip_systemd:
+        click.echo(click.style("[4/5] Install systemd --user service...", bold=True))
+        ctx.invoke(init_systemd_cmd, user_unit_dir=str(HOME / ".config/systemd/user"), enable=True)
+    else:
+        click.echo(click.style("[4/5] Skipped systemd install (--skip-systemd).", bold=True))
+    click.echo()
+
+    # 5. Wrapper in ~/bin or ~/.local/bin
+    if not skip_wrapper:
+        click.echo(click.style("[5/5] Install ~/bin/cus wrapper...", bold=True))
+        target = None
+        for candidate in [HOME / "bin", HOME / ".local" / "bin"]:
+            if candidate.exists() and candidate.is_dir():
+                target = candidate / "cus"
+                break
+        if target is None:
+            target = HOME / ".local" / "bin" / "cus"
+            target.parent.mkdir(parents=True, exist_ok=True)
+        wrapper_source = Path(__file__).resolve().parent / "cus"
+        if target.exists() or target.is_symlink():
+            click.echo(f"  {target} already exists; leaving untouched")
+        else:
+            target.symlink_to(wrapper_source)
+            click.echo(f"  Symlinked {target} → {wrapper_source}")
+            # Check PATH
+            path = os.environ.get("PATH", "")
+            if str(target.parent) not in path.split(":"):
+                click.echo(f"  WARNING: {target.parent} is not in $PATH. Add to your shell rc:")
+                click.echo(f"    export PATH=\"{target.parent}:$PATH\"")
+    else:
+        click.echo(click.style("[5/5] Skipped wrapper install (--skip-wrapper).", bold=True))
+
+    click.echo()
+    click.echo(click.style("=== install complete ===", bold=True, fg="green"))
+    click.echo()
+    click.echo("Next steps:")
+    click.echo("  cus status                 # check state")
+    click.echo("  cus sos                    # check if any human action is needed")
+    click.echo("  cus config --explain       # see every setting + description")
+    click.echo("  cus add <name>             # add another account")
+
+
+@cli.command(name="uninstall")
+@click.option("--keep-data", is_flag=True, help="Don't delete ~/claude-accounts/ (account dirs + logs + state).")
+@click.option("--yes", is_flag=True, help="Don't prompt for confirmation.")
+def uninstall_cmd(keep_data: bool, yes: bool) -> None:
+    """Reverse `cus install`: stop daemon, uninstall hooks, remove statusLine, unsymlink wrapper.
+
+    By default, leaves ~/claude-accounts/ untouched (your credentials and
+    history are preserved). Use --keep-data=false to also remove that
+    (irreversible).
+
+    Does NOT touch your ~/.claude/ dir, the cus.py source, or any
+    legacy ~/.claude-<name>/ dirs.
+    """
+    if not yes:
+        click.echo("This will:")
+        click.echo("  - Stop + disable the systemd service")
+        click.echo("  - Uninstall Claude Code hooks from ~/.claude/settings.json")
+        click.echo("  - Remove the statusLine entry (if it points at cus)")
+        click.echo("  - Unsymlink ~/bin/cus or ~/.local/bin/cus")
+        if not keep_data:
+            click.echo(click.style(f"  - DELETE {ACCOUNTS_DIR} (use --keep-data to skip)", fg="red"))
+        click.confirm("Continue?", abort=True)
+
+    # 1. systemd
+    click.echo("[1/4] Stop + disable systemd service...")
+    try:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "cus.service"], check=False, capture_output=True)
+        unit_path = HOME / ".config/systemd/user/cus.service"
+        if unit_path.exists():
+            unit_path.unlink()
+            click.echo(f"  removed {unit_path}")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+    except Exception as e:
+        click.echo(f"  warning: {e}")
+
+    # 2. Hooks
+    click.echo("[2/4] Uninstall hooks...")
+    result = uninstall_hooks()
+    for event, status in result.items():
+        click.echo(f"  {event:<30} {status}")
+
+    # 3. StatusLine
+    click.echo("[3/4] Remove statusLine entry...")
+    settings_path = CLAUDE_DIR / "settings.json"
+    if settings_path.exists():
+        settings = read_json(settings_path)
+        sl = settings.get("statusLine", {})
+        if isinstance(sl, dict) and "cus.py" in sl.get("command", ""):
+            del settings["statusLine"]
+            write_json(settings_path, settings)
+            click.echo(f"  removed statusLine pointing at cus.py")
+        else:
+            click.echo(f"  no cus statusLine found (your statusLine is unmodified)")
+    else:
+        click.echo(f"  {settings_path} doesn't exist; nothing to remove")
+
+    # 4. Wrapper symlink
+    click.echo("[4/4] Remove ~/bin/cus wrapper...")
+    for candidate in [HOME / "bin" / "cus", HOME / ".local" / "bin" / "cus"]:
+        if candidate.is_symlink() and "claude-usage-swap" in str(candidate.resolve()):
+            candidate.unlink()
+            click.echo(f"  removed {candidate}")
+
+    # 5. Optionally remove storage
+    if not keep_data and ACCOUNTS_DIR.exists():
+        click.echo("Deleting ~/claude-accounts/ ...")
+        shutil.rmtree(ACCOUNTS_DIR)
+        click.echo(f"  removed {ACCOUNTS_DIR}")
+    elif keep_data:
+        click.echo(f"Preserved {ACCOUNTS_DIR} (use without --keep-data to also remove).")
+
+    click.echo()
+    click.echo(click.style("=== uninstall complete ===", bold=True, fg="green"))
+    click.echo("Your ~/.claude/ dir and any legacy ~/.claude-*/ dirs are untouched.")
+
+
+@cli.command(name="rename")
+@click.argument("old_name")
+@click.argument("new_name")
+def rename_cmd(old_name: str, new_name: str) -> None:
+    """Rename an account: ~/claude-accounts/account-<old> → account-<new>.
+
+    Updates state.json, config.yaml, swap_history, session_locks.pinned, and
+    meta.yaml to reference the new name. The folder is renamed atomically;
+    symlinks inside the dir continue to work.
+
+    Use this when you want to switch naming conventions (e.g. from
+    `account-merkos` to `account-01`) without losing config or history.
+    """
+    if not new_name.replace("-", "").replace("_", "").isalnum():
+        click.echo(f"Bad new_name '{new_name}' — alphanumeric + dashes/underscores only.")
+        sys.exit(1)
+    if new_name == "default":
+        click.echo("'default' is reserved for the live ~/.claude/ dir.")
+        sys.exit(1)
+
+    old_dir = ACCOUNTS_DIR / f"account-{old_name}"
+    new_dir = ACCOUNTS_DIR / f"account-{new_name}"
+    if not old_dir.exists():
+        click.echo(f"Source dir {old_dir} doesn't exist.")
+        sys.exit(1)
+    if new_dir.exists():
+        click.echo(f"Target dir {new_dir} already exists.")
+        sys.exit(1)
+
+    # 1. Rename the dir (atomic on same filesystem)
+    os.rename(old_dir, new_dir)
+    click.echo(f"renamed {old_dir} → {new_dir}")
+
+    # 2. Update meta.yaml inside
+    meta_path = new_dir / "meta.yaml"
+    if meta_path.exists():
+        meta = read_yaml(meta_path)
+        meta["name"] = new_name
+        meta["renamed_from"] = old_name
+        meta["renamed_ts"] = now_iso()
+        write_yaml(meta_path, meta)
+        click.echo(f"  updated {meta_path}")
+
+    # 3. Update state.json
+    if STATE_JSON.exists():
+        state = load_state()
+        if old_name in state.get("accounts", {}):
+            state["accounts"][new_name] = state["accounts"].pop(old_name)
+        if state.get("active") == old_name:
+            state["active"] = new_name
+        for entry in state.get("swap_history", []):
+            if entry.get("from") == old_name:
+                entry["from"] = new_name
+            if entry.get("to") == old_name:
+                entry["to"] = new_name
+        save_state(state)
+        click.echo(f"  updated state.json")
+
+    # 4. Update config.yaml
+    if CONFIG_YAML.exists():
+        cfg = read_yaml(CONFIG_YAML)
+        changed = False
+        for acct in cfg.get("accounts", []):
+            if acct.get("name") == old_name:
+                acct["name"] = new_name
+                changed = True
+        pinned = cfg.get("session_locks", {}).get("pinned", {}) or {}
+        for k, v in list(pinned.items()):
+            if v == old_name:
+                pinned[k] = new_name
+                changed = True
+        if changed:
+            write_yaml(CONFIG_YAML, cfg)
+            click.echo(f"  updated config.yaml")
+
+    click.echo()
+    click.echo(click.style(f"Done. Account '{old_name}' is now '{new_name}'.", fg="green"))
+    click.echo("If the daemon is running, restart it: systemctl --user restart cus.service")
 
 
 @cli.command(name="init-systemd")

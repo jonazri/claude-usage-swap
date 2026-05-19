@@ -41,62 +41,97 @@ Across many concurrent sessions and many machines, this gets old. `cus` automate
 - `tmux` (only needed for hot-swap of live sessions)
 - One or more Claude Pro/Max accounts
 
-### Steps
+### One-command install (recommended)
 
 ```bash
 # 1. Clone
 git clone https://github.com/rayistern/claude-usage-swap ~/repos/claude-usage-swap
 cd ~/repos/claude-usage-swap
 
-# 2. Discover existing Claude config dirs, migrate to managed layout
-python3 cus.py init
+# 2. Run the bootstrap: imports accounts, installs hooks, wires statusline,
+#    installs systemd service, symlinks ~/bin/cus or ~/.local/bin/cus.
+python3 cus.py install
 
-# 3. Verify
-python3 cus.py list             # accounts found + their OAuth identities
-python3 cus.py poll             # one-shot usage poll
-python3 cus.py status           # current state
+# 3. From now on, use `cus` (no more `python3 cus.py`):
+cus status
+cus sos
+cus config --explain
+```
 
-# 4. Install Claude Code hooks (lifecycle events the daemon needs)
-python3 cus.py hooks install
+`cus install` is idempotent. Re-run safely; already-done steps are skipped. Use `--skip-hooks`, `--skip-statusline`, `--skip-systemd`, or `--skip-wrapper` to opt out of individual pieces.
 
-# 5. Run as a systemd --user service (survives reboot)
-python3 cus.py init-systemd --enable
+### Manual install (if you want explicit control)
 
-# 6. (Optional) Wire the statusline into Claude Code
-# Edit ~/.claude/settings.json and add:
+```bash
+python3 cus.py init                 # discover + migrate accounts
+python3 cus.py hooks install        # install lifecycle hooks
+python3 cus.py init-systemd --enable # systemd --user service
+# Then manually add statusLine to ~/.claude/settings.json:
 # "statusLine": {"type": "command", "command": "python3 /full/path/to/cus.py statusline"}
+```
+
+### Uninstall
+
+```bash
+cus uninstall                       # stops daemon, removes hooks, statusline, wrapper
+cus uninstall --keep-data           # ... but preserves ~/claude-accounts/
 ```
 
 ## Quick reference
 
 ```bash
-cus init                      # discover + migrate accounts (idempotent)
-cus init --force              # refresh stale credential snapshots
-cus list                      # accounts + OAuth identities
+# Setup / teardown (run once per machine)
+cus install                   # one-command bootstrap (all-in-one)
+cus uninstall                 # reverse install
+
+# Daily inspection
 cus status                    # active + per-account state + live sessions
 cus sos                       # exit 1 + actions if anything needs you
-cus statusline                # one-line summary (for CC statusLine)
-cus config                    # effective merged config
+cus list                      # configured accounts with OAuth identities
+cus statusline                # one-line (for CC statusLine — usually wired automatically)
 
+# Config — what's configured, how to change
+cus config                    # print effective merged config
+cus config --explain          # annotated list: every setting + description + current value
+cus config --edit             # open ~/claude-accounts/config.yaml in $EDITOR
+cus config --path             # print the file path (useful for: `vim $(cus config --path)`)
+
+# Operations
 cus poll                      # one-shot usage poll
 cus daemon                    # foreground loop (or use systemd)
 cus daemon --once             # single cycle and exit
 cus daemon --once --no-execute # dry-run (decide, don't swap)
 
+# Manual swap
 cus switch <name>             # manual atomic swap
 cus switch <name> --dry-run   # preview
 
-cus add <name>                # create a new account dir
+# Account lifecycle
+cus add <name>                # create a new account dir, print login command
 cus add <name> --exec         # ... and launch claude under it
-cus relogin <name>            # print login command for token-expired account
+cus relogin <name>            # print login command for an existing account
 cus relogin <name> --exec     # ... and launch claude under it
+cus rename <old> <new>        # rename an account (preserves config + history)
 
+# Locks
 cus pin <pane> <account>      # pin a tmux pane to an account (never swap)
 cus unpin <pane>              # remove pin
 
+# Low-level (rarely needed after `cus install`)
+cus init                      # re-discover + migrate accounts
+cus init --force              # refresh stale credential snapshots
 cus hooks install/uninstall/list
 cus init-systemd --enable     # install + start systemd --user service
 ```
+
+### Account naming
+
+Folder names are whatever you give at `cus add`. Pick what works for you:
+- **Numbered** (`account-01`, `account-02`) — durable; immune to identity changes
+- **Word** (`account-work`, `account-personal`, `account-merkos`) — more readable
+- **Mixed** — `account-01-work`, etc.
+
+Renaming later is supported: `cus rename <old> <new>`. It updates the folder, `state.json`, `config.yaml`, swap history, and pins atomically.
 
 ## How a swap actually happens
 
