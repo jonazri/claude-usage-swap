@@ -57,6 +57,7 @@ authoritative on this point).
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -93,6 +94,7 @@ RATE_LIMIT_LOG = ACCOUNTS_DIR / "429.log"
 TOOL_USE_LOG = ACCOUNTS_DIR / "tool_use.log"
 DAEMON_LOG = ACCOUNTS_DIR / "daemon.log"
 DAEMON_PID = ACCOUNTS_DIR / "daemon.pid"
+ORCHESTRATE_LOCK = ACCOUNTS_DIR / "orchestrate.lock"
 INBOX_MD = ACCOUNTS_DIR / "inbox.md"
 SOS_MD = ACCOUNTS_DIR / "SOS.md"
 LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
@@ -1709,6 +1711,34 @@ def find_live_panes(account_filter: str | None = None) -> list[LiveSession]:
     return out
 
 
+def tmux_exit_claude(pane: str) -> None:
+    """Cleanly /exit claude in a tmux pane, handling input-box-has-focus cases.
+
+    The 2026-05-19 incident showed that a bare `/exit` typed via tmux send-keys
+    gets eaten by claude's input box as TEXT when the input is focused or
+    contains user-typed content — claude doesn't interpret it as a slash
+    command. Result: pane stays at claude, never returns to shell.
+
+    Defensive sequence:
+      1. Escape — drop modal state, lose input-box focus (no-op if already at shell)
+      2. C-u — clear input line (kills any text the user typed)
+      3. `/exit` + Enter — typed cleanly, recognized as slash command
+
+    Best-effort: if claude is genuinely wedged, escape sequences may do
+    nothing, and `wait_for_shell` will eventually time out + skip relaunch.
+    """
+    if not tmux_is_available() or not pane or pane == "no-tmux":
+        return
+    # Step 1: Escape (lose focus / dismiss modal)
+    tmux_send_keys(pane, "Escape")
+    time.sleep(0.2)
+    # Step 2: C-u (clear line in any readline-style input)
+    tmux_send_keys(pane, "C-u")
+    time.sleep(0.2)
+    # Step 3: type /exit and press Enter
+    tmux_send_text(pane, "/exit")
+
+
 def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25) -> bool:
     """Poll until the tmux pane's current command is no longer claude/node.
 
@@ -1731,6 +1761,55 @@ def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 
 
 def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> None:
     """Hot-swap orchestrator (rewritten 2026-05-19 after the find_live_sessions incident).
+
+    Wrapped in `fcntl.flock` on `ORCHESTRATE_LOCK`. If another orchestrator
+    is already running (e.g. daemon + manual `cus auto-swap --orchestrate`),
+    this invocation aborts immediately rather than racing on the same panes.
+    The 2026-05-19 second incident was caused by lack of this lock: daemon
+    ran a second orchestration 100s after a manual one, both typing /exit
+    + relaunch into the same panes. See audit P0 item 11c.
+    """
+    ORCHESTRATE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    # Open the lock file (create if needed). Use O_RDWR so we can write pid.
+    lock_fd = os.open(str(ORCHESTRATE_LOCK), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Read the holder's pid for diagnostics
+            try:
+                holder = os.read(lock_fd, 64).decode().strip()
+            except OSError:
+                holder = "(unknown)"
+            click.echo(f"  hot_swap: another orchestrator is running (pid {holder}); aborting this invocation")
+            return
+        # We hold the lock. Write our pid for debugging.
+        os.lseek(lock_fd, 0, 0)
+        pid_str = f"{os.getpid()}\n".encode()
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, pid_str)
+        try:
+            _hot_swap_orchestrate_impl(decision, state, config)
+        finally:
+            # Release lock + truncate pid
+            try:
+                os.lseek(lock_fd, 0, 0)
+                os.ftruncate(lock_fd, 0)
+            except OSError:
+                pass
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict) -> None:
+    """Inner implementation of hot_swap_orchestrate (called under flock).
 
     Per-pane iteration (not per-session-id), drops the wake-up positional
     arg, polls pane_current_command instead of sleeping, optionally passes
@@ -1841,10 +1920,13 @@ def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> N
                     click.echo(f"      timed out; aborting (will retry next cycle)")
                     return
 
-    # /exit each pane
+    # /exit each pane — use tmux_exit_claude which sends Escape + C-u first
+    # to drop input-box focus and clear any pending text, then types /exit.
+    # Bare `tmux send-keys "/exit"` gets eaten as input-box text when claude's
+    # input is focused — the 2026-05-19 incident on pane %3 showed this.
     for s in swappable:
-        click.echo(f"    pane {s.pane}: /exit")
-        tmux_send_text(s.pane, "/exit")
+        click.echo(f"    pane {s.pane}: /exit (with Escape + C-u prefix)")
+        tmux_exit_claude(s.pane)
 
     # Poll each pane until shell prompt is back. Replaces the original
     # sleep(2) which raced — claude wasn't always done exiting when the
