@@ -1541,12 +1541,24 @@ def tmux_pane_name(pane: str) -> str:
 # --------------------------------------------------------------------------
 
 def session_is_pinned(session: LiveSession, config: dict) -> tuple[bool, str]:
-    """Check if a session is locked to its current account (Phase 6 feature)."""
+    """Check if a session is locked — orchestrator will skip it during swaps.
+
+    Semantics: any pane (or session-id) listed in `session_locks.pinned`
+    is NEVER swapped by the orchestrator, regardless of current/target
+    account. The dict-value (account name) records WHICH account the pane
+    "should" be on, but the simple "if pinned, skip" rule applies always.
+
+    Use case: protect an agent's own pane from being /exit'd by its own
+    orchestration (the 2026-05-19 lesson — pane %2 was the agent that
+    triggered the orchestrator, and the orchestrator kept /exit'ing it).
+    """
     pinned = config.get("session_locks", {}).get("pinned", {}) or {}
-    if session.pane in pinned and pinned[session.pane] != session.account:
-        return True, f"pinned via pane: {pinned[session.pane]}"
+    if session.pane in pinned:
+        target = pinned[session.pane]
+        return True, f"pinned to '{target}' (skip swap)"
     if session.session_id in pinned:
-        return True, f"pinned via session_id: {pinned[session.session_id]}"
+        target = pinned[session.session_id]
+        return True, f"session-id pinned to '{target}' (skip swap)"
     return False, ""
 
 
