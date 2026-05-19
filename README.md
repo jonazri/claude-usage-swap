@@ -263,6 +263,26 @@ hooks:
 
 Run `cus config` to see the effective merged config.
 
+## Claude Code skill — `/cus`
+
+Manage `cus` from any Claude Code session via natural language. Install:
+
+```bash
+cp ~/repos/claude-usage-swap/skills/cus.md ~/.claude/commands/cus.md
+```
+
+Then in any Claude Code session:
+
+```
+/cus check my status
+/cus how should I make swapping less aggressive
+/cus add a new account called work
+/cus my merkos account's token expired
+/cus what does the strategy setting do
+```
+
+The skill orients itself first (runs `cus sos` + `cus status`), interprets your intent, and walks through the right `cus` commands. It won't drive interactive OAuth flows (those need a browser); it'll tell you what to run.
+
 ## Documentation
 
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) — day-to-day operations
