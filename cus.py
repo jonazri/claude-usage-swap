@@ -195,6 +195,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "install_pre_tool_use": False,    # only needed if subagent_skip.enabled
         "install_subagent_stop": False,   # only needed if subagent_skip.enabled
     },
+    "statusline": {
+        "verbose": False,                 # cus statusline output verbosity
+        "show_other_accounts": True,      # in verbose mode, include other account states
+        "show_poll_age": True,            # include "polled Nago"
+        "show_reset_times": True,         # show time until 5h / 7d resets
+    },
     "accounts": [],              # filled in at init time from discovery
 }
 
@@ -1586,6 +1592,26 @@ def wait_for_stop(session_id: str, timeout_seconds: int) -> bool:
     return False
 
 
+def session_is_idle(session: LiveSession, idle_seconds: int) -> bool:
+    """Return True if the session's transcript has had no new writes in `idle_seconds`.
+
+    This is the "already past its last Stop" check: if no JSONL activity for
+    `idle_seconds`, the session is between turns — Claude is at the input
+    prompt, not generating. We can swap *immediately* in this state, no
+    need to wait for a fresh Stop signal (which won't fire until the user
+    types something next).
+
+    Returns False if we can't determine (no transcript path, can't stat).
+    """
+    if session.transcript_path is None or not session.transcript_path.exists():
+        return False
+    try:
+        mtime = datetime.fromtimestamp(session.transcript_path.stat().st_mtime, tz=timezone.utc)
+        return (datetime.now(timezone.utc) - mtime).total_seconds() > idle_seconds
+    except OSError:
+        return False
+
+
 def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> None:
     """Hot-swap orchestrator. Called by daemon when config.hot_swap.enabled=true.
 
@@ -1640,12 +1666,18 @@ def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> N
                     click.echo(f"    DEFER: subagent active in {s.session_id[:8]} (tier={tier} < defer_below={defer_below})")
                     return
 
-    # Cache-bust window — Tier 1 only
+    # Cache-bust window — Tier 1 only, AND only for non-idle sessions.
+    # If a session is idle (no JSONL writes in mid_turn_idle_seconds), its
+    # cache will go cold by the time the user types next — no cost to swap
+    # now. Only ACTIVE sessions with warm cache are worth deferring for.
     if tier == 1:
         window = hot.get("cache_bust_window_seconds", 300)
+        idle_seconds = hot.get("mid_turn_idle_seconds", 30)
         for s in swappable:
+            if session_is_idle(s, idle_seconds):
+                continue  # idle session — its cache cost is hypothetical
             if s.transcript_path and cache_warm(s.transcript_path, window):
-                click.echo(f"    DEFER: cache warm for {s.session_id[:8]} (Tier 1 swap would burn cache)")
+                click.echo(f"    DEFER: cache warm for active session {s.session_id[:8]} (Tier 1 swap would burn cache)")
                 return
 
     # Per-tier pause behavior
@@ -1669,11 +1701,17 @@ def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> N
                     f"Account `{current}` was force-swapped to `{decision.target}` while session had active tool calls:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` if you'd rather keep going on the original account.",
                 )
         else:  # tier 1
-            click.echo(f"    {s.session_id[:8]}: waiting for natural Stop (up to {hot.get('stop_wait_timeout_seconds', 300)}s)")
-            ok = wait_for_stop(s.session_id, hot.get("stop_wait_timeout_seconds", 300))
-            if not ok:
-                click.echo(f"      timed out; aborting hot-swap (will retry next cycle)")
-                return
+            idle_seconds = hot.get("mid_turn_idle_seconds", 30)
+            if session_is_idle(s, idle_seconds):
+                # Session is between turns — no Stop will fire until user
+                # types again. Don't wait; swap immediately.
+                click.echo(f"    {s.session_id[:8]}: idle (>{idle_seconds}s since last activity); swapping immediately")
+            else:
+                click.echo(f"    {s.session_id[:8]}: mid-turn — waiting for natural Stop (up to {hot.get('stop_wait_timeout_seconds', 300)}s)")
+                ok = wait_for_stop(s.session_id, hot.get("stop_wait_timeout_seconds", 300))
+                if not ok:
+                    click.echo(f"      timed out; aborting hot-swap (will retry next cycle)")
+                    return
 
     # All swappable sessions are now at a turn boundary (or force-interrupted).
     # Exit each pane's claude process.
@@ -2035,6 +2073,64 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+@cli.command(name="auto-swap")
+@click.argument("target", required=False)
+@click.option("--trigger", default="manual-auto", help="Tag for the swap history entry.")
+def auto_swap_cmd(target: str | None, trigger: str) -> None:
+    """Force-swap NOW, bypassing the threshold check.
+
+    Two modes:
+      cus auto-swap <name>      Swap to the named account explicitly.
+      cus auto-swap             Swap to whatever the current `strategy`
+                                picker chooses (e.g. `smart` will pick
+                                the best non-blocked, 7d-safe candidate).
+
+    Differs from `cus switch <name>` in that the no-argument mode uses the
+    strategy picker to choose for you. Differs from waiting for `cus daemon`
+    to act on threshold-crossing in that it acts NOW, regardless of usage %.
+
+    Useful when you've manually paused your sessions and want to swap
+    immediately without waiting for the daemon's next poll cycle (or
+    when the daemon is deferring due to cache-warm / wait-for-Stop).
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+
+    state = load_state()
+    config = load_config()
+
+    if target:
+        if target not in state["accounts"]:
+            click.echo(f"Unknown account '{target}'. Known: {sorted(state['accounts'].keys())}")
+            sys.exit(1)
+        chosen_name = target
+        reason = f"explicit (auto-swap {target})"
+    else:
+        picked = pick_swap_target(state, config)
+        if picked is None:
+            click.echo("No valid swap target available. All non-current accounts are blocked.")
+            click.echo("Run `cus sos` for diagnosis.")
+            sys.exit(1)
+        chosen_name = picked.name
+        reason = f"strategy pick ({picked.reason})"
+
+    current = state.get("active")
+    if chosen_name == current:
+        click.echo(f"{chosen_name} is already active. Nothing to do.")
+        return
+
+    click.echo(f"Swapping {current} -> {chosen_name}")
+    click.echo(f"  reason: {reason}")
+    try:
+        execute_swap(chosen_name, trigger=trigger)
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        click.echo(f"ERROR: {e}")
+        sys.exit(1)
+    click.echo(f"✓ Swapped. Next `claude` invocation uses {chosen_name}.")
+    click.echo(f"  Live sessions keep their loaded tokens until refresh — restart them to immediately use {chosen_name}.")
 
 
 @cli.command()
@@ -2442,19 +2538,65 @@ def unpin(pane_or_session: str) -> None:
         click.echo(f"{pane_or_session} was not pinned")
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as a short human duration: '5m', '1h23m', '3d', '12d6h'."""
+    if seconds < 0:
+        return "now"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h{m}m" if m else f"{h}h"
+    d = int(seconds // 86400)
+    h = int((seconds % 86400) // 3600)
+    return f"{d}d{h}h" if h else f"{d}d"
+
+
+def _time_until(iso_str: str | None) -> float | None:
+    """Return seconds from now until iso_str, or None if unparseable."""
+    if not iso_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return (ts - datetime.now(timezone.utc)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _time_since(iso_str: str | None) -> float | None:
+    """Return seconds since iso_str, or None if unparseable."""
+    delta = _time_until(iso_str)
+    return -delta if delta is not None else None
+
+
 @cli.command(name="statusline")
-def statusline_cmd() -> None:
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
+@click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
+def statusline_cmd(verbose: bool, compact: bool) -> None:
     """One-line summary for Claude Code statusline integration.
 
-    Output format: `<account> 5h:NN% 7d:NN%` or `🚨 SOS: <action>` when
-    human action is needed. Configure in ~/.claude/settings.json:
+    Compact (default): `cus:<account> 5h:NN% 7d:NN% nxt:NN%` or `🚨 SOS: ...`.
+    Verbose: `cus:<active> 5h NN%·1h23m 7d NN%·3d | <other> 5h NN% 7d NN% | poll Nago`.
+
+    Verbosity priority: --compact flag > --verbose flag > config.statusline.verbose.
+
+    Configure in ~/.claude/settings.json:
+      "statusLine": {"type": "command", "command": "python3 /path/to/cus.py statusline --verbose"}
+    or:
       "statusLine": {"type": "command", "command": "python3 /path/to/cus.py statusline"}
+      (compact, controlled by ~/claude-accounts/config.yaml statusline.verbose)
     """
     if not STATE_JSON.exists():
         click.echo("cus: not init (run `cus init`)")
         return
     state = read_json(STATE_JSON)
     config = load_config()
+    sl_cfg = config.get("statusline", {})
+
+    is_verbose = not compact and (verbose or sl_cfg.get("verbose", False))
 
     # SOS takes priority — if human action is needed, surface it loudly
     conditions = diagnose(state, config)
@@ -2467,18 +2609,67 @@ def statusline_cmd() -> None:
         click.echo(f"⚠ cus: {warning[0].summary}")
         return
 
-    # Normal output
     active = state.get("active", "?")
     acct = state.get("accounts", {}).get(active, {})
     fh = acct.get("current_5h_pct", 0)
     sd = acct.get("current_7d_pct", 0)
     nx = acct.get("next_swap_at_pct", 50)
-    flag = ""
-    if max(fh, sd) >= nx:
-        flag = " ⚠ "
-    elif max(fh, sd) >= nx * 0.8:
-        flag = " · "
-    click.echo(f"cus:{active}{flag}5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
+
+    if not is_verbose:
+        # Compact mode (original behavior).
+        flag = ""
+        if max(fh, sd) >= nx:
+            flag = " ⚠ "
+        elif max(fh, sd) >= nx * 0.8:
+            flag = " · "
+        click.echo(f"cus:{active}{flag}5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
+        return
+
+    # Verbose mode.
+    show_resets = sl_cfg.get("show_reset_times", True)
+    show_others = sl_cfg.get("show_other_accounts", True)
+    show_poll = sl_cfg.get("show_poll_age", True)
+
+    def fmt_account(name: str, a: dict, is_active: bool) -> str:
+        h5 = a.get("current_5h_pct", 0)
+        h7 = a.get("current_7d_pct", 0)
+        flags = []
+        if a.get("token_expired"):
+            flags.append("EXP")
+        if a.get("rate_limited"):
+            flags.append("429")
+        flag_str = "(" + ",".join(flags) + ")" if flags else ""
+        marker = "*" if is_active else ""
+        parts = [f"{name}{marker}"]
+        if show_resets:
+            r5 = _time_until(a.get("five_hour_resets_at"))
+            r7 = _time_until(a.get("seven_day_resets_at"))
+            r5_str = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 else ""
+            r7_str = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 else ""
+            parts.append(f"5h:{h5:.0f}%{r5_str}")
+            parts.append(f"7d:{h7:.0f}%{r7_str}")
+        else:
+            parts.append(f"5h:{h5:.0f}%")
+            parts.append(f"7d:{h7:.0f}%")
+        if flag_str:
+            parts.append(flag_str)
+        return " ".join(parts)
+
+    pieces = [fmt_account(active, acct, True)]
+
+    if show_others:
+        for name, a in sorted(state.get("accounts", {}).items()):
+            if name == active:
+                continue
+            pieces.append(fmt_account(name, a, False))
+
+    if show_poll:
+        last_poll = acct.get("last_poll_ts")
+        age = _time_since(last_poll)
+        if age is not None and age >= 0:
+            pieces.append(f"poll {_fmt_duration(age)}ago")
+
+    click.echo("cus " + " | ".join(pieces))
 
 
 @cli.command(name="sos")

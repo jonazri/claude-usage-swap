@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch](#2026-05-19-deviation-hot-swap-orchestration-disabled-2026-05-19-after-burning-4-of-user-s-5h-on-bungled-live-session-relaunch)
 - [2026-05-19 — decision — **ARCH DECISION** — Unified-tree storage: each account-* dir is a valid CLAUDE_CONFIG_DIR](#2026-05-19-decision-arch-decision-unified-tree-storage-each-account-dir-is-a-valid-claude-config-dir)
 - [2026-05-18 — decision — **ARCH DECISION** — Phases 3-6 single-file: hot-swap orchestrator + Phase 6 controls in cus.py, not split](#2026-05-18-decision-arch-decision-phases-3-6-single-file-hot-swap-orchestrator-phase-6-controls-in-cus-py-not-split)
 - [2026-05-18 — decision — **ARCH DECISION** — Direct Anthropic OAuth usage API, not ccusage, as the daemon's signal source](#2026-05-18-decision-arch-decision-direct-anthropic-oauth-usage-api-not-ccusage-as-the-daemon-s-signal-source)
@@ -14,6 +15,47 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch
+
+- **Status:** open
+- **Type:** deviation
+- **Tags:** #incident #hot-swap #disabled
+
+### What I would have asked you
+> Hot-swap (Phase 3-5 / config `hot_swap.enabled`) triggered a multi-bug failure on rayi's machine. Disable until the issues below are redesigned?
+
+### What I decided
+Set `hot_swap.enabled: false` in `~/claude-accounts/config.yaml`. Daemon stays running (level 3: swap creds for new sessions only) but stops trying to `/exit` + relaunch live tmux sessions.
+
+### Why
+Concrete failure mode observed by user, captured from their terminal output:
+
+1. **`claude --resume <id>` silently fails to resume after a credential swap.** Audit P1 #11 warned about this; user's experience confirms — fresh new sessions, not resumed. Anthropic's behavior: `--resume` looks up the session-id in `~/.claude/projects/<cwd>/<id>.jsonl`, which IS visible across accounts via our symlinks, but Claude refuses to honor it when the live `userID` differs from the transcript's recorded `userID`.
+
+2. **The positional wake-up message becomes the first user prompt.** `claude --resume <id> "Continue where you left off."` — when `--resume` fails, the positional arg becomes the FIRST USER MESSAGE of a new session. First message triggers full system context + every SessionStart hook (including rayi's `compliance-reviewer` hook, which is large) + CLAUDE.md ingest. **Cost: ~4% of 5h usage PER bungled session.**
+
+3. **Multiple session-ids per pane race.** `find_live_sessions` returns one entry per session-id; some panes had many session-ids from prior claude → /exit → claude cycles. The orchestrator typed `claude --resume <id>` separately for EACH session-id in the SAME pane. After the first one started loading, the second got typed INTO the still-loading claude's TUI as text.
+
+4. **`--dangerously-skip-permissions` not passed on relaunch.** Sessions came back up in normal permission-prompt mode regardless of how the user originally launched them.
+
+### Walk-back path
+1. `cus auto-swap default` to swap back to default if merkos isn't preferred (state is currently merkos as of 20:25 UTC swap).
+2. `systemctl --user start cus.service` to resume the daemon at level 3 (no live-session touching).
+3. To re-enable hot-swap later: fix all four issues in the next dev cycle, smoke-test against rayi's tmux setup, set `hot_swap.enabled: true`.
+
+### Flags for follow-up
+- The real fix is probably to NOT auto-relaunch live sessions at all. Just swap creds; let live sessions continue with their loaded tokens until they naturally restart (user `/exit`s and reopens). Anthropic doesn't support cross-account `--resume` reliably; trying to work around that adds complexity for marginal benefit.
+- Or: relaunch WITHOUT wake-up message (no positional arg). New session starts at blank prompt; user types whatever they want next. Cost: lose conversation context but no token burn.
+- Audit P1 #11 (cross-account `--resume`) now empirically verified: doesn't work. Update `docs/AUDIT.md`.
+
+### Walk-back path
+1. `cus auto-swap default` to swap back to default account.
+2. `systemctl --user start cus.service` to resume daemon at level 3.
+3. To re-enable hot-swap: fix the 4 issues, smoke-test, then `hot_swap.enabled: true` in config.
+
+---
+
 
 ## 2026-05-19 — decision — **ARCH DECISION** — Unified-tree storage: each account-* dir is a valid CLAUDE_CONFIG_DIR
 
