@@ -181,6 +181,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # set to "--dangerously-skip-permissions" if that's how you normally
         # run claude. Space-separated string; passed as-is to the shell.
         "relaunch_flags": "",
+        # When True (default), relaunch is `claude --resume <session-id>` to
+        # preserve conversation. Set False to relaunch FRESH (just `claude`,
+        # no --resume) — useful for stagnant or loop-driven sessions that
+        # don't need conversation continuity, and avoids loading the old
+        # JSONL (which may have hook-leaked content from upstream issues).
+        "relaunch_with_resume": True,
     },
     "subagent_skip": {
         "enabled": True,
@@ -1868,10 +1874,25 @@ def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> N
     #
     # relaunch_flags lets the user inject `--dangerously-skip-permissions`
     # etc. via config — defaults to empty (no flags) for safety.
+    #
+    # relaunch_with_resume: when False, relaunch is plain `claude` (fresh
+    # session, no continuity). Use this for stagnant or loop-driven sessions
+    # that don't need conversation continuity — avoids loading the old JSONL
+    # (which may have pollution from validator hook env-var leaks etc.).
+    #
+    # wake_up_message: defaults to empty — no positional sent. Set non-empty
+    # ONLY if you understand the cost (positional becomes a first user
+    # message → billed response → post-assistant hooks fire → also billed).
     flags = hot.get("relaunch_flags", "").strip()
     flag_part = f" {flags}" if flags else ""
+    use_resume = hot.get("relaunch_with_resume", True)
+    wake = hot.get("wake_up_message", "").strip()
+    wake_part = f" {shlex.quote(wake)}" if wake else ""
     for s in panes_ready:
-        cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}"
+        if use_resume:
+            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}{wake_part}"
+        else:
+            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part}{wake_part}"
         click.echo(f"    pane {s.pane}: relaunch → {cmd}")
         tmux_send_text(s.pane, cmd)
 
