@@ -11,6 +11,33 @@ External agent audit of `cus.py` + `hooks/*.sh`. Prioritized P0-P3. **P0 + criti
 | 3 | **P1** | Threshold ladder hardcoded `THRESHOLD_STEPS = [50, 75, 90, 100]` even though config has `thresholds.steps`. Editing config didn't affect actual ladder progression. | Earlier commit (b607000) fixed `execute_swap` + `maybe_reset_thresholds` to read `config["thresholds"]["steps"]`. |
 | 4 | **P1** | `decide_swap` had no hard-7d-cap path. User's stated goal "never go over 80%" wasn't enforceable except as a normal threshold step. | Added Trigger 1 to `decide_swap`: if active's 7d ≥ `hard_7d_cap_pct` (config'd 80% default), force-swap regardless of progressive ladder. |
 
+## P0 — architectural (verified live 2026-05-20)
+
+### 11f — `state.active` drifts from per-pane in-memory account
+
+**[GH issue #2](https://github.com/rayistern/claude-usage-swap/issues/2)**
+
+`state.active` tracks `~/.claude/.credentials.json` (the file). Each running claude pane has its own OAuth tokens loaded in process memory at startup. After any non-orchestrated swap (manual `cus switch`, `cus auto-swap` without `--orchestrate`, `hot_swap.enabled: false` daemon swap), the two views drift: file says X, panes are on Y.
+
+**Sources of drift** (each produces a permanent gap until pane is manually `/exit`'d):
+
+| Mechanism | Drift |
+|---|---|
+| `cus switch <name>` | File swaps; panes unchanged |
+| `cus auto-swap` without `--orchestrate` | Same |
+| Daemon swap with `hot_swap.enabled: false` (level 3) | Same |
+| Hot-swap with pinned panes | Pinned panes stay on old loaded account |
+| Hot-swap with `subagent_skip.defer_below_tier: 100` + active subagent | Defers indefinitely |
+| Hot-swap with mid-turn + `stop_wait_timeout` hit | Aborts; no panes restart this cycle |
+
+**Orchestrator filters by recorded account, misses drifted panes.** `find_live_panes(account_filter=current)` matches against the SessionStart-recorded account from `sessions.log`. After a swap, drifted panes were recorded under the PREVIOUS active. The orchestrator can't see them.
+
+**Proposed 4-phase fix** (see GH issue #2 for full sketch):
+1. **Detect drift**: `find_drifted_panes(state)` returns panes with SessionStart ts < `last_swap_ts`. `cus status` displays count.
+2. **Orchestrator targets drifted panes**: regardless of recorded account.
+3. **Refuse silent drift**: `cus switch` and `cus auto-swap` warn/block when drift exists; require `--orchestrate` or `--allow-drift`.
+4. **Periodic drift alert**: `cus sos` warns when drift count > 0. Add `cus realign` to `/exit + relaunch` all drifted panes (no account change; just resync).
+
 ## Remaining — known issues, tracked for future fix or community contribution
 
 ### P1 — correctness / races
