@@ -1358,6 +1358,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # operator knows we've lost observability — not a fatal condition (the
     # account itself may still be usable for actual Claude Code traffic),
     # but worth flagging.
+    now = datetime.now(timezone.utc)
     for name, acct in accounts.items():
         until = acct.get("poll_backoff_until_ts")
         if not until:
@@ -1381,7 +1382,6 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
 
     # Condition 4: stale poll
     poll_freshness_seconds = config.get("poll_interval_seconds", 300) * 4  # 4 cycles of staleness = real problem
-    now = datetime.now(timezone.utc)
     stale_accounts: list[str] = []
     for name, acct in accounts.items():
         last_poll = acct.get("last_poll_ts")
