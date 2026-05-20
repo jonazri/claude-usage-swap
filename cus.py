@@ -1784,32 +1784,47 @@ def _find_descendant_claude_pid(root_pid: int) -> int | None:
     return max(found)
 
 
-def _read_claude_session_id_from_environ(pid: int) -> str | None:
-    """Parse /proc/<pid>/environ for CLAUDE_CODE_SESSION_ID.
+def _read_claude_session_id_from_cmdline(pid: int) -> str | None:
+    """Parse /proc/<pid>/cmdline for the `--resume <id>` arg.
 
-    The environ file is NUL-separated KEY=VALUE pairs. Returns None on any
-    read failure (process gone, permission denied, key absent).
+    The cmdline file is NUL-separated argv. When claude is launched with
+    --resume <id>, this is the canonical id of the running session. Returns
+    None if the file can't be read, claude wasn't launched with --resume
+    (fresh session — there's no id we can recover from the live process),
+    or the arg parsing fails.
+
+    Important caveat: the earlier version of this function tried to read
+    CLAUDE_CODE_SESSION_ID from /proc/<pid>/environ. That env var is NOT
+    set in the claude process's own environ — claude only sets it when
+    spawning hook subprocesses (validator, statusline, etc.) — so that
+    lookup always returned None and silently fell back to sessions.log.
+    cmdline is the only reliable signal for a running claude process.
     """
     try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except (OSError, PermissionError):
         return None
-    for chunk in raw.split(b"\x00"):
-        if chunk.startswith(b"CLAUDE_CODE_SESSION_ID="):
-            return chunk[len(b"CLAUDE_CODE_SESSION_ID=") :].decode("utf-8", errors="replace")
+    args = [chunk.decode("utf-8", errors="replace") for chunk in raw.split(b"\x00") if chunk]
+    for i, arg in enumerate(args):
+        if arg == "--resume" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--resume="):
+            return arg.split("=", 1)[1]
     return None
 
 
 def pane_live_session_id(pane: str) -> str | None:
     """Authoritative current session-id for a tmux pane, read from the live
-    claude process's environ. Falls back to None if anything goes wrong;
-    callers should then fall back to the sessions.log heuristic.
+    claude process's cmdline (--resume arg). Returns None if claude was
+    launched without --resume (fresh session) or any lookup step failed;
+    callers should fall back to the sessions.log heuristic.
 
-    See GH #10: the sessions.log heuristic (latest entry per pane) can pick a
-    stale session-id when a pane has had multiple claude sessions over time,
-    e.g. user manually started a new --resume in the pane without SessionStart
-    firing. Reading the live process's CLAUDE_CODE_SESSION_ID gives the
-    canonical answer for what's actually running RIGHT NOW.
+    See GH #10. The sessions.log heuristic (latest entry per pane) can pick
+    a stale session-id when a pane has had multiple claude sessions over
+    time and the SessionStart hook didn't fire for the live one. Parsing
+    the cmdline gives the canonical answer for resumed sessions; for fresh
+    sessions, the session-id isn't recoverable from the live process and
+    we fall back to sessions.log.
     """
     pid = _pane_pid(pane)
     if pid is None:
@@ -1817,7 +1832,7 @@ def pane_live_session_id(pane: str) -> str | None:
     claude_pid = _find_descendant_claude_pid(pid)
     if claude_pid is None:
         return None
-    return _read_claude_session_id_from_environ(claude_pid)
+    return _read_claude_session_id_from_cmdline(claude_pid)
 
 
 def tmux_pane_name(pane: str) -> str:
