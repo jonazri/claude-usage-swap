@@ -70,7 +70,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -576,6 +576,47 @@ def migrate_account_dir(account_dir: Path) -> dict:
         details.append(f"symlinked {sub} → {target}")
 
     return {"action": "migrated", "details": details}
+
+
+def account_in_backoff(state: dict, account_name: str) -> tuple[bool, str | None]:
+    """Return (in_backoff, until_iso) for an account's poll-throttle backoff.
+
+    Anthropic per-IP-throttles `/api/oauth/usage`. Once an account triggers
+    429, we exponentially back off subsequent polls for THAT account to
+    avoid hammering the endpoint and prolonging the throttle. Reset on
+    next successful poll.
+    """
+    acct = state.get("accounts", {}).get(account_name, {})
+    until = acct.get("poll_backoff_until_ts")
+    if not until:
+        return False, None
+    try:
+        until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) < until_dt:
+            return True, until
+    except ValueError:
+        pass
+    return False, until
+
+
+def update_backoff(acct: dict, success: bool, config: dict) -> None:
+    """Update poll-backoff state. On success: reset. On 429: exponential.
+
+    Backoff doubles each consecutive 429: base * 2^(n-1), capped at max.
+    With base=300, max=1800: 5min → 10min → 20min → 30min (capped).
+    """
+    polling_cfg = config.get("polling", {})
+    base = polling_cfg.get("base_backoff_seconds", 300)
+    cap = polling_cfg.get("max_backoff_seconds", 1800)
+    if success:
+        acct.pop("poll_backoff_until_ts", None)
+        acct.pop("poll_backoff_consecutive_429s", None)
+        return
+    n = acct.get("poll_backoff_consecutive_429s", 0) + 1
+    delay = min(base * (2 ** (n - 1)), cap)
+    until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    acct["poll_backoff_consecutive_429s"] = n
+    acct["poll_backoff_until_ts"] = until.isoformat().replace("+00:00", "Z")
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -1152,6 +1193,7 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
     simultaneously). The picker filters by any of (token_expired,
     rate_limited, poll_error); each is exclusive on a per-cycle basis.
     """
+    config = load_config()
     for name, acct in state["accounts"].items():
         u = usage_by_account.get(name)
         if u is None:
@@ -1163,14 +1205,17 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct.pop("rate_limited", None)
             acct.pop("poll_error", None)
             acct["last_poll_ts"] = u.polled_at
+            # Token expiry isn't a polling-throttle event; don't backoff.
             continue
 
-        # Branch 2: rate-limited (429). Preserve last known current_*_pct.
+        # Branch 2: rate-limited (429). Preserve last known current_*_pct +
+        # apply exponential backoff so we stop hammering the endpoint.
         if u.raw.get("rate_limited"):
             acct["rate_limited"] = True
             acct["token_expired"] = False
             acct.pop("poll_error", None)
             acct["last_poll_ts"] = u.polled_at
+            update_backoff(acct, success=False, config=config)
             continue
 
         # Branch 3: other poll error (network, timeout, JSON parse). Preserve prior values.
@@ -1183,10 +1228,11 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["last_poll_ts"] = u.polled_at
             continue
 
-        # Branch 4: success. Clear all flags + store new values.
+        # Branch 4: success. Clear all flags + store new values + reset backoff.
         acct.pop("poll_error", None)
         acct.pop("rate_limited", None)
         acct["token_expired"] = False
+        update_backoff(acct, success=True, config=config)
         acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
         acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else acct.get("current_7d_pct", 0.0)
         acct["last_poll_ts"] = u.polled_at
@@ -2329,7 +2375,7 @@ def init(dry_run: bool, force: bool) -> None:
     if not CONFIG_YAML.exists():
         config = {
             "accounts": [{"name": n, "priority": 1} for n, _ in candidates],
-            "poll_interval_seconds": 300,
+            "poll_interval_seconds": 600,
             "thresholds": {
                 "steps": THRESHOLD_STEPS[:-1],  # exclude 100 (force) from user-config
                 "five_hour": True,
@@ -2677,6 +2723,10 @@ def poll(account: str | None, no_write: bool) -> None:
 
     usage_by_account: dict[str, AccountUsage] = {}
     for name in targets:
+        in_backoff, until = account_in_backoff(state, name)
+        if in_backoff:
+            click.echo(f"skipping {name}: in poll-backoff until {until} (avoid hammering Anthropic's per-IP throttle)")
+            continue
         click.echo(f"polling {name}...")
         u = poll_account_usage(name)
         usage_by_account[name] = u
@@ -2756,9 +2806,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 execute_swap(reactive_decision.target, trigger="reactive-429")
             return
 
-        # 1. Poll
+        # 1. Poll — skip accounts currently in poll-backoff (per-account
+        # exponential delay after 429, to avoid prolonging the throttle).
         usage_by_account: dict[str, AccountUsage] = {}
         for name in state["accounts"]:
+            in_backoff, until = account_in_backoff(state, name)
+            if in_backoff:
+                click.echo(f"  skip {name}: in poll-backoff until {until}")
+                continue
             usage_by_account[name] = poll_account_usage(name)
 
         # 2. Update state
@@ -3083,7 +3138,23 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         click.echo(f"⚠ cus: {warning[0].summary}")
         return
 
-    active = state.get("active", "?")
+    # Determine THIS session's account (the one this pane's claude actually
+    # loaded tokens for) vs machine-wide active. Tokens get loaded once at
+    # claude start; if a swap happens after, the pane's claude still uses
+    # its loaded creds until /exit + restart. Showing only machine-wide
+    # active is misleading for that pane.
+    machine_active = state.get("active", "?")
+    this_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    this_session_account = None
+    if this_session_id:
+        for e in reversed(_parse_sessions_log()):
+            if e.get("session_id") == this_session_id:
+                this_session_account = e.get("account")
+                break
+    # Display PRIMARY = this session's account if known, else machine-active.
+    active = this_session_account or machine_active
+    pending_swap = this_session_account and this_session_account != machine_active
+
     acct = state.get("accounts", {}).get(active, {})
     fh = acct.get("current_5h_pct", 0)
     sd = acct.get("current_7d_pct", 0)
@@ -3094,18 +3165,32 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if _pct_is_unknown(acct):
             click.echo(f"cus:{active} 5h:? 7d:? nxt:{nx}%")
             return
-        flag = ""
+        flag_marker = ""
         if max(fh, sd) >= nx:
-            flag = " ⚠ "
+            flag_marker = "⚠"
         elif max(fh, sd) >= nx * 0.8:
-            flag = " · "
-        click.echo(f"cus:{active}{flag}5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
+            flag_marker = "·"
+        prefix_bits = [f"cus:{active}"]
+        if pending_swap:
+            prefix_bits.append(f"→{machine_active}")
+        if flag_marker:
+            prefix_bits.append(flag_marker)
+        prefix = " ".join(prefix_bits)
+        click.echo(f"{prefix} 5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
         return
 
     # Verbose mode.
     show_resets = sl_cfg.get("show_reset_times", True)
     show_others = sl_cfg.get("show_other_accounts", True)
     show_poll = sl_cfg.get("show_poll_age", True)
+
+    if pending_swap:
+        # Lead with the mismatch so the user knows their pane's claude is
+        # using a different account than what the machine just swapped to.
+        # Restart this pane to pick up the machine-active account.
+        pieces_prefix = f"cus this:{this_session_account} →{machine_active}(swap pending—/exit to apply) | "
+    else:
+        pieces_prefix = "cus "
 
     def fmt_account(name: str, a: dict, is_active: bool) -> str:
         h5 = a.get("current_5h_pct", 0)
@@ -3149,7 +3234,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if age is not None and age >= 0:
             pieces.append(f"poll {_fmt_duration(age)}ago")
 
-    click.echo("cus " + " | ".join(pieces))
+    click.echo(pieces_prefix + " | ".join(pieces))
 
 
 @cli.command(name="sos")
