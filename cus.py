@@ -1878,23 +1878,43 @@ def tmux_exit_claude(pane: str) -> None:
     contains user-typed content — claude doesn't interpret it as a slash
     command. Result: pane stays at claude, never returns to shell.
 
-    Defensive sequence:
-      1. Escape — drop modal state, lose input-box focus (no-op if already at shell)
-      2. C-u — clear input line (kills any text the user typed)
-      3. `/exit` + Enter — typed cleanly, recognized as slash command
+    The 2026-05-20 follow-up incident showed that the previous Escape + C-u
+    sequence was insufficient: when there was multi-line text already in the
+    chat input box, C-u didn't fully clear it (claude's Ink-based TUI doesn't
+    honor readline C-u semantics on multi-line buffers — it tends to clear only
+    the current visual line). The `/exit` then got appended to the leftover
+    text and submitted as a regular message instead of being recognized as a
+    slash command. Result: the pane stayed inside claude and the user got an
+    "exit" message sent to the model.
+
+    Defensive sequence (2026-05-20 hardened):
+      1. Escape, Escape — drop any modal (slash-command picker, autocomplete,
+         file-search dropdown), lose input-box focus
+      2. C-u — best-effort readline-style clear (no-op if already empty)
+      3. BSpace x 400 — brute-force backspace flurry to wipe any remaining
+         input. 400 chars covers worst-case multi-line drafts; sent as a
+         single tmux send-keys call so it's atomic from the TUI's perspective.
+      4. `/exit` + Enter — typed cleanly into a now-empty input box,
+         recognized as a slash command.
 
     Best-effort: if claude is genuinely wedged, escape sequences may do
     nothing, and `wait_for_shell` will eventually time out + skip relaunch.
     """
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return
-    # Step 1: Escape (lose focus / dismiss modal)
+    # Step 1: Escape twice (dismiss any modal/overlay, defocus input)
     tmux_send_keys(pane, "Escape")
-    time.sleep(0.2)
-    # Step 2: C-u (clear line in any readline-style input)
+    time.sleep(0.15)
+    tmux_send_keys(pane, "Escape")
+    time.sleep(0.15)
+    # Step 2: C-u (readline-style clear; harmless if already empty)
     tmux_send_keys(pane, "C-u")
-    time.sleep(0.2)
-    # Step 3: type /exit and press Enter
+    time.sleep(0.15)
+    # Step 3: BSpace flurry — wipe any multi-line text C-u didn't reach.
+    # 400 chars handles realistic worst-case drafts a user might have typed.
+    tmux_send_keys(pane, *(["BSpace"] * 400))
+    time.sleep(0.3)
+    # Step 4: type /exit and press Enter into a (now) empty input box
     tmux_send_text(pane, "/exit")
 
 
