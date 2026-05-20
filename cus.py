@@ -603,11 +603,16 @@ def update_backoff(acct: dict, success: bool, config: dict) -> None:
     """Update poll-backoff state. On success: reset. On 429: exponential.
 
     Backoff doubles each consecutive 429: base * 2^(n-1), capped at max.
-    With base=300, max=1800: 5min → 10min → 20min → 30min (capped).
+    With base=300, max=600 (defaults 2026-05-20, GH #9): 5min → 10min (cap).
+    Previously the cap defaulted to 1800s (30min); that wedged accounts for
+    hours when another machine kept hitting the same per-IP throttle on
+    `/api/oauth/usage`. 10min cap means we recover observability within ~15
+    min of the throttle clearing rather than ~hours. Users wanting the old
+    behavior can set `polling.max_backoff_seconds: 1800` in config.yaml.
     """
     polling_cfg = config.get("polling", {})
     base = polling_cfg.get("base_backoff_seconds", 300)
-    cap = polling_cfg.get("max_backoff_seconds", 1800)
+    cap = polling_cfg.get("max_backoff_seconds", 600)
     if success:
         acct.pop("poll_backoff_until_ts", None)
         acct.pop("poll_backoff_consecutive_429s", None)
@@ -1339,6 +1344,33 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                     action="Add another Claude account (run `claude /login` with CLAUDE_CONFIG_DIR=~/.claude-newname/) or wait for cooldown. Or set `smart_strategy.allow_rate_limited_targets: true` if you have a rate-limited account that works elsewhere.",
                     affected=active,
                 ))
+
+    # Condition 3b (GH #9): account stuck in 429 poll-backoff for > 30 min.
+    # The polling endpoint is per-IP throttled; another machine hammering it
+    # can wedge our local view of an account for hours. Surface this so the
+    # operator knows we've lost observability — not a fatal condition (the
+    # account itself may still be usable for actual Claude Code traffic),
+    # but worth flagging.
+    for name, acct in accounts.items():
+        until = acct.get("poll_backoff_until_ts")
+        if not until:
+            continue
+        last_poll = acct.get("last_poll_ts")
+        if not last_poll:
+            continue
+        try:
+            last_poll_dt = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        consecutive = acct.get("poll_backoff_consecutive_429s", 0)
+        backoff_age = (now - last_poll_dt).total_seconds()
+        if backoff_age > 1800 and consecutive >= 3:
+            out.append(SOSCondition(
+                severity="warning",
+                summary=f"{name}: stuck in 429 poll-backoff ({consecutive} consecutive 429s, last poll {int(backoff_age/60)}m ago)",
+                action=f"Anthropic's per-IP throttle on /api/oauth/usage is engaged. Usage % shown for {name} is stale (frozen at last successful poll). To bypass once: `cus force-poll {name}`. To wait it out: usually clears in 30-60 min after the offending machine stops polling.",
+                affected=name,
+            ))
 
     # Condition 4: stale poll
     poll_freshness_seconds = config.get("poll_interval_seconds", 300) * 4  # 4 cycles of staleness = real problem
@@ -2946,6 +2978,59 @@ def poll(account: str | None, no_write: bool) -> None:
         save_state(state)
         click.echo()
         click.echo(f"state.json updated.")
+
+
+@cli.command(name="force-poll")
+@click.argument("account", required=True)
+def force_poll(account: str) -> None:
+    """Poll an account immediately, bypassing the 429 backoff window.
+
+    Use when you've verified Anthropic's per-IP throttle on /api/oauth/usage
+    has cleared (e.g. another machine stopped polling) and you want a fresh
+    read without waiting for the backoff to expire. Resets the backoff
+    counter on success; does NOT reset on 429 (the next 429 starts a fresh
+    backoff cycle). See GH #9.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    state = load_state()
+    if account not in state.get("accounts", {}):
+        click.echo(f"Unknown account: {account}. Known: {', '.join(state.get('accounts', {}).keys())}")
+        sys.exit(1)
+
+    acct = state["accounts"][account]
+    backoff_until = acct.get("poll_backoff_until_ts")
+    consecutive = acct.get("poll_backoff_consecutive_429s", 0)
+    if backoff_until:
+        click.echo(f"Bypassing backoff for {account} (was: until {backoff_until}, {consecutive} consecutive 429s)")
+    else:
+        click.echo(f"No backoff active for {account}; polling anyway")
+
+    click.echo(f"polling {account}...")
+    u = poll_account_usage(account)
+    config = load_config()
+    if u.token_expired:
+        click.echo("  TOKEN EXPIRED — re-auth this account (`cus relogin <account>`)")
+        update_state_with_usage(state, {account: u})
+        save_state(state)
+        sys.exit(2)
+    if u.raw.get("error") == "rate_limited":
+        click.echo("  STILL 429 — Anthropic throttle still engaged. Backoff cycle restarted.")
+        update_backoff(acct, success=False, config=config)
+        update_state_with_usage(state, {account: u})
+        save_state(state)
+        sys.exit(3)
+    if u.raw.get("error"):
+        click.echo(f"  ERROR: {u.raw['error']}")
+        sys.exit(4)
+    fh = f"{u.five_hour.utilization:.1f}%" if u.five_hour else "—"
+    sd = f"{u.seven_day.utilization:.1f}%" if u.seven_day else "—"
+    click.echo(f"  5h: {fh}    7d: {sd}    polled_at: {u.polled_at}")
+    click.echo("  Backoff cleared.")
+    update_state_with_usage(state, {account: u})
+    maybe_reset_thresholds(state, config)
+    save_state(state)
 
 
 @cli.command()
