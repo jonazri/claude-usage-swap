@@ -427,12 +427,27 @@ class UsageWindow:
 
 @dataclass
 class AccountUsage:
-    """All usage windows for a single OAuth account, plus error state."""
+    """All usage windows for a single OAuth account, plus error state.
+
+    Error state model (mutually exclusive; ordered from most-recoverable to
+    least-recoverable):
+      - token_stale: our stored access token has expired but the refresh token
+        is still valid. NOT an SOS condition — claude code will refresh the
+        access token transparently on first real use. We just can't poll the
+        usage API ourselves until next swap (which writes a fresh access
+        token to storage). See GH #13.
+      - rate_limited: Anthropic returned 429. Account is throttled; usage
+        windows shown are stale (preserved from last successful poll).
+      - poll_error: some other transport/parse failure.
+      - token_expired: 401 response WITH a non-expired stored access token
+        — means refresh-token-level failure, needs interactive re-login.
+    """
     five_hour: UsageWindow | None = None
     seven_day: UsageWindow | None = None
     seven_day_sonnet: UsageWindow | None = None
     seven_day_opus: UsageWindow | None = None
     token_expired: bool = False
+    token_stale: bool = False
     polled_at: str = field(default_factory=now_iso)
     raw: dict = field(default_factory=dict)
 
@@ -624,19 +639,79 @@ def update_backoff(acct: dict, success: bool, config: dict) -> None:
     acct["poll_backoff_until_ts"] = until.isoformat().replace("+00:00", "Z")
 
 
+def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int | None]:
+    """Like _read_access_token but also returns the stored expiresAt timestamp.
+
+    expiresAt is the Unix milliseconds at which the stored access token
+    expires (per the OAuth flow). Returns (None, None) if the file can't be
+    read. The expiresAt is used to detect "token stale, not actually expired"
+    (GH #13) — when an inactive account's stored access token has aged out
+    but its refresh token is still valid, polling will 401 even though the
+    account is fully usable.
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except Exception:
+        state = {}
+    if state.get("active") == account_name and CREDS_JSON.exists():
+        creds_path = CREDS_JSON
+    else:
+        creds_path = account_creds_path(account_name)
+    if not creds_path.exists():
+        return None, None
+    try:
+        creds = read_json(creds_path)
+        oauth = creds.get("claudeAiOauth", {})
+        return oauth.get("accessToken"), oauth.get("expiresAt")
+    except (json.JSONDecodeError, OSError):
+        return None, None
+
+
 def poll_account_usage(account_name: str) -> AccountUsage:
     """Query the Anthropic OAuth usage endpoint for one account.
 
-    The same endpoint Claude Code itself uses for /usage. Returns parsed
-    AccountUsage. On 401, sets `token_expired=True` so the caller can
-    surface it without crashing the daemon. On other errors, returns
-    empty `AccountUsage` with raw error in `raw['error']`.
+    Returns parsed AccountUsage with one of these error states (priority
+    order — only one is set):
+      - token_stale: stored access token's expiresAt is in the past. Don't
+        even attempt the HTTP call — we know we'd get 401 and the account
+        is recoverable (refresh token still valid). NOT an SOS condition.
+      - rate_limited: HTTP 429.
+      - token_expired: HTTP 401 despite the stored access token being
+        within its expiresAt window — real auth failure needing re-login.
+      - poll_error: any other transport/parse failure.
+
+    GH #13: previously ANY 401 was treated as token_expired. That produced
+    false positives whenever an inactive account's stored snapshot aged
+    out (>1 hour since the last swap-to-this-account), because we wrote
+    the access token to storage at swap-time but only the LIVE creds file
+    gets the periodic refresh.
     """
-    token = _read_access_token(account_name)
+    token, expires_at = _read_access_token_with_expiry(account_name)
     if not token:
         u = AccountUsage.empty()
         u.raw = {"error": f"no access_token for account {account_name}"}
         return u
+
+    # Pre-flight: is the stored access token already past its expiry?
+    # If so, don't bother making the HTTP request — flag token_stale and
+    # let the caller treat this as a transient (non-SOS) condition. The
+    # refresh token in the same creds file is still valid; the account
+    # will be usable the moment we swap to it (claude code refreshes
+    # transparently on first request).
+    if expires_at is not None:
+        try:
+            now_ms = int(time.time() * 1000)
+            # 30s grace — don't fire on tokens that are about to expire mid-flight
+            if int(expires_at) < now_ms - 30_000:
+                u = AccountUsage.empty()
+                u.token_stale = True
+                u.raw = {
+                    "error": "stored access token expired (refresh token still valid)",
+                    "expired_minutes_ago": (now_ms - int(expires_at)) // 60_000,
+                }
+                return u
+        except (TypeError, ValueError):
+            pass
 
     req = urllib.request.Request(
         USAGE_API_URL,
@@ -661,7 +736,13 @@ def poll_account_usage(account_name: str) -> AccountUsage:
         u = AccountUsage.empty()
         body_preview = e.read()[:200].decode(errors="replace") if e.fp else ""
         if e.code == 401:
+            # We pre-checked expiresAt above and the token was within its
+            # validity window — so a 401 HERE means refresh-token-level
+            # failure (or Anthropic key rotation, or account revoked).
+            # That's the real token_expired condition.
             u.token_expired = True
+            u.raw = {"error": f"HTTP 401 despite non-expired stored token: {body_preview}"}
+            return u
         elif e.code == 429:
             # Account is currently rate-limited by Anthropic. Flag it; do NOT
             # set five_hour/seven_day. update_state_with_usage will preserve
@@ -1194,16 +1275,20 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
     """Mutate state.json's per-account current_*_pct from a poll cycle.
 
-    Each per-account update follows one of four exclusive branches:
-      1. token_expired (HTTP 401)    — flag and preserve prior percentages
-      2. rate_limited (HTTP 429)     — flag and preserve prior percentages
+    Each per-account update follows one of five exclusive branches:
+      0. token_stale (stored access token aged out — refresh token still
+         valid) — flag and preserve prior percentages, NO SOS escalation
+      1. token_expired (HTTP 401 despite non-expired stored token) — real
+         auth failure, flag and preserve prior percentages
+      2. rate_limited (HTTP 429) — flag and preserve prior percentages
       3. poll_error (other failures) — flag and preserve prior percentages
       4. success — clear all flags, store new percentages + reset times
 
-    The four-way exclusive structure replaces a buggy version where 429
-    fell through to the poll_error branch (both flags getting set
-    simultaneously). The picker filters by any of (token_expired,
-    rate_limited, poll_error); each is exclusive on a per-cycle basis.
+    The branches are exclusive on a per-cycle basis. GH #13 added the
+    token_stale branch to distinguish "we can't poll this inactive account
+    because our snapshot's access token aged out" (transient, recoverable
+    on next swap) from "the refresh token itself has failed and we need
+    interactive re-login" (real SOS condition).
     """
     config = load_config()
     for name, acct in state["accounts"].items():
@@ -1211,9 +1296,21 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         if u is None:
             continue
 
-        # Branch 1: token expired (401)
+        # Branch 0: token stale (stored access token expired but refresh
+        # token still valid — recoverable on next swap, NOT an SOS condition).
+        # Clear any prior false-positive token_expired flag if present.
+        if u.token_stale:
+            acct["token_stale"] = True
+            acct["token_expired"] = False
+            acct.pop("rate_limited", None)
+            acct.pop("poll_error", None)
+            acct["last_poll_ts"] = u.polled_at
+            continue
+
+        # Branch 1: token expired (401 despite non-expired stored token)
         if u.token_expired:
             acct["token_expired"] = True
+            acct.pop("token_stale", None)
             acct.pop("rate_limited", None)
             acct.pop("poll_error", None)
             acct["last_poll_ts"] = u.polled_at
@@ -1243,6 +1340,7 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         # Branch 4: success. Clear all flags + store new values + reset backoff.
         acct.pop("poll_error", None)
         acct.pop("rate_limited", None)
+        acct.pop("token_stale", None)
         acct["token_expired"] = False
         update_backoff(acct, success=True, config=config)
         acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
@@ -3090,6 +3188,12 @@ def force_poll(account: str) -> None:
     click.echo(f"polling {account}...")
     u = poll_account_usage(account)
     config = load_config()
+    if u.token_stale:
+        minutes = u.raw.get("expired_minutes_ago", "?")
+        click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable). State updated to clear any prior token_expired flag.")
+        update_state_with_usage(state, {account: u})
+        save_state(state)
+        sys.exit(0)
     if u.token_expired:
         click.echo("  TOKEN EXPIRED — re-auth this account (`cus relogin <account>`)")
         update_state_with_usage(state, {account: u})
