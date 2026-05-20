@@ -1870,7 +1870,7 @@ def find_live_panes(account_filter: str | None = None) -> list[LiveSession]:
     return out
 
 
-def tmux_exit_claude(pane: str) -> None:
+def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
     """Cleanly /exit claude in a tmux pane, handling input-box-has-focus cases.
 
     The 2026-05-19 incident showed that a bare `/exit` typed via tmux send-keys
@@ -1878,43 +1878,63 @@ def tmux_exit_claude(pane: str) -> None:
     contains user-typed content — claude doesn't interpret it as a slash
     command. Result: pane stays at claude, never returns to shell.
 
-    The 2026-05-20 follow-up incident showed that the previous Escape + C-u
-    sequence was insufficient: when there was multi-line text already in the
-    chat input box, C-u didn't fully clear it (claude's Ink-based TUI doesn't
-    honor readline C-u semantics on multi-line buffers — it tends to clear only
-    the current visual line). The `/exit` then got appended to the leftover
-    text and submitted as a regular message instead of being recognized as a
-    slash command. Result: the pane stayed inside claude and the user got an
-    "exit" message sent to the model.
+    The 2026-05-20 follow-up incident showed that the earlier "Escape + C-u"
+    sequence was insufficient against multi-line input drafts: claude's
+    Ink-based TUI doesn't honor readline C-u semantics on multi-line buffers
+    (at best, it clears the current visual line). `/exit` then got appended
+    to the leftover text and submitted as a regular message.
 
-    Defensive sequence (2026-05-20 hardened):
-      1. Escape, Escape — drop any modal (slash-command picker, autocomplete,
-         file-search dropdown), lose input-box focus
-      2. C-u — best-effort readline-style clear (no-op if already empty)
-      3. BSpace x 400 — brute-force backspace flurry to wipe any remaining
-         input. 400 chars covers worst-case multi-line drafts; sent as a
-         single tmux send-keys call so it's atomic from the TUI's perspective.
-      4. `/exit` + Enter — typed cleanly into a now-empty input box,
-         recognized as a slash command.
+    User feedback 2026-05-20 (GH #11): the brute-force-clear variant of this
+    function destroyed user drafts. The user prefers a "submit" variant that
+    *preserves* the draft by sending it as a normal chat message, then types
+    `/exit` against the now-empty input box. Configurable via
+    `hot_swap.draft_handling`:
 
-    Best-effort: if claude is genuinely wedged, escape sequences may do
-    nothing, and `wait_for_shell` will eventually time out + skip relaunch.
+      "submit" (DEFAULT) — preserves any user draft as a sent message:
+        1. Send Enter — submits any draft in the input box as a chat message.
+           If the input was empty, Enter is a no-op in claude's TUI.
+        2. Send `/exit` + Enter into the now-empty input box.
+        Trade-off: claude may start responding to the user's half-finished
+        draft before getting exited. The draft is recoverable in history on
+        --resume.
+
+      "clear" (LEGACY) — wipes any user draft before /exit:
+        1. Escape, Escape (dismiss modal/overlay, defocus input).
+        2. C-u (best-effort readline clear; harmless if empty).
+        3. BSpace x 400 (brute-force backspace flurry for multi-line drafts).
+        4. `/exit` + Enter.
+        Trade-off: ANY draft the user was composing is destroyed — gone for
+        good, not recoverable.
+
+    Best-effort either way: if claude is genuinely wedged, escape sequences
+    may do nothing, and `wait_for_shell` will eventually time out + skip
+    relaunch.
     """
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return
-    # Step 1: Escape twice (dismiss any modal/overlay, defocus input)
-    tmux_send_keys(pane, "Escape")
-    time.sleep(0.15)
-    tmux_send_keys(pane, "Escape")
-    time.sleep(0.15)
-    # Step 2: C-u (readline-style clear; harmless if already empty)
-    tmux_send_keys(pane, "C-u")
-    time.sleep(0.15)
-    # Step 3: BSpace flurry — wipe any multi-line text C-u didn't reach.
-    # 400 chars handles realistic worst-case drafts a user might have typed.
-    tmux_send_keys(pane, *(["BSpace"] * 400))
+
+    if draft_handling == "clear":
+        # Legacy brute-force-clear path. Discards user draft.
+        tmux_send_keys(pane, "Escape")
+        time.sleep(0.15)
+        tmux_send_keys(pane, "Escape")
+        time.sleep(0.15)
+        tmux_send_keys(pane, "C-u")
+        time.sleep(0.15)
+        tmux_send_keys(pane, *(["BSpace"] * 400))
+        time.sleep(0.3)
+        tmux_send_text(pane, "/exit")
+        return
+
+    # Default: "submit" — preserve draft by sending it as a message first.
+    # If input box is empty, the first Enter is a no-op in claude's TUI.
+    # If non-empty, the draft becomes a normal user turn in chat history;
+    # claude may begin responding before we type /exit, but the draft is
+    # safely persisted in the JSONL and visible on --resume.
+    tmux_send_keys(pane, "Enter")
     time.sleep(0.3)
-    # Step 4: type /exit and press Enter into a (now) empty input box
+    # Type /exit into the (now-empty) input box. tmux_send_text appends
+    # Enter automatically.
     tmux_send_text(pane, "/exit")
 
 
@@ -2122,13 +2142,14 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     click.echo(f"      timed out; aborting (will retry next cycle)")
                     return
 
-    # /exit each pane — use tmux_exit_claude which sends Escape + C-u first
-    # to drop input-box focus and clear any pending text, then types /exit.
-    # Bare `tmux send-keys "/exit"` gets eaten as input-box text when claude's
-    # input is focused — the 2026-05-19 incident on pane %3 showed this.
+    # /exit each pane — see tmux_exit_claude docstring for the draft-handling
+    # modes. Default "submit" preserves the user's in-progress draft as a sent
+    # message; "clear" brute-force-wipes the input box before /exit (legacy,
+    # destroys drafts). Configurable via hot_swap.draft_handling (GH #11).
+    draft_handling = hot.get("draft_handling", "submit")
     for s in swappable:
-        click.echo(f"    pane {s.pane}: /exit (with Escape + C-u prefix)")
-        tmux_exit_claude(s.pane)
+        click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
+        tmux_exit_claude(s.pane, draft_handling=draft_handling)
 
     # Poll each pane until shell prompt is back. Replaces the original
     # sleep(2) which raced — claude wasn't always done exiting when the
