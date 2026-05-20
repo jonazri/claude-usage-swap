@@ -2186,6 +2186,49 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     tier = decision.tier
     target = decision.target
 
+    # Pre-swap verify-poll (GH #8): if the picker's view of `target` is more
+    # than 60 seconds stale AND target isn't in poll-backoff, do a fresh poll
+    # right before orchestrating. The picker may have decided based on
+    # 5-10 min old data from the previous daemon cycle. Another machine using
+    # `target` in that window could have pushed it close to its cap; we'd
+    # rather catch that now than swap onto a hot account.
+    # Abort scenarios (logged + return without orchestrating):
+    #   - target is now token_expired
+    #   - target's max usage is now >= 99% (no headroom, swap would be wasted)
+    target_acct = state.get("accounts", {}).get(target, {})
+    last_poll = target_acct.get("last_poll_ts")
+    target_in_backoff, _ = account_in_backoff(state, target)
+    poll_age_seconds = None
+    if last_poll:
+        try:
+            last_poll_dt = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
+            poll_age_seconds = (datetime.now(timezone.utc) - last_poll_dt).total_seconds()
+        except ValueError:
+            poll_age_seconds = None
+    if poll_age_seconds is not None and poll_age_seconds > 60 and not target_in_backoff:
+        click.echo(f"  pre-swap verify-poll: target {target} last polled {int(poll_age_seconds)}s ago; refreshing...")
+        fresh = poll_account_usage(target)
+        update_state_with_usage(state, {target: fresh})
+        save_state(state)
+        if fresh.token_expired:
+            click.echo(f"    ABORT: {target} is now TOKEN_EXPIRED — letting next cycle pick a different target")
+            return
+        if fresh.raw.get("error") == "rate_limited":
+            click.echo(f"    note: {target} polling endpoint is rate-limited; proceeding with cached numbers (account itself may still be usable)")
+        else:
+            fh = f"{fresh.five_hour.utilization:.1f}%" if fresh.five_hour else "—"
+            sd = f"{fresh.seven_day.utilization:.1f}%" if fresh.seven_day else "—"
+            click.echo(f"    fresh: 5h={fh}, 7d={sd}")
+            max_pct = max(
+                fresh.five_hour.utilization if fresh.five_hour else 0,
+                fresh.seven_day.utilization if fresh.seven_day else 0,
+            )
+            if max_pct >= 99:
+                click.echo(f"    ABORT: {target} is now at {max_pct:.0f}% — no headroom, letting next cycle pick a different target")
+                return
+    elif poll_age_seconds is not None and target_in_backoff:
+        click.echo(f"  pre-swap verify-poll: target {target} in backoff; proceeding with cached numbers (age {int(poll_age_seconds)}s)")
+
     # CHANGED 2026-05-20 (issue #2 fix): query EVERY live pane, then keep only
     # those whose loaded account doesn't match the target. The pane's loaded
     # account is its latest SessionStart-recorded account (sessions.log,
