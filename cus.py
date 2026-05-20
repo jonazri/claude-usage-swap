@@ -460,8 +460,34 @@ def account_claude_json_path(account_name: str) -> Path:
 
 
 def _read_access_token(account_name: str) -> str | None:
-    """Read the OAuth access_token from the account dir."""
-    creds_path = account_creds_path(account_name)
+    """Read the OAuth access_token for an account.
+
+    For the ACTIVE account, always reads from the LIVE
+    `~/.claude/.credentials.json`. Why: Claude refreshes the access_token
+    in that file every ~hour as part of normal operation; our storage-side
+    snapshot is only updated during a swap. If we don't swap for several
+    hours, the storage snapshot's access_token has expired but the live
+    file's is fresh.
+
+    For INACTIVE accounts, reads from the storage-side snapshot in
+    `~/claude-accounts/account-<name>/`. The snapshot's access_token may
+    be expired but the refresh_token is still valid (30 day lifetime),
+    so on next swap+use, Claude will refresh it.
+
+    Bug history: before 2026-05-20 this always read storage. Result:
+    polling an active account whose tokens hadn't been swap-saved-back
+    in >1hr returned HTTP 401, which we treated as "token expired
+    forever." User correctly pointed out that the account WAS working
+    (live tokens valid) — we were just reading the wrong file.
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except Exception:
+        state = {}
+    if state.get("active") == account_name and CREDS_JSON.exists():
+        creds_path = CREDS_JSON
+    else:
+        creds_path = account_creds_path(account_name)
     if not creds_path.exists():
         return None
     try:
