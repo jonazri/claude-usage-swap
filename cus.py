@@ -1304,7 +1304,18 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             ))
 
     # Condition 2 + 3: targets available?
-    valid = [n for n, a in accounts.items() if not a.get("token_expired") and not a.get("rate_limited") and not a.get("poll_error")]
+    # Honor allow_rate_limited_targets (issue #5): if set, rate_limited
+    # accounts are still "valid" candidates from the picker's perspective,
+    # so SOS shouldn't claim "no other account available" when the
+    # orchestrator would have happily swapped to one.
+    allow_rl = config.get("smart_strategy", {}).get("allow_rate_limited_targets", False)
+    def is_valid(a: dict) -> bool:
+        if a.get("token_expired") or a.get("poll_error"):
+            return False
+        if a.get("rate_limited") and not allow_rl:
+            return False
+        return True
+    valid = [n for n, a in accounts.items() if is_valid(a)]
     active = state.get("active")
     if active and active in accounts:
         active_acct = accounts[active]
@@ -1315,7 +1326,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             out.append(SOSCondition(
                 severity="urgent",
                 summary="All accounts blocked",
-                action="Re-login any TOKEN_EXPIRED accounts (see above). For RATE_LIMITED accounts, wait for cooldown (5h or 7d window reset).",
+                action="Re-login any TOKEN_EXPIRED accounts (see above). For RATE_LIMITED accounts, wait for cooldown (5h or 7d window reset). Or set `smart_strategy.allow_rate_limited_targets: true` to use rate-limited accounts when no better option exists.",
                 affected="system",
             ))
         elif cur_pct >= threshold:
@@ -1325,7 +1336,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 out.append(SOSCondition(
                     severity="urgent",
                     summary=f"{active} at {cur_pct:.0f}% (≥{threshold}%) and no other account available",
-                    action="Add another Claude account (run `claude /login` with CLAUDE_CONFIG_DIR=~/.claude-newname/) or wait for cooldown.",
+                    action="Add another Claude account (run `claude /login` with CLAUDE_CONFIG_DIR=~/.claude-newname/) or wait for cooldown. Or set `smart_strategy.allow_rate_limited_targets: true` if you have a rate-limited account that works elsewhere.",
                     affected=active,
                 ))
 
