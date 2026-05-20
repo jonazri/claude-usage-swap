@@ -1167,8 +1167,15 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     # Trigger 2: progressive ladder.
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
     threshold = active_acct.get("next_swap_at_pct", cfg_steps[0])
-    if threshold >= 100:  # force sentinel: any usage trips
-        threshold = 0
+    if threshold >= 100:
+        # Sentinel: the ladder ran off the end (more swap-aways than configured
+        # steps). Previously this collapsed to 0% which made ANY usage trip a
+        # swap — causing rapid-swap loops when both accounts ended up at the
+        # sentinel and the 5h-reset wasn't yet detected. Bug fixed 2026-05-20:
+        # at sentinel, treat as if we're still at the LAST configured step
+        # (most aggressive but bounded). The hard 7d cap still fires above
+        # this, and reactive 429 catches actually-exhausted accounts.
+        threshold = cfg_steps[-1]
 
     cur_pct = current_max_pct(cur_usage, config)
     if cur_pct < threshold:
@@ -1460,15 +1467,23 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
 
 
 def maybe_reset_thresholds(state: dict, config: dict) -> None:
-    """Reset next_swap_at_pct to config's first step under two conditions:
-      1. Both windows have dropped below `reset_below_pct` (window-reset case).
-      2. The current value isn't in the configured ladder (config was edited
+    """Reset next_swap_at_pct to config's first step under these conditions:
+      1. 5h window appears to have reset: current_5h_pct < first_step. Since
+         the ladder bumps up each time we swap AWAY (we always wait until 5h
+         crosses some ladder step before swapping), a 5h reading below the
+         FIRST step means the 5h window must have reset since we last swapped
+         — start the ladder over so we can use gentle Tier 1 again.
+      2. Both windows below `reset_below_pct` (legacy safety net for cases
+         where 5h didn't reset but usage just decayed under both windows).
+      3. The current value isn't in the configured ladder (config was edited
          since last state save) — migrate to the nearest matching step.
 
-    Without this, after a week's reset an account's ladder stays at 95 and
-    we'd never use the gentle Tier 1 again. AND, without the migration arm,
-    editing `thresholds.steps` in config.yaml wouldn't take effect on
-    already-populated state.
+    Bug fixed 2026-05-20: previously condition 1 required BOTH windows to
+    drop below `reset_below_pct`. When 5h reset but 7d (which decays much
+    more slowly) stayed above 50%, the ladder got pinned at 100 (the
+    sentinel for "any usage trips") and the daemon swapped accounts every
+    cycle. The new "5h < first_step" rule reliably detects 5h window resets
+    regardless of 7d state.
     """
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
     first_step = cfg_steps[0]
@@ -1476,14 +1491,21 @@ def maybe_reset_thresholds(state: dict, config: dict) -> None:
     reset_below = config.get("thresholds", {}).get("reset_below_pct", 50)
     for name, acct in state["accounts"].items():
         cur = acct.get("next_swap_at_pct", first_step)
-        # Window-reset case
-        if acct.get("current_5h_pct", 0) < reset_below and acct.get("current_7d_pct", 0) < reset_below:
+        cur_5h = acct.get("current_5h_pct", 0)
+        cur_7d = acct.get("current_7d_pct", 0)
+        # Condition 1: 5h has reset (current 5h < first ladder step → window
+        # must have rolled, since the ladder only progresses past first step
+        # after swap-aways at 70%+/85%+ etc.)
+        if cur_5h < first_step and cur > first_step:
+            acct["next_swap_at_pct"] = first_step
+            continue
+        # Condition 2: legacy AND-both-below safety net
+        if cur_5h < reset_below and cur_7d < reset_below:
             if cur > first_step:
                 acct["next_swap_at_pct"] = first_step
                 continue
-        # Stale-config-value migration
+        # Condition 3: stale-config-value migration
         if cur not in ladder:
-            # Snap to the nearest step >= current value (don't lower thresholds silently)
             acct["next_swap_at_pct"] = next((s for s in ladder if s >= cur), first_step)
 
 
