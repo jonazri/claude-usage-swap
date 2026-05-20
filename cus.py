@@ -155,6 +155,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "five_hour_headroom_weight": 0.6,
         "seven_day_headroom_weight": 0.4,
         "cold_account_penalty": 0,       # 0 = none; >0 deprioritizes accounts with 5h=0% (clock not ticking)
+        # When True, the picker may select a rate_limited account if no
+        # better option exists. Useful because the `rate_limited` flag
+        # conflates two failure modes: (a) Anthropic's polling-endpoint
+        # IP throttle (account itself still works) vs (b) account-cap hit
+        # (account unusable). We can't reliably distinguish from a 429
+        # response alone. Default False = safer (avoid landing on a
+        # potentially-capped account). Set True if you observe the flag
+        # firing despite the account working elsewhere (other machine, etc.).
+        "allow_rate_limited_targets": False,
     },
     "headroom_strategy": {
         "hard_7d_cap_pct": 80,
@@ -683,13 +692,30 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     if not current or not accounts:
         return None
 
+    # Hard filter: never pick an account with no working tokens / can't poll
+    # at all. token_expired and poll_error always exclude.
     candidates: list[tuple[str, dict]] = [
         (name, acct) for name, acct in accounts.items()
         if name != current
         and not acct.get("token_expired", False)
-        and not acct.get("rate_limited", False)
         and not acct.get("poll_error")
     ]
+
+    # Rate-limited is a SOFT filter by default — try non-rate-limited first,
+    # but fall back to rate-limited candidates if nothing else is available.
+    # See smart_strategy.allow_rate_limited_targets in DEFAULT_CONFIG for
+    # why this conflates two distinct 429s (polling throttle vs account cap).
+    strategy_cfg = config.get(f"{config.get('strategy', '')}_strategy", {})
+    allow_rl = strategy_cfg.get("allow_rate_limited_targets", config.get("smart_strategy", {}).get("allow_rate_limited_targets", False))
+    non_rate_limited = [(n, a) for n, a in candidates if not a.get("rate_limited", False)]
+    if non_rate_limited:
+        # Prefer non-rate-limited candidates when any exist.
+        candidates = non_rate_limited
+    elif not allow_rl:
+        # All remaining candidates are rate-limited and config says no.
+        return None
+    # else: candidates list keeps the rate-limited ones; picker proceeds.
+
     if not candidates:
         return None
 
@@ -2365,7 +2391,7 @@ def status() -> None:
         if a.get("poll_error"):
             flags.append("POLL_ERROR")
         status_col = ",".join(flags) if flags else "ok"
-        click.echo(f"{name+marker:<20} {a.get('current_5h_pct', 0):>8.1f} {a.get('current_7d_pct', 0):>8.1f} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}")
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}")
     click.echo()
 
     # Locks
@@ -2961,6 +2987,31 @@ def unpin(pane_or_session: str) -> None:
         click.echo(f"{pane_or_session} was not pinned")
 
 
+def _pct_is_unknown(acct: dict) -> bool:
+    """Return True when an account's stored current_*_pct should not be displayed.
+
+    The percentages get displayed as "?" instead of a number when ANY of the
+    blocker flags is set, because we don't actually have current data — what's
+    stored is last-known-good which may be hours old.
+
+    Shows "?" rather than the buggy "0.0" sentinel (or stale numbers) per the
+    2026-05-20 user feedback: 0% implied "no usage" which was equally
+    misleading as 100% from the prior sentinel bug.
+    """
+    return bool(acct.get("rate_limited") or acct.get("token_expired") or acct.get("poll_error"))
+
+
+def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1) -> str:
+    """Format a percentage for display, returning '?' if stale.
+
+    Use this in any user-facing output of current_5h_pct or current_7d_pct.
+    """
+    if _pct_is_unknown(acct):
+        return f"{'?':>{width}}"
+    val = acct.get(key, 0.0)
+    return f"{val:>{width}.{prec}f}"
+
+
 def _fmt_duration(seconds: float) -> str:
     """Format seconds as a short human duration: '5m', '1h23m', '3d', '12d6h'."""
     if seconds < 0:
@@ -3039,7 +3090,10 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     nx = acct.get("next_swap_at_pct", 50)
 
     if not is_verbose:
-        # Compact mode (original behavior).
+        # Compact mode. Render "?" if we don't have reliable data.
+        if _pct_is_unknown(acct):
+            click.echo(f"cus:{active} 5h:? 7d:? nxt:{nx}%")
+            return
         flag = ""
         if max(fh, sd) >= nx:
             flag = " ⚠ "
@@ -3056,6 +3110,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     def fmt_account(name: str, a: dict, is_active: bool) -> str:
         h5 = a.get("current_5h_pct", 0)
         h7 = a.get("current_7d_pct", 0)
+        unknown = _pct_is_unknown(a)
         flags = []
         if a.get("token_expired"):
             flags.append("EXP")
@@ -3064,16 +3119,18 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         flag_str = "(" + ",".join(flags) + ")" if flags else ""
         marker = "*" if is_active else ""
         parts = [f"{name}{marker}"]
+        pct5 = "?" if unknown else f"{h5:.0f}%"
+        pct7 = "?" if unknown else f"{h7:.0f}%"
         if show_resets:
             r5 = _time_until(a.get("five_hour_resets_at"))
             r7 = _time_until(a.get("seven_day_resets_at"))
-            r5_str = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 else ""
-            r7_str = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 else ""
-            parts.append(f"5h:{h5:.0f}%{r5_str}")
-            parts.append(f"7d:{h7:.0f}%{r7_str}")
+            r5_str = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
+            r7_str = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown else ""
+            parts.append(f"5h:{pct5}{r5_str}")
+            parts.append(f"7d:{pct7}{r7_str}")
         else:
-            parts.append(f"5h:{h5:.0f}%")
-            parts.append(f"7d:{h7:.0f}%")
+            parts.append(f"5h:{pct5}")
+            parts.append(f"7d:{pct7}")
         if flag_str:
             parts.append(flag_str)
         return " ".join(parts)
