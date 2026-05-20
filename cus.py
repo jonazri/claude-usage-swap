@@ -582,11 +582,16 @@ def poll_account_usage(account_name: str) -> AccountUsage:
         if e.code == 401:
             u.token_expired = True
         elif e.code == 429:
-            # Account is actively rate-limited by Anthropic. Treat as 100%
-            # utilization on both windows so the swap target picker treats it
-            # as "completely full" and refuses to swap to it.
-            u.five_hour = UsageWindow(utilization=100.0, resets_at=None)
-            u.seven_day = UsageWindow(utilization=100.0, resets_at=None)
+            # Account is currently rate-limited by Anthropic. Flag it; do NOT
+            # set five_hour/seven_day. update_state_with_usage will preserve
+            # the prior current_*_pct values. The `rate_limited: True` flag
+            # is the load-bearing signal — `pick_swap_target` filters by it.
+            #
+            # Previously we set both windows to UsageWindow(100.0) as a
+            # sentinel "treat as completely full." That worked for the
+            # picker but destroyed observability: `cus status` would show
+            # 100% / 100% even when the real values were known to be lower
+            # from the prior successful poll. See GH issue tracking this.
             u.raw = {"error": f"HTTP 429 (rate_limited): {body_preview}", "rate_limited": True}
         else:
             u.raw = {"error": f"HTTP {e.code}: {body_preview}"}
@@ -1031,6 +1036,20 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     if cur_usage is None:
         return None
 
+    # Trigger 0: active account just returned HTTP 429.
+    # Replaces the prior sentinel approach (set current_*_pct=100 → ladder
+    # trips → swap). After the 2026-05-20 fix preserving last known good
+    # percentages on 429, we need this explicit trigger instead.
+    if cur_usage.raw.get("rate_limited"):
+        target = pick_swap_target(state, config)
+        if target is None:
+            return None
+        return SwapDecision(
+            target=target.name,
+            reason=f"active {current} is rate-limited (HTTP 429); target: {target.reason}",
+            tier=determine_tier(active_acct, config),
+        )
+
     # Trigger 1: hard 7d cap.
     # Active strategy must support this; smart and headroom do via their
     # respective config blocks. Other strategies pick up the default 80%.
@@ -1070,33 +1089,52 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
     """Mutate state.json's per-account current_*_pct from a poll cycle.
 
-    On poll error (network failure, JSON parse failure, etc.), we PRESERVE
-    the previous current_*_pct values rather than zeroing them out — a
-    transient error shouldn't make the strategy picker think the account
-    is suddenly idle.
+    Each per-account update follows one of four exclusive branches:
+      1. token_expired (HTTP 401)    — flag and preserve prior percentages
+      2. rate_limited (HTTP 429)     — flag and preserve prior percentages
+      3. poll_error (other failures) — flag and preserve prior percentages
+      4. success — clear all flags, store new percentages + reset times
+
+    The four-way exclusive structure replaces a buggy version where 429
+    fell through to the poll_error branch (both flags getting set
+    simultaneously). The picker filters by any of (token_expired,
+    rate_limited, poll_error); each is exclusive on a per-cycle basis.
     """
     for name, acct in state["accounts"].items():
         u = usage_by_account.get(name)
         if u is None:
             continue
+
+        # Branch 1: token expired (401)
         if u.token_expired:
             acct["token_expired"] = True
+            acct.pop("rate_limited", None)
+            acct.pop("poll_error", None)
             acct["last_poll_ts"] = u.polled_at
             continue
-        # Detect transient/unrecoverable errors that returned no usable data
+
+        # Branch 2: rate-limited (429). Preserve last known current_*_pct.
+        if u.raw.get("rate_limited"):
+            acct["rate_limited"] = True
+            acct["token_expired"] = False
+            acct.pop("poll_error", None)
+            acct["last_poll_ts"] = u.polled_at
+            continue
+
+        # Branch 3: other poll error (network, timeout, JSON parse). Preserve prior values.
         has_error = bool(u.raw.get("error"))
         has_any_window = u.five_hour is not None or u.seven_day is not None
         if has_error and not has_any_window:
             acct["poll_error"] = u.raw["error"]
+            acct["token_expired"] = False
+            acct.pop("rate_limited", None)
             acct["last_poll_ts"] = u.polled_at
             continue
-        # Clear prior error state and any token_expired flag
+
+        # Branch 4: success. Clear all flags + store new values.
         acct.pop("poll_error", None)
+        acct.pop("rate_limited", None)
         acct["token_expired"] = False
-        if u.raw.get("rate_limited"):
-            acct["rate_limited"] = True
-        else:
-            acct.pop("rate_limited", None)
         acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
         acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else acct.get("current_7d_pct", 0.0)
         acct["last_poll_ts"] = u.polled_at
