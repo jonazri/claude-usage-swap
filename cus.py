@@ -1307,19 +1307,14 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     if cur_usage is None:
         return None
 
-    # Trigger 0: active account just returned HTTP 429.
-    # Replaces the prior sentinel approach (set current_*_pct=100 → ladder
-    # trips → swap). After the 2026-05-20 fix preserving last known good
-    # percentages on 429, we need this explicit trigger instead.
-    if cur_usage.raw.get("rate_limited"):
-        target = pick_swap_target(state, config)
-        if target is None:
-            return None
-        return SwapDecision(
-            target=target.name,
-            reason=f"active {current} is rate-limited (HTTP 429); target: {target.reason}",
-            tier=determine_tier(active_acct, config),
-        )
+    # NOTE: the previous "Trigger 0: active is rate-limited (poll 429)" has
+    # been REMOVED (GH #18). That trigger fired on the POLLING endpoint's
+    # 429 — Anthropic's per-IP throttle on /api/oauth/usage, which is NOT
+    # a signal that the account itself is exhausted. The account is fully
+    # usable for real claude code traffic when polling is throttled.
+    # The CORRECT reactive 429 path is `check_rate_limit_reactive` (called
+    # at the top of one_cycle), which reads the rate_limit_log populated
+    # by the PostToolUseFailure hook from actual user-facing 429s.
 
     # Trigger 1: hard 7d cap.
     # Active strategy must support this; smart and headroom do via their
@@ -1328,8 +1323,39 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     hard_7d_cap = strategy_cfg.get("hard_7d_cap_pct") or config.get("smart_strategy", {}).get("hard_7d_cap_pct", 80)
     cur_7d = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
     if cur_7d >= hard_7d_cap:
+        # Hard 7d cap is normally a bypass path (it's the user's invariant)
+        # but apply minimum hysteresis so a previous cap-swap can't be
+        # immediately undone — and only allow the swap if the picker has
+        # a target with REAL safety (not a DEGRADED fallback). If all
+        # accounts are above cap, swapping doesn't help — emit SOS instead.
+        hyst_cfg = config.get("swap_hysteresis", {})
+        if hyst_cfg.get("enabled", True):
+            min_seconds = hyst_cfg.get("min_seconds_between_cap_swaps", 60)
+            last_swap = active_acct.get("last_swap_ts")
+            if last_swap:
+                try:
+                    last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
+                    elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
+                    if elapsed < min_seconds:
+                        click.echo(
+                            f"  hard 7d cap tripped ({current} at {cur_7d:.1f}%) "
+                            f"but last swap was {int(elapsed)}s ago (< {min_seconds}s); deferring"
+                        )
+                        return None
+                except ValueError:
+                    pass
+
         target = pick_swap_target(state, config)
         if target is None:
+            return None
+        # If the picker had to fall back to a DEGRADED candidate (also above
+        # hard_7d_cap), swapping doesn't actually help — both accounts are
+        # exhausted. Don't churn; the SOS layer will surface it.
+        if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
+            click.echo(
+                f"  hard 7d cap tripped on {current} ({cur_7d:.1f}%) but all "
+                f"other accounts are ALSO above cap — not swapping (would just churn); SOS will fire"
+            )
             return None
         return SwapDecision(
             target=target.name,
@@ -2735,6 +2761,11 @@ def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
 
     Returns a Tier-3 SwapDecision (force) so hot_swap_orchestrate skips
     the gentle wait-for-Stop path.
+
+    Hysteresis: respects swap_hysteresis.min_seconds_between_reactive_swaps
+    (default 60s — shorter than the ladder gate because reactive 429s are
+    real emergencies). Prevents rapid-fire reactive swaps when the
+    rate_limit_log churns or sessions.log mapping is briefly stale.
     """
     if not config.get("reactive", {}).get("enabled", True):
         return None
@@ -2757,6 +2788,25 @@ def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
             break
     if not matched_session:
         return None
+
+    # Hysteresis check (GH #18): even legitimate reactive 429s respect a
+    # short minimum interval. Reactive cooldown defaults to 60s rather than
+    # the ladder's 300s — real 429s are emergencies, but we still need to
+    # prevent ping-pong on flaky parsing or stale session→account mappings.
+    hyst_cfg = config.get("swap_hysteresis", {})
+    if hyst_cfg.get("enabled", True):
+        min_seconds = hyst_cfg.get("min_seconds_between_reactive_swaps", 60)
+        active_acct = state.get("accounts", {}).get(active, {})
+        last_swap = active_acct.get("last_swap_ts")
+        if last_swap:
+            try:
+                last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
+                if elapsed < min_seconds:
+                    click.echo(f"  reactive 429 detected on {active} but last swap was {int(elapsed)}s ago (< {min_seconds}s); deferring")
+                    return None
+            except ValueError:
+                pass
 
     target = pick_swap_target(state, config)
     if target is None:
