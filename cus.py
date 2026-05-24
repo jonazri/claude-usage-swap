@@ -1245,6 +1245,28 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
             tier=determine_tier(active_acct, config),
         )
 
+    # Universal hysteresis: enforce a minimum interval between swaps.
+    # Final safety-net against any rapid-swap loop bug in the ladder logic
+    # or any picker strategy. Reactive 429 + hard 7d cap above bypass this
+    # gate (they're emergencies). Default 300s = 5 minutes between ladder
+    # swaps. Config-tunable via swap_hysteresis.min_seconds_between_swaps.
+    hyst_cfg = config.get("swap_hysteresis", {})
+    if hyst_cfg.get("enabled", True):
+        min_seconds = hyst_cfg.get("min_seconds_between_swaps", 300)
+        last_swap = active_acct.get("last_swap_ts")
+        if last_swap:
+            try:
+                last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
+                if elapsed < min_seconds:
+                    click.echo(
+                        f"  ladder check deferred: last swap was {int(elapsed)}s ago "
+                        f"(< min_seconds_between_swaps={min_seconds}s)"
+                    )
+                    return None
+            except ValueError:
+                pass
+
     # Trigger 2: progressive ladder.
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
     threshold = active_acct.get("next_swap_at_pct", cfg_steps[0])
