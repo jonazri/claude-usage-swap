@@ -1262,6 +1262,41 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     if cur_pct < threshold:
         return None
 
+    # Usage-growth gate (GH #15): only swap via the ladder if the active
+    # account's local usage is ACTUALLY GROWING since the previous poll.
+    # User report 2026-05-24: "it literally spent 2 days swapping back and
+    # forth with no usage on this machine." Root cause: 7d/5h numbers were
+    # high due to OTHER machines' consumption, but locally we weren't
+    # spending anything. Every cycle the threshold tripped on stale-high
+    # numbers and triggered a swap. The threshold is a signal that we need
+    # MORE headroom — but if we're not consuming anything on this machine,
+    # we have all the headroom we need; swapping is just wasted activity.
+    #
+    # Reactive-429 and hard-7d-cap paths above intentionally bypass this
+    # gate — they're emergencies. Only the ladder is gated.
+    growth_cfg = config.get("usage_growth_gate", {})
+    if growth_cfg.get("enabled", True):
+        min_delta_pct = growth_cfg.get("min_delta_pct", 0.5)
+        prev_5h = active_acct.get("prev_current_5h_pct")
+        prev_7d = active_acct.get("prev_current_7d_pct")
+        cur_5h = cur_usage.five_hour.utilization if cur_usage.five_hour else None
+        cur_7d_val = cur_usage.seven_day.utilization if cur_usage.seven_day else None
+        # Compute deltas where we have both prev and current readings.
+        deltas = []
+        if prev_5h is not None and cur_5h is not None:
+            deltas.append(cur_5h - prev_5h)
+        if prev_7d is not None and cur_7d_val is not None:
+            deltas.append(cur_7d_val - prev_7d)
+        if deltas and max(deltas) < min_delta_pct:
+            # No meaningful growth. Suppress the ladder swap. We still log
+            # so the operator can see the gate firing in daemon.log.
+            click.echo(
+                f"  ladder threshold tripped ({current} at {cur_pct:.1f}% >= "
+                f"{threshold}%) BUT usage isn't growing on this machine "
+                f"(max delta {max(deltas):.2f}% < {min_delta_pct}%); skipping swap"
+            )
+            return None
+
     target = pick_swap_target(state, config)
     if target is None:
         return None
@@ -1343,6 +1378,13 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct.pop("token_stale", None)
         acct["token_expired"] = False
         update_backoff(acct, success=True, config=config)
+        # Snapshot the PREVIOUS current_*_pct before overwriting — used by
+        # the usage-growth gate in decide_swap (GH #15) to suppress ladder
+        # swaps when local usage isn't actually increasing.
+        if "current_5h_pct" in acct:
+            acct["prev_current_5h_pct"] = acct["current_5h_pct"]
+        if "current_7d_pct" in acct:
+            acct["prev_current_7d_pct"] = acct["current_7d_pct"]
         acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
         acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else acct.get("current_7d_pct", 0.0)
         acct["last_poll_ts"] = u.polled_at
