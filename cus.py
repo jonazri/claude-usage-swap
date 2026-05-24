@@ -1430,7 +1430,18 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     if active and active in accounts:
         active_acct = accounts[active]
         threshold = active_acct.get("next_swap_at_pct", 50)
-        cur_pct = max(active_acct.get("current_5h_pct", 0), active_acct.get("current_7d_pct", 0))
+        # Honor thresholds.five_hour / thresholds.seven_day config so the SOS
+        # message reflects the actual ladder calculation. GH #14: previously
+        # this max'd over both windows unconditionally, giving misleading
+        # "default at 75%" alerts when 7d=75% but the user had configured
+        # seven_day:false so only 5h actually drives the swap ladder.
+        thr_cfg = config.get("thresholds", {})
+        candidates = []
+        if thr_cfg.get("five_hour", True):
+            candidates.append(active_acct.get("current_5h_pct", 0))
+        if thr_cfg.get("seven_day", True):
+            candidates.append(active_acct.get("current_7d_pct", 0))
+        cur_pct = max(candidates) if candidates else 0
 
         if not valid:
             out.append(SOSCondition(
@@ -1591,18 +1602,29 @@ def maybe_reset_thresholds(state: dict, config: dict) -> None:
         cur = acct.get("next_swap_at_pct", first_step)
         cur_5h = acct.get("current_5h_pct", 0)
         cur_7d = acct.get("current_7d_pct", 0)
-        # Condition 1: 5h has reset (current 5h < first ladder step → window
-        # must have rolled, since the ladder only progresses past first step
-        # after swap-aways at 70%+/85%+ etc.)
-        if cur_5h < first_step and cur > first_step:
-            acct["next_swap_at_pct"] = first_step
-            continue
-        # Condition 2: legacy AND-both-below safety net
+        # Condition 1 (GH #14, replaces overly-eager "5h < first_step" rule
+        # from GH #12): only reset when the 5h window GENUINELY rolled over,
+        # detected by comparing Anthropic's resets_at boundary against the
+        # previously-stored value. The earlier rule fired any time 5h was low,
+        # which broke for freshly-swapped-TO accounts: those have low 5h
+        # naturally, so every swap reset the destination's ladder to first_step
+        # and 7d immediately re-tripped it → infinite loop.
+        cur_resets_at = acct.get("five_hour_resets_at")
+        prev_resets_at = acct.get("prev_five_hour_resets_at")
+        if cur_resets_at and prev_resets_at and cur_resets_at != prev_resets_at:
+            if cur > first_step:
+                acct["next_swap_at_pct"] = first_step
+                acct["prev_five_hour_resets_at"] = cur_resets_at
+                continue
+        # Always track current resets_at so we can detect the next rollover.
+        if cur_resets_at:
+            acct["prev_five_hour_resets_at"] = cur_resets_at
+        # Condition 2: legacy AND-both-below safety net.
         if cur_5h < reset_below and cur_7d < reset_below:
             if cur > first_step:
                 acct["next_swap_at_pct"] = first_step
                 continue
-        # Condition 3: stale-config-value migration
+        # Condition 3: stale-config-value migration.
         if cur not in ladder:
             acct["next_swap_at_pct"] = next((s for s in ladder if s >= cur), first_step)
 
