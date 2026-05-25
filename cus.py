@@ -2377,25 +2377,35 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         transcript = None
         chosen_source = None
 
-        # Step 1: cmdline (validated). Pane-specific.
+        # Step 1: cmdline (validated). Pane-specific. Validation is needed
+        # here because the launch-time --resume id may point to a JSONL
+        # that's since been deleted by compaction (GH #21, the 28eac355 case).
         if live_sid:
             t = _validate(live_sid)
             if t:
                 sid, transcript, chosen_source = live_sid, t, "cmdline"
 
-        # Step 2: sessions.log latest for THIS PANE (validated). Pane-specific.
-        if sid is None:
-            t = _validate(e["session_id"])
-            if t:
-                sid, transcript, chosen_source = e["session_id"], t, "sessions.log"
+        # Step 2: sessions.log latest for THIS PANE. Pane-specific. NOT
+        # validated against JSONL existence anymore (GH #23 fix): there's
+        # a brief race between SessionStart firing and the first JSONL
+        # line being written (~5s window). If we polled during that
+        # window we'd reject the id and silently lose the session. The
+        # 2026-05-25 incident: pane %13's session 927e2992 was
+        # SessionStart-logged but its JSONL wasn't created until 5s after
+        # the swap decision fired. We accept sessions.log unconditionally
+        # here because if SessionStart fired, claude IS running that
+        # session, and the JSONL will exist by relaunch time.
+        if sid is None and e.get("session_id"):
+            sid = e["session_id"]
+            transcript = _validate(e["session_id"])  # may be None during race
+            chosen_source = "sessions.log"
 
         # Step 3: newest-mtime .jsonl in cwd's project dir (validated by
         # mtime < 1h). CWD-WIDE, not pane-specific — only safe to use when
         # we have NO better signal AND only ONE live pane is in this cwd.
         # GH #22: if multiple panes share this cwd, the newest-mtime would
         # return the same id for ALL of them, causing them to relaunch into
-        # the same chat. We skip the fallback in that case (sid stays None;
-        # relaunch will be plain `claude` no --resume).
+        # the same chat. We skip the fallback in that case.
         if sid is None and cwd and cwd_pane_count.get(cwd, 0) <= 1:
             try:
                 projects_root = Path.home() / ".claude" / "projects"
