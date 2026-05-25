@@ -1269,17 +1269,40 @@ class SwapDecision:
 
 
 def determine_tier(active_acct: dict, config: dict) -> int:
-    """Map current next_swap_at_pct to a tier based on config.
+    """Map ladder step + current usage to an urgency tier.
 
-    Tier 1: at first step (default 50) — gentlest, wait for Stop, defer if cache warm.
-    Tier 2: at tier_2_at_pct step (default 75) — inject pause-message.
-    Tier 3: at tier_3_at_pct step or force (default 90 or 100) — interrupt, log shells.
+    Tier 1: gentle — wait for Stop, defer if cache warm.
+    Tier 2: send pause-message asking session to wrap up.
+    Tier 3: force interrupt (double-Escape), log shell state.
+
+    Two inputs are considered (max wins): the ladder step
+    (next_swap_at_pct, which represents how many times we've already
+    swapped away from this account) AND the CURRENT usage. Previously
+    only the ladder step was used — which meant when an account at
+    next_swap_at_pct=70 suddenly spiked to 95% real usage, we'd run
+    tier 1 (just wait for Stop), the swap could time out and abort,
+    and we'd be stuck at 95%+ with no escalation. User-reported bug
+    2026-05-25 (GH #20): "ran out of usage, didn't auto swap" — the
+    direct cause was tier-1 wait timing out on a stuck pane; the tier
+    SHOULD have been 3 since the account was at 100%.
     """
-    step = active_acct.get("next_swap_at_pct", 50)
     hot = config.get("hot_swap", {})
-    if step >= hot.get("tier_3_at_pct", 90):
+    tier_2_at = hot.get("tier_2_at_pct", 75)
+    tier_3_at = hot.get("tier_3_at_pct", 90)
+
+    step = active_acct.get("next_swap_at_pct", 50)
+    cur_5h = active_acct.get("current_5h_pct", 0)
+    cur_7d = active_acct.get("current_7d_pct", 0)
+    cur_max = max(cur_5h, cur_7d)
+
+    # Take the max-urgency signal between the ladder step and the actual
+    # current usage. The ladder represents accumulated history; current
+    # usage represents the live emergency level.
+    urgency = max(step, cur_max)
+
+    if urgency >= tier_3_at:
         return 3
-    if step >= hot.get("tier_2_at_pct", 75):
+    if urgency >= tier_2_at:
         return 2
     return 1
 
