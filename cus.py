@@ -2524,12 +2524,21 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return
 
+    # CRITICAL safety prefix (GH #24, 2026-05-25): send Escape × 2 FIRST
+    # in BOTH modes. User report: "apparently it sends the answers to
+    # claude's questions too" — if claude is in an interactive prompt
+    # state (permission dialog, choice picker, autocomplete dropdown,
+    # slash-command picker), our blind Enter would have ANSWERED the
+    # prompt. Escape dismisses any modal/picker/prompt without
+    # submitting anything. Two Escapes to cover nested UI state
+    # (autocomplete inside a prompt, etc.).
+    tmux_send_keys(pane, "Escape")
+    time.sleep(0.15)
+    tmux_send_keys(pane, "Escape")
+    time.sleep(0.15)
+
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
-        tmux_send_keys(pane, "Escape")
-        time.sleep(0.15)
-        tmux_send_keys(pane, "Escape")
-        time.sleep(0.15)
         tmux_send_keys(pane, "C-u")
         time.sleep(0.15)
         tmux_send_keys(pane, *(["BSpace"] * 400))
@@ -2538,10 +2547,10 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
         return
 
     # Default: "submit" — preserve draft by sending it as a message first.
-    # If input box is empty, the first Enter is a no-op in claude's TUI.
-    # If non-empty, the draft becomes a normal user turn in chat history;
-    # claude may begin responding before we type /exit, but the draft is
-    # safely persisted in the JSONL and visible on --resume.
+    # Now SAFE because Escape × 2 above dismissed any interactive prompt;
+    # the Enter below only sees the main chat input. If the input is empty,
+    # Enter is a no-op in claude's TUI. If non-empty, the draft is sent
+    # as a normal user turn (safely persisted in JSONL, visible on --resume).
     tmux_send_keys(pane, "Enter")
     time.sleep(0.3)
     # Type /exit into the (now-empty) input box. tmux_send_text appends
@@ -4068,7 +4077,19 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if flag_marker:
             prefix_bits.append(flag_marker)
         prefix = " ".join(prefix_bits)
-        click.echo(f"{prefix} 5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
+        # GH #25: add a small countdown to next poll so compact mode also
+        # has a live "fresh data in X" signal that ticks down between polls.
+        last_poll = acct.get("last_poll_ts")
+        age = _time_since(last_poll)
+        poll_part = ""
+        if age is not None and age >= 0:
+            poll_interval = config.get("poll_interval_seconds", 600)
+            remaining = poll_interval - age
+            if remaining > 0:
+                poll_part = f" ({_fmt_duration(remaining)} to poll)"
+            else:
+                poll_part = " (poll due)"
+        click.echo(f"{prefix} 5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%{poll_part}")
         return
 
     # Verbose mode.
@@ -4124,7 +4145,18 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         last_poll = acct.get("last_poll_ts")
         age = _time_since(last_poll)
         if age is not None and age >= 0:
-            pieces.append(f"poll {_fmt_duration(age)}ago")
+            # GH #25: show countdown to next poll in addition to age. The
+            # statusline is re-rendered on Claude Code's own cadence
+            # (typically a few seconds), so each render shows a live count
+            # toward the next poll. "polled 7m ago, next in 3m" is more
+            # useful than just "polled 7m ago" — operator can see when
+            # fresh data is coming.
+            poll_interval = config.get("poll_interval_seconds", 600)
+            remaining = poll_interval - age
+            if remaining > 0:
+                pieces.append(f"poll {_fmt_duration(age)}ago·next in {_fmt_duration(remaining)}")
+            else:
+                pieces.append(f"poll {_fmt_duration(age)}ago·due now")
 
     click.echo(pieces_prefix + " | ".join(pieces))
 
