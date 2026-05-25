@@ -1853,7 +1853,7 @@ def maybe_reset_thresholds(state: dict, config: dict) -> None:
 @dataclass
 class LiveSession:
     """One Claude Code session believed to be alive based on hook log tails."""
-    session_id: str
+    session_id: str | None  # None means "no resumable session-id found; relaunch fresh"
     account: str
     pane: str           # tmux pane id like %12, or "no-tmux"
     cwd: str
@@ -2336,22 +2336,92 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             # Pane is back to shell (or running something else). No live claude.
             continue
 
-        # Prefer the live claude process's CLAUDE_CODE_SESSION_ID over the
-        # latest sessions.log entry — see GH #10. The sessions.log heuristic
-        # is stale when a pane has had multiple sessions and the live one
-        # wasn't recorded (or was recorded earlier than another now-dead one).
+        # Pick session-id with FALLBACK CHAIN (GH #21, 2026-05-25):
+        #   1. /proc cmdline --resume arg (GH #10) — strongest signal when
+        #      claude was launched with --resume <id> AND the JSONL exists
+        #   2. newest-mtime .jsonl in cwd's project dir, mtime within 1 hour
+        #      — strong signal because claude is actively writing to it RIGHT
+        #      NOW. Handles "user manually /exit + claude (fresh)" case where
+        #      cmdline has no --resume.
+        #   3. sessions.log latest for this pane (SessionStart hook log) —
+        #      weaker because the hook may not have fired or may be stale
+        #   4. sessions.log latest UNVALIDATED — last resort so we always
+        #      have SOMETHING to attempt --resume with
+        #
+        # Each candidate is validated to have an actual .jsonl file before
+        # we accept it (except the desperate fallback).
+        #
+        # 2026-05-25 incident: pane %11 cmdline said --resume 28eac355-...,
+        # but only `28eac355.../tool-results/` existed — the .jsonl had been
+        # cleaned up (claude internal compaction/rotation). Relaunching with
+        # --resume 28eac355 → "No conversation found." User also noted
+        # "we often have multiple sessions in the same tmux (like close and
+        # open a new one manually)" — covered by the newest-mtime fallback.
+        cwd = e.get("cwd", "")
         live_sid = pane_live_session_id(pane)
-        sid = live_sid or e["session_id"]
-        if verbose and live_sid and live_sid != e["session_id"]:
-            # Log the discrepancy so we have evidence that the /proc-based
-            # lookup is correcting a real mismatch — useful for validating
-            # the fix in production logs. Verbose-only to avoid spamming
-            # `cus status` / statusline callers.
+
+        def _validate(cand_sid: str) -> Path | None:
+            t = _find_transcript(cand_sid, cwd)
+            return t if (t and t.exists()) else None
+
+        sid = None
+        transcript = None
+        chosen_source = None
+
+        # Step 1: cmdline (validated)
+        if live_sid:
+            t = _validate(live_sid)
+            if t:
+                sid, transcript, chosen_source = live_sid, t, "cmdline"
+
+        # Step 2: newest-mtime JSONL in cwd's project dir (validated by mtime
+        # < 1h to filter against stale files from previous days)
+        if sid is None and cwd:
+            try:
+                projects_root = Path.home() / ".claude" / "projects"
+                encoded = cwd.replace("/", "-")
+                proj_dir = projects_root / encoded
+                if proj_dir.exists():
+                    jsonls = sorted(
+                        proj_dir.glob("*.jsonl"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for j in jsonls:
+                        mtime = datetime.fromtimestamp(j.stat().st_mtime, tz=timezone.utc)
+                        if (now - mtime).total_seconds() < 3600:
+                            sid, transcript, chosen_source = j.stem, j, "newest-jsonl-mtime"
+                            break
+            except OSError:
+                pass
+
+        # Step 3: sessions.log latest (validated)
+        if sid is None:
+            t = _validate(e["session_id"])
+            if t:
+                sid, transcript, chosen_source = e["session_id"], t, "sessions.log"
+
+        # Step 4 (user directive 2026-05-25): no fallback to unvalidated.
+        # If no candidate has a JSONL, sid stays None and the relaunch logic
+        # below uses plain `claude` (no --resume). Better to start a fresh
+        # session than to fail with "No conversation found" — user said:
+        # "If theres no solution for that, we can just never do that I guess."
+        if sid is None and verbose:
+            click.echo(
+                f"    pane {pane}: NO valid session-id found "
+                f"(cmdline={live_sid[:8] if live_sid else 'None'}, sessions.log={e['session_id'][:8]}); "
+                f"will relaunch WITHOUT --resume (fresh session)"
+            )
+        elif verbose and chosen_source != "cmdline":
+            click.echo(
+                f"    pane {pane}: session-id {sid[:8]} from {chosen_source} "
+                f"(cmdline returned {live_sid[:8] if live_sid else 'None'})"
+            )
+        elif verbose and live_sid and live_sid != e["session_id"]:
             click.echo(
                 f"    pane {pane}: live session-id {live_sid[:8]} differs "
                 f"from sessions.log latest {e['session_id'][:8]}; using live"
             )
-        transcript = _find_transcript(sid, e.get("cwd", ""))
         last_stop_at = latest_stops.get(sid)
 
         # Liveness double-check — even though we confirmed pane_current_command
@@ -2808,10 +2878,15 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     wake = hot.get("wake_up_message", "").strip()
     wake_part = f" {shlex.quote(wake)}" if wake else ""
     for s in panes_ready:
-        if use_resume:
+        # GH #21: if we couldn't find a valid session-id with an existing
+        # JSONL, launch plain `claude` (no --resume) — better fresh session
+        # than failed "No conversation found" relaunch.
+        if use_resume and s.session_id:
             cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}{wake_part}"
         else:
             cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part}{wake_part}"
+            if use_resume and not s.session_id:
+                click.echo(f"    pane {s.pane}: no valid session-id found; relaunching FRESH (no --resume)")
         click.echo(f"    pane {s.pane}: relaunch → {cmd}")
         tmux_send_text(s.pane, cmd)
 
