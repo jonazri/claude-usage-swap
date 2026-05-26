@@ -4167,11 +4167,19 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         click.echo("Not initialized. Run `cus init` first.")
         sys.exit(1)
 
-    # Daemon writes its pid so `cus sos` can detect "pid recorded but gone"
-    try:
-        DAEMON_PID.write_text(str(os.getpid()))
-    except OSError:
-        pass
+    # Daemon writes its pid so `cus sos` can detect "pid recorded but gone".
+    # GH #35: only the long-running daemon (systemd / foreground) should
+    # claim that slot. A `--once` invocation is transient — writing its own
+    # pid and exiting leaves a dead pid in the file, which makes every
+    # SUBSEQUENT cycle of the persistent daemon (or every `cus sos` call)
+    # emit a spurious "Daemon pid X recorded but process is gone" warning.
+    # `--once` callers (cron, smoke-tests, one-shot polls) don't need the
+    # SOS-tracking slot at all; skip the write.
+    if not once:
+        try:
+            DAEMON_PID.write_text(str(os.getpid()))
+        except OSError:
+            pass
 
     def _emit_sos_after(state: dict, config: dict) -> None:
         conditions = diagnose(state, config)
