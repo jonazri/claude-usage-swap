@@ -94,6 +94,7 @@ STOPS_LOG = ACCOUNTS_DIR / "stops.log"
 RATE_LIMIT_LOG = ACCOUNTS_DIR / "429.log"
 TOOL_USE_LOG = ACCOUNTS_DIR / "tool_use.log"
 DAEMON_LOG = ACCOUNTS_DIR / "daemon.log"
+DECISIONS_LOG = ACCOUNTS_DIR / "decisions.jsonl"   # GH #56: one structured record per daemon decision
 DAEMON_PID = ACCOUNTS_DIR / "daemon.pid"
 ORCHESTRATE_LOCK = ACCOUNTS_DIR / "orchestrate.lock"
 INBOX_MD = ACCOUNTS_DIR / "inbox.md"
@@ -1442,6 +1443,93 @@ class SwapDecision:
     # session riding into a rate-limit. Keyed explicitly (NOT off `tier`) because
     # a hard-cap swap can land at tier 2 yet must never be deferred.
     deferrable: bool = True
+
+
+def _build_decision_record(
+    state: dict,
+    config: dict,
+    *,
+    action: str,
+    gate: str,
+    reason: str,
+    target: str | None = None,
+    tier: int | None = None,
+    where: dict | None = None,
+) -> dict:
+    """Assemble one structured who/what/where/when/why decision record (GH #56).
+
+    Written once per daemon cycle to decisions.jsonl so the operator can audit
+    exactly why each swap did or didn't happen over a long testing window.
+      who   = the active account + its live usage
+      what  = action: swap | hold | defer | would_swap
+      where = panes/sessions affected (who pays the prompt-cache rebuild)
+      when  = timestamp
+      why   = gate (which rule decided) + a human reason sentence
+    """
+    active = state.get("active")
+    accts = {}
+    for n, a in (state.get("accounts") or {}).items():
+        accts[n] = {
+            "5h": a.get("current_5h_pct"),
+            "7d": a.get("current_7d_pct"),
+            "next_swap_at_pct": a.get("next_swap_at_pct"),
+            "five_hour_resets_at": a.get("five_hour_resets_at"),
+        }
+    who = accts.get(active, {})
+    th = config.get("thresholds", {})
+    return {
+        "when": now_iso(),
+        "action": action,
+        "gate": gate,
+        "reason": reason,
+        "who": {
+            "active": active,
+            "5h": who.get("5h"),
+            "7d": who.get("7d"),
+            "next_swap_at_pct": who.get("next_swap_at_pct"),
+        },
+        "target": target,
+        "tier": tier,
+        "where": where or {},
+        "accounts": accts,
+        "mode": "hot_swap" if config.get("hot_swap", {}).get("enabled", False) else "background",
+        "config": {
+            "steps": th.get("steps"),
+            "min_improvement_pct": config.get("swap_hysteresis", {}).get("min_improvement_pct"),
+            "lazy_swap": config.get("lazy_swap", {}).get("enabled"),
+            "burn_before_reset": config.get("burn_before_reset", {}).get("enabled"),
+        },
+    }
+
+
+def _log_decision(record: dict) -> None:
+    """Append a decision record to decisions.jsonl (size-rotated at ~5MB).
+
+    Best-effort: a logging failure must NEVER break the daemon cycle, so all
+    OSErrors are swallowed. GH #56.
+    """
+    try:
+        if DECISIONS_LOG.exists() and DECISIONS_LOG.stat().st_size > 5_000_000:
+            DECISIONS_LOG.replace(DECISIONS_LOG.with_name(DECISIONS_LOG.name + ".1"))
+        with DECISIONS_LOG.open("a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+def _migrating_panes() -> dict:
+    """The 'where' of a background swap: every live session follows the global
+    creds, so all live panes migrate to the new account (and the warm ones pay
+    a one-time prompt-cache rebuild). Returns {count, panes} for the decision
+    record. Best-effort — only call this on actual swap/defer cycles, not on
+    every hold, to avoid scanning sessions.log needlessly. GH #56.
+    """
+    try:
+        panes = sorted({s.pane for s in find_live_sessions()
+                        if s.pane and s.pane != "no-tmux"})
+    except Exception:
+        panes = []
+    return {"live_pane_count": len(panes), "panes": panes}
 
 
 def determine_tier(active_acct: dict, config: dict) -> int:
@@ -4710,6 +4798,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         if reactive_decision is not None:
             click.echo(f"  reactive (429): {reactive_decision.reason}")
             save_state(state)
+            _log_decision(_build_decision_record(
+                state, config,
+                action=("would_swap" if no_execute else "swap"),
+                gate="reactive_429", reason=reactive_decision.reason,
+                target=reactive_decision.target, tier=reactive_decision.tier,
+                where=_migrating_panes(),
+            ))
             if no_execute:
                 click.echo("    (--no-execute) skipping reactive swap")
             elif config.get("hot_swap", {}).get("enabled", False):
@@ -4736,13 +4831,22 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         maybe_reset_thresholds(state, config)
 
         # 3. Decide
-        decision = decide_swap(state, config, usage_by_account)
+        trace: dict = {}
+        decision = decide_swap(state, config, usage_by_account, trace)
 
         # Persist usage updates BEFORE acting on swap (so a crash during
         # swap leaves valid usage state)
         save_state(state)
 
         if decision is None:
+            # GH #56: log the no-swap decision with the exact gate that held it
+            # (below_threshold, growth gate, min-improvement, hysteresis, ...).
+            _log_decision(_build_decision_record(
+                state, config,
+                action="hold",
+                gate=trace.get("gate", "no_swap"),
+                reason=trace.get("reason", "no swap needed"),
+            ))
             # Diagnose: was a swap WANTED but no target available?
             active = state["active"]
             active_acct = state["accounts"][active]
@@ -4775,6 +4879,11 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         if no_execute:
             click.echo("    (--no-execute) skipping actual swap")
+            _log_decision(_build_decision_record(
+                state, config, action="would_swap", gate=decision.gate,
+                reason=decision.reason, target=decision.target, tier=decision.tier,
+                where=_migrating_panes(),
+            ))
             return
 
         # 4. Execute. Phase 2: simple swap. Phase 3+ will dispatch to hot-swap
@@ -4790,6 +4899,11 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
             click.echo(f"    swapped (new sessions only — live sessions unaffected)")
 
+        _log_decision(_build_decision_record(
+            state, config, action="swap", gate=decision.gate,
+            reason=decision.reason, target=decision.target, tier=decision.tier,
+            where=_migrating_panes(),
+        ))
         _emit_sos_after(load_state(), config)
 
     if once:
@@ -5304,6 +5418,77 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             pieces.append(click.style(poll_piece, dim=True) if color_on else poll_piece)
 
     click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}", color=color_on)
+
+
+@cli.command(name="decisions")
+@click.option("-n", "--tail", default=20, help="Show the last N decision records.")
+@click.option("--swaps-only", is_flag=True, help="Hide routine 'hold' cycles; show only swap/defer/would-swap.")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSONL records instead of the formatted view.")
+def decisions_cmd(tail: int, swaps_only: bool, as_json: bool) -> None:
+    """Show recent swap decisions — who / what / where / when / why (GH #56).
+
+    Reads ~/claude-accounts/decisions.jsonl, one structured record per daemon
+    cycle: the active account + usage (who), the action (what: swap / hold /
+    defer / would_swap), the affected panes (where), the timestamp (when), and
+    the gate + reason that decided it (why).
+    """
+    if not DECISIONS_LOG.exists():
+        click.echo("No decisions logged yet (decisions.jsonl absent — the daemon writes one per cycle).")
+        return
+    try:
+        lines = DECISIONS_LOG.read_text().splitlines()
+    except OSError as e:
+        click.echo(f"Could not read {DECISIONS_LOG}: {e}")
+        return
+    records = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            records.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    if swaps_only:
+        records = [r for r in records if r.get("action") != "hold"]
+    records = records[-tail:]
+    if not records:
+        click.echo("No matching decision records.")
+        return
+    if as_json:
+        for r in records:
+            click.echo(json.dumps(r))
+        return
+
+    action_style = {
+        "swap": ("SWAP", "green"),
+        "would_swap": ("WOULD-SWAP", "cyan"),
+        "defer": ("DEFER", "yellow"),
+        "hold": ("hold", "bright_black"),
+    }
+    color_on = sys.stdout.isatty()
+    for r in records:
+        action = r.get("action", "?")
+        label, color = action_style.get(action, (action.upper(), "white"))
+        when = r.get("when", "?")
+        who = r.get("who", {})
+        active = who.get("active", "?")
+        a5, a7 = who.get("5h"), who.get("7d")
+        gate = r.get("gate", "?")
+        target = r.get("target")
+        tier = r.get("tier")
+        arrow = (f" → {target}" + (f" (tier {tier})" if tier else "")) if target else ""
+        head = click.style(f"{label:<11}", fg=color, bold=True) if color_on else f"{label:<11}"
+        usage = f"{active} 5h={a5}% 7d={a7}%" if a5 is not None else str(active)
+        click.echo(f"{when}  {head} {usage}{arrow}  [{gate}]")
+        reason = r.get("reason")
+        if reason:
+            click.echo(f"             why:   {reason}")
+        where = r.get("where") or {}
+        panes = where.get("panes")
+        if panes:
+            shown = ", ".join(panes[:8]) + (f" +{len(panes) - 8} more" if len(panes) > 8 else "")
+            click.echo(f"             where: {where.get('live_pane_count', len(panes))} panes — {shown}")
 
 
 @cli.command(name="sos")
