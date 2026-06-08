@@ -1432,6 +1432,16 @@ class SwapDecision:
     target: str
     reason: str
     tier: int   # 1 = wait-for-Stop, 2 = pause-message, 3 = force
+    # GH #56: which trigger/rule produced this decision — surfaced in the
+    # structured decision log so the operator can see WHY every swap happened.
+    gate: str = "ladder"
+    # GH #56: may the cache-aware lazy background-swap gate defer this swap?
+    # True for non-urgent balancing swaps (ladder below saturation, burn-before-
+    # reset). False for urgent ones — hard 7d cap, 5h saturation, reactive 429 —
+    # which must proceed regardless of prompt-cache warmth, else we'd strand a
+    # session riding into a rate-limit. Keyed explicitly (NOT off `tier`) because
+    # a hard-cap swap can land at tier 2 yet must never be deferred.
+    deferrable: bool = True
 
 
 def determine_tier(active_acct: dict, config: dict) -> int:
@@ -1586,10 +1596,21 @@ def _maybe_burn_before_reset(
             f"vs active {current} resets in {act_desc}; {target.reason}"
         ),
         tier=1,
+        gate="burn_before_reset",
+        # GH #56: burn-before-reset is a non-urgent throughput optimization, so
+        # it IS lazy-deferrable — only worth a cache rebuild when the cache is
+        # already cold. If sessions are warm we skip the burn (the missed 5h
+        # headroom is free to give up given large weekly headroom).
+        deferrable=True,
     )
 
 
-def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUsage]) -> SwapDecision | None:
+def decide_swap(
+    state: dict,
+    config: dict,
+    usage_by_account: dict[str, AccountUsage],
+    trace: dict | None = None,
+) -> SwapDecision | None:
     """Given current state + fresh usage, decide whether to swap.
 
     Returns None if no action needed. Otherwise a SwapDecision with target
@@ -1602,14 +1623,25 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
          is the user-stated invariant: "never go over 80% of 7 day usage."
       2. **Progressive threshold ladder**: the standard path. Trigger when
          current max(5h, 7d) crosses the active account's next_swap_at_pct.
+
+    `trace` (GH #56): optional dict the caller passes in to capture WHICH rule
+    decided this cycle (gate), the outcome (action: "swap"/"hold"), and a
+    human reason — for the structured decision log. Every return path records
+    it via `_note`; pass None to skip (the logic is unaffected either way).
     """
+    def _note(gate: str, action: str, reason: str) -> None:
+        if trace is not None:
+            trace["gate"], trace["action"], trace["reason"] = gate, action, reason
+
     current = state.get("active")
     if not current:
+        _note("no_active", "hold", "no active account set")
         return None
 
     active_acct = state["accounts"][current]
     cur_usage = usage_by_account.get(current)
     if cur_usage is None:
+        _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
     # NOTE: the previous "Trigger 0: active is rate-limited (poll 429)" has
@@ -1642,30 +1674,42 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
                     last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
                     elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
                     if elapsed < min_seconds:
-                        click.echo(
-                            f"  hard 7d cap tripped ({current} at {cur_7d:.1f}%) "
+                        msg = (
+                            f"hard 7d cap tripped ({current} at {cur_7d:.1f}%) "
                             f"but last swap was {int(elapsed)}s ago (< {min_seconds}s); deferring"
                         )
+                        click.echo(f"  {msg}")
+                        _note("hard_7d_cap_hysteresis", "hold", msg)
                         return None
                 except ValueError:
                     pass
 
         target = pick_swap_target(state, config)
         if target is None:
+            _note("hard_7d_cap_no_target", "hold",
+                  f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but no valid swap target")
             return None
         # If the picker had to fall back to a DEGRADED candidate (also above
         # hard_7d_cap), swapping doesn't actually help — both accounts are
         # exhausted. Don't churn; the SOS layer will surface it.
         if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
-            click.echo(
-                f"  hard 7d cap tripped on {current} ({cur_7d:.1f}%) but all "
+            msg = (
+                f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but all "
                 f"other accounts are ALSO above cap — not swapping (would just churn); SOS will fire"
             )
+            click.echo(f"  {msg}")
+            _note("hard_7d_cap_degraded", "hold", msg)
             return None
+        reason = f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}"
+        _note("hard_7d_cap", "swap", reason)
+        # Hard cap is the user's invariant — NEVER lazy-deferrable (deferring it
+        # would let 7d climb past the cap while sessions are warm). GH #56.
         return SwapDecision(
             target=target.name,
-            reason=f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}",
+            reason=reason,
             tier=determine_tier(active_acct, config),
+            gate="hard_7d_cap",
+            deferrable=False,
         )
 
     # Universal hysteresis: enforce a minimum interval between swaps.
@@ -1682,10 +1726,12 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
                 last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
                 elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
                 if elapsed < min_seconds:
-                    click.echo(
-                        f"  ladder check deferred: last swap was {int(elapsed)}s ago "
+                    msg = (
+                        f"ladder check deferred: last swap was {int(elapsed)}s ago "
                         f"(< min_seconds_between_swaps={min_seconds}s)"
                     )
+                    click.echo(f"  {msg}")
+                    _note("swap_hysteresis", "hold", msg)
                     return None
             except ValueError:
                 pass
@@ -1704,6 +1750,7 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
             state, config, current, active_acct, cur_usage, usage_by_account
         )
         if bbr_decision is not None:
+            _note("burn_before_reset", "swap", bbr_decision.reason)
             return bbr_decision
 
     # Trigger 2: progressive ladder.
@@ -1721,6 +1768,8 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 
     cur_pct = current_max_pct(cur_usage, config)
     if cur_pct < threshold:
+        _note("below_threshold", "hold",
+              f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
         return None
 
     # Defer-if-5h-resetting-soon (GH #51, 2026-05-28): the ladder threshold
@@ -1751,11 +1800,13 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
         if five_h_over and not seven_d_over and cur_5h < max_defer_pct:
             time_to_reset_s = _five_hour_remaining_seconds(cur_usage, active_acct)
             if time_to_reset_s is not None and 0 < time_to_reset_s <= wait_window_s:
-                click.echo(
-                    f"  ladder threshold tripped ({current} 5h={cur_5h:.0f}% >= {threshold}%) "
+                msg = (
+                    f"ladder threshold tripped ({current} 5h={cur_5h:.0f}% >= {threshold}%) "
                     f"BUT 5h resets in {time_to_reset_s / 60:.0f}min (<= {wait_window_s // 60}min window) "
                     f"and 5h < max_defer_pct({max_defer_pct}%); WAITING for the reset instead of swapping"
                 )
+                click.echo(f"  {msg}")
+                _note("defer_near_5h_reset", "hold", msg)
                 return None
 
     # Usage-growth gate (GH #15): only swap via the ladder if the active
@@ -1793,11 +1844,13 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
         if deltas and max(deltas) < min_delta_pct:
             # No meaningful growth. Suppress the ladder swap. We still log
             # so the operator can see the gate firing in daemon.log.
-            click.echo(
-                f"  ladder threshold tripped ({current} at {cur_pct:.1f}% >= "
+            msg = (
+                f"ladder threshold tripped ({current} at {cur_pct:.1f}% >= "
                 f"{threshold}%) BUT usage isn't growing on this machine "
                 f"(max delta {max(deltas):.2f}% < {min_delta_pct}%); skipping swap"
             )
+            click.echo(f"  {msg}")
+            _note("usage_growth_gate", "hold", msg)
             return None
     elif growth_cfg.get("enabled", True) and cur_pct >= saturation_pct:
         click.echo(
@@ -1807,6 +1860,8 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 
     target = pick_swap_target(state, config)
     if target is None:
+        _note("no_target", "hold",
+              f"ladder tripped on {current} ({cur_pct:.1f}% >= {threshold}%) but no valid swap target")
         return None
 
     # Anti-pingpong / cap-degraded-target gate (GH #53, 2026-05-28): refuse a
@@ -1823,11 +1878,13 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     # "no usable target" state. (User 2026-05-28: "we shouldn't switch to an
     # account that's going to trigger a switch back.")
     if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
-        click.echo(
-            f"  ladder swap suppressed: only target {target.name} is over the 7d cap "
+        msg = (
+            f"ladder swap suppressed: only target {target.name} is over the 7d cap "
             f"({int(hard_7d_cap)}%) — swapping there would pingpong (it'd immediately "
             f"re-trip the hard cap); staying on {current}, SOS will surface"
         )
+        click.echo(f"  {msg}")
+        _note("cap_degraded_target", "hold", msg)
         return None
 
     # Anti-pingpong / "must improve" gate (GH #40, 2026-05-27): a LADDER swap
@@ -1859,18 +1916,28 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
         active_eff = _account_effective_pct(active_acct, config)
         target_eff = _account_effective_pct(state["accounts"][target.name], config)
         if target_eff > active_eff - min_improvement:
-            click.echo(
-                f"  ladder swap suppressed: target {target.name} at "
+            msg = (
+                f"ladder swap suppressed: target {target.name} at "
                 f"{target_eff:.1f}% would not improve on active {current} at "
                 f"{active_eff:.1f}% by min_improvement_pct={min_improvement}pp "
                 f"(picker reason: {target.reason})"
             )
+            click.echo(f"  {msg}")
+            _note("min_improvement_gate", "hold", msg)
             return None
 
+    reason = f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%"
+    _note("ladder", "swap", reason)
+    # GH #56: a ladder swap below saturation is a non-urgent balancing move →
+    # lazy-deferrable (only worth a cache rebuild once the cache is cold). At or
+    # above saturation_pct the active account is effectively capped, so the swap
+    # is urgent (escape the cap before sessions hit a 429) → NOT deferrable.
     return SwapDecision(
         target=target.name,
-        reason=f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%",
+        reason=reason,
         tier=determine_tier(active_acct, config),
+        gate="ladder",
+        deferrable=cur_pct < saturation_pct,
     )
 
 
@@ -3900,6 +3967,8 @@ def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
         target=target.name,
         reason=f"429 reactive: {matched_session['match']} in session {matched_session['session_id'][:8]}",
         tier=3,
+        gate="reactive_429",
+        deferrable=False,  # GH #56: a real user-facing 429 is an emergency — never lazy-defer
     )
 
 
@@ -4388,7 +4457,8 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
         # Build a synthetic SwapDecision and run the orchestrator. This is
         # the level-4 path the daemon would normally take when hot_swap.enabled
         # is true and a threshold trips — but here, manually invoked.
-        decision = SwapDecision(target=chosen_name, reason=reason, tier=tier)
+        decision = SwapDecision(target=chosen_name, reason=reason, tier=tier,
+                                gate="manual", deferrable=False)
         try:
             hot_swap_orchestrate(decision, state, config)
         except Exception as e:
