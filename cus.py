@@ -4950,6 +4950,12 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 reason=msg, target=decision.target, tier=decision.tier,
                 where={"warm_pane_count": len(warm_panes), "panes": warm_panes},
             ))
+            # A defer is a real live-cycle outcome (unlike --no-execute), so it
+            # must still refresh SOS — on a busy fleet the cache stays warm and
+            # the active account can sit in a long 90–95% defer streak; without
+            # this, SOS.md would freeze and hide a token-expiry / stale-poll /
+            # no-target condition until a hold or swap cycle finally fired.
+            _emit_sos_after(state, config)
             return
 
         if no_execute:
