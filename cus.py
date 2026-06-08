@@ -4207,11 +4207,26 @@ def status() -> None:
         click.echo()
 
     # Live sessions (from sessions.log + stops.log)
+    # GH #56: the `account` field records where a session was registered at
+    # SessionStart, NOT where it actually is now. In background-swap mode every
+    # unpinned session follows the single global credential file on its next
+    # request, so its true account is the machine-active one. Show that truth
+    # (and note the SessionStart drift) rather than the stale recorded value,
+    # which read as misleading "this session is on a different account" rows.
     live = find_live_sessions()
     if live:
+        machine_active = state.get("active", "?")
+        hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
         click.echo(f"Live sessions ({len(live)}):")
         for s in live:
-            click.echo(f"  {s.session_id[:8]}  account={s.account:<10} pane={s.pane:<8} cwd={s.cwd}")
+            # Background mode: every session follows the global creds → its true
+            # account is machine_active (pins are advisory swap-policy only, they
+            # do NOT route creds per-session — see session_is_pinned). Hot-swap
+            # mode: a pane keeps its loaded creds until relaunch, so the recorded
+            # SessionStart account is the better estimate.
+            eff = s.account if hot_swap_on else machine_active
+            drift = "" if eff == s.account else f" (start:{s.account})"
+            click.echo(f"  {s.session_id[:8]}  account={eff:<10} pane={s.pane:<8}{drift} cwd={s.cwd}")
         click.echo()
 
     history = state.get("swap_history", [])
