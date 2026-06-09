@@ -5232,6 +5232,37 @@ def _time_since(iso_str: str | None) -> float | None:
     return -delta if delta is not None else None
 
 
+def _five_hour_rolled_since_poll(acct: dict) -> bool:
+    """True when an account's 5h window has reset since our last poll (GH #59).
+
+    The reset countdown shown in the statusline is computed live against the
+    stored `five_hour_resets_at` from the last poll, so it ticks down between
+    polls on its own. But once it reaches zero the window has rolled over — the
+    real 5h usage is now ~0 — while the stored `current_5h_pct` is still the
+    PRE-reset value (e.g. 96%) until the next poll (up to a poll interval away).
+
+    This returns True exactly in that window: the reset time is in the past AND
+    our most recent poll was taken at/before that reset (so we have NOT yet
+    observed the post-reset state). It lets the statusline flag "this window
+    just reset" live, without waiting to repoll — the thing the operator wants
+    to see at a glance. Returns False for an idle account sitting at 0% with an
+    old reset time, because there we DID already poll and saw the 0%.
+    """
+    resets_at = acct.get("five_hour_resets_at")
+    if not resets_at:
+        return False
+    secs_to_reset = _time_until(resets_at)
+    if secs_to_reset is None or secs_to_reset > 0:
+        return False  # reset still in the future (or unparseable) — nothing rolled
+    reset_age = -secs_to_reset                 # seconds since the reset fired
+    last_poll = acct.get("last_poll_ts")
+    if not last_poll:
+        return True                            # never polled → can't have seen post-reset
+    poll_age = _time_since(last_poll)          # seconds since the last poll
+    # Stale iff the last poll predates the reset (poll older than the reset).
+    return poll_age is not None and poll_age > reset_age
+
+
 def _fmt_render_stamp_eastern() -> str:
     """Wall-clock stamp of WHEN THIS STATUSLINE WAS RENDERED, in US Eastern time.
 
@@ -5447,20 +5478,30 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if show_resets:
             r5 = _time_until(a.get("five_hour_resets_at"))
             r7 = _time_until(a.get("seven_day_resets_at"))
-            r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
             r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown else ""
-            # Time left on the ACTIVE account's 5h clock is the key operational
-            # number — it's the runway on the account you're actually using AND
-            # what the burn-before-reset trigger (GH #42) keys on — so make it
-            # POP (bold bright-magenta + a ↻ glyph) instead of dimming it like
-            # everything else. Other accounts' 5h and everyone's 7d stay dim.
-            if is_active and r5_raw:
-                r5_disp = f" ↻{_fmt_duration(r5)}"
-                r5_str = click.style(r5_disp, fg="bright_magenta", bold=True) if color_on else r5_disp
-            else:
-                r5_str = click.style(r5_raw, dim=True) if color_on and r5_raw else r5_raw
             r7_str = click.style(r7_raw, dim=True) if color_on and r7_raw else r7_raw
-            parts.append(f"5h:{pct5}{r5_str}")
+            rolled5 = _five_hour_rolled_since_poll(a)
+            if rolled5 and not unknown:
+                # GH #59: the live countdown has elapsed — the 5h window rolled
+                # over since our last poll, so the displayed % is pre-reset
+                # stale. Flag it (↻reset, was X%) rather than showing the stale
+                # number bare, so the operator knows a reset happened without
+                # waiting to repoll. Next poll confirms the new (~0%) value.
+                rolled_lbl = f"5h:↻reset(was {h5:.0f}%)"
+                parts.append(click.style(rolled_lbl, fg="bright_magenta", bold=True) if color_on else rolled_lbl)
+            else:
+                r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
+                # Time left on the ACTIVE account's 5h clock is the key operational
+                # number — it's the runway on the account you're actually using AND
+                # what the burn-before-reset trigger (GH #42) keys on — so make it
+                # POP (bold bright-magenta + a ↻ glyph) instead of dimming it like
+                # everything else. Other accounts' 5h and everyone's 7d stay dim.
+                if is_active and r5_raw:
+                    r5_disp = f" ↻{_fmt_duration(r5)}"
+                    r5_str = click.style(r5_disp, fg="bright_magenta", bold=True) if color_on else r5_disp
+                else:
+                    r5_str = click.style(r5_raw, dim=True) if color_on and r5_raw else r5_raw
+                parts.append(f"5h:{pct5}{r5_str}")
             parts.append(f"7d:{pct7}{r7_str}")
         else:
             parts.append(f"5h:{pct5}")
