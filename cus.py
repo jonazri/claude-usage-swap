@@ -949,15 +949,26 @@ def _account_effective_pct(acct: dict, config: dict) -> float:
 
 
 def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
-    """Return True if this candidate would re-trip its own ladder right
-    after we swap to it (effective_pct >= next_swap_at_pct). Used to prune
-    "doomed" candidates that would cause a swap-back loop. GH #17."""
-    threshold = acct.get("next_swap_at_pct", 70)
-    if threshold >= 100:
-        # Sentinel: behaves as last configured step (see decide_swap).
-        cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
-        threshold = cfg_steps[-1]
-    return _account_effective_pct(acct, config) >= threshold
+    """Return True if this candidate is "full" — its effective utilization is
+    at/above the FIRST ladder step — and so should not be swapped onto. Used to
+    prune "doomed" candidates that would cause a swap-back loop. GH #17.
+
+    2026-06-12: clamp the "full" test to steps[0] instead of the candidate's
+    OWN advanced next_swap_at_pct. Why: after an account is swapped away from,
+    its step ratchets 90->96 (advance_ladder); maybe_reset_thresholds only
+    unwinds that to 90 on a DETECTED 5h rollover or when both windows fall
+    below 50. A parked account sitting at 5h=0% / 7d=92% never rolls its 5h
+    window, so its step stays stuck at 96 indefinitely — and at threshold=96 a
+    7d=92% account passed this filter (92 < 96) and got chosen as a swap target.
+    That is the exact hole behind the 2026-06-11T21:04 incident (swapped ONTO a
+    weekly-exhausted `default`), which is why hard_7d_cap_pct had been doing the
+    job this filter should. "Full" must mean the same 90% line for every account
+    regardless of where its ladder happens to sit. Degraded/all-full pools are
+    still handled downstream by headroom_fallback + the min-improvement gate, so
+    progressive-return semantics survive.
+    """
+    cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    return _account_effective_pct(acct, config) >= cfg_steps[0]
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
