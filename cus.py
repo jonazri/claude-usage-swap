@@ -949,15 +949,26 @@ def _account_effective_pct(acct: dict, config: dict) -> float:
 
 
 def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
-    """Return True if this candidate would re-trip its own ladder right
-    after we swap to it (effective_pct >= next_swap_at_pct). Used to prune
-    "doomed" candidates that would cause a swap-back loop. GH #17."""
-    threshold = acct.get("next_swap_at_pct", 70)
-    if threshold >= 100:
-        # Sentinel: behaves as last configured step (see decide_swap).
-        cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
-        threshold = cfg_steps[-1]
-    return _account_effective_pct(acct, config) >= threshold
+    """Return True if this candidate is "full" — its effective utilization is
+    at/above the FIRST ladder step — and so should not be swapped onto. Used to
+    prune "doomed" candidates that would cause a swap-back loop. GH #17.
+
+    2026-06-12: clamp the "full" test to steps[0] instead of the candidate's
+    OWN advanced next_swap_at_pct. Why: after an account is swapped away from,
+    its step ratchets 90->96 (advance_ladder); maybe_reset_thresholds only
+    unwinds that to 90 on a DETECTED 5h rollover or when both windows fall
+    below 50. A parked account sitting at 5h=0% / 7d=92% never rolls its 5h
+    window, so its step stays stuck at 96 indefinitely — and at threshold=96 a
+    7d=92% account passed this filter (92 < 96) and got chosen as a swap target.
+    That is the exact hole behind the 2026-06-11T21:04 incident (swapped ONTO a
+    weekly-exhausted `default`), which is why hard_7d_cap_pct had been doing the
+    job this filter should. "Full" must mean the same 90% line for every account
+    regardless of where its ladder happens to sit. Degraded/all-full pools are
+    still handled downstream by headroom_fallback + the min-improvement gate, so
+    progressive-return semantics survive.
+    """
+    cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    return _account_effective_pct(acct, config) >= cfg_steps[0]
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
@@ -4169,6 +4180,42 @@ def cli() -> None:
     """claude-usage-swap (cus) — auto-rotate Claude Code OAuth accounts."""
 
 
+def write_account_meta(name: str, source_dir: Path, dst: Path, existed: bool) -> dict:
+    """(Re)write account-<name>/meta.yaml, refreshing the system-managed OAuth
+    identity while preserving user-edited fields (priority, locked_sessions).
+
+    Factored out of init() so it can be called from BOTH import paths:
+      - importing a brand-new dir copied in from elsewhere, and
+      - force-refreshing a dir that already lives in ~/claude-accounts/.
+
+    The second path is the one that matters for `cus add`: that command writes
+    meta.yaml with oauth_email="unknown (run /login)" BEFORE the interactive
+    login exists, so the identity must be re-read from .claude.json on the next
+    `init --force`. Without this refresh the account shows "unknown" in
+    `cus list` forever. (Bug found 2026-06-12: add-account flow never registered.)
+
+    Reads identity from the dir's own .claude.json (dst), since after `cus add`
+    + login that's where the freshly-written oauthAccount lives.
+    """
+    cj = claude_json_for_config_dir(dst)
+    identity = extract_identity(cj) if cj is not None and cj.exists() else {}
+    meta_path = dst / "meta.yaml"
+    prior_meta = read_yaml(meta_path) if meta_path.exists() else {}
+    oauth = identity.get("oauthAccount") or {}
+    meta = {
+        "name": name,
+        "source_dir": str(source_dir),
+        "oauth_email": oauth.get("emailAddress", "unknown") if isinstance(oauth, dict) else "unknown",
+        "oauth_account_uuid": oauth.get("accountUuid", "unknown") if isinstance(oauth, dict) else "unknown",
+        "priority": prior_meta.get("priority", 1),
+        "locked_sessions": prior_meta.get("locked_sessions", []),
+        "imported_ts": prior_meta.get("imported_ts", now_iso()) if existed else now_iso(),
+        "refreshed_ts": now_iso() if existed else None,
+    }
+    write_yaml(meta_path, meta)
+    return meta
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Show what would happen without writing anything.")
 @click.option("--force", is_flag=True, help="Overwrite existing account dirs (refreshes stale credential snapshots).")
@@ -4223,7 +4270,14 @@ def init(dry_run: bool, force: bool) -> None:
                 migrated += 1
                 click.echo(f"  migrated {name} -> {dst} ({len(migration['details'])} changes)")
             elif force:
-                # Force refresh: re-read creds + identity from this dir (no-op if same)
+                # Force refresh: re-read identity from this dir's .claude.json and
+                # rewrite meta.yaml. Critical for the `cus add` flow — that command
+                # seeds meta with oauth_email="unknown" before login, so the real
+                # identity only becomes available here, after the user has logged in.
+                # (Bug 2026-06-12: this branch previously did nothing but bump the
+                # counter, leaving newly-added accounts stuck at "unknown".)
+                meta = write_account_meta(name, dst, dst, existed=True)
+                click.echo(f"  refreshed {name} -> {dst} (identity: {meta['oauth_email']})")
                 refreshed += 1
             continue
 
@@ -4247,10 +4301,8 @@ def init(dry_run: bool, force: bool) -> None:
         if src_cj is not None and src_cj.exists():
             # Copy the whole .claude.json; per-account state is fine to duplicate
             shutil.copy2(src_cj, dst_cj)
-            identity = extract_identity(dst_cj)
         else:
-            identity = {}
-            write_json(dst_cj, identity)
+            write_json(dst_cj, {})
 
         # 3. Symlink shared subdirs to ~/.claude/ so projects/plugins/etc. are shared
         for sub in SHARED_SYMLINK_SUBDIRS:
@@ -4267,20 +4319,7 @@ def init(dry_run: bool, force: bool) -> None:
 
         # 3. Meta — preserve user-edited fields (priority, locked_sessions),
         # refresh the system-managed fields. Only happens on --force refresh.
-        meta_path = dst / "meta.yaml"
-        prior_meta = read_yaml(meta_path) if meta_path.exists() else {}
-        oauth = identity.get("oauthAccount") or {}
-        meta = {
-            "name": name,
-            "source_dir": str(src_dir),
-            "oauth_email": oauth.get("emailAddress", "unknown") if isinstance(oauth, dict) else "unknown",
-            "oauth_account_uuid": oauth.get("accountUuid", "unknown") if isinstance(oauth, dict) else "unknown",
-            "priority": prior_meta.get("priority", 1),
-            "locked_sessions": prior_meta.get("locked_sessions", []),
-            "imported_ts": prior_meta.get("imported_ts", now_iso()) if existed else now_iso(),
-            "refreshed_ts": now_iso() if existed else None,
-        }
-        write_yaml(dst / "meta.yaml", meta)
+        write_account_meta(name, src_dir, dst, existed=existed)
         if existed:
             click.echo(f"  refreshed {name} -> {dst}")
             refreshed += 1
@@ -4288,23 +4327,40 @@ def init(dry_run: bool, force: bool) -> None:
             click.echo(f"  imported {name} -> {dst}")
             imported += 1
 
-    # 4. state.json — runtime state for the (future) daemon
+    # Default per-account state seed, shared by the create-fresh and merge-into-
+    # existing paths below so a newly-registered account looks identical however
+    # it got there. The daemon/poll fill in the live fields on the next cycle.
+    def _seed_state_entry() -> dict:
+        return {
+            "current_5h_pct": 0.0,
+            "current_7d_pct": 0.0,
+            "next_swap_at_pct": 50,
+            "last_swap_ts": None,
+        }
+
+    # 4. state.json — runtime state for the daemon
     if not STATE_JSON.exists():
         state = {
             "active": "default" if any(n == "default" for n, _ in candidates) else candidates[0][0],
-            "accounts": {
-                name: {
-                    "current_5h_pct": 0.0,
-                    "current_7d_pct": 0.0,
-                    "next_swap_at_pct": 50,
-                    "last_swap_ts": None,
-                }
-                for name, _ in candidates
-            },
+            "accounts": {name: _seed_state_entry() for name, _ in candidates},
             "swap_history": [],
         }
         write_json(STATE_JSON, state)
         click.echo(f"  wrote {STATE_JSON} (active = {state['active']})")
+    else:
+        # state.json already exists — merge in any newly-discovered accounts.
+        # BUGFIX 2026-06-12: previously this branch did nothing, so an account
+        # created via `cus add` after the initial init was never inserted here.
+        # poll(), status, and the daemon all iterate state["accounts"], so the
+        # new account stayed permanently invisible despite a valid login.
+        state = load_state()
+        newly_registered = [n for n, _ in candidates if n not in state.get("accounts", {})]
+        if newly_registered:
+            state.setdefault("accounts", {})
+            for name in newly_registered:
+                state["accounts"][name] = _seed_state_entry()
+            save_state(state)
+            click.echo(f"  registered in state.json: {', '.join(newly_registered)}")
 
     # 5. config.yaml — user-editable defaults
     if not CONFIG_YAML.exists():
@@ -4320,6 +4376,21 @@ def init(dry_run: bool, force: bool) -> None:
         }
         write_yaml(CONFIG_YAML, config)
         click.echo(f"  wrote {CONFIG_YAML}")
+    else:
+        # config.yaml is documented as "auto-populated by cus init" — append any
+        # newly-discovered accounts to its accounts list (preserving everything
+        # the user has edited). Needed so the strict_priority strategy can see
+        # the new account; harmless for the other strategies. Part of the
+        # 2026-06-12 add-account registration fix.
+        config = read_yaml(CONFIG_YAML)
+        existing_names = {a.get("name") for a in config.get("accounts", []) if isinstance(a, dict)}
+        missing = [n for n, _ in candidates if n not in existing_names]
+        if missing:
+            config.setdefault("accounts", [])
+            for name in missing:
+                config["accounts"].append({"name": name, "priority": 1})
+            write_yaml(CONFIG_YAML, config)
+            click.echo(f"  added to config.yaml accounts: {', '.join(missing)}")
 
     click.echo()
     click.echo(f"Done. Imported {imported}, migrated {migrated}, refreshed {refreshed}, skipped {skipped}.")
@@ -5750,7 +5821,10 @@ def add_cmd(name: str, exec_flag: bool) -> None:
     valid CLAUDE_CONFIG_DIR, symlinks shared subdirs to ~/.claude/, and
     prints the exact command to log in.
 
-    After login, run `cus poll` to register the new account in state.json.
+    After login, run `cus init --force && cus poll` to register the new
+    account: init writes it into state.json and refreshes its OAuth identity
+    in meta.yaml; poll then fills in usage. (poll alone cannot register a new
+    account — it only iterates accounts already present in state.json.)
     """
     if not name.replace("-", "").replace("_", "").isalnum():
         click.echo(f"Bad name '{name}' — use alphanumeric + dashes/underscores only.")
