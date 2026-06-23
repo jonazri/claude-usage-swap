@@ -22,7 +22,9 @@ Storage:
     state.json                   Runtime state (active + per-account thresholds + history).
     sessions.log                 SessionStart hook output (one line per new session).
     stops.log                    Stop hook output (one line per turn end).
-    429.log                      PostToolUseFailure detections.
+    429.log                      Rate-limit detections: StopFailure (primary, real
+                                 model-level 429s) + PostToolUseFailure (secondary,
+                                 best-effort subagent-internal API errors).
     tool_use.log                 PreToolUse + SubagentStop signals.
     daemon.log                   Daemon stdout/stderr when running.
     inbox.md                     Decisions made autonomously by the daemon.
@@ -49,6 +51,10 @@ Methodology lifted (not code) from cux (github.com/inulute/cux):
   - Strategy picker patterns (drain/balanced) (internal/strategy/strategy.go)
   - Hook-based turn-boundary signaling
   - PostToolUseFailure 429 substring-match (internal/hooks/hooks.go:765-800)
+    [A2 2026-06-23: superseded as the PRIMARY 429 source by a StopFailure hook —
+    PostToolUseFailure structurally never sees model-level 429s (those fire
+    StopFailure with a categorized `error` enum); the old loose substring match
+    manufactured false positives from downstream tool output.]
   - --resume <id> "Go continue." wake-up pattern (wrapper.go:180-185)
 NOT lifted: cux's keystore-swap, because on Linux .credentials.json IS the
 keystore — no libsecret/keychain dance is needed (Claude Code auth docs are
@@ -150,6 +156,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seven_day": True,       # apply progressive thresholds to 7d window
         "reset_below_pct": 50,   # when both windows drop below this, reset next_swap_at to first step
     },
+    # Fix B (user 2026-06-23 "never swap to a 100% account"): a fully-saturated
+    # target is a hard wall, not a degraded-but-usable option. Applied as a HARD
+    # universal filter in pick_swap_target with NO degraded fallback — if every
+    # candidate is at/above this, the picker returns None (stay put) rather than
+    # bounce onto an exhausted account and immediately re-trip the same 429s. The
+    # sub-100% gray zone is intentionally left to the scoring / would-re-trip
+    # logic ("below 100% is a judgment call" — user). 100 = only block truly
+    # exhausted accounts; lower it to keep a wider safety margin.
+    "never_swap_to_pct": 100,
     "smart_strategy": {
         "hard_7d_cap_pct": 80,           # force-swap active when 7d crosses this; never SWAP TO an account above
         "burn_window_hours": 2,          # if 5h resets within N hours and clock is ticking, boost score
@@ -319,8 +334,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # orchestration; the cred swap and other panes' restarts proceed.
         "defer_below_tier": 3,
     },
+    # Burn-rate estimator (C, 2026-06-23). Between polls, extrapolate each
+    # account's CURRENT usage from its last poll + measured %/min burn rate, so
+    # the picker's "is this target too full to swap onto" judgment isn't fooled
+    # by a stale-but-climbing number ("estimate where default is based on the
+    # last ping and the rate of increase" — user). Only ever moves an estimate
+    # UPWARD from the polled value, so it can make target selection MORE
+    # conservative but never less. Falls back to raw polled % when no rate has
+    # been measured yet (first poll after a swap/reset).
+    "estimator": {
+        "enabled": True,
+        "max_extrapolation_minutes": 10,   # don't trust a measured rate beyond this many min past the last poll
+    },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
+        # Fix A1 (user 2026-06-23): a 429 only justifies an account swap when the
+        # ACTIVE account is plausibly near its budget cap. The PostToolUseFailure
+        # hook substring-matches "rate limit"/"usage limit"/etc. anywhere in a
+        # failed tool body, so a downstream API limit or a concurrency/RPM spike
+        # from blasting parallel subagents trips it even though the account has
+        # tons of budget left. Below this floor we treat the 429 as noise and do
+        # NOT swap (swapping wouldn't help and risks landing on a worse account).
+        # Set well under the first ladder step so genuine "poll says 70% but we
+        # just hit the wall before the next poll" cases still react. 0 = react to
+        # every 429 (pre-2026-06-23 behavior).
+        "min_active_pct": 50,
     },
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
@@ -333,6 +371,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hooks": {
         "install_session_start": True,
         "install_stop": True,
+        "install_stop_failure": True,     # A2: reliable model-level 429 detector (StopFailure)
         "install_post_tool_use_failure": True,
         "install_pre_tool_use": False,    # only needed if subagent_skip.enabled
         "install_post_tool_use": False,   # only needed if subagent_skip.enabled — pairs with install_pre_tool_use (GH #27)
@@ -948,6 +987,72 @@ def _account_effective_pct(acct: dict, config: dict) -> float:
     return max(candidates) if candidates else 0.0
 
 
+def _compute_burn_rate(old_pct: float | None, new_pct: float | None,
+                       old_ts: str | None, new_ts: str | None) -> float:
+    """%/min usage increase between two polls, or 0.0 if not computable.
+
+    Estimator (C, 2026-06-23). Only positive rates are meaningful: usage climbs
+    monotonically WITHIN a window, so a drop means the window reset between polls
+    — we return 0 and let the next interval re-measure from the post-reset base.
+    """
+    if old_pct is None or new_pct is None or not old_ts or not new_ts:
+        return 0.0
+    try:
+        t0 = datetime.fromisoformat(old_ts.replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(new_ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return 0.0
+    dt_min = (t1 - t0).total_seconds() / 60.0
+    if dt_min <= 0 or new_pct < old_pct:
+        return 0.0
+    return (new_pct - old_pct) / dt_min
+
+
+def estimate_window_pct(acct: dict, window: str, config: dict, now=None) -> float:
+    """Extrapolate an account's CURRENT usage % for one window ("5h"/"7d") from
+    its last poll + measured burn rate (C, 2026-06-23). Returns a value >= the
+    polled %, clamped to 100.
+
+    Falls back to the raw polled % whenever the estimator is disabled or no rate
+    has been measured yet (first poll after a swap/reset) — so in the absence of
+    data, every caller behaves exactly as it did pre-estimator. The estimate only
+    ever moves UPWARD from the polled value, so wiring it into target-fullness
+    checks can only make the picker MORE conservative, never less.
+    """
+    polled = acct.get(f"current_{window}_pct", 0.0)
+    est_cfg = config.get("estimator", {})
+    if not est_cfg.get("enabled", True):
+        return polled
+    rate = acct.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
+    last_poll = acct.get("last_poll_ts")
+    if rate <= 0 or not last_poll:
+        return polled
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        t0 = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return polled
+    # Cap how far we trust a stale rate: a burn rate measured one interval ago
+    # says little about usage 30 min later (the session may have gone idle).
+    max_min = est_cfg.get("max_extrapolation_minutes", 10)
+    dt_min = max(0.0, min((now - t0).total_seconds() / 60.0, max_min))
+    return min(100.0, polled + rate * dt_min)
+
+
+def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> float:
+    """Like _account_effective_pct, but using extrapolated per-window values (C).
+    Used by the target-fullness judgments (saturation filter + would-re-trip) so
+    a fast-climbing account near the line is treated as already-full."""
+    thr_cfg = config.get("thresholds", {})
+    vals = []
+    if thr_cfg.get("five_hour", True):
+        vals.append(estimate_window_pct(acct, "5h", config, now))
+    if thr_cfg.get("seven_day", True):
+        vals.append(estimate_window_pct(acct, "7d", config, now))
+    return max(vals) if vals else 0.0
+
+
 def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     """Return True if this candidate is "full" — its effective utilization is
     at/above the FIRST ladder step — and so should not be swapped onto. Used to
@@ -968,7 +1073,10 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     progressive-return semantics survive.
     """
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
-    return _account_effective_pct(acct, config) >= cfg_steps[0]
+    # Estimator (C): use the extrapolated %, so a target polled just under the
+    # step but climbing fast (will be over it by the time the swap lands) is
+    # still treated as full. Falls back to polled when no rate is known.
+    return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
@@ -1024,6 +1132,26 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
     if not candidates:
         return None
+
+    # Fix B (user 2026-06-23 "never swap to a 100% account"): a fully-saturated
+    # target is a hard wall, not a degraded-but-usable option. Unlike the 7d-cap
+    # and would-re-trip filters below — which deliberately fall back to "swap
+    # somewhere rather than sit on a hot active" — there is NO fallback here.
+    # Swapping onto a 100% account just churns context and immediately re-trips
+    # the same 429s (the 2026-06-23 merkos-bounce incident: reactive 429s landed
+    # the active cred on a correctly-polled 100% merkos). If this empties the
+    # pool, return None and stay put; SOS surfaces the all-full condition. The
+    # sub-100% gray zone is intentionally left to the scoring / would-re-trip
+    # logic below — "below 100% is a judgment call" (user).
+    full_line = config.get("never_swap_to_pct", 100)
+    # Estimator (C): judge saturation on the EXTRAPOLATED %, so an account polled
+    # at e.g. 96% but climbing is treated as already-full and excluded (it would
+    # be 100% by the time the swap arrives). Falls back to polled when no rate is
+    # known, so behavior is unchanged in the absence of burn-rate data.
+    not_saturated = [(n, a) for n, a in candidates if _account_estimated_effective_pct(a, config) < full_line]
+    if not not_saturated:
+        return None
+    candidates = not_saturated
 
     # Universal filter (GH #17, all strategies): exclude candidates above
     # the user-stated weekly ceiling. Previously only headroom/smart applied
@@ -1313,6 +1441,13 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
 HOOK_EVENTS = {
     "SessionStart": ("cus_session_start.sh", "install_session_start"),
     "Stop": ("cus_stop.sh", "install_stop"),
+    # StopFailure (A2, 2026-06-23): the DOCUMENTED, reliable Anthropic-429 signal.
+    # A model-level rate limit fires StopFailure (instead of Stop) with a clean
+    # categorized `error` enum ("rate_limit"/"overloaded"), NOT PostToolUseFailure
+    # — which only sees tool-execution failures. This is the primary 429 detector;
+    # the PostToolUseFailure hook below is now a best-effort secondary for
+    # subagent-internal API errors only.
+    "StopFailure": ("cus_stop_failure.sh", "install_stop_failure"),
     "PostToolUseFailure": ("cus_post_tool_use_failure.sh", "install_post_tool_use_failure"),
     "PreToolUse": ("cus_pre_tool_use.sh", "install_pre_tool_use"),
     # PostToolUse(success) closes the start/stop ledger so subagent_active
@@ -2181,6 +2316,29 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct.pop("token_stale", None)
         acct["token_expired"] = False
         update_backoff(acct, success=True, config=config)
+        # Estimator (C, 2026-06-23): measure per-window burn rate (%/min) from the
+        # gap between the PRIOR poll and this one, before the old values are
+        # overwritten below. Only valid WITHIN a window: if the 5h/7d window rolled
+        # over (resets_at changed), the prior % is from a different window, so the
+        # rate is meaningless — store 0 and let the next interval re-measure from
+        # the post-reset base. Stored on the account for estimate_window_pct().
+        old_5h = acct.get("current_5h_pct")
+        old_7d = acct.get("current_7d_pct")
+        old_poll_ts = acct.get("last_poll_ts")
+        old_5h_resets = acct.get("five_hour_resets_at")
+        old_7d_resets = acct.get("seven_day_resets_at")
+        new_5h_val = u.five_hour.utilization if u.five_hour else old_5h
+        new_7d_val = u.seven_day.utilization if u.seven_day else old_7d
+        new_5h_resets = u.five_hour.resets_at if (u.five_hour and u.five_hour.resets_at) else old_5h_resets
+        new_7d_resets = u.seven_day.resets_at if (u.seven_day and u.seven_day.resets_at) else old_7d_resets
+        acct["burn_rate_5h_pct_per_min"] = (
+            _compute_burn_rate(old_5h, new_5h_val, old_poll_ts, u.polled_at)
+            if old_5h_resets == new_5h_resets else 0.0
+        )
+        acct["burn_rate_7d_pct_per_min"] = (
+            _compute_burn_rate(old_7d, new_7d_val, old_poll_ts, u.polled_at)
+            if old_7d_resets == new_7d_resets else 0.0
+        )
         # Snapshot the PREVIOUS current_*_pct before overwriting — used by
         # the usage-growth gate in decide_swap (GH #15) to suppress ladder
         # swaps when local usage isn't actually increasing.
@@ -4109,6 +4267,25 @@ def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
     if not matched_session:
         return None
 
+    # Fix A1 (user 2026-06-23): only treat a 429 as a swap trigger if the active
+    # account is plausibly near its budget cap. Observed failure mode: session
+    # db246f7f emitted downstream/concurrency "rate limit" strings while `default`
+    # sat at 4-23% 5h — nowhere near exhausted — and each one bounced the active
+    # cred onto a full merkos. A real budget-429 cannot surface from 8%: the poll
+    # lag (<= poll_interval) can't hide a ~90-point jump. Below the floor we treat
+    # the 429 as noise (downstream API limit / RPM spike from parallel subagents)
+    # and decline to swap — swapping wouldn't help and lands us on a worse account.
+    min_active_pct = config.get("reactive", {}).get("min_active_pct", 50)
+    active_acct = state.get("accounts", {}).get(active, {})
+    active_pct = _account_effective_pct(active_acct, config)
+    if active_pct < min_active_pct:
+        click.echo(
+            f"  429 on {active} session {matched_session['session_id'][:8]} ignored: "
+            f"active at {active_pct:.0f}% (< reactive.min_active_pct={min_active_pct}%) — "
+            "downstream/concurrency 429, not budget exhaustion; not swapping"
+        )
+        return None
+
     # Hysteresis check (GH #18): even legitimate reactive 429s respect a
     # short minimum interval. Reactive cooldown defaults to 60s rather than
     # the ladder's 300s — real 429s are emergencies, but we still need to
@@ -4490,7 +4667,17 @@ def status() -> None:
         if a.get("token_stale"):
             flags.append("TOKEN_STALE")
         status_col = ",".join(flags) if flags else "ok"
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}")
+        # Estimator (C): annotate the extrapolated CURRENT usage when it diverges
+        # from the last poll, so a fast-climbing account is visible between polls
+        # (this is what the picker now uses to judge target fullness).
+        est_note = ""
+        for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
+            polled = a.get(key, 0.0)
+            est = estimate_window_pct(a, win, config)
+            if est - polled >= 1.0:
+                rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
+                est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
     click.echo()
 
     # Locks
