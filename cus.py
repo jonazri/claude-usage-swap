@@ -1354,6 +1354,96 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 # Swap primitive (callable from daemon, not just CLI)
 # --------------------------------------------------------------------------
 
+def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> tuple[str, str | None, str]:
+    """Identify which account the live credentials file actually belongs to (GH #3).
+
+    Why this exists: a DRIFTED pane (its in-memory tokens are account X's while
+    state.json says account Y is active) will eventually refresh its access
+    token and write X's tokens over `~/.claude/.credentials.json`. If a swap
+    then blindly saves the live file back into Y's storage snapshot, Y's
+    snapshot — including its long-lived refresh token — is clobbered with X's
+    tokens, and the corruption compounds on every subsequent swap.
+
+    Identification strategy: the credentials file carries no explicit identity
+    (no email / account uuid — just tokens), so we match on REFRESH TOKEN
+    lineage. Refresh tokens are long-lived (~30 days) and stable across the
+    hourly access-token refreshes, so `live.refreshToken == snapshot.refreshToken`
+    is a reliable "same account" signal, and matching a *different* account's
+    snapshot is definitive proof of drift. Access-token equality alone is NOT
+    used as a signal: the live access token legitimately diverges from every
+    snapshot within an hour of normal use.
+
+    Returns (verdict, owner, detail):
+      - ("expected", expected, ...)  live file provably belongs to `expected` —
+        safe to save back into its snapshot.
+      - ("foreign", X, ...)          live file provably belongs to account X !=
+        expected — the GH #3 drift case. Do NOT save into expected's snapshot.
+      - ("conflict", None, ...)      live refresh token matches MULTIPLE
+        snapshots (duplicate-identity setup, see GH #70) — ownership is
+        ambiguous, don't guess.
+      - ("unknown", None, ...)       live refresh token matches no snapshot.
+        Usually means the refresh endpoint ROTATED the active account's refresh
+        token since the last swap (benign — the save-back is exactly how the
+        rotated token gets persisted). Indistinguishable from a drifted pane
+        whose refresh also rotated; callers should preserve the historical
+        save-back behavior here (skipping would strand legitimately-rotated
+        tokens, which is the worse failure).
+      - ("invalid", None, ...)       live creds parse as JSON but carry NO
+        claudeAiOauth.refreshToken (a `claude logout`-shaped file, an empty
+        `{}`, or JSON that isn't even an object). There is nothing durable to
+        save back — an access token alone expires within the hour and can't
+        be renewed — so writing these bytes over a snapshot can only destroy
+        its refresh token. Callers must SKIP the save-back, same as for
+        unparseable JSON. (Review amendment 2026-07-01: this case originally
+        fell through to "unknown" and clobbered the outgoing snapshot with
+        tokenless garbage — the same snapshot-destruction class GH #3 exists
+        to prevent, just via valid-JSON garbage instead of invalid.)
+    """
+    # Defensive extraction: any process can scribble on the live creds file,
+    # and json.loads happily returns lists/strings/numbers — so never assume
+    # dict shapes. An uncaught AttributeError here would crash the entire
+    # swap (callers catch only FileNotFoundError/ValueError/RuntimeError).
+    live_oauth = live_creds.get("claudeAiOauth") if isinstance(live_creds, dict) else None
+    live_rt = live_oauth.get("refreshToken") if isinstance(live_oauth, dict) else None
+    if not live_rt:
+        return ("invalid", None,
+                "live credentials carry no claudeAiOauth.refreshToken — nothing durable "
+                "to save back (logout-shaped or malformed file)")
+
+    matches: list[str] = []
+    for name in state.get("accounts", {}):
+        snap_path = account_creds_path(name)
+        if not snap_path.exists():
+            continue
+        try:
+            snap = read_json(snap_path)
+        except (json.JSONDecodeError, OSError):
+            # A corrupt/unreadable snapshot can't vote on ownership; skip it
+            # rather than failing the whole swap.
+            continue
+        # Same non-dict paranoia as for the live file: a snapshot holding a
+        # JSON list/string must not AttributeError the swap out from under us.
+        snap_oauth = snap.get("claudeAiOauth") if isinstance(snap, dict) else None
+        snap_rt = snap_oauth.get("refreshToken") if isinstance(snap_oauth, dict) else None
+        if snap_rt and snap_rt == live_rt:
+            matches.append(name)
+
+    if len(matches) > 1:
+        return ("conflict", None,
+                f"live refresh token matches multiple account snapshots: {sorted(matches)} "
+                f"(duplicate-identity accounts? see GH #70)")
+    if len(matches) == 1:
+        owner = matches[0]
+        if owner == expected:
+            return ("expected", owner, f"live refresh token matches '{owner}' snapshot")
+        return ("foreign", owner,
+                f"live refresh token matches '{owner}' snapshot, not active account "
+                f"'{expected}' — a drifted pane's token refresh overwrote the live file (GH #3)")
+    return ("unknown", None,
+            "live refresh token matches no account snapshot (most likely the active "
+            "account's refresh token was rotated since the last swap)")
+
+
 def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     """Atomically swap to `target_name`. Returns updated state dict.
 
@@ -1401,7 +1491,89 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         existing = {}
     existing.update(current_identity)
     write_json(current_dir / ".claude.json", existing)
-    atomic_copy(CREDS_JSON, current_dir / ".credentials.json", mode=0o600)
+
+    # ---- GH #3: refresh-time drift detection on the credentials save-back ----
+    # The live file is read into memory EXACTLY ONCE and those same bytes are
+    # what gets written to storage. This closes the read-check-write race: a
+    # pane's token refresh can rewrite the live file at any moment, and a
+    # naive "check the file, then atomic_copy the file" would validate one
+    # version and copy another. (atomic_write_bytes still makes the *write*
+    # atomic; the residual race — a refresh landing between this read and the
+    # target-creds install below — existed before this change and only loses
+    # at most one access-token refresh, never a snapshot's lineage.)
+    if not CREDS_JSON.exists():
+        # Preserve pre-GH#3 behavior: atomic_copy(CREDS_JSON, ...) raised
+        # FileNotFoundError here, and `switch`/daemon callers handle exactly
+        # that exception type.
+        raise FileNotFoundError(f"{CREDS_JSON} missing — cannot save active account's tokens back to storage")
+    live_creds_bytes = CREDS_JSON.read_bytes()
+    try:
+        live_creds = json.loads(live_creds_bytes)
+    except json.JSONDecodeError as e:
+        # Pre-GH#3 this copied the unparseable bytes into current's snapshot
+        # verbatim, destroying a known-good snapshot with garbage (Claude
+        # mid-write, disk corruption, ...). Skipping the save-back is strictly
+        # safer: the snapshot keeps its last-known-good tokens, and the swap
+        # itself still proceeds (the target install below overwrites the
+        # corrupt live file with a good one — which also happens to repair it).
+        live_creds = None
+        click.echo(f"creds-save-back: SKIPPED — live {CREDS_JSON} unparseable ({e}); "
+                   f"keeping '{current}' snapshot as-is")
+    if live_creds is not None:
+        verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
+        if verdict in ("expected", "unknown"):
+            # "expected": provably current's tokens — the normal save-back.
+            # "unknown": no snapshot matched, which is what a legitimate
+            # refresh-token rotation on the active account looks like; the
+            # save-back is the only way that rotated token gets persisted, so
+            # keep the historical behavior (see classify_live_creds_owner).
+            if verdict == "unknown":
+                click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
+            atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+        elif verdict == "foreign":
+            # THE GH #3 case: a drifted pane's refresh overwrote the live file
+            # with a different account's tokens. Two actions:
+            #   1. Do NOT write them into current's snapshot (that was the bug —
+            #      current's refresh token would be lost).
+            #   2. DO write them into the true owner's snapshot: the live file
+            #      provably carries the owner's lineage (same refresh token)
+            #      with a fresher access token from the drifted pane's refresh.
+            #      Discarding it would strand the owner's snapshot on an older
+            #      access token for no benefit; same-lineage writes are safe.
+            atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
+                               live_creds_bytes, mode=0o600)
+            msg = (f"DRIFT DETECTED at swap ({current} -> {target_name}): {detail}. "
+                   f"Skipped save-back into '{current}' snapshot (kept its last-known-good tokens); "
+                   f"routed live tokens to their true owner '{owner}' instead.")
+            click.echo(f"creds-save-back: {msg}")
+            # Surface it for the operator too — drift means some pane is loaded
+            # with the wrong account and will keep rewriting the live file
+            # until it's restarted (see GH #3 for the mechanism).
+            try:
+                append_inbox("drift", f"token-refresh drift detected ({owner} overwrote live creds)", msg)
+            except OSError:
+                pass  # inbox is best-effort observability; never fail a swap over it
+        elif verdict == "invalid":
+            # Parseable JSON but no refresh token inside (logout-shaped file,
+            # `{}`, or a non-object). Same treatment as unparseable JSON: a
+            # save-back could only replace the snapshot's refresh token with
+            # nothing, so keep the last-known-good snapshot and move on — the
+            # target install below rewrites the live file with good creds.
+            # (Review amendment 2026-07-01; previously this fell into the
+            # "unknown" save-back and destroyed the outgoing snapshot.)
+            click.echo(f"creds-save-back: SKIPPED — {detail}; keeping '{current}' snapshot as-is")
+        else:  # "conflict"
+            # Multiple snapshots share the live refresh token — duplicate-
+            # identity accounts (GH #70). Any write would be a guess; keep
+            # every snapshot untouched and let the operator untangle it.
+            msg = (f"AMBIGUOUS creds ownership at swap ({current} -> {target_name}): {detail}. "
+                   f"Skipped save-back entirely to avoid corrupting a snapshot.")
+            click.echo(f"creds-save-back: {msg}")
+            try:
+                append_inbox("drift", "ambiguous creds ownership — save-back skipped", msg)
+            except OSError:
+                pass
+    # ---- end GH #3 drift detection ----
 
     # Merge target's account-bound keys into live ~/.claude.json
     target_account_cj = read_json(target_cj)
@@ -4994,6 +5166,20 @@ def poll(account: str | None, no_write: bool) -> None:
         click.echo(f"polling {name}...")
         u = poll_account_usage(name)
         usage_by_account[name] = u
+        # GH #68: token_stale must be checked BEFORE the generic raw["error"]
+        # branch. poll_account_usage sets raw["error"] alongside token_stale
+        # (the raw text is what an operator sees in --json dumps), so without
+        # this branch a benign aged-out access token on an inactive account
+        # fell through to the scary "ERROR: ..." line. That mislabel caused a
+        # real operator to re-login a perfectly healthy account. force-poll
+        # already had the friendly branch; this mirrors it. The account stays
+        # swap-eligible (pick_swap_target only excludes token_expired /
+        # poll_error), so say so explicitly to preempt the "will it ever swap
+        # to it?" worry that GH #68 documents.
+        if u.token_stale:
+            minutes = u.raw.get("expired_minutes_ago", "?")
+            click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable and swap-eligible).")
+            continue
         if u.token_expired:
             click.echo(f"  TOKEN EXPIRED — re-auth this account (claude login under its config dir)")
             continue
@@ -5669,6 +5855,50 @@ def _sl_rolled_5h_label(acct: dict, current_pct: float, color_on: bool) -> str:
     was_pct = was_pct if was_pct is not None else current_pct
     raw = f"5h:↻reset(was {was_pct:.0f}%)"
     return click.style(raw, fg="bright_magenta", bold=True) if color_on else raw
+def _current_pane_pin(config: dict) -> tuple[str | None, str | None]:
+    """Which pin (if any) applies to the pane rendering this statusline (GH #36).
+
+    The statusline command is spawned by the claude process running inside the
+    tmux pane, so it inherits TMUX_PANE (e.g. "%12") and CLAUDE_CODE_SESSION_ID
+    from that pane's environment — the same two key shapes `cus pin` accepts
+    and `session_is_pinned` matches for the daemon's skip-swap decision. Pane
+    id is checked first, mirroring session_is_pinned's precedence, so both
+    sides of the system always agree on which pin wins.
+
+    Returns (matched_key, pinned_account) or (None, None) when this pane isn't
+    pinned (or we're not under tmux and have no session id).
+    """
+    pinned = config.get("session_locks", {}).get("pinned", {}) or {}
+    if not pinned:
+        return None, None
+    pane = os.environ.get("TMUX_PANE")
+    if pane and pane in pinned:
+        return pane, pinned[pane]
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid and sid in pinned:
+        return sid, pinned[sid]
+    return None, None
+
+
+def _sl_pin_label(pin_account: str | None, active: str, color_on: bool) -> str:
+    """Format the statusline pin indicator (GH #36); empty string when unpinned.
+
+    `📌<account>` when the pane is pinned to the account it's displayed on.
+    `📌<account>!` (yellow bold when color is on) when the pin target differs
+    from the account the pane is actually shown against — that mismatch is the
+    interesting case: with hot-swap off (background-swap mode, the default
+    here) a pinned pane still follows the single global credentials file, so
+    a pin only prevents daemon-driven relaunches; it does NOT keep the pane's
+    usage on the pinned account. The `!` tells the operator at a glance that
+    their pin intent and the pane's real account have diverged.
+    """
+    if not pin_account:
+        return ""
+    if pin_account == active:
+        raw = f"📌{pin_account}"
+        return click.style(raw, dim=True) if color_on else raw
+    raw = f"📌{pin_account}!"
+    return click.style(raw, fg="yellow", bold=True) if color_on else raw
 
 
 @cli.command(name="statusline")
@@ -5687,6 +5917,9 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     A 5h window that rolled over since the last poll is flagged live as
     `5h:↻reset(was X%)` in BOTH modes instead of showing the stale pre-reset
     percentage (GH #59).
+    If THIS pane is pinned (`cus pin`), a `📌<account>` badge appears next to
+    the account label in both modes; `📌<account>!` (yellow) means the pin
+    target differs from the account the pane is actually shown on (GH #36).
 
     Verbosity priority: --compact flag > --verbose flag > config.statusline.verbose.
 
@@ -5762,6 +5995,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     active = this_session_account or machine_active
     pending_swap = this_session_account and this_session_account != machine_active
 
+    # GH #36: is THIS pane pinned, and to which account? Computed once and
+    # surfaced in both compact and verbose modes (SOS/warning early-returns
+    # above intentionally stay uncluttered — human-action-needed beats pin
+    # bookkeeping for the one line we get).
+    _, pin_account = _current_pane_pin(config)
+    pin_lbl = _sl_pin_label(pin_account, active, color_on)
+
     acct = state.get("accounts", {}).get(active, {})
     fh = acct.get("current_5h_pct", 0)
     sd = acct.get("current_7d_pct", 0)
@@ -5775,7 +6015,8 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     if not is_verbose:
         # Compact mode. Render "?" if we don't have reliable data.
         if _pct_is_unknown(acct):
-            click.echo(f"cus:{active_lbl} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
+            pin_bit = f" {pin_lbl}" if pin_lbl else ""
+            click.echo(f"cus:{active_lbl}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
             return
         # GH #59: compact mode must flag a rolled-over 5h window live, exactly
         # like verbose mode already does. The reset countdown elapses between
@@ -5800,6 +6041,10 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         elif max(marker_fh, sd) >= nx * 0.8:
             flag_marker = "·"
         prefix_bits = [f"cus:{active_lbl}"]
+        if pin_lbl:
+            # GH #36: pin badge rides directly next to the account label so
+            # "which account" and "is it pinned here" read as one glance.
+            prefix_bits.append(pin_lbl)
         if pending_swap:
             prefix_bits.append(f"→{machine_active}")
         if flag_marker:
@@ -5897,6 +6142,11 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         return " ".join(parts)
 
     pieces = [fmt_account(active, acct, True)]
+
+    # GH #36: pin badge as its own segment right after the active account, so
+    # verbose reads "cus <active> ... | 📌<pin> | <other accounts> ...".
+    if pin_lbl:
+        pieces.append(pin_lbl)
 
     if show_others:
         for name, a in sorted(state.get("accounts", {}).items()):
