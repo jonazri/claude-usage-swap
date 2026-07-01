@@ -5838,6 +5838,52 @@ def _sl_pct(value: float, nxt: float, on: bool) -> str:
     return click.style(txt, fg="green")
 
 
+def _current_pane_pin(config: dict) -> tuple[str | None, str | None]:
+    """Which pin (if any) applies to the pane rendering this statusline (GH #36).
+
+    The statusline command is spawned by the claude process running inside the
+    tmux pane, so it inherits TMUX_PANE (e.g. "%12") and CLAUDE_CODE_SESSION_ID
+    from that pane's environment — the same two key shapes `cus pin` accepts
+    and `session_is_pinned` matches for the daemon's skip-swap decision. Pane
+    id is checked first, mirroring session_is_pinned's precedence, so both
+    sides of the system always agree on which pin wins.
+
+    Returns (matched_key, pinned_account) or (None, None) when this pane isn't
+    pinned (or we're not under tmux and have no session id).
+    """
+    pinned = config.get("session_locks", {}).get("pinned", {}) or {}
+    if not pinned:
+        return None, None
+    pane = os.environ.get("TMUX_PANE")
+    if pane and pane in pinned:
+        return pane, pinned[pane]
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid and sid in pinned:
+        return sid, pinned[sid]
+    return None, None
+
+
+def _sl_pin_label(pin_account: str | None, active: str, color_on: bool) -> str:
+    """Format the statusline pin indicator (GH #36); empty string when unpinned.
+
+    `📌<account>` when the pane is pinned to the account it's displayed on.
+    `📌<account>!` (yellow bold when color is on) when the pin target differs
+    from the account the pane is actually shown against — that mismatch is the
+    interesting case: with hot-swap off (background-swap mode, the default
+    here) a pinned pane still follows the single global credentials file, so
+    a pin only prevents daemon-driven relaunches; it does NOT keep the pane's
+    usage on the pinned account. The `!` tells the operator at a glance that
+    their pin intent and the pane's real account have diverged.
+    """
+    if not pin_account:
+        return ""
+    if pin_account == active:
+        raw = f"📌{pin_account}"
+        return click.style(raw, dim=True) if color_on else raw
+    raw = f"📌{pin_account}!"
+    return click.style(raw, fg="yellow", bold=True) if color_on else raw
+
+
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
@@ -5850,6 +5896,10 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     Percentages are colored by proximity to the swap point (green/yellow/red)
     and the active account is bold-cyan when `statusline.color` is on (GH #38);
     NO_COLOR disables it. Claude Code's statusLine renders the ANSI.
+
+    If THIS pane is pinned (`cus pin`), a `📌<account>` badge appears next to
+    the account label in both modes; `📌<account>!` (yellow) means the pin
+    target differs from the account the pane is actually shown on (GH #36).
 
     Verbosity priority: --compact flag > --verbose flag > config.statusline.verbose.
 
@@ -5925,6 +5975,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     active = this_session_account or machine_active
     pending_swap = this_session_account and this_session_account != machine_active
 
+    # GH #36: is THIS pane pinned, and to which account? Computed once and
+    # surfaced in both compact and verbose modes (SOS/warning early-returns
+    # above intentionally stay uncluttered — human-action-needed beats pin
+    # bookkeeping for the one line we get).
+    _, pin_account = _current_pane_pin(config)
+    pin_lbl = _sl_pin_label(pin_account, active, color_on)
+
     acct = state.get("accounts", {}).get(active, {})
     fh = acct.get("current_5h_pct", 0)
     sd = acct.get("current_7d_pct", 0)
@@ -5938,7 +5995,8 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     if not is_verbose:
         # Compact mode. Render "?" if we don't have reliable data.
         if _pct_is_unknown(acct):
-            click.echo(f"cus:{active_lbl} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
+            pin_bit = f" {pin_lbl}" if pin_lbl else ""
+            click.echo(f"cus:{active_lbl}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
             return
         flag_marker = ""
         if max(fh, sd) >= nx:
@@ -5946,6 +6004,10 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         elif max(fh, sd) >= nx * 0.8:
             flag_marker = "·"
         prefix_bits = [f"cus:{active_lbl}"]
+        if pin_lbl:
+            # GH #36: pin badge rides directly next to the account label so
+            # "which account" and "is it pinned here" read as one glance.
+            prefix_bits.append(pin_lbl)
         if pending_swap:
             prefix_bits.append(f"→{machine_active}")
         if flag_marker:
@@ -6049,6 +6111,11 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         return " ".join(parts)
 
     pieces = [fmt_account(active, acct, True)]
+
+    # GH #36: pin badge as its own segment right after the active account, so
+    # verbose reads "cus <active> ... | 📌<pin> | <other accounts> ...".
+    if pin_lbl:
+        pieces.append(pin_lbl)
 
     if show_others:
         for name, a in sorted(state.get("accounts", {}).items()):
