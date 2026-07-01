@@ -5652,6 +5652,25 @@ def _sl_pct(value: float, nxt: float, on: bool) -> str:
     return click.style(txt, fg="green")
 
 
+def _sl_rolled_5h_label(acct: dict, current_pct: float, color_on: bool) -> str:
+    """Render the `5h:↻reset(was X%)` badge for a rolled-over window (GH #59).
+
+    Shown when `_five_hour_rolled_since_poll` says the 5h window reset after
+    our last poll — the stored % is pre-reset stale, so displaying it bare
+    would lie (e.g. `5h:96%` on a window that actually just reset to ~0).
+
+    "was X%" prefers the `five_hour_pct_pre_reset` stash (written by the
+    daemon's countdown-fallback inference when it zeroes `current_5h_pct`);
+    falls back to the still-stale stored % when the statusline renders before
+    the daemon's next cycle has run the inference. Shared by compact and
+    verbose modes so the two renderings can't drift apart.
+    """
+    was_pct = acct.get("five_hour_pct_pre_reset")
+    was_pct = was_pct if was_pct is not None else current_pct
+    raw = f"5h:↻reset(was {was_pct:.0f}%)"
+    return click.style(raw, fg="bright_magenta", bold=True) if color_on else raw
+
+
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
@@ -5664,6 +5683,10 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     Percentages are colored by proximity to the swap point (green/yellow/red)
     and the active account is bold-cyan when `statusline.color` is on (GH #38);
     NO_COLOR disables it. Claude Code's statusLine renders the ANSI.
+
+    A 5h window that rolled over since the last poll is flagged live as
+    `5h:↻reset(was X%)` in BOTH modes instead of showing the stale pre-reset
+    percentage (GH #59).
 
     Verbosity priority: --compact flag > --verbose flag > config.statusline.verbose.
 
@@ -5754,10 +5777,27 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if _pct_is_unknown(acct):
             click.echo(f"cus:{active_lbl} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
             return
+        # GH #59: compact mode must flag a rolled-over 5h window live, exactly
+        # like verbose mode already does. The reset countdown elapses between
+        # polls; once it has, the stored 5h % is pre-reset stale (up to a full
+        # poll interval of showing e.g. 96% on a window that actually reset to
+        # ~0). Compact is the DEFAULT rendering, so before this it was the one
+        # place the stale number still showed bare.
+        rolled5 = _five_hour_rolled_since_poll(acct)
+        if rolled5:
+            fh_piece = _sl_rolled_5h_label(acct, fh, color_on)
+            # The stale % must not drive the near-swap-point marker either —
+            # the window just reset, so its real contribution is ~0. (If the
+            # daemon's countdown inference already zeroed current_5h_pct this
+            # is a no-op; this covers renders before that cycle runs.)
+            marker_fh = 0.0
+        else:
+            fh_piece = f"5h:{_sl_pct(fh, nx, color_on)}"
+            marker_fh = fh
         flag_marker = ""
-        if max(fh, sd) >= nx:
+        if max(marker_fh, sd) >= nx:
             flag_marker = "⚠"
-        elif max(fh, sd) >= nx * 0.8:
+        elif max(marker_fh, sd) >= nx * 0.8:
             flag_marker = "·"
         prefix_bits = [f"cus:{active_lbl}"]
         if pending_swap:
@@ -5778,7 +5818,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             else:
                 poll_part = " (poll due)"
         click.echo(
-            f"{prefix} 5h:{_sl_pct(fh, nx, color_on)} 7d:{_sl_pct(sd, nx, color_on)} "
+            f"{prefix} {fh_piece} 7d:{_sl_pct(sd, nx, color_on)} "
             f"{nxt_lbl(nx)}{poll_part} · {render_stamp}",
             color=color_on,
         )
@@ -5829,14 +5869,8 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 # stale. Flag it (↻reset, was X%) rather than showing the stale
                 # number bare, so the operator knows a reset happened without
                 # waiting to repoll. Next poll confirms the new (~0%) value.
-                # Prefer the stashed pre-reset value (set when the daemon's
-                # countdown fallback already zeroed current_5h_pct); fall back to
-                # the still-stale h5 when the statusline renders before the
-                # daemon has inferred. GH #59.
-                was_pct = a.get("five_hour_pct_pre_reset")
-                was_pct = was_pct if was_pct is not None else h5
-                rolled_lbl = f"5h:↻reset(was {was_pct:.0f}%)"
-                parts.append(click.style(rolled_lbl, fg="bright_magenta", bold=True) if color_on else rolled_lbl)
+                # Rendering shared with compact mode via _sl_rolled_5h_label.
+                parts.append(_sl_rolled_5h_label(a, h5, color_on))
             else:
                 r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
                 # Time left on the ACTIVE account's 5h clock is the key operational
