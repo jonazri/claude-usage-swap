@@ -124,6 +124,11 @@ cus unlock <slot>             # remove a slot lock
 cus pool <slot>               # show a slot's pool
 cus pool <slot> standard      # retag a slot: premium (honor per-model cap) vs standard (ignore it)
 
+# Same account on multiple sessions (GH #109) — see "Running one account on more than one session"
+cus launch <account>          # with per_session.lane_sharing: joins the live lane for that account (no login)
+cus login-mount <slot> <acct> # provision an independent login for a 2nd, independently-swappable lane
+cus login-mount --list        # show provisioned independent logins
+
 # Low-level (rarely needed after `cus install`)
 cus init                      # re-discover + migrate accounts
 cus init --force              # refresh stale credential snapshots
@@ -213,6 +218,54 @@ Caveats: `bypassPermissions` is ignored when Claude runs as root, and a managed/
 
 Details: `docs/plans/2026-07-02-per-session-accounts.md` (design + decision history) and the storage-roles inventory in `docs/ARCHITECTURE.md`.
 
+### Running one account on more than one session (2026-07-02, GH #109)
+
+A live mount's `.credentials.json` is one OAuth login family, and Anthropic rotates the refresh token on every ~hourly refresh. So **two live mounts that hold *copies* of one account clobber** — one session gets silently logged out (the reason the no-double-book guard above exists). There are two safe ways to put 2+ sessions on the same account, and they compose:
+
+**1. Lane sharing (`per_session.lane_sharing: true`) — the no-login default.** A "lane" is just a slot dir that hosts *more than one* session. With lane sharing on, `cus launch <account>` **joins** the live lane already holding that account instead of minting a second mount:
+
+```yaml
+per_session:
+  lane_sharing: true
+```
+
+```bash
+cus launch rayi1      # first session → lane on rayi1 (seeded from rayi1's existing login)
+cus launch rayi1      # second session → JOINS that same lane (shared login)
+```
+
+Both sessions share one config dir and one login; a swap of that lane moves them together (one shared cache-bust). **No extra login, ever** — one account lives on one lane, seeded free from the login it already has. This is the right choice when same-account sessions can swap as a group (they usually can — they're together because that account is best, and they'd leave it together when it gets hot).
+
+**2. Independent logins (`independent_logins.use_independent_logins: true`) — the escape hatch.** Only needed when you want one account on **two *independently*-swappable lanes** (one leaves at its cap while the other keeps riding). That genuinely requires a second login family, and only an interactive `/login` can mint one:
+
+```bash
+# provision a distinct login for (slot-9, rayi1) — interactive, one time:
+cus login-mount slot-9 rayi1          # prints the CLAUDE_CONFIG_DIR=… claude command to run
+#   run it, log in AS rayi1, /exit, then:
+cus login-mount slot-9 rayi1 --finish # verifies it landed on rayi1 (refuses a wrong-account login) + records it
+# now launch a 2nd, independent rayi1 lane (the no-double-book guard lifts because it's provably independent):
+cus launch rayi1 --lane slot-9
+```
+
+Supporting commands:
+
+- `cus login-mount <slot> <account> --from-existing` — seed a lane's login from the account's on-disk snapshot with **no browser login** (for a single-mount account). Not independent from the snapshot, so only safe as that account's sole lane.
+- `cus login-mount --list` — show every provisioned login (identity, fingerprint, assumed expiry).
+- The store lives at `~/claude-accounts/logins/<account>/<slot>/`. `cus status` tags each lane (`[indep-login ✓]` / `[copy]`), and `cus sos` flags expired, near-expiry, wrong-account, or **family-collision** (two lanes sharing one login family) conditions.
+
+Config keys (both default **off** — behavior is unchanged until you opt in):
+
+```yaml
+per_session:
+  lane_sharing: false            # true = `cus launch` joins the live lane for an account (share, swap together)
+independent_logins:
+  use_independent_logins: false  # true = swaps install/save-back the per-(slot,account) independent login when one is provisioned
+  refresh_token_ttl_days: 30     # assumed refresh-token lifetime — drives only the sos near-expiry nudge (unconfirmed; see #109 Phase 0)
+  warn_expiry_within_days: 5
+```
+
+Design + the experiment that established it: `docs/plans/2026-07-02-seamless-swap-independent-logins.md` and issue #109.
+
 ## Progressive thresholds (the novel bit)
 
 Each account has its own `next_swap_at_pct` field. Starts at 50; climbs through `[75, 90, force]` each time we swap *out* of it. Reset to 50 when both windows drop below `reset_below_pct`.
@@ -254,6 +307,10 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the full catalog with
     plugins/, agents/, skills/, commands/, memory/, hooks/, scripts/ (symlinks)
   account-merkos/
     ...
+  slot-1/, slot-2/ ...            # per_session/hybrid live mounts (one per session/lane)
+  logins/<account>/<slot>/        # GH #109 per-(slot,account) independent logins (opt-in)
+    .credentials.json             #   an independent OAuth family (distinct from the account snapshot)
+    provenance.json               #   mint time, source email, refresh-token fingerprint, bootstrapped flag
 ```
 
 Each `account-<name>/` directory is a fully-functional `CLAUDE_CONFIG_DIR`. To log into a new account: `CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/ claude` (or use `cus add <name>` to create + launch in one step).

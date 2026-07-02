@@ -99,6 +99,25 @@ A slot dir exists on disk with real credentials but no `state.json` entry (crash
 cus slot gc --slot slot-N
 ```
 
+### `Independent-login families collide across mounts: <slot>-><acct>, …` (GH #109)
+
+Two lanes hold the **same** login family (e.g. an account bootstrapped with `--from-existing` onto two slots, or a hand-copied store entry). Two live mounts on one refresh-token family clobber on rotation — the exact thing independent logins prevent. Give the extra lane its **own** login (a real `/login`, not `--from-existing`, which only copies):
+
+```bash
+cus login-mount <slot> <account>          # run the printed cmd, log in, then:
+cus login-mount <slot> <account> --finish
+```
+
+### `Independent login(s) … wrong account / past assumed lifetime / expiring soon` (GH #109)
+
+A provisioned independent login (`cus login-mount --list`) needs attention: it was recorded for the wrong account (`--finish` normally refuses this — a hand-edit or `--force` slipped one through), or it's near/past the assumed refresh-token lifetime (`independent_logins.refresh_token_ttl_days`, a soft estimate). Re-provision it:
+
+```bash
+cus login-mount <slot> <account>          # log in as the correct account, then --finish
+```
+
+Expiry is an assumption, not a measured fact (see #109 Phase 0) — it only drives this soft nudge, never a hard action.
+
 ---
 
 ## Non-SOS issues
