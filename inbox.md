@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed](#2026-07-02-flag-gym-record-loop-unavailable-for-pr-86-review-pr-88-merge-cus-is-not-gym-initialized-hook-99-v2-guidance-needed)
 - [2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps](#2026-07-02-decision-gh-77-freshness-guard-active-account-relogin-bare-claude-login-not-storage-dir-sync-guard-covers-the-expected-verdict-too-finish-allows-incomparable-timestamps)
 - [2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast](#2026-07-02-decision-gh-76-swap-lock-crash-journal-journal-is-a-standalone-file-not-a-state-json-key-recovery-auto-reconciles-determinate-crashes-lock-waits-instead-of-failing-fast)
 - [2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant](#2026-07-02-decision-gh-79-backup-rotation-also-back-up-the-live-creds-file-before-target-install-backup-failures-are-not-swallowed-keep-bound-is-a-constant)
@@ -20,6 +21,26 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym-discipline #hook-99 #pr-86 #pr-88
+
+**What happened.** The MCP-discipline hook (#99 v2) fired after `gh pr merge` (PR #88, merge commit `e9f489b`, follow-up to PR #86) and required the gym record loop (gym_design → gym_drill → gym_run with the merge SHA), with "STOP and post an inbox question" as the fallback. The loop cannot complete here: `gym_session_start` fails with "database_path 'gym.db' has no 'alembic_version' table — not an initialized gym database". claude-usage-swap has no `.gym/` / `gym.config.yaml`; per `~/repos/gym/gym_general.md`, non-research repos can skip gym — but the hook is unconditional on `gh pr merge`.
+
+**Question for the operator.** Which is intended for non-gym repos like cus?
+1. Exempt non-gym-initialized repos in hook #99 v2 (check for `.gym/` or `gym.config.yaml` before demanding the loop), or
+2. Initialize gym in claude-usage-swap so PR merges here get gym provenance rows, or
+3. Route these merges to a central gym store (e.g. `~/repos/gym`) with a cross-repo cluster.
+
+Until answered, this session's two merges (#86 was merged by the parallel review pass; #88 by this one) have no gym rows. Work products are fully recorded in git + PR bodies + this inbox.
+
+**Session facts for provenance:** PR #86 merged `5b01ab0` (parallel pass); PR #88 merged `e9f489b` (this pass; carries the two post-merge-stranded amendments: GH #59 rollover override in `_account_poll_due` + 2 pinning tests). Suite: 146 passed.
+
+---
+
 
 ## 2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps
 
