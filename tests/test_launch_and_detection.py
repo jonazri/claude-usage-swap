@@ -112,15 +112,27 @@ def test_acquire_slot_prefers_matching_then_free_then_create():
         state = cus.load_state()
         n1, _ = cus.create_slot(state)
         n2, _ = cus.create_slot(state)
-        state["slots"][n1]["account"] = "beta"
-        state["slots"][n2]["account"] = "alpha"
+        # acquire_slot reloads state from disk under the lock, so assign
+        # accounts + clear the just-created reservations ON DISK (the slots are
+        # idle in this test — no live launch to protect).
+        state = cus.load_state()
+        state["slots"][n1].update({"account": "beta"})
+        state["slots"][n2].update({"account": "alpha"})
+        for e in state["slots"].values():
+            e.pop("reserved_until", None)
+        cus.save_state(state)
 
         name, _ = cus.acquire_slot(state, prefer_account="alpha")
         assert name == n2, "free slot already holding the account wins (no swap needed)"
 
-        # Occupied slots are skipped; none free → new slot created.
+        # Occupied slots are skipped; none free → new slot created. (Also clear
+        # the reservation acquire just put on n2 so it's not the reason.)
+        st = cus.load_state()
+        for e in st["slots"].values():
+            e.pop("reserved_until", None)
+        cus.save_state(st)
         cus.mount_pids = lambda mount: [1]
-        name, d = cus.acquire_slot(state, prefer_account="alpha")
+        name, d = cus.acquire_slot(cus.load_state(), prefer_account="alpha")
         assert name == "slot-3"
         cus.mount_pids = lambda mount: []
     finally:
@@ -145,7 +157,15 @@ def test_launch_prepare_full_flow():
         assert st["slots"][slot_name].get("last_launch_ts")
         assert st["active"] == "gamma", "global mount untouched"
 
-        # Relaunching the same account reuses the same slot without a swap.
+        # Relaunching the same account reuses the same slot without a swap —
+        # but only once the prior launch's reservation has lapsed (a slot
+        # claimed <120s ago is deliberately NOT reused, so concurrent launches
+        # don't collide). Simulate the reservation expiring (session came and
+        # went idle) by clearing it on disk.
+        st = cus.load_state()
+        for e in st["slots"].values():
+            e.pop("reserved_until", None)
+        cus.save_state(st)
         slot_name2, _, _ = cus._launch_prepare("alpha", cus.load_state(), config)
         assert slot_name2 == slot_name
     finally:

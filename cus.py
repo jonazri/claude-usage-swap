@@ -172,6 +172,15 @@ SHARED_SYMLINK_FILES = ["settings.json", "settings.local.json"]
 # ~/.claude/ is swapped in global mode. Account dirs stay storage-only.
 SLOT_PREFIX = "slot-"
 
+# How long a slot stays RESERVED after acquire_slot/create_slot claims it, so a
+# launch that hasn't exec'd claude yet (no PID on the mount) still looks busy to
+# a concurrent launch and to the daemon's gc (review findings 2026-07-02:
+# acquire TOCTOU + gc-mid-launch). Must comfortably exceed the acquire → doctor
+# → sync → execute_swap → execvpe window; once claude is live, mount_in_use
+# takes over and the reservation is irrelevant. A crashed pre-exec launch's
+# reservation simply expires and the slot becomes reusable.
+SLOT_RESERVATION_SECONDS = 120
+
 # The full list of keys that are tied to OAuth identity — verified empirically
 # against the user's two config dirs (2026-05-18). All other keys in
 # ~/.claude.json are machine-level state and stay put during a swap.
@@ -1139,7 +1148,12 @@ def scaffold_mount_dir(mount: Path) -> list[str]:
     """
     actions: list[str] = []
     if not mount.exists():
-        mount.mkdir(parents=True)
+        # exist_ok=True: two racing creators can both reach here for the same
+        # index (the create_slot TOCTOU); the loser must not crash on
+        # FileExistsError. The under-lock allocation in create_slot makes the
+        # race rare, but scaffold is also called directly (doctor pre-flight,
+        # launch), so keep it independently safe.
+        mount.mkdir(parents=True, exist_ok=True)
         actions.append(f"created {mount}")
     for sub in SHARED_SYMLINK_SUBDIRS + SHARED_SYMLINK_FILES:
         link = mount / sub
@@ -1157,22 +1171,111 @@ def scaffold_mount_dir(mount: Path) -> list[str]:
     return actions
 
 
-def create_slot(state: dict) -> tuple[str, Path]:
-    """Allocate the lowest free slot index, scaffold its dir, register in state.
+def _slot_reserved(entry: dict, now: datetime | None = None) -> bool:
+    """True while a slot's reservation (set by acquire/create) is still fresh.
 
-    "Free" means the index has no existing dir AND no state entry — a gc'd
-    slot's index is reusable. Caller is responsible for save_state().
+    A reserved slot is treated as busy by both free-slot scans and gc, so an
+    in-flight launch that hasn't exec'd claude yet (no PID on the mount) is not
+    stolen by a concurrent launch or reaped by the daemon.
+    """
+    until = entry.get("reserved_until")
+    if not until:
+        return False
+    try:
+        until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    return (now or datetime.now(timezone.utc)) < until_dt
+
+
+def _slot_busy(name: str, entry: dict) -> bool:
+    """A slot is busy (not allocatable, not gc-able) if a live process holds it
+    OR it carries a fresh reservation."""
+    return mount_in_use(slot_path(name)) or _slot_reserved(entry)
+
+
+def _reserve(entry: dict) -> dict:
+    entry["reserved_until"] = (datetime.now(timezone.utc) + timedelta(seconds=SLOT_RESERVATION_SECONDS)) \
+        .isoformat().replace("+00:00", "Z")
+    return entry
+
+
+def _allocate_slot_unlocked(state: dict) -> tuple[str, Path]:
+    """Lowest-free-index allocation + scaffold + reservation, NO lock/save.
+
+    Inner helper so acquire_slot (already holding the swap lock) can allocate
+    without re-taking the lock (flock is not reentrant across fds in one
+    process — a nested take would deadlock).
     """
     slots = state.setdefault("slots", {})
     n = 1
     while True:
         name = f"{SLOT_PREFIX}{n}"
+        # Free index = no state entry AND no dir on disk. A dir with no entry is
+        # an orphan (SOS flags it); skip its index rather than colliding.
         if name not in slots and not slot_path(name).exists():
             break
         n += 1
     d = slot_path(name)
     scaffold_mount_dir(d)
-    slots[name] = {"account": None, "created_ts": now_iso()}
+    slots[name] = _reserve({"account": None, "created_ts": now_iso()})
+    return name, d
+
+
+def create_slot(state: dict) -> tuple[str, Path]:
+    """Allocate the lowest free slot index, scaffold, register + reserve it.
+
+    Runs under the swap lock and persists state itself (then syncs the caller's
+    `state["slots"]` to the just-persisted view), so two concurrent creators
+    can't allocate the same index — the loser reloads inside the lock and picks
+    the next free one. The reservation makes the new slot look busy until its
+    launch attaches a PID.
+    """
+    with _swap_lock():
+        fresh = load_state()
+        name, d = _allocate_slot_unlocked(fresh)
+        save_state(fresh)
+    state["slots"] = fresh.get("slots", {})
+    return name, d
+
+
+def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, Path]:
+    """Find a free slot for a launch (create one if none), reserving it.
+
+    Runs the free-scan + reservation under the swap lock on a freshly-reloaded
+    state, so two concurrent `cus launch`es can't both claim the same slot: the
+    reservation is persisted before the lock releases, so the second acquire
+    sees it as busy (review finding 2026-07-02: acquire TOCTOU). A slot is free
+    only if no live PID holds it AND it carries no fresh reservation.
+
+    Preference order: a free slot ALREADY holding prefer_account (no swap
+    needed), then any free slot, then a new slot. Orphan dirs (on disk, no
+    state entry) are adopted. Persists state and syncs the caller's view.
+    """
+    with _swap_lock():
+        fresh = load_state()
+        slots_state = fresh.setdefault("slots", {})
+        free: list[Path] = []
+        for d in list_slot_dirs():
+            entry = slots_state.setdefault(d.name, {"account": None, "created_ts": now_iso()})
+            if _slot_busy(d.name, entry):
+                continue
+            free.append(d)
+        chosen: Path | None = None
+        if prefer_account:
+            for d in free:
+                if slots_state[d.name].get("account") == prefer_account:
+                    chosen = d
+                    break
+        if chosen is None and free:
+            chosen = free[0]
+        if chosen is not None:
+            _reserve(slots_state[chosen.name])
+            name, d = chosen.name, chosen
+        else:
+            name, d = _allocate_slot_unlocked(fresh)  # already locked — use inner
+        save_state(fresh)
+    state["slots"] = fresh.get("slots", {})
     return name, d
 
 
@@ -1272,11 +1375,17 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
     its guards always run.
     """
     d = slot_path(name)
+    entry = state.get("slots", {}).get(name, {})
     if not d.exists():
         state.get("slots", {}).pop(name, None)
         return {"action": "dropped_stale_entry", "slot": name}
     if not force and mount_in_use(d):
         return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
+    if not force and _slot_reserved(entry):
+        # An in-flight launch has claimed this slot but not exec'd claude yet
+        # (no PID). rmtree'ing it now would pull the dir out from under the
+        # launch that's mid-install (review finding 2026-07-02: gc-mid-launch).
+        return {"action": "refused_reserved", "slot": name, "reserved_until": entry.get("reserved_until")}
     expected = state.get("slots", {}).get(name, {}).get("account")
     saveback = saveback_mount_credentials(d, expected, state)
     shutil.rmtree(d)
@@ -2684,7 +2793,8 @@ def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> t
             "account's refresh token was rotated since the last swap)")
 
 
-def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = None) -> dict:
+def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = None,
+                 bump_ladder: bool = True) -> dict:
     """Atomically swap to `target_name`. Returns updated state dict.
 
     Shared between the CLI `cus switch` command and the daemon's auto-swap.
@@ -2713,10 +2823,11 @@ def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = N
     """
     with _swap_lock():
         _recover_pending_swap()
-        return _execute_swap_locked(target_name, trigger, slot=slot)
+        return _execute_swap_locked(target_name, trigger, slot=slot, bump_ladder=bump_ladder)
 
 
-def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None) -> dict:
+def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None,
+                         bump_ladder: bool = True) -> dict:
     """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
     # State is loaded AFTER the lock is acquired: a concurrent swap that just
     # finished has already persisted its state.json, so `current` below is
@@ -2767,13 +2878,31 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     if not target_cj.exists():
         raise FileNotFoundError(f"{target_cj} missing — re-run `cus init --force`")
 
-    try:
-        # A freshly-scaffolded slot may not have a .claude.json yet (crash
-        # between mkdir and seed) — treat as empty rather than failing the
-        # install that would repair it.
-        live_cj = read_json(live_cj_path) if (slot is None or live_cj_path.exists()) else {}
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"{live_cj_path} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
+    if live_cj_path.exists():
+        # Read the live .claude.json when present — its non-account keys (MCP
+        # registrations, per-project state, sync'd from canonical) must survive
+        # the install, so we merge the target identity INTO it rather than
+        # replacing it.
+        try:
+            live_cj = read_json(live_cj_path)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"{live_cj_path} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
+    elif current is None:
+        # Swap-into-EMPTY-slot install (cus launch's primitive) with no
+        # .claude.json yet (freshly-scaffolded slot, crash between mkdir and
+        # seed): start from {}. There is no outgoing account, so nothing is
+        # saved back and nothing is lost.
+        live_cj = {}
+    else:
+        # OCCUPIED slot (current set) whose live .claude.json is unexpectedly
+        # missing. Do NOT substitute {}: the save-back below would write a
+        # bogus empty identity snapshot for the outgoing account (the exact
+        # corruption the credentials path guards against a few lines down —
+        # review finding 2026-07-02, swap-correctness dimension). Refuse, same
+        # discipline as the missing-credentials guard.
+        raise FileNotFoundError(
+            f"{live_cj_path} missing — cannot save the outgoing account's identity back to "
+            f"storage (occupied slot with no live .claude.json; run `cus doctor --fix-dirs`)")
 
     # GH #76: write the intent journal BEFORE the first mutating step. From
     # here to the post-save_state clear, a crash leaves the journal on disk
@@ -2950,8 +3079,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
 
     # Bump current account's next_swap_at_pct ladder using CONFIG steps.
     # Falls back to the hardcoded default ladder if config is missing.
-    # (Skipped for a swap-into-empty-slot: no outgoing account to bump.)
-    if current is not None:
+    # (Skipped for a swap-into-empty-slot: no outgoing account to bump, and
+    # skipped when the caller passes bump_ladder=False — the per-slot fan-out
+    # moves several slots off ONE hot account in a cycle and must advance that
+    # account's shared ladder exactly ONCE, not once per slot, else a single
+    # 50% trip could jump straight to 90% (review finding 2026-07-02).)
+    if current is not None and bump_ladder:
         config = load_config()
         cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
         ladder = list(cfg_steps) + [100]  # 100 = force sentinel
@@ -3833,6 +3966,40 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
     return out
 
 
+def session_current_slot(session_id: str) -> str | None:
+    """Resolve which slot a session is running under RIGHT NOW.
+
+    sessions.log's `account` field is a launch-time binding that goes stale
+    the moment the daemon moves a slot in place under a live session — but the
+    session's `pane` binding is stable for the session's life. So map
+    session_id → pane (from sessions.log) → mount (live /proc via
+    pane_mount_name) → slot name. Returns None for bare/non-slot sessions.
+    This is the trustworthy "where is this session now" primitive that both
+    429 attribution and lazy-warm filtering need (review findings 2026-07-02).
+    """
+    pane = None
+    for e in reversed(_parse_sessions_log()):
+        if e.get("session_id") == session_id:
+            pane = e.get("pane")
+            break
+    if not pane:
+        return None
+    mnt = pane_mount_name(pane)
+    return mnt if (mnt and mnt.startswith(SLOT_PREFIX)) else None
+
+
+def live_sessions_on_slot(slot_name: str) -> list:
+    """Live sessions currently running under a given slot, by pane→mount (live
+    /proc), NOT by sessions.log's stale launch-time account. Used for per-slot
+    lazy-swap warmth checks after an in-place move has changed the slot's
+    account out from under sessions.log (review finding 2026-07-02)."""
+    try:
+        sessions = find_live_sessions()
+    except Exception:
+        return []
+    return [s for s in sessions if pane_mount_name(s.pane) == slot_name]
+
+
 def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "AccountUsage"],
                       traces: dict | None = None) -> list[dict]:
     """Per-slot swap decisions for one cycle (Phase 3.1).
@@ -3881,11 +4048,14 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
 def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dict]:
     """per_session counterpart of check_rate_limit_reactive (Phase 3.1/4.2).
 
-    Attributes fresh 429s to accounts via sessions.log (per-session accounts
-    are trustworthy since the Phase 2.3 hook change) and returns urgent
-    (non-deferrable, tier-3) moves for every live slot those accounts occupy.
-    A 429'd account with no live slots (a bare session on ~/.claude) yields
-    no move — bare mounts are observe-only in this mode; SOS surfaces it.
+    Attributes fresh 429s to the SLOT the offending session runs on right now
+    (session → pane → live mount → slot → current occupant), NOT to the
+    launch-time account in sessions.log — that field goes stale after the
+    daemon moves a slot in place, which would misattribute the 429 to the
+    wrong account and move the wrong (or no) slot (review finding 2026-07-02).
+    Returns urgent (non-deferrable, tier-3) moves for the exact slots that hit
+    429s. A 429 from a bare session (no slot) yields no move — bare mounts are
+    observe-only in this mode; SOS surfaces it.
 
     Mutates state["last_429_check_ts"] exactly like the global variant;
     caller persists state.
@@ -3896,19 +4066,23 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dic
     state["last_429_check_ts"] = now_iso()
     if not entries:
         return []
-    session_account: dict[str, str] = {}
-    for e in _parse_sessions_log():
-        session_account[e.get("session_id", "")] = e.get("account", "")
-    hit_accounts = sorted({session_account.get(e["session_id"]) for e in entries}
-                          - {None, "", "unknown"})
-    if not hit_accounts:
+    # Resolve each 429'd session to the slot it is CURRENTLY on, then that
+    # slot's current occupant. Dedupe: one move per hit slot.
+    slot_to_account: dict[str, str] = {}
+    for e in entries:
+        slot_name = session_current_slot(e["session_id"])
+        if not slot_name:
+            continue  # bare session or resolvable-to-no-slot → observe-only
+        acct = state.get("slots", {}).get(slot_name, {}).get("account")
+        if acct:
+            slot_to_account[slot_name] = acct
+    if not slot_to_account:
         return []
     hyst = config.get("swap_hysteresis", {})
     min_gap = hyst.get("min_seconds_between_reactive_swaps", 60) if hyst.get("enabled", True) else 0
-    occupied = occupied_slot_accounts(state)
     moves: list[dict] = []
     taken: set[str] = set()
-    for acct in hit_accounts:
+    for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
             try:
@@ -3917,19 +4091,18 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dic
                     continue  # reactive hysteresis: this account just moved
             except ValueError:
                 pass
-        for slot_name in occupied.get(acct, []):
-            shim = dict(state)
-            shim["active"] = acct
-            shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
-            target = pick_swap_target(shim, config)
-            if target is None:
-                continue  # nowhere safe to go; SOS handles the all-full case
-            taken.add(target.name)
-            moves.append({
-                "slot": slot_name, "from": acct, "to": target.name,
-                "gate": "reactive_429", "tier": 3, "deferrable": False,
-                "reason": f"user-facing 429 on '{acct}' session(s); {target.reason}",
-            })
+        shim = dict(state)
+        shim["active"] = acct
+        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
+        target = pick_swap_target(shim, config)
+        if target is None:
+            continue  # nowhere safe to go; SOS handles the all-full case
+        taken.add(target.name)
+        moves.append({
+            "slot": slot_name, "from": acct, "to": target.name,
+            "gate": "reactive_429", "tier": 3, "deferrable": False,
+            "reason": f"user-facing 429 on the '{acct}' session in {slot_name}; {target.reason}",
+        })
     return moves
 
 
@@ -3937,11 +4110,12 @@ def _lazy_warm_slot_sessions(move: dict, config: dict) -> list:
     """Per-move lazy_swap gate (Phase 3.2): the sessions a slot move would
     cache-bust, when the move is deferrable and any of them is still warm.
 
-    Same contract as _lazy_warm_sessions but scoped to the move's OUTGOING
-    account: per-session accounts in sessions.log are trustworthy (Phase 2.3
-    hook), and every slot holding that account moves in the same round, so
-    account granularity == the exact set of paying sessions. Urgent moves
-    (hard cap / saturation / reactive 429) return [] — swap regardless.
+    Scoped to the move's SLOT via live pane→mount resolution, NOT to the
+    outgoing account via sessions.log: after a slot's first in-place move,
+    sessions.log still records the launch-time account, so an account_filter
+    would match nothing and silently skip the deferral it exists to provide
+    (review finding 2026-07-02). Urgent moves (hard cap / saturation /
+    reactive 429) return [] — swap regardless.
     """
     if config.get("hot_swap", {}).get("enabled", False):
         return []
@@ -3951,10 +4125,7 @@ def _lazy_warm_slot_sessions(move: dict, config: dict) -> list:
     if not move.get("deferrable", True):
         return []
     window = lazy.get("cache_window_seconds", 300)
-    try:
-        sessions = find_live_sessions(account_filter=move["from"])
-    except Exception:
-        return []
+    sessions = live_sessions_on_slot(move["slot"])
     return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
 
 
@@ -3987,9 +4158,11 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     gc_hours = config.get("per_session", {}).get("slot_gc_idle_hours", 72)
     for name in list(state.get("slots", {})):
         d = slot_path(name)
-        if d.exists() and mount_in_use(d):
-            continue
         entry = state.get("slots", {}).get(name, {})
+        # Busy = live PID OR fresh reservation (an in-flight launch mid-install
+        # that hasn't exec'd claude yet — don't reap the dir out from under it).
+        if d.exists() and _slot_busy(name, entry):
+            continue
         ref_ts = entry.get("last_launch_ts") or entry.get("created_ts")
         if not ref_ts:
             continue
@@ -4026,6 +4199,11 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
             click.echo(f"   {name}{occ}: 5h={acct.get('current_5h_pct', 0):.1f}%, 7d={acct.get('current_7d_pct', 0):.1f}%, next={acct.get('next_swap_at_pct', 50)}%{te}")
         return
 
+    # Fan-out ladder dedup (review finding 2026-07-02): several slots on ONE
+    # hot account move in the same cycle, but that account's ladder step is
+    # shared and must advance exactly once — the first executed move bumps it,
+    # the rest pass bump_ladder=False.
+    ladder_bumped: set[str] = set()
     for move in moves:
         label = f"{move['slot']}: {move['from']} -> {move['to']}"
         warm = _lazy_warm_slot_sessions(move, config)
@@ -4048,7 +4226,9 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
             ))
             continue
         try:
-            execute_swap(move["to"], trigger=f"auto-{move['gate']}", slot=move["slot"])
+            bump = move["from"] not in ladder_bumped
+            execute_swap(move["to"], trigger=f"auto-{move['gate']}", slot=move["slot"], bump_ladder=bump)
+            ladder_bumped.add(move["from"])
             click.echo(f"    moved in place — session on {move['slot']} continues uninterrupted")
             _log_decision(_build_decision_record(
                 state, config, action="swap", gate=move["gate"], reason=move["reason"],
@@ -8827,6 +9007,14 @@ def rename_cmd(old_name: str, new_name: str) -> None:
             state["accounts"][new_name] = state["accounts"].pop(old_name)
         if state.get("active") == old_name:
             state["active"] = new_name
+        # per_session: a slot holding the renamed account must follow, or the
+        # per-slot decision loop shims a now-missing account name into
+        # decide_swap and raises KeyError every cycle (swallowed by the daemon
+        # loop → silent no-op; fatal for `cus daemon --once`). Review finding
+        # 2026-07-02.
+        for slot_entry in (state.get("slots", {}) or {}).values():
+            if slot_entry.get("account") == old_name:
+                slot_entry["account"] = new_name
         for entry in state.get("swap_history", []):
             if entry.get("from") == old_name:
                 entry["from"] = new_name
@@ -9033,8 +9221,11 @@ def _launch_prepare(account: str | None, state: dict, config: dict) -> tuple[str
         click.echo(click.style(f"warning: '{account}' is flagged token_expired — the session may demand /login "
                                f"(fix first: `cus relogin {account}`)", fg="yellow"))
 
+    # acquire_slot persists the reservation itself (under the swap lock), so a
+    # concurrent launch / the daemon's gc already see this slot as claimed —
+    # no save_state here (it would re-write our possibly-staler `state` over
+    # acquire's fresh persist).
     slot_name, slot_dir = acquire_slot(state, prefer_account=account)
-    save_state(state)
 
     # Pre-flight: heal the slot's layout quietly (a launch should never come
     # up bare-hooked because a symlink rotted), then align its .claude.json
@@ -9184,7 +9375,12 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
         if mount_in_use(d):
             click.echo(f"  {d.name}: still live — left in place (unmanaged)")
             continue
-        result = gc_slot(d.name, state)
+        # force=True so a lingering reservation (an in-flight launch that never
+        # exec'd) doesn't block teardown — we've already refused above if any
+        # slot has a LIVE process, so a non-live reserved slot is safe to reap
+        # (save-back still runs). Without force, mode global could leave
+        # reserved-but-dead slots behind.
+        result = gc_slot(d.name, state, force=True)
         if result["action"] == "reaped":
             sb = result["saveback"]
             click.echo(f"  {d.name}: reaped (save-back {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")")

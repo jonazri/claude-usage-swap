@@ -180,19 +180,26 @@ def test_reactive_429_attributes_to_slot_account():
         from datetime import datetime, timedelta, timezone
         def _iso(minutes_ago: float) -> str:
             return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
-        # sessions.log: session sA is on alpha (per-session accounts are
-        # trustworthy post-Phase-2.3); the 429 hit sA.
+        # sessions.log records the panes; the 429 hit sA. Attribution now
+        # resolves session → CURRENT slot via /proc (session_current_slot),
+        # not the stale launch-time account field — stub it since there are no
+        # real processes on the panes in-test. sA is on slot-1 (alpha), sB on
+        # slot-2 (beta).
         cus.SESSIONS_LOG.write_text(f"{_iso(10)},sA,alpha,%1,/tmp\n{_iso(10)},sB,beta,%2,/tmp\n")
         cus.RATE_LIMIT_LOG.write_text(f"{_iso(1)},sA,429 rate limit\n")
         state["last_429_check_ts"] = _iso(5)
+        _orig_scs = cus.session_current_slot
+        cus.session_current_slot = lambda sid: {"sA": s1}.get(sid)
+        try:
+            moves = cus.check_rate_limit_reactive_per_session(state, _config())
+            assert len(moves) == 1
+            assert moves[0]["slot"] == s1 and moves[0]["from"] == "alpha"
+            assert moves[0]["deferrable"] is False and moves[0]["gate"] == "reactive_429"
 
-        moves = cus.check_rate_limit_reactive_per_session(state, _config())
-        assert len(moves) == 1
-        assert moves[0]["slot"] == s1 and moves[0]["from"] == "alpha"
-        assert moves[0]["deferrable"] is False and moves[0]["gate"] == "reactive_429"
-
-        # Watermark advanced → same entries don't re-trigger.
-        assert cus.check_rate_limit_reactive_per_session(state, _config()) == []
+            # Watermark advanced → same entries don't re-trigger.
+            assert cus.check_rate_limit_reactive_per_session(state, _config()) == []
+        finally:
+            cus.session_current_slot = _orig_scs
     finally:
         env.restore()
 

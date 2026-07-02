@@ -112,9 +112,17 @@ def test_create_slot_allocates_lowest_free_index():
         n1, _ = cus.create_slot(state)
         n2, _ = cus.create_slot(state)
         assert (n1, n2) == ("slot-1", "slot-2")
-        # gc slot-1, next create reuses index 1
+        # New slots carry a fresh reservation (protects an in-flight launch);
+        # clear it so gc treats slot-1 as reapable (simulates the reservation
+        # having expired / the session having come and gone).
+        for e in state["slots"].values():
+            e.pop("reserved_until", None)
+        # gc slot-1, next create reuses index 1. Persist the gc'd pop —
+        # create_slot reloads state from disk under the lock, so the drop must
+        # be on disk (real callers save_state after gc, as slot_gc_cmd does).
         result = cus.gc_slot("slot-1", state)
         assert result["action"] == "reaped"
+        cus.save_state(state)
         n3, _ = cus.create_slot(state)
         assert n3 == "slot-1"
         assert set(state["slots"]) == {"slot-1", "slot-2"}
@@ -251,6 +259,10 @@ def test_gc_slot_refuses_in_use_then_reaps():
         assert d.exists()
 
         cus.mount_pids = lambda mount: []
+        # A fresh reservation also blocks gc (in-flight-launch guard) — verify
+        # that, then clear it to exercise the actual reap.
+        assert cus.gc_slot(name, state)["action"] == "refused_reserved"
+        state["slots"][name].pop("reserved_until", None)
         r = cus.gc_slot(name, state)
         assert r["action"] == "reaped"
         assert r["saveback"]["action"] == "saved"
