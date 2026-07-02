@@ -605,6 +605,12 @@ class AccountUsage:
     seven_day: UsageWindow | None = None
     seven_day_sonnet: UsageWindow | None = None
     seven_day_opus: UsageWindow | None = None
+    # Per-model WEEKLY utilization keyed by model display_name (e.g. "Fable",
+    # "Sonnet", "Opus"). The usage API exposes per-model data only at weekly
+    # granularity — there is NO per-model 5-hour window (`five_hour` is
+    # aggregate). Populated from the `limits[]` array's model-scoped entries
+    # plus the legacy seven_day_sonnet/opus fields. See _parse_per_model_weekly.
+    per_model_weekly: dict = field(default_factory=dict)  # {display_name: UsageWindow}
     token_expired: bool = False
     token_stale: bool = False
     polled_at: str = field(default_factory=now_iso)
@@ -987,9 +993,54 @@ def poll_account_usage(account_name: str) -> AccountUsage:
         seven_day=parse_window(data.get("seven_day")),
         seven_day_sonnet=parse_window(data.get("seven_day_sonnet")),
         seven_day_opus=parse_window(data.get("seven_day_opus")),
+        per_model_weekly=_parse_per_model_weekly(data),
         polled_at=now_iso(),
         raw=data,
     )
+
+
+def _parse_per_model_weekly(data: dict) -> dict:
+    """Extract per-model WEEKLY utilization from the usage API response.
+
+    The API exposes per-model usage only at weekly granularity — there is NO
+    per-model 5-hour window (`five_hour` is aggregate across all models). Two
+    sources are merged:
+
+      1. The `limits[]` array — each entry may carry `scope.model.display_name`
+         (e.g. "Fable"). The weekly-group, model-scoped entries give that
+         model's weekly %. This is the forward-looking structured source: newer
+         models (Fable) appear ONLY here, not as a dedicated top-level field.
+      2. Legacy dedicated fields `seven_day_sonnet` / `seven_day_opus`, kept for
+         models that predate the `limits[]` scoping.
+
+    Returns {display_name: UsageWindow}. The `limits[]` value wins on conflict
+    (it's the live structured value); legacy fields fill in models absent there.
+    Robust to the API's in-flux shape — any malformed entry is skipped, never
+    raised, so a schema tweak can't take polling down.
+    """
+    out: dict[str, UsageWindow] = {}
+    # Legacy named fields first, so limits[] can override them.
+    for field_name, model in (("seven_day_sonnet", "Sonnet"), ("seven_day_opus", "Opus")):
+        obj = data.get(field_name)
+        if isinstance(obj, dict) and obj.get("utilization") is not None:
+            out[model] = UsageWindow(utilization=float(obj["utilization"]),
+                                     resets_at=obj.get("resets_at"))
+    # limits[] model-scoped weekly entries (authoritative).
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        for entry in limits:
+            if not isinstance(entry, dict) or entry.get("group") != "weekly":
+                continue
+            scope = entry.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            if not isinstance(model, dict):
+                continue
+            name = model.get("display_name")
+            pct = entry.get("percent")
+            if name and pct is not None:
+                out[name] = UsageWindow(utilization=float(pct),
+                                        resets_at=entry.get("resets_at"))
+    return out
 
 
 def current_max_pct(usage: AccountUsage, config: dict) -> float:
@@ -2577,6 +2628,16 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["five_hour_resets_at"] = u.five_hour.resets_at
         if u.seven_day and u.seven_day.resets_at:
             acct["seven_day_resets_at"] = u.seven_day.resets_at
+        # Per-model WEEKLY utilization (GH: fable/sonnet tracking). Persisted as
+        # a flat {model: pct} dict so `cus status` and the weekly-cap gate can
+        # read it from state.json without a live poll. Only written on a
+        # SUCCESSFUL poll (this branch); the error branches above `continue`
+        # early, preserving the prior dict — same preserve-on-error semantics as
+        # current_*_pct. An empty result clears it (no model-scoped limits =
+        # none active).
+        acct["per_model_weekly_pct"] = {
+            model: win.utilization for model, win in u.per_model_weekly.items()
+        }
     return state
 
 
@@ -4902,6 +4963,14 @@ def status() -> None:
                 rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
                 est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
         click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
+        # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
+        # sub-line only for accounts that have any, sorted highest-first so a
+        # model nearing its own weekly cap is the first thing the eye lands on.
+        # 5h is intentionally absent — the API has no per-model 5h window.
+        pm = a.get("per_model_weekly_pct") or {}
+        if pm:
+            parts = "  ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+            click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
     # Locks
