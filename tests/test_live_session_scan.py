@@ -26,6 +26,8 @@ import cus  # noqa: E402
 
 
 def _now_iso() -> str:
+    """UTC timestamp in cus's sessions.log format (Z-suffixed, seconds
+    precision) — used to write recent-looking log + transcript entries."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -56,10 +58,13 @@ def _setup_env(tmp: Path, n_stale: int = 50):
     cus.CLAUDE_DIR = claude_dir
     cus.SESSIONS_LOG = sessions_log
     cus.STOPS_LOG = tmp / "stops.log"  # absent — liveness rides on transcripts
+    cus._TRANSCRIPT_INDEX_CACHE.clear()  # don't inherit a prior test's scan
     return saved, live_sid
 
 
 def _restore(saved):
+    """Undo _setup_env's monkeypatch. `saved` is the 3-tuple _setup_env
+    returned: (CLAUDE_DIR, SESSIONS_LOG, STOPS_LOG), restored positionally."""
     cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG = saved
 
 
@@ -121,8 +126,36 @@ def test_transcript_index_missing_projects_root():
     with tempfile.TemporaryDirectory() as td:
         saved = (cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG)
         cus.CLAUDE_DIR = Path(td) / "nonexistent"
+        cus._TRANSCRIPT_INDEX_CACHE.clear()
         try:
             assert cus._transcript_index() == {}
+        finally:
+            _restore(saved)
+
+
+def test_resolve_transcript_prefers_session_cwd_over_duplicate():
+    """Review finding 2026-07-02: a session id duplicated across two project
+    dirs must resolve to the transcript in the SESSION'S OWN cwd, not to
+    whichever the index glob happened to see last — else a stale duplicate
+    shadows the live transcript and the session can be dropped / mis-swapped."""
+    with tempfile.TemporaryDirectory() as td:
+        saved, _ = _setup_env(Path(td))
+        try:
+            sid = "dup-session"
+            own = cus.CLAUDE_DIR / "projects" / "-home-x-mine"
+            other = cus.CLAUDE_DIR / "projects" / "-home-x-stale"
+            own.mkdir(parents=True); other.mkdir(parents=True)
+            own_t = own / f"{sid}.jsonl"; own_t.write_text("{}\n")
+            (other / f"{sid}.jsonl").write_text("{}\n")
+            cus._TRANSCRIPT_INDEX_CACHE.clear()
+            idx = cus._transcript_index()
+            # cwd-first wins regardless of which dir the index cached.
+            resolved = cus._resolve_transcript(sid, "/home/x/mine", idx)
+            assert resolved == own_t, f"expected the session's own-cwd transcript, got {resolved}"
+            # No cwd → falls back to the index (arbitrary but present).
+            assert cus._resolve_transcript(sid, "", idx) is not None
+            # Unknown session, no cwd → None.
+            assert cus._resolve_transcript("nope", "", idx) is None
         finally:
             _restore(saved)
 

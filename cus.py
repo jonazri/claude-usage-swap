@@ -3702,7 +3702,15 @@ def _latest_stops_per_session() -> dict[str, str]:
     return result
 
 
-def _transcript_index() -> dict[str, Path]:
+# Per-scan cache of the transcript index, keyed by CLAUDE_DIR so tests with
+# separate temp trees never share entries. GH #91 follow-up (review finding
+# 2026-07-02): find_live_sessions can run more than once per daemon cycle
+# (lazy_warm + migrating_panes), and each rebuild walks the whole projects
+# tree; a short TTL lets the repeated calls in one cycle share a single scan.
+_TRANSCRIPT_INDEX_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     """One-shot {session_id: transcript_path} index of ~/.claude/projects.
 
     GH #91: find_live_sessions used to call _find_transcript() per session,
@@ -3714,18 +3722,47 @@ def _transcript_index() -> dict[str, Path]:
     the daemon loop mid-swap exactly when observability mattered most.
 
     A single glob("*/*.jsonl") walk visits each project dir once (~11k
-    entries, sub-second) and makes every per-session lookup O(1). Duplicate
-    session ids across project dirs are possible in principle (transcript
-    moved between cwds); last-seen wins, matching the old fallback's
-    "first glob hit" arbitrariness closely enough for liveness inference.
+    entries, sub-second) and makes every per-session lookup O(1). This index
+    is used only as the FALLBACK for a session whose deterministic
+    cwd-encoded path is missing — find_live_sessions still resolves the
+    cwd-encoded candidate first (see there), so a duplicate session id in
+    another project dir cannot shadow the transcript in the session's own
+    cwd (review finding 2026-07-02). Among genuine duplicates with no cwd
+    match, last-seen wins — close enough to the old fallback's arbitrary
+    "first glob hit" for liveness inference.
+
+    Cached for `max_age_seconds` (keyed by CLAUDE_DIR) so repeated
+    find_live_sessions calls within one daemon cycle share the scan.
     """
+    key = str(CLAUDE_DIR)
+    now = time.monotonic()
+    hit = _TRANSCRIPT_INDEX_CACHE.get(key)
+    if hit and now - hit[0] < max_age_seconds:
+        return hit[1]
     projects_root = CLAUDE_DIR / "projects"
     index: dict[str, Path] = {}
-    if not projects_root.exists():
-        return index
-    for jsonl in projects_root.glob("*/*.jsonl"):
-        index[jsonl.stem] = jsonl
+    if projects_root.exists():
+        for jsonl in projects_root.glob("*/*.jsonl"):
+            index[jsonl.stem] = jsonl
+    _TRANSCRIPT_INDEX_CACHE[key] = (now, index)
     return index
+
+
+def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Path | None:
+    """Deterministic cwd-first transcript resolution with an O(1) index
+    fallback (GH #91 + review finding 2026-07-02).
+
+    The session's own cwd-encoded path is tried FIRST — that is where Claude
+    Code actually writes this session's transcript, so it is never shadowed
+    by a same-id duplicate from another project dir. Only when that direct
+    candidate is absent do we fall back to the prebuilt index (O(1)), never
+    to the minutes-long full-tree glob that _find_transcript's fallback runs.
+    """
+    if cwd:
+        candidate = CLAUDE_DIR / "projects" / cwd.replace("/", "-") / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+    return index.get(session_id)
 
 
 def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
@@ -3767,10 +3804,11 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
             except ValueError:
                 pass
 
-        # GH #91: O(1) index lookup instead of _find_transcript(), whose
-        # glob fallback made this loop take minutes at sessions.log scale
-        # (see _transcript_index docstring for the incident numbers).
-        transcript = transcripts.get(sid)
+        # GH #91: deterministic cwd-first resolution + O(1) index fallback,
+        # never the minutes-long glob that _find_transcript's fallback runs
+        # (see _resolve_transcript / _transcript_index for the incident
+        # numbers and the duplicate-id correctness note).
+        transcript = _resolve_transcript(sid, e.get("cwd", ""), transcripts)
         if transcript and transcript.exists():
             mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
             if (now - mtime).total_seconds() < 3600:
@@ -4379,6 +4417,14 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         if c:
             cwd_pane_count[c] = cwd_pane_count.get(c, 0) + 1
 
+    # GH #91 follow-up (review finding 2026-07-02): build the transcript index
+    # ONCE for the whole pane sweep and resolve every candidate through it
+    # (cwd-first + O(1) index fallback), instead of _validate globbing the
+    # projects tree per pane and the per-pane loop using a lossy cwd-only
+    # lookup. Cached, so this shares the same scan as any find_live_sessions
+    # call in the cycle.
+    transcripts = _transcript_index()
+
     out: list[LiveSession] = []
     for pane, e in by_pane.items():
         if account_filter and e["account"] != account_filter:
@@ -4413,7 +4459,8 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         live_sid = pane_live_session_id(pane)
 
         def _validate(cand_sid: str) -> Path | None:
-            t = _find_transcript(cand_sid, cwd)
+            # cwd-first + O(1) index fallback (no full-tree glob) — GH #91.
+            t = _resolve_transcript(cand_sid, cwd, transcripts)
             return t if (t and t.exists()) else None
 
         sid = None
@@ -4502,16 +4549,15 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             pe_sid = pe.get("session_id")
             if not pe_sid or pe_sid == sid:
                 continue
-            # Direct path lookup only (skip _find_transcript's fallback
-            # glob across all project dirs — that scan is O(projects) per
-            # call and would push the whole function back over 5s on
-            # 3000-entry logs). Sessions.log entries written by our own
-            # SessionStart hook always record an absolute cwd, so the
-            # canonical encoded-path lookup is sufficient.
+            # cwd-first + O(1) index fallback (GH #91 review finding
+            # 2026-07-02): the old code did an encoded-cwd-only lookup to
+            # avoid _find_transcript's O(projects) glob — correct on the fast
+            # path but lossy when a transcript moved cwd. The prebuilt index
+            # gives the same fallback the glob provided, still O(1) per entry.
             pe_cwd = pe.get("cwd", cwd)
-            if not pe_cwd:
+            pe_t = _resolve_transcript(pe_sid, pe_cwd, transcripts)
+            if pe_t is None:
                 continue
-            pe_t = CLAUDE_DIR / "projects" / pe_cwd.replace("/", "-") / f"{pe_sid}.jsonl"
             try:
                 pe_mtime = pe_t.stat().st_mtime
             except (OSError, FileNotFoundError):
@@ -6518,11 +6564,17 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 one_cycle()
             except Exception as e:
                 click.echo(f"ERROR in cycle: {type(e).__name__}: {e}", err=True)
-            cycle_secs = time.monotonic() - cycle_t0
             # GH #59: adaptive repoll — wake just after the soonest known 5h
             # reset (if sooner than the normal interval) to refresh real data
             # promptly instead of running on the countdown-inferred value.
             intended = _adaptive_sleep_seconds(load_state(), config, interval)
+            # Freeze `took` AFTER the adaptive-sleep computation (which itself
+            # does a load_state()): otherwise the state read + these log lines
+            # sit in a window counted by neither `took` nor `sleeping` — the
+            # exact silent-gap blind spot this heartbeat exists to close
+            # (review finding 2026-07-02). Everything from cycle_t0 to the
+            # time.sleep() below is now attributed to `took`.
+            cycle_secs = time.monotonic() - cycle_t0
             # GH #91 heartbeat: log cycle wall-clock + intended sleep every
             # tick, so an inter-cycle gap in the log is attributable — a slow
             # cycle body shows up in `took`, a deliberate long sleep in
@@ -6531,18 +6583,31 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             # (11-min silent gap during a swap+burn) was undiagnosable for
             # lack of exactly this line.
             click.echo(f"[{now_iso()}] cycle end. took {cycle_secs:.1f}s; sleeping {intended:.0f}s")
-            if cycle_secs > interval:
-                click.echo(f"  WARNING: cycle body ({cycle_secs:.0f}s) exceeded "
-                           f"the {interval:.0f}s tick — in-cycle stall (GH #91)")
+            # In-cycle-stall threshold: a cold-start cycle legitimately polls
+            # every account at once, each with up to USAGE_API_TIMEOUT_SECONDS
+            # plus polling.stagger_seconds between them, which can exceed one
+            # tick without being a stall (review finding 2026-07-02). Warn only
+            # past a bound that accounts for that worst-case poll budget.
+            stagger = config.get("polling", {}).get("stagger_seconds", 0) or 0
+            n_acct = len(load_state().get("accounts", {}))
+            poll_budget = n_acct * (USAGE_API_TIMEOUT_SECONDS + stagger)
+            stall_threshold = max(interval, poll_budget)
+            if cycle_secs > stall_threshold:
+                click.echo(f"[{now_iso()}]   WARNING: cycle body ({cycle_secs:.0f}s) exceeded "
+                           f"the {stall_threshold:.0f}s stall threshold — in-cycle stall (GH #91)")
             slept_t0 = time.monotonic()
             time.sleep(intended)
             overslept = time.monotonic() - slept_t0 - intended
-            # 30s slop: time.sleep() legitimately overshoots by scheduler
-            # jitter; only flag gaps big enough to mean starvation/suspend.
-            if overslept > 30:
+            # Oversleep slop scales with the intended sleep: adaptive repoll can
+            # shrink `intended` to ~30s near a 5h reset, where a fixed 30s slop
+            # would false-positive on ordinary jitter (review finding
+            # 2026-07-02). max(30, 0.5*intended) keeps the absolute floor for
+            # long sleeps while widening the band for short adaptive ones.
+            slop = max(30.0, 0.5 * intended)
+            if overslept > slop:
                 click.echo(f"[{now_iso()}] WARNING: overslept by {overslept:.0f}s "
-                           f"(intended {intended:.0f}s) — scheduler starvation "
-                           f"or system suspend (GH #91)")
+                           f"(intended {intended:.0f}s, slop {slop:.0f}s) — scheduler "
+                           f"starvation or system suspend (GH #91)")
     except KeyboardInterrupt:
         click.echo("\ndaemon stopped.")
 
