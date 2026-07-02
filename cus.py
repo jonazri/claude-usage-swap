@@ -998,6 +998,31 @@ def mount_pids(mount: Path) -> list[int]:
     return pids
 
 
+def pane_mount_name(pane: str) -> str | None:
+    """Which mount ('slot-N' / 'account-X') a tmux pane's claude process uses.
+
+    None = bare/global (~/.claude/) or undeterminable. Walks the pane's
+    process tree to the claude pid and reads its /proc environ — same ground
+    truth as mount_pids, from the pane side (for `cus status` display).
+    """
+    if not pane or pane == "no-tmux":
+        return None
+    try:
+        pid = _pane_pid(pane)
+        if not pid:
+            return None
+        cpid = _find_descendant_claude_pid(pid) or pid
+    except Exception:
+        return None
+    cfg = _pid_config_dir(cpid)
+    if not cfg:
+        return None
+    p = Path(cfg).expanduser()
+    if p.parent == ACCOUNTS_DIR and (p.name.startswith(SLOT_PREFIX) or p.name.startswith("account-")):
+        return p.name
+    return None
+
+
 def mount_account_from_env(state: dict) -> tuple[str | None, str | None]:
     """Resolve (mount_name, account) from this process's own CLAUDE_CONFIG_DIR.
 
@@ -4462,6 +4487,66 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         except (ValueError, OSError):
             pass
 
+    # ---- per_session conditions (Phase 4.2 guardrail audit) ----
+
+    # Condition 7: slot↔account drift — GH #2 reframed for slots. The slot's
+    # on-disk identity is what its session actually uses; state.slots is what
+    # the daemon BELIEVES. A mismatch means usage attribution, polling cadence
+    # and swap decisions for that slot are all against the wrong account.
+    for slot_name, entry in sorted(state.get("slots", {}).items()):
+        acct = entry.get("account")
+        if not acct:
+            continue
+        d = slot_path(slot_name)
+        cj = mount_claude_json_path(d)
+        if not cj.exists():
+            continue
+        try:
+            slot_ids = _identity_fields(read_json(cj))
+        except (json.JSONDecodeError, OSError):
+            continue
+        match = _identities_match(slot_ids, _dir_identity(acct))
+        if match is False:  # None = no shared evidence — can't say, stay quiet
+            out.append(SOSCondition(
+                severity="critical",
+                summary=f"{slot_name} identity does not match its assigned account '{acct}' (slot↔state drift, GH #2 class)",
+                action=(f"The slot's live files hold a different account than state.json claims. "
+                        f"Check `python3 ~/repos/claude-usage-swap/cus.py slot list` and the slot's .claude.json oauthAccount; "
+                        f"fix state.json slots.{slot_name}.account to match reality (record reality — do NOT swap first)."),
+                affected=slot_name,
+            ))
+
+    # Condition 8: bare session burning a hot account. In per_session mode the
+    # daemon never swaps ~/.claude/ (3.4) — so a bare session riding the global
+    # active past its ladder is invisible to the per-slot loop and will hit the
+    # account's caps. The remedy is launching slotted, not a swap.
+    if config.get("mode", "global") == "per_session" and state.get("active"):
+        active_name = state["active"]
+        active_acct = accounts.get(active_name, {})
+        threshold = active_acct.get("next_swap_at_pct", THRESHOLD_STEPS[0])
+        eff = max(active_acct.get("current_5h_pct", 0), active_acct.get("current_7d_pct", 0))
+        if eff >= threshold and mount_in_use(CLAUDE_DIR):
+            out.append(SOSCondition(
+                severity="warning",
+                summary=(f"Bare session(s) on ~/.claude/ are burning '{active_name}' at {eff:.0f}% "
+                         f"(>= its {threshold}% step) — per_session mode will NOT swap the global mount"),
+                action=("Exit the bare session and relaunch slotted: `cus launch` "
+                        "(or add the alias: alias claude='cus launch auto --')."),
+                affected=active_name,
+            ))
+
+    # Condition 9: orphan slot dirs — real credentials on disk that no state
+    # entry tracks (a crash between mkdir and state save, or hand-made dirs).
+    known_slots = set(state.get("slots", {}))
+    for d in list_slot_dirs():
+        if d.name not in known_slots and mount_creds_path(d).exists():
+            out.append(SOSCondition(
+                severity="warning",
+                summary=f"Orphan slot dir {d.name} holds credentials but has no state entry",
+                action=f"Reap it (saves creds back first): `python3 ~/repos/claude-usage-swap/cus.py slot gc --slot {d.name}`",
+                affected=d.name,
+            ))
+
     return out
 
 
@@ -6587,7 +6672,11 @@ def status() -> None:
 
     state = read_json(STATE_JSON)
     config = load_config()
-    click.echo(f"Active account: {state['active']}")
+    per_session = config.get("mode", "global") == "per_session"
+    if per_session:
+        click.echo(f"Mode: per_session (global mount observe-only). Bare-launch account: {state['active']}")
+    else:
+        click.echo(f"Active account: {state['active']}")
     click.echo()
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 104)
@@ -6625,6 +6714,23 @@ def status() -> None:
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
+    # Slots (per_session): slot → account → live pids, with any orphan dirs.
+    slots_state = state.get("slots", {}) or {}
+    slot_dirs_on_disk = list_slot_dirs()
+    if slots_state or slot_dirs_on_disk:
+        click.echo("Slots:")
+        seen = set()
+        for d in slot_dirs_on_disk:
+            seen.add(d.name)
+            entry = slots_state.get(d.name, {})
+            pids = mount_pids(d)
+            live_col = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+            orphan = "" if d.name in slots_state else click.style("  [orphan — not in state]", fg="yellow")
+            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{orphan}")
+        for name in sorted(set(slots_state) - seen):
+            click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
+        click.echo()
+
     # Locks
     pins = config.get("session_locks", {}).get("pinned", {}) or {}
     patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
@@ -6649,11 +6755,27 @@ def status() -> None:
         hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
         click.echo(f"Live sessions ({len(live)}):")
         for s in live:
+            # per_session: the pane's own mount (via /proc) is ground truth —
+            # slot sessions show pane → slot → account; anything on the global
+            # mount is flagged `bare` (observe-only in this mode, 3.4).
             # Background mode: every session follows the global creds → its true
             # account is machine_active (pins are advisory swap-policy only, they
             # do NOT route creds per-session — see session_is_pinned). Hot-swap
             # mode: a pane keeps its loaded creds until relaunch, so the recorded
             # SessionStart account is the better estimate.
+            if per_session:
+                mnt = pane_mount_name(s.pane)
+                if mnt and mnt.startswith(SLOT_PREFIX):
+                    eff = state.get("slots", {}).get(mnt, {}).get("account") or s.account
+                    where = f"slot={mnt:<8}"
+                elif mnt:  # account-dir launch (relogin flow)
+                    eff = mnt.removeprefix("account-")
+                    where = f"mount={mnt} "
+                else:
+                    eff = machine_active
+                    where = click.style("bare      ", fg="yellow")
+                click.echo(f"  {s.session_id[:8]}  account={eff:<10} pane={s.pane:<8} {where} cwd={s.cwd}")
+                continue
             eff = s.account if hot_swap_on else machine_active
             drift = "" if eff == s.account else f" (start:{s.account})"
             click.echo(f"  {s.session_id[:8]}  account={eff:<10} pane={s.pane:<8}{drift} cwd={s.cwd}")
@@ -7456,6 +7578,8 @@ def hooks_list_cmd() -> None:
 
 
 CONFIG_EXPLAIN_MAP: dict[str, str] = {
+    "mode": "Live-mount topology (docs/plans/2026-07-02-per-session-accounts.md). `global` (default): one live mount (~/.claude/), the daemon swaps it in place, every session follows the active account. `per_session`: each session launched via `cus launch` gets its own slot dir (~/claude-accounts/slot-N/) holding one account; the daemon swaps individual slots in place (sessions never restart) and NEVER writes ~/.claude/ (bare launches are observed, not swapped). Switch with `cus mode per-session` / `cus mode global` — never edit this key by hand mid-flight.",
+    "per_session": "per_session-mode tuning. `slot_gc_idle_hours: 72`: how long a slot may sit with no live session before the daemon reaps it (credentials save back to the owning account dir first). Long default because a free slot is a reuse candidate for the next `cus launch` (no swap needed when it already holds the right account).",
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
     "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
     "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
@@ -8962,6 +9086,112 @@ def launch_cmd(account: str | None, claude_args: tuple[str, ...]) -> None:
     # execvpe replaces this process — claude runs as if launched directly
     # from the shell (signals, tty, exit code all pass through untouched).
     os.execvpe("claude", ["claude", *claude_args], env)
+
+
+def _set_config_mode(new_mode: str) -> None:
+    """Flip config.yaml's mode key with a TEXTUAL edit, not a YAML rewrite.
+
+    write_yaml would round-trip the whole file through safe_dump and destroy
+    every hand-written comment in the production config — the mode line is
+    one key, so edit one line.
+    """
+    if CONFIG_YAML.exists():
+        text = CONFIG_YAML.read_text()
+        if re.search(r"(?m)^mode:", text):
+            text = re.sub(r"(?m)^mode:.*$", f"mode: {new_mode}", text)
+        else:
+            text = f"mode: {new_mode}\n{text}"
+        atomic_write_bytes(CONFIG_YAML, text.encode())
+    else:
+        write_yaml(CONFIG_YAML, {"mode": new_mode})
+
+
+@cli.command(name="mode")
+@click.argument("new_mode", required=False, type=click.Choice(["per-session", "per_session", "global"]))
+@click.option("--force", is_flag=True, help="global transition: proceed even with live slot sessions (they keep running, unmanaged).")
+def mode_cmd(new_mode: str | None, force: bool) -> None:
+    """Show or switch the live-mount topology (global | per_session).
+
+    per-session: validates every pool account (doctor-heals its dir, checks
+    its snapshot carries a refresh token), ensures one free slot exists, and
+    flips config. The global mount keeps whatever account it holds — bare
+    launches continue working, observe-only.
+
+    global: reaps every idle slot (credentials saved back), flips config.
+    Walk-back is always `cus mode global` — global-mode code paths are
+    untouched by per_session, so it restores today's exact behavior.
+
+    Both directions need a daemon restart to take effect mid-cycle:
+    `systemctl --user restart cus.service` (the daemon re-reads config each
+    cycle, so a running daemon picks it up next cycle anyway).
+    """
+    config = load_config()
+    current = config.get("mode", "global")
+    if new_mode is None:
+        click.echo(f"mode: {current}")
+        return
+    new_mode = "per_session" if new_mode == "per-session" else new_mode
+    if new_mode == current:
+        click.echo(f"already in mode {current}")
+        return
+
+    state = load_state()
+    if new_mode == "per_session":
+        # Validation: every pool account must be a healthy launch source.
+        problems: list[str] = []
+        for name in sorted(state.get("accounts", {})):
+            d = ACCOUNTS_DIR / f"account-{name}"
+            if not d.exists():
+                problems.append(f"account-{name}: dir missing")
+                continue
+            healed = doctor_mount(d, fix=True)
+            for f in healed:
+                click.echo(f"  doctor healed account-{name}/{f['entry']} ({f['problem']})")
+            creds = d / ".credentials.json"
+            try:
+                oauth = read_json(creds).get("claudeAiOauth", {}) if creds.exists() else {}
+            except (json.JSONDecodeError, OSError):
+                oauth = {}
+            if not oauth.get("refreshToken"):
+                problems.append(f"account-{name}: snapshot has no refresh token — `cus relogin {name}` first")
+            if state["accounts"][name].get("token_expired"):
+                problems.append(f"account-{name}: flagged token_expired — `cus relogin {name}` first")
+        if problems:
+            click.echo(click.style("cannot enter per_session mode:", fg="red"))
+            for p in problems:
+                click.echo(f"  - {p}")
+            sys.exit(1)
+        if not any(not mount_in_use(d) for d in list_slot_dirs()):
+            name, _ = create_slot(state)
+            save_state(state)
+            click.echo(f"  created first slot: {name}")
+        _set_config_mode("per_session")
+        click.echo(click.style("mode: per_session", fg="green", bold=True))
+        click.echo("  launch sessions with `cus launch` (or: alias claude='cus launch auto --')")
+        click.echo("  bare `claude` keeps working on ~/.claude/ — observed, never swapped")
+        click.echo("  rollout note: consider relaxing polling.active_interval_seconds (e.g. 300) —")
+        click.echo("  N occupied accounts poll at the fast cadence now (429-budget, see plan 3.3)")
+        click.echo("  walk-back: `cus mode global`")
+        return
+
+    # → global
+    live = [d.name for d in list_slot_dirs() if mount_in_use(d)]
+    if live and not force:
+        click.echo(click.style(f"live slot session(s): {', '.join(live)} — exit them first, or --force "
+                               f"(they keep running but become unmanaged)", fg="red"))
+        sys.exit(1)
+    for d in list_slot_dirs():
+        if mount_in_use(d):
+            click.echo(f"  {d.name}: still live — left in place (unmanaged)")
+            continue
+        result = gc_slot(d.name, state)
+        if result["action"] == "reaped":
+            sb = result["saveback"]
+            click.echo(f"  {d.name}: reaped (save-back {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")")
+    save_state(state)
+    _set_config_mode("global")
+    click.echo(click.style("mode: global", fg="green", bold=True))
+    click.echo(f"  ~/.claude/ still holds '{state.get('active')}' — `cus switch <name>` to change")
 
 
 @cli.command(name="init-systemd")

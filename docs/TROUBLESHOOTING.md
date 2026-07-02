@@ -74,9 +74,47 @@ systemctl --user restart cus.service
 rm ~/claude-accounts/daemon.pid
 ```
 
+### `slot-N identity does not match its assigned account` (per_session)
+
+The slot's on-disk `.claude.json` identity differs from what `state.json` `slots.<name>.account` claims — the GH #2 drift class, reframed for slots. Usage attribution and swap decisions for that slot are against the wrong account until fixed.
+
+```bash
+cus slot list                    # what state believes
+# what the slot actually holds:
+python3 -c "import json; print(json.load(open('$HOME/claude-accounts/slot-N/.claude.json'))['oauthAccount']['emailAddress'])"
+# Fix state.json slots.slot-N.account to match REALITY (record reality — do
+# NOT run a swap first; its save-back would write one account's tokens into
+# another's snapshot).
+```
+
+### `Bare session(s) on ~/.claude/ are burning '<name>'` (per_session)
+
+A session launched as plain `claude` (not `cus launch`) rides the global mount, and per_session mode never swaps that mount (that would move every bare session at once — the cache bust this mode eliminates). The session will run its account into the caps. Exit it and relaunch slotted (`cus launch`), or add `alias claude='cus launch auto --'`.
+
+### `Orphan slot dir slot-N holds credentials` (per_session)
+
+A slot dir exists on disk with real credentials but no `state.json` entry (crash between mkdir and state save, or a hand-made dir). Reap it — credentials are saved back to the owning account dir first:
+
+```bash
+cus slot gc --slot slot-N
+```
+
 ---
 
 ## Non-SOS issues
+
+### per_session: `sync-config` says "live session — skipped"
+
+Deliberate: Claude Code rewrites its own `.claude.json`, so merging into a live mount is a lost-update race. The slot picks up the canonical sync at its next `cus launch`. Nothing to fix.
+
+### per_session: a slot session came up with no hooks/statusline
+
+A shared-state symlink in the slot broke — most likely something rewrote `settings.json` via tempfile+rename, which replaces the symlink with a real file and forks the slot off the share. Heal and re-check:
+
+```bash
+cus doctor            # shows exactly which entries drifted
+cus doctor --fix-dirs # folds novel keys back into the shared file, relinks
+```
 
 ### Daemon is running but not swapping when I think it should
 

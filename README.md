@@ -164,6 +164,17 @@ After the swap, the daemon:
 
 The `PostToolUseFailure` hook substring-matches `rate_limit | usage limit | overloaded_error` in tool error bodies. On a hit, the daemon swaps immediately without waiting for the next poll.
 
+### `mode: per_session` — one account per concurrent session (2026-07-02)
+
+Everything above describes `mode: global` (the default): one live mount (`~/.claude/`), every session follows the active account, and a swap moves *all* sessions at once — busting every session's prompt cache. `per_session` mode removes that cost for multi-session workflows:
+
+- Each session launched via `cus launch` gets its own **slot dir** (`~/claude-accounts/slot-<n>/`, used as `CLAUDE_CONFIG_DIR`) holding one account's credentials. Four sessions on four accounts burn each account ~4× slower.
+- When an account crosses its ladder step, the daemon runs the **same in-place two-file swap, scoped to that slot** — the session on top keeps running mid-conversation (no `/exit`, no `--resume`), and the other slots' caches are never touched.
+- The daemon **never writes `~/.claude/`** in this mode: bare `claude` launches keep working on whatever account it holds, observed and SOS-flagged but never swapped.
+- Enter/leave with `cus mode per-session` / `cus mode global` (validated, reversible — global-mode code paths are untouched). Optional alias so every launch is slotted: `alias claude='cus launch auto --'`.
+
+Details: `docs/plans/2026-07-02-per-session-accounts.md` (design + decision history) and the storage-roles inventory in `docs/ARCHITECTURE.md`.
+
 ## Progressive thresholds (the novel bit)
 
 Each account has its own `next_swap_at_pct` field. Starts at 50; climbs through `[75, 90, force]` each time we swap *out* of it. Reset to 50 when both windows drop below `reset_below_pct`.

@@ -126,7 +126,44 @@ To disable: flip `hot_swap.enabled: false`, restart daemon. Hot-swap-related con
 | `hot_swap.shell_return_timeout_seconds` | `10` | Max poll for pane to return to shell after `/exit` |
 | `hot_swap.relaunch_flags` | `""` | Flags passed to relaunched `claude` — set to `"--dangerously-skip-permissions"` if you use it |
 
-## Starting / stopping the daemon
+## Per-session mode (slots) — one account per concurrent session
+
+Added 2026-07-02 (plan: `docs/plans/2026-07-02-per-session-accounts.md`). Each session gets its own slot dir as `CLAUDE_CONFIG_DIR`; the daemon swaps individual slots in place (sessions never restart) and never touches `~/.claude/`.
+
+### Enter / leave
+
+```bash
+cus mode                 # show current mode
+cus mode per-session     # validate pool (doctor-heal + refresh-token check), create first slot, flip config
+cus mode global          # reap idle slots (creds saved back), flip config — restores today's exact behavior
+```
+
+Both directions print what changed. `cus mode global` refuses while slot sessions are live (exit them, or `--force` to leave them running unmanaged).
+
+**Rollout note (429 budget):** N occupied accounts poll at the fast cadence — start with `polling.active_interval_seconds` relaxed (e.g. 300) and tighten only after a week of clean 429 logs. Do NOT shorten intervals to compensate for anything (2026-06-19 burnout).
+
+### Launching sessions
+
+```bash
+cus launch                        # auto-pick best account (spreads across accounts), new/reused slot
+cus launch rayi1                  # explicit account
+cus launch rayi1 -- --resume ID   # args after -- pass through to claude
+alias claude='cus launch auto --' # optional: make every launch slotted (documented opt-in, never auto-installed)
+```
+
+A launch heals the slot (doctor), syncs `.claude.json` from the canonical, installs the account's creds (in-place swap primitive), and `exec`s claude with `CLAUDE_CONFIG_DIR` set. Bare `claude` still works — it rides `~/.claude/`, is shown as `bare` in `cus status`, and is never swapped in this mode.
+
+### Day-to-day
+
+```bash
+cus status               # Slots section: slot → account → live/idle; live sessions show pane → slot → account
+cus slot list            # slot inventory with pids
+cus slot gc              # reap idle slots now (creds save back first); daemon gc's after per_session.slot_gc_idle_hours (72h)
+cus doctor [--fix-dirs]  # check/heal account dirs + slots against the canonical symlink layout
+cus sync-config          # push canonical ~/.claude.json non-account keys to idle slots (live slots sync at next launch)
+```
+
+Statuslines resolve their own slot's account every render, so a per-slot swap shows up immediately in the pane that moved — and only there.
 
 If installed via systemd (`cus init-systemd --enable`):
 
