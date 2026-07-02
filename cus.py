@@ -346,6 +346,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "max_extrapolation_minutes": 10,   # don't trust a measured rate beyond this many min past the last poll
     },
+    # Per-model WEEKLY tracking (2026-07-02). The usage API exposes per-model
+    # usage only weekly (no per-model 5h window). `gate_enabled: False` by
+    # default = surface-only (shown in `cus status`, no effect on swaps) so
+    # unmodified installs are unchanged. When True, the highest tracked
+    # per-model weekly % folds into the weekly-cap logic: the active account is
+    # force-swapped when a model's week is exhausted, and no swap TARGET is
+    # chosen whose model-week is at/above the hard 7d cap. `models: []` = track
+    # every model the API reports; set e.g. ["Fable","Sonnet"] to gate only on
+    # the models you actually use.
+    "per_model_weekly": {
+        "gate_enabled": False,
+        "models": [],
+    },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
         # Fix A1 (user 2026-06-23): a 429 only justifies an account swap when the
@@ -1043,14 +1056,59 @@ def _parse_per_model_weekly(data: dict) -> dict:
     return out
 
 
+def _per_model_weekly_gate(config: dict) -> tuple[bool, set]:
+    """Resolve the per-model weekly gate toggle + optional model allowlist.
+
+    Returns (enabled, allowed_lowercased_names). When `per_model_weekly.models`
+    is empty/unset the allowlist is empty, meaning "all models the API reports"
+    (no restriction). Default DISABLED so unmodified installs keep the pre-2026-
+    07-02 behavior (gate only on aggregate 5h/7d) — this is an opt-in.
+    """
+    cfg = config.get("per_model_weekly", {})
+    allow = {str(m).lower() for m in (cfg.get("models") or [])}
+    return bool(cfg.get("gate_enabled", False)), allow
+
+
+def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
+    """Highest tracked per-model WEEKLY utilization on an AccountUsage, or 0.0
+    when the gate is off / no data. Used to fold per-model weekly caps into the
+    active account's threshold-trip decision (current_max_pct)."""
+    enabled, allow = _per_model_weekly_gate(config)
+    if not enabled or not usage.per_model_weekly:
+        return 0.0
+    vals = [w.utilization for m, w in usage.per_model_weekly.items()
+            if not allow or m.lower() in allow]
+    return max(vals) if vals else 0.0
+
+
+def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
+    """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
+    per_model_weekly_pct from state.json. Used to fold per-model weekly caps
+    into swap-target selection (_account_effective_pct)."""
+    enabled, allow = _per_model_weekly_gate(config)
+    pm = acct.get("per_model_weekly_pct") or {}
+    if not enabled or not pm:
+        return 0.0
+    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    return max(vals) if vals else 0.0
+
+
 def current_max_pct(usage: AccountUsage, config: dict) -> float:
-    """Return the higher of 5h / 7d utilization (whichever the config enables)."""
+    """Return the higher of 5h / 7d utilization (whichever the config enables).
+
+    When the per-model weekly gate is enabled (`per_model_weekly.gate_enabled`),
+    the highest tracked per-model WEEKLY % also counts — so an account whose
+    Fable/Sonnet weekly cap is exhausted trips the swap threshold even if its
+    aggregate 5h/7d still has headroom. Per-model data is weekly-only (the API
+    has no per-model 5h window), so this is treated as a weekly signal.
+    """
     thresholds = config.get("thresholds", {})
     candidates = []
     if thresholds.get("five_hour", True) and usage.five_hour:
         candidates.append(usage.five_hour.utilization)
     if thresholds.get("seven_day", True) and usage.seven_day:
         candidates.append(usage.seven_day.utilization)
+    candidates.append(_max_model_weekly_from_usage(usage, config))  # 0.0 when gate off
     return max(candidates) if candidates else 0.0
 
 
@@ -1087,6 +1145,11 @@ def _account_effective_pct(acct: dict, config: dict) -> float:
         candidates.append(acct.get("current_5h_pct", 0.0))
     if thr_cfg.get("seven_day", True):
         candidates.append(acct.get("current_7d_pct", 0.0))
+    # Per-model weekly gate (opt-in): an account whose Fable/Sonnet weekly cap is
+    # exhausted reads as "effectively full" so the hard_7d_cap filter won't pick
+    # it as a swap target and drain-style strategies deprioritize it. 0.0 when
+    # the gate is off, so this is a no-op for unmodified installs.
+    candidates.append(_max_model_weekly_from_acct(acct, config))
     return max(candidates) if candidates else 0.0
 
 
@@ -1153,6 +1216,11 @@ def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> floa
         vals.append(estimate_window_pct(acct, "5h", config, now))
     if thr_cfg.get("seven_day", True):
         vals.append(estimate_window_pct(acct, "7d", config, now))
+    # Per-model weekly gate (opt-in): a target whose tracked model-week is
+    # exhausted is treated as full so it isn't picked. Not extrapolated (there's
+    # no per-model burn rate) — the raw persisted weekly % is the signal. 0.0
+    # when the gate is off.
+    vals.append(_max_model_weekly_from_acct(acct, config))
     return max(vals) if vals else 0.0
 
 
@@ -1262,7 +1330,14 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # account. Falls back to "any candidate" if ALL are above cap (system
     # is degraded; swap somewhere rather than stay on a hot active).
     hard_7d = _hard_7d_cap_for_config(config)
-    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+    # The weekly ceiling applies to the aggregate 7d AND (when the gate is on)
+    # to any tracked per-model weekly — so we never swap ONTO an account whose
+    # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
+    # when the gate is off, so this is exactly the old aggregate-7d filter then.
+    safe_7d = [
+        (n, a) for n, a in candidates
+        if max(a.get("current_7d_pct", 0), _max_model_weekly_from_acct(a, config)) < hard_7d
+    ]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -2238,6 +2313,11 @@ def decide_swap(
     strategy_cfg = config.get(f"{config.get('strategy', '')}_strategy", {})
     hard_7d_cap = strategy_cfg.get("hard_7d_cap_pct") or config.get("smart_strategy", {}).get("hard_7d_cap_pct", 80)
     cur_7d = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
+    # Per-model weekly gate (opt-in): force a swap OFF the active account when a
+    # tracked model's weekly cap is exhausted, even if aggregate 7d has room.
+    # 0.0 when the gate is off, so the hard-cap trigger is unchanged for
+    # unmodified installs. Per-model is weekly-only, so it belongs on this cap.
+    cur_7d = max(cur_7d, _max_model_weekly_from_usage(cur_usage, config))
     if cur_7d >= hard_7d_cap:
         # Hard 7d cap is normally a bypass path (it's the user's invariant)
         # but apply minimum hysteresis so a previous cap-swap can't be
@@ -5675,6 +5755,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
+    "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` folds the highest tracked per-model weekly % into the weekly-cap logic: force-swap the active account when a model's week is exhausted, and never pick a swap target whose model-week is at/above `hard_7d_cap_pct`. `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
