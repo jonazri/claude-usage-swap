@@ -26,9 +26,27 @@ EVENT=$(cat || true)
 SESSION_ID=$(echo "$EVENT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || echo "unknown")
 CWD=$(echo "$EVENT" | grep -o '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || echo "unknown")
 
-# Active account from state.json (best-effort grep)
+# Account resolution (per_session Phase 2.3): a slot-launched session inherits
+# CLAUDE_CONFIG_DIR from `cus launch` — resolve the slot's occupant from
+# state.json (python3 for the nested lookup; cus itself requires python3, and
+# grep can't index into slots.<name>.account reliably). An account-dir launch
+# (relogin flow) IS the account. Bare launches fall back to the global active,
+# exactly the pre-per_session behavior.
 ACCOUNT="unknown"
-if [[ -f "$STATE" ]]; then
+if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    BASE=$(basename "$CLAUDE_CONFIG_DIR")
+    case "$BASE" in
+        slot-*)
+            if [[ -f "$STATE" ]]; then
+                ACCOUNT=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(s.get('slots',{}).get(sys.argv[2],{}).get('account') or 'unknown')" "$STATE" "$BASE" 2>/dev/null || echo "unknown")
+            fi
+            ;;
+        account-*)
+            ACCOUNT="${BASE#account-}"
+            ;;
+    esac
+fi
+if [[ "$ACCOUNT" == "unknown" && -f "$STATE" ]]; then
     ACCOUNT=$(grep -o '"active"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATE" | sed 's/.*"\([^"]*\)"$/\1/' || echo "unknown")
 fi
 
