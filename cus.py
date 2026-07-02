@@ -364,6 +364,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "max_extrapolation_minutes": 10,   # don't trust a measured rate beyond this many min past the last poll
     },
+    # Per-model WEEKLY tracking (2026-07-02). The usage API exposes per-model
+    # usage only weekly (no per-model 5h window). `gate_enabled: False` by
+    # default = surface-only (shown in `cus status`, no effect on swaps) so
+    # unmodified installs are unchanged. When True, the highest tracked
+    # per-model weekly % folds into the weekly-cap logic: the active account is
+    # force-swapped when a model's week is exhausted, and no swap TARGET is
+    # chosen whose model-week is at/above the hard 7d cap. `models: []` = track
+    # every model the API reports; set e.g. ["Fable","Sonnet"] to gate only on
+    # the models you actually use.
+    "per_model_weekly": {
+        "gate_enabled": False,
+        "models": [],
+    },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
         # Fix A1 (user 2026-06-23): a 429 only justifies an account swap when the
@@ -694,6 +707,12 @@ class AccountUsage:
     seven_day: UsageWindow | None = None
     seven_day_sonnet: UsageWindow | None = None
     seven_day_opus: UsageWindow | None = None
+    # Per-model WEEKLY utilization keyed by model display_name (e.g. "Fable",
+    # "Sonnet", "Opus"). The usage API exposes per-model data only at weekly
+    # granularity — there is NO per-model 5-hour window (`five_hour` is
+    # aggregate). Populated from the `limits[]` array's model-scoped entries
+    # plus the legacy seven_day_sonnet/opus fields. See _parse_per_model_weekly.
+    per_model_weekly: dict = field(default_factory=dict)  # {display_name: UsageWindow}
     token_expired: bool = False
     token_stale: bool = False
     polled_at: str = field(default_factory=now_iso)
@@ -887,6 +906,58 @@ def update_backoff(acct: dict, success: bool, config: dict) -> None:
     acct["poll_backoff_until_ts"] = until.isoformat().replace("+00:00", "Z")
 
 
+def _account_poll_interval(state: dict, config: dict, account_name: str) -> float:
+    """Resolve the poll cadence (seconds) for one account under the differential
+    poll schedule (2026-07-02).
+
+    The ACTIVE account is polled on the fast `polling.active_interval_seconds`
+    cadence — it's the only account actually burning usage, so we want to catch
+    its ramp toward the swap threshold before it overshoots. INACTIVE accounts
+    are polled on the slow `polling.inactive_interval_seconds` cadence — they're
+    idle, needed only for swap-target selection, so a stale-ish reading is fine.
+
+    Both fall back to the legacy flat `poll_interval_seconds` when unset, so an
+    unmodified config keeps polling every account every cycle (backward-compat).
+
+    Why this exists: flat fast polling of all N accounts sends N requests per
+    interval to the per-IP-throttled /api/oauth/usage endpoint. On 2026-07-02,
+    flat 60s x 5 accounts dropped every account into 429 poll-backoff (cus went
+    blind). Fast-active / slow-inactive cuts the steady-state request rate to
+    ~1 per active-interval plus the occasional inactive refresh, keeping us well
+    under the throttle while polling the account that matters MORE often, not
+    less. See GH #84 for the burn-rate-adaptive evolution of the active cadence.
+    """
+    polling_cfg = config.get("polling", {})
+    flat = config.get("poll_interval_seconds", 300)
+    if state.get("active") == account_name:
+        return polling_cfg.get("active_interval_seconds") or flat
+    return polling_cfg.get("inactive_interval_seconds") or flat
+
+
+def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[bool, str]:
+    """Whether `account_name` is due for a poll this cycle under differential
+    cadence. Returns (due, human-readable reason).
+
+    Due when the account has never been polled, its stored timestamp is
+    unparseable (fail-open — poll rather than starve observability), or at least
+    its class interval (`_account_poll_interval`) has elapsed since last_poll_ts.
+    """
+    interval = _account_poll_interval(state, config, account_name)
+    acct = state.get("accounts", {}).get(account_name, {})
+    last = acct.get("last_poll_ts")
+    if not last:
+        return True, "no prior poll"
+    try:
+        last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return True, "unparseable last_poll_ts"
+    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+    role = "active" if state.get("active") == account_name else "inactive"
+    if elapsed >= interval:
+        return True, f"due ({role}: {elapsed:.0f}s >= {interval:.0f}s)"
+    return False, f"{role}: {elapsed:.0f}s < {interval:.0f}s"
+
+
 def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int | None]:
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
@@ -1024,19 +1095,109 @@ def poll_account_usage(account_name: str) -> AccountUsage:
         seven_day=parse_window(data.get("seven_day")),
         seven_day_sonnet=parse_window(data.get("seven_day_sonnet")),
         seven_day_opus=parse_window(data.get("seven_day_opus")),
+        per_model_weekly=_parse_per_model_weekly(data),
         polled_at=now_iso(),
         raw=data,
     )
 
 
+def _parse_per_model_weekly(data: dict) -> dict:
+    """Extract per-model WEEKLY utilization from the usage API response.
+
+    The API exposes per-model usage only at weekly granularity — there is NO
+    per-model 5-hour window (`five_hour` is aggregate across all models). Two
+    sources are merged:
+
+      1. The `limits[]` array — each entry may carry `scope.model.display_name`
+         (e.g. "Fable"). The weekly-group, model-scoped entries give that
+         model's weekly %. This is the forward-looking structured source: newer
+         models (Fable) appear ONLY here, not as a dedicated top-level field.
+      2. Legacy dedicated fields `seven_day_sonnet` / `seven_day_opus`, kept for
+         models that predate the `limits[]` scoping.
+
+    Returns {display_name: UsageWindow}. The `limits[]` value wins on conflict
+    (it's the live structured value); legacy fields fill in models absent there.
+    Robust to the API's in-flux shape — any malformed entry is skipped, never
+    raised, so a schema tweak can't take polling down.
+    """
+    out: dict[str, UsageWindow] = {}
+    # Legacy named fields first, so limits[] can override them.
+    for field_name, model in (("seven_day_sonnet", "Sonnet"), ("seven_day_opus", "Opus")):
+        obj = data.get(field_name)
+        if isinstance(obj, dict) and obj.get("utilization") is not None:
+            out[model] = UsageWindow(utilization=float(obj["utilization"]),
+                                     resets_at=obj.get("resets_at"))
+    # limits[] model-scoped weekly entries (authoritative).
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        for entry in limits:
+            if not isinstance(entry, dict) or entry.get("group") != "weekly":
+                continue
+            scope = entry.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            if not isinstance(model, dict):
+                continue
+            name = model.get("display_name")
+            pct = entry.get("percent")
+            if name and pct is not None:
+                out[name] = UsageWindow(utilization=float(pct),
+                                        resets_at=entry.get("resets_at"))
+    return out
+
+
+def _per_model_weekly_gate(config: dict) -> tuple[bool, set]:
+    """Resolve the per-model weekly gate toggle + optional model allowlist.
+
+    Returns (enabled, allowed_lowercased_names). When `per_model_weekly.models`
+    is empty/unset the allowlist is empty, meaning "all models the API reports"
+    (no restriction). Default DISABLED so unmodified installs keep the pre-2026-
+    07-02 behavior (gate only on aggregate 5h/7d) — this is an opt-in.
+    """
+    cfg = config.get("per_model_weekly", {})
+    allow = {str(m).lower() for m in (cfg.get("models") or [])}
+    return bool(cfg.get("gate_enabled", False)), allow
+
+
+def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
+    """Highest tracked per-model WEEKLY utilization on an AccountUsage, or 0.0
+    when the gate is off / no data. Used to fold per-model weekly caps into the
+    active account's threshold-trip decision (current_max_pct)."""
+    enabled, allow = _per_model_weekly_gate(config)
+    if not enabled or not usage.per_model_weekly:
+        return 0.0
+    vals = [w.utilization for m, w in usage.per_model_weekly.items()
+            if not allow or m.lower() in allow]
+    return max(vals) if vals else 0.0
+
+
+def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
+    """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
+    per_model_weekly_pct from state.json. Used to fold per-model weekly caps
+    into swap-target selection (_account_effective_pct)."""
+    enabled, allow = _per_model_weekly_gate(config)
+    pm = acct.get("per_model_weekly_pct") or {}
+    if not enabled or not pm:
+        return 0.0
+    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    return max(vals) if vals else 0.0
+
+
 def current_max_pct(usage: AccountUsage, config: dict) -> float:
-    """Return the higher of 5h / 7d utilization (whichever the config enables)."""
+    """Return the higher of 5h / 7d utilization (whichever the config enables).
+
+    When the per-model weekly gate is enabled (`per_model_weekly.gate_enabled`),
+    the highest tracked per-model WEEKLY % also counts — so an account whose
+    Fable/Sonnet weekly cap is exhausted trips the swap threshold even if its
+    aggregate 5h/7d still has headroom. Per-model data is weekly-only (the API
+    has no per-model 5h window), so this is treated as a weekly signal.
+    """
     thresholds = config.get("thresholds", {})
     candidates = []
     if thresholds.get("five_hour", True) and usage.five_hour:
         candidates.append(usage.five_hour.utilization)
     if thresholds.get("seven_day", True) and usage.seven_day:
         candidates.append(usage.seven_day.utilization)
+    candidates.append(_max_model_weekly_from_usage(usage, config))  # 0.0 when gate off
     return max(candidates) if candidates else 0.0
 
 
@@ -1073,6 +1234,11 @@ def _account_effective_pct(acct: dict, config: dict) -> float:
         candidates.append(acct.get("current_5h_pct", 0.0))
     if thr_cfg.get("seven_day", True):
         candidates.append(acct.get("current_7d_pct", 0.0))
+    # Per-model weekly gate (opt-in): an account whose Fable/Sonnet weekly cap is
+    # exhausted reads as "effectively full" so the hard_7d_cap filter won't pick
+    # it as a swap target and drain-style strategies deprioritize it. 0.0 when
+    # the gate is off, so this is a no-op for unmodified installs.
+    candidates.append(_max_model_weekly_from_acct(acct, config))
     return max(candidates) if candidates else 0.0
 
 
@@ -1139,6 +1305,11 @@ def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> floa
         vals.append(estimate_window_pct(acct, "5h", config, now))
     if thr_cfg.get("seven_day", True):
         vals.append(estimate_window_pct(acct, "7d", config, now))
+    # Per-model weekly gate (opt-in): a target whose tracked model-week is
+    # exhausted is treated as full so it isn't picked. Not extrapolated (there's
+    # no per-model burn rate) — the raw persisted weekly % is the signal. 0.0
+    # when the gate is off.
+    vals.append(_max_model_weekly_from_acct(acct, config))
     return max(vals) if vals else 0.0
 
 
@@ -1248,7 +1419,14 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # account. Falls back to "any candidate" if ALL are above cap (system
     # is degraded; swap somewhere rather than stay on a hot active).
     hard_7d = _hard_7d_cap_for_config(config)
-    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+    # The weekly ceiling applies to the aggregate 7d AND (when the gate is on)
+    # to any tracked per-model weekly — so we never swap ONTO an account whose
+    # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
+    # when the gate is off, so this is exactly the old aggregate-7d filter then.
+    safe_7d = [
+        (n, a) for n, a in candidates
+        if max(a.get("current_7d_pct", 0), _max_model_weekly_from_acct(a, config)) < hard_7d
+    ]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -2649,6 +2827,11 @@ def decide_swap(
     strategy_cfg = config.get(f"{config.get('strategy', '')}_strategy", {})
     hard_7d_cap = strategy_cfg.get("hard_7d_cap_pct") or config.get("smart_strategy", {}).get("hard_7d_cap_pct", 80)
     cur_7d = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
+    # Per-model weekly gate (opt-in): force a swap OFF the active account when a
+    # tracked model's weekly cap is exhausted, even if aggregate 7d has room.
+    # 0.0 when the gate is off, so the hard-cap trigger is unchanged for
+    # unmodified installs. Per-model is weekly-only, so it belongs on this cap.
+    cur_7d = max(cur_7d, _max_model_weekly_from_usage(cur_usage, config))
     if cur_7d >= hard_7d_cap:
         # Hard 7d cap is normally a bypass path (it's the user's invariant)
         # but apply minimum hysteresis so a previous cap-swap can't be
@@ -3039,6 +3222,16 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["five_hour_resets_at"] = u.five_hour.resets_at
         if u.seven_day and u.seven_day.resets_at:
             acct["seven_day_resets_at"] = u.seven_day.resets_at
+        # Per-model WEEKLY utilization (GH: fable/sonnet tracking). Persisted as
+        # a flat {model: pct} dict so `cus status` and the weekly-cap gate can
+        # read it from state.json without a live poll. Only written on a
+        # SUCCESSFUL poll (this branch); the error branches above `continue`
+        # early, preserving the prior dict — same preserve-on-error semantics as
+        # current_*_pct. An empty result clears it (no model-scoped limits =
+        # none active).
+        acct["per_model_weekly_pct"] = {
+            model: win.utilization for model, win in u.per_model_weekly.items()
+        }
     return state
 
 
@@ -3299,22 +3492,32 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             ))
 
     # Condition 4: stale poll
-    poll_freshness_seconds = config.get("poll_interval_seconds", 300) * 4  # 4 cycles of staleness = real problem
+    # Differential cadence (2026-07-02): staleness must be judged per-account
+    # against the cadence that account is actually polled on — fast active /
+    # slow inactive / legacy flat (_account_poll_interval). Judging every
+    # account against the flat poll_interval_seconds would permanently flag
+    # every idle account as "stale" whenever polling.inactive_interval_seconds
+    # exceeds 4x the flat interval (e.g. flat 180s + inactive 900s), turning
+    # the daemon-down detector into constant false SOS noise. 4 missed cycles
+    # of an account's OWN cadence = real problem, same tolerance as before.
     stale_accounts: list[str] = []
+    stale_worst_minutes = 0
     for name, acct in accounts.items():
         last_poll = acct.get("last_poll_ts")
         if not last_poll:
             continue
+        poll_freshness_seconds = _account_poll_interval(state, config, name) * 4
         try:
             ts = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
             if (now - ts).total_seconds() > poll_freshness_seconds:
                 stale_accounts.append(name)
+                stale_worst_minutes = max(stale_worst_minutes, int(poll_freshness_seconds) // 60)
         except ValueError:
             continue
     if stale_accounts and any(accounts.keys()) and accounts.get(list(accounts.keys())[0], {}).get("last_poll_ts"):
         out.append(SOSCondition(
             severity="warning",
-            summary=f"Stale usage data for: {', '.join(stale_accounts)} (no fresh poll in >{poll_freshness_seconds // 60} min)",
+            summary=f"Stale usage data for: {', '.join(stale_accounts)} (no fresh poll within 4x each account's poll cadence; worst allowance {stale_worst_minutes} min)",
             action="Daemon may be down. Check: `systemctl --user status cus.service` or restart `python3 ~/repos/claude-usage-swap/cus.py daemon`.",
             affected="daemon",
         ))
@@ -5488,6 +5691,14 @@ def status() -> None:
                 rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
                 est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
         click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
+        # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
+        # sub-line only for accounts that have any, sorted highest-first so a
+        # model nearing its own weekly cap is the first thing the eye lands on.
+        # 5h is intentionally absent — the API has no per-model 5h window.
+        pm = a.get("per_model_weekly_pct") or {}
+        if pm:
+            parts = "  ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+            click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
     # Locks
@@ -6082,15 +6293,34 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 execute_swap(reactive_decision.target, trigger="reactive-429")
             return
 
-        # 1. Poll — skip accounts currently in poll-backoff (per-account
-        # exponential delay after 429, to avoid prolonging the throttle).
+        # 1. Poll — differential cadence (2026-07-02): the ACTIVE account is
+        # polled fast (catch its usage ramp), inactive accounts slowly (they're
+        # idle, only needed for target selection). This keeps the per-IP-throttled
+        # /api/oauth/usage endpoint well under its burst limit while reacting
+        # quickly on the one account that's actually burning — see
+        # _account_poll_due / _account_poll_interval. Accounts in 429 poll-backoff
+        # are skipped regardless of cadence.
+        #
+        # Anti-burst stagger: when >1 account falls due in the same cycle (e.g.
+        # cold start, or two inactive intervals coinciding), space the successive
+        # HTTP polls by `polling.stagger_seconds` so they don't hit the per-IP
+        # throttle as a single burst. No delay before the first poll of a cycle.
         usage_by_account: dict[str, AccountUsage] = {}
+        stagger = config.get("polling", {}).get("stagger_seconds", 0) or 0
+        polled_this_cycle = 0
         for name in state["accounts"]:
             in_backoff, until = account_in_backoff(state, name)
             if in_backoff:
                 click.echo(f"  skip {name}: in poll-backoff until {until}")
                 continue
+            due, why = _account_poll_due(state, config, name)
+            if not due:
+                click.echo(f"  skip {name}: not due ({why})")
+                continue
+            if polled_this_cycle > 0 and stagger > 0:
+                time.sleep(stagger)
             usage_by_account[name] = poll_account_usage(name)
+            polled_this_cycle += 1
 
         # GH #75 (lost-update race): the poll loop above holds the network
         # for seconds to ~40s (per-account HTTP calls, 10s timeout each). A
@@ -6225,8 +6455,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         return
 
     config = load_config()
-    interval = config.get("poll_interval_seconds", 300)
-    click.echo(f"daemon starting. poll_interval={interval}s. Ctrl-C to stop.")
+    # Loop tick = the fastest cadence (active-account interval) so the active
+    # account can actually be polled that often; per-account due-checks inside
+    # one_cycle() gate which accounts are polled each tick. Falls back to the
+    # flat poll_interval_seconds when the differential keys aren't set.
+    polling_cfg = config.get("polling", {})
+    flat = config.get("poll_interval_seconds", 300)
+    interval = polling_cfg.get("active_interval_seconds") or flat
+    inactive_interval = polling_cfg.get("inactive_interval_seconds") or flat
+    click.echo(f"daemon starting. tick={interval}s (active), "
+               f"inactive={inactive_interval}s. Ctrl-C to stop.")
     try:
         while True:
             try:
@@ -6281,7 +6519,8 @@ def hooks_list_cmd() -> None:
 
 CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
-    "poll_interval_seconds": "How often the daemon calls Anthropic's OAuth usage endpoint per account. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default.",
+    "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
+    "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
     "strategy": "Swap target picker — see docs/STRATEGIES.md. `smart` (recommended): hard 7d cap + burn-before-reset for 5h windows about to expire. `headroom`: weighted 5h+7d score with hard 7d cap. `lowest_usage`: cux balanced — sort by 7d util only. `drain`: deplete-current. `strict_priority`: priority order. `round_robin`: cycle by name.",
     "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
@@ -6291,6 +6530,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
+    "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` folds the highest tracked per-model weekly % into the weekly-cap logic: force-swap the active account when a model's week is exhausted, and never pick a swap target whose model-week is at/above `hard_7d_cap_pct`. `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
