@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted](#2026-07-02-decision-built-pr-93-plan-per-session-slots-same-day-on-the-plan-s-own-branch-production-untouched-three-plan-deviations-noted)
 - [2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed](#2026-07-02-flag-gym-record-loop-unavailable-for-pr-86-review-pr-88-merge-cus-is-not-gym-initialized-hook-99-v2-guidance-needed)
 - [2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps](#2026-07-02-decision-gh-77-freshness-guard-active-account-relogin-bare-claude-login-not-storage-dir-sync-guard-covers-the-expected-verdict-too-finish-allows-incomparable-timestamps)
 - [2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast](#2026-07-02-decision-gh-76-swap-lock-crash-journal-journal-is-a-standalone-file-not-a-state-json-key-recovery-auto-reconciles-determinate-crashes-lock-waits-instead-of-failing-fast)
@@ -21,6 +22,31 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #per-session #pr-93 #slots #claude-config-dir
+
+**What I decided.** The user asked to "build the plan in PR 93". I implemented all four phases as commits on the SAME branch (`feature/per-session-accounts-20260702`), turning the docs-only PR into plan+implementation, rather than opening a separate implementation PR. Rationale: the worktree was already checked out on that branch for this session, and reviewing the plan next to its implementation is easier than cross-referencing two PRs.
+
+**Autonomous calls worth review:**
+1. **PR #93 scope change** (docs → docs+code). Title/body updated to match.
+2. **Production left in `mode: global` and `cus doctor --fix-dirs` NOT run against the live tree** — read-only doctor confirms the drift (4 settings stubs, missing symlinks), but healing live account dirs while the daemon runs and sessions are active is an operator step (it's also the first step of `cus mode per-session`).
+3. **Plan deviations** (annotated in the plan doc header): launch auto-pick shims `pick_swap_target` with a sentinel active instead of a new scorer; per-session reactive 429 got its own attribution function (sessions.log-based) instead of reusing `check_rate_limit_reactive`; slot gc got a 72h idle grace (`per_session.slot_gc_idle_hours`) because eager reaping defeats launch slot-reuse.
+4. **Filed GH #95** for a pre-existing `cus status` hang (`find_live_sessions` with 1.3MB sessions.log) found during smoke — reproduced on unmodified main, so logged as an issue, not fixed in this PR.
+
+**Verification.** Suite 177 passing (146 pre-existing unmodified + 31 new); `daemon --once --no-execute` against live state runs global mode bit-for-bit; slot-swap isolation invariant (global mount + state.active never touched) is under test.
+
+### Walk-back path
+1. To make PR #93 docs-only again: `git revert a600806 aa64676 9c8519a fa43acb a57821f 5567846` on the branch (or interactive-rebase them out) — the two plan-doc commits (e9fd807, bf4e90a) stay.
+2. To back out only the behavior change risk: nothing changed in production — `mode: global` is still set, no `--fix-dirs` was run, the daemon binary in use is the installed main checkout. There is nothing to revert on the machine.
+3. If merged and per_session misbehaves later: `cus mode global` restores today's exact behavior (global-mode code paths untouched — verified by the 146 pre-existing tests passing unmodified).
+4. GH #95 can be closed as wontfix if the hang is judged sandbox-only.
+
+---
+
 
 ## 2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed
 
