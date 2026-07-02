@@ -63,6 +63,7 @@ authoritative on this point).
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -103,9 +104,26 @@ DAEMON_LOG = ACCOUNTS_DIR / "daemon.log"
 DECISIONS_LOG = ACCOUNTS_DIR / "decisions.jsonl"   # GH #56: one structured record per daemon decision
 DAEMON_PID = ACCOUNTS_DIR / "daemon.pid"
 ORCHESTRATE_LOCK = ACCOUNTS_DIR / "orchestrate.lock"
+# GH #76: how long a second swap waits for the global swap lock before
+# erroring out loudly. Swaps are sub-second; 30s covers even a pathologically
+# slow disk. Module constant (not config) so tests can shrink it without a
+# config file. The lock/journal PATHS are functions (below, next to
+# _swap_lock) rather than constants: tests repoint ACCOUNTS_DIR at a temp
+# tree, and a path captured at import time would silently escape the sandbox
+# and touch the live ~/claude-accounts/.
+SWAP_LOCK_TIMEOUT_SECONDS = 30.0
 INBOX_MD = ACCOUNTS_DIR / "inbox.md"
 SOS_MD = ACCOUNTS_DIR / "SOS.md"
 LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
+
+# GH #79: how many timestamped `.credentials.json.bak.<ts>` files to keep per
+# directory. Each account's OAuth payload (incl. the ~30-day refresh token)
+# lives in exactly ONE authoritative place at a time, so every overwrite of a
+# credentials file is potentially the destruction of the only copy — the
+# terminal event of every clobber bug (#3, #70, #75, #76, #77). Backups are
+# ~500 bytes each; 5 generations costs nothing and converts "account locked
+# out until interactive re-login" into "run `cus restore-creds <name>`".
+CREDS_BACKUP_KEEP = 5
 
 # Hook scripts ship in <repo>/hooks/. Daemon installs them into ~/.claude/settings.json
 # at user request via `cus hooks install`. Source paths discovered relative to cus.py.
@@ -440,6 +458,77 @@ def atomic_copy(src: Path, dst: Path, mode: int = 0o644) -> None:
     with src.open("rb") as f:
         content = f.read()
     atomic_write_bytes(dst, content, mode=mode)
+
+
+def backup_credentials_file(path: Path, keep: int = CREDS_BACKUP_KEEP) -> Path | None:
+    """Preserve an about-to-be-overwritten credentials file as a timestamped
+    sibling backup, pruning to the newest `keep` generations (GH #79).
+
+    This is the choke-point last-line defense for the credential-clobber bug
+    class (#3, #70, #75, #76, #77): whatever writer bug slips past the other
+    guards, the destroyed refresh token is still recoverable for a few
+    generations via `cus restore-creds`. Call it immediately before ANY write
+    that replaces an existing `.credentials.json` (snapshot or live).
+
+    Design notes:
+      - Backup name is `<name>.bak.<UTC-ts>` in the SAME directory, so the
+        backup inherits the directory's fate (a deleted account dir takes its
+        backups with it) and never crosses account boundaries.
+      - Timestamp format %Y%m%dT%H%M%S.%fZ is fixed-width and lexically
+        sortable, so pruning can sort filenames without parsing dates.
+      - Mode 0600 always — these files hold OAuth tokens.
+      - Best-effort by contract: returns None if there is nothing to back up.
+        Callers must NOT let a backup failure abort the primary write path —
+        but we deliberately do NOT swallow exceptions here; an unwritable
+        account dir would break the primary write two lines later anyway,
+        and silently skipping backups would defeat the whole feature.
+
+    Returns the backup path, or None if `path` didn't exist.
+    """
+    if not path.exists():
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    bak = path.with_name(f"{path.name}.bak.{ts}")
+    atomic_copy(path, bak, mode=0o600)
+    # Prune oldest generations beyond `keep`. Lexical sort == chronological
+    # sort thanks to the fixed-width timestamp; newest sort last.
+    backups = sorted(path.parent.glob(path.name + ".bak.*"))
+    for old in backups[:-keep] if keep > 0 else backups:
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass  # concurrent pruner got it first — fine
+    return bak
+
+
+def list_creds_backups(account_name: str) -> list[Path]:
+    """All backup generations for an account's snapshot, newest first (GH #79)."""
+    d = ACCOUNTS_DIR / f"account-{account_name}"
+    return sorted(d.glob(".credentials.json.bak.*"), reverse=True)
+
+
+def restore_creds_backup(account_name: str, backup: Path, into_live: bool = False) -> None:
+    """Restore a backup generation into an account's snapshot (GH #79).
+
+    The snapshot being replaced is itself backed up first, so a restore is
+    always reversible (it just becomes the newest generation). With
+    `into_live=True` the backup is also installed as the live
+    `~/.claude/.credentials.json` — only meaningful when the account is the
+    ACTIVE one, because for the active account the live file (not the
+    snapshot) is what Claude actually reads.
+
+    Best-effort by nature: if the backed-up refresh token was rotated
+    server-side after the backup was taken, Anthropic may reject it — but in
+    the clobber scenarios this feature exists for (#3/#70/#75/#76/#77) the
+    destroyed token was never used again after the overwrite, which is
+    exactly when the restore works.
+    """
+    snap = ACCOUNTS_DIR / f"account-{account_name}" / ".credentials.json"
+    backup_credentials_file(snap)  # make the restore itself walk-back-able
+    atomic_copy(backup, snap, mode=0o600)
+    if into_live:
+        backup_credentials_file(CREDS_JSON)
+        atomic_copy(backup, CREDS_JSON, mode=0o600)
 
 
 def read_json(path: Path) -> dict:
@@ -1532,6 +1621,347 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 # Swap primitive (callable from daemon, not just CLI)
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# GH #76: swap mutual exclusion + crash journal
+# --------------------------------------------------------------------------
+
+def _swap_lock_path() -> Path:
+    """Path of the global swap lock (GH #76).
+
+    One flock-style lock serializing execute_swap across ALL entry points
+    (daemon reactive + background paths, `cus switch`, `cus auto-swap`,
+    hot-swap orchestrator sub-paths). ORCHESTRATE_LOCK only guards the
+    pane-typing orchestrator; the 4-file swap sequence itself raced freely
+    before this. Lock ordering (fixed, never reversed): ORCHESTRATE_LOCK
+    outer, swap lock inner — the orchestrator holds its lock and calls
+    execute_swap, which takes this one. Nothing takes them in reverse.
+
+    Computed from ACCOUNTS_DIR at call time (not an import-time constant) so
+    tests that repoint ACCOUNTS_DIR at a temp tree can't accidentally lock
+    the live ~/claude-accounts/.
+    """
+    return ACCOUNTS_DIR / "swap.lock"
+
+
+def _swap_journal_path() -> Path:
+    """Path of the write-ahead swap-intent journal (GH #76).
+
+    Present on disk = a swap is in flight (or crashed mid-flight). Written
+    before the first mutating step of execute_swap, removed after state.json
+    is persisted. Call-time derivation for the same test-sandboxing reason
+    as _swap_lock_path.
+    """
+    return ACCOUNTS_DIR / "swap.journal"
+
+
+@contextlib.contextmanager
+def _swap_lock(timeout_seconds: float | None = None):
+    """Global inter-process mutex around the whole swap sequence (GH #76).
+
+    Why: execute_swap is a 5-step, multi-file, non-transactional sequence.
+    Each individual write is atomic, but two interleaved swaps (daemon +
+    manual `cus auto-swap`, or two daemon paths) can each save the live
+    credentials back into the OTHER's outgoing snapshot, destroying a refresh
+    token that exists nowhere else. fcntl.flock is used (same pattern as
+    ORCHESTRATE_LOCK) because it dies with the process — no stale-lockfile
+    cleanup problem after a crash.
+
+    Blocking-with-timeout rather than fail-fast: the common contention case
+    is a sub-second swap already in flight, and the right behavior for the
+    second caller is to wait its turn, not to error a user-invoked
+    `cus switch`. On timeout raises RuntimeError — the exception type every
+    execute_swap caller already catches and reports.
+
+    Lock ordering: ORCHESTRATE_LOCK (hot-swap orchestrator) is always taken
+    OUTSIDE this lock, never the reverse.
+    """
+    timeout = SWAP_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    lock_path = _swap_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    try:
+                        os.lseek(fd, 0, 0)
+                        holder = os.read(fd, 64).decode(errors="replace").strip() or "(unknown)"
+                    except OSError:
+                        holder = "(unknown)"
+                    raise RuntimeError(
+                        f"another swap is in flight (swap lock {lock_path} held by pid {holder}; "
+                        f"waited {timeout:.0f}s). Retry in a moment — if the holder pid is dead the "
+                        f"lock has already been released by the kernel, so a retry will succeed.")
+                time.sleep(0.05)
+        # We hold the lock; record our pid for contention diagnostics.
+        try:
+            os.lseek(fd, 0, 0)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass  # pid note is best-effort; the flock itself is what matters
+        try:
+            yield
+        finally:
+            try:
+                os.lseek(fd, 0, 0)
+                os.ftruncate(fd, 0)
+            except OSError:
+                pass
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _write_swap_journal(from_name: str, to_name: str, trigger: str) -> None:
+    """Persist swap intent BEFORE the first mutating step (GH #76).
+
+    If the process dies anywhere inside the swap sequence, this file is what
+    lets the next start detect it and reconcile, instead of silently running
+    with live files pointing at one account and state.json at another — the
+    desync whose next-swap save-back destroys a refresh token (#70/#76).
+    """
+    write_json(_swap_journal_path(), {
+        "from": from_name, "to": to_name, "trigger": trigger, "ts": now_iso(),
+        # For a human reading the file after a crash:
+        "note": "swap was in flight; if this file exists after a crash, run any cus command — recovery is automatic on next swap/daemon start",
+    })
+
+
+def _clear_swap_journal() -> None:
+    try:
+        _swap_journal_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _identity_fields(cj: Any) -> dict:
+    """Extract the comparable identity facets of a .claude.json payload.
+
+    Used by crash recovery to determine which account the live files belong
+    to. Only non-empty fields participate, so a sparse file still matches on
+    whatever evidence it has.
+    """
+    if not isinstance(cj, dict):
+        return {}
+    oa = cj.get("oauthAccount")
+    oa = oa if isinstance(oa, dict) else {}
+    out: dict = {}
+    for key, val in (("accountUuid", oa.get("accountUuid")),
+                     ("emailAddress", oa.get("emailAddress")),
+                     ("userID", cj.get("userID"))):
+        if val:
+            out[key] = val
+    return out
+
+
+def _identities_match(a: dict, b: dict) -> bool | None:
+    """True/False when the two identity dicts share comparable fields;
+    None when there is no shared evidence (can't say either way)."""
+    shared = set(a) & set(b)
+    if not shared:
+        return None
+    return all(a[k] == b[k] for k in shared)
+
+
+def _dir_identity(account_name: str) -> dict:
+    p = ACCOUNTS_DIR / f"account-{account_name}" / ".claude.json"
+    if not p.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(p))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _recover_pending_swap() -> None:
+    """Detect and reconcile a swap that crashed mid-flight (GH #76).
+
+    Caller MUST hold the swap lock (execute_swap and the daemon startup check
+    both do). No-op when no journal exists — the overwhelmingly common path.
+
+    Reconciliation logic: the journal says a swap `from` → `to` was in
+    flight. Determine how far it got by comparing the live ~/.claude.json
+    identity against both accounts' stored identities (with credentials
+    refresh-token lineage as a fallback when identity evidence is missing):
+
+      - live == `to`:   the live mutation completed but state.json may not
+        have been persisted (crash between install and save_state). Repair:
+        finish the install if the live creds are still `from`'s (crash in the
+        millisecond window between identity write and creds copy), then set
+        state.active = to. This is exactly the #70 "second layer" desync that
+        would otherwise poison the NEXT swap's save-back.
+      - live == `from`: the crash happened before the live mutation — nothing
+        durable changed hands. state.active already says `from`; just clear
+        the journal (the interrupted swap simply never happened).
+      - indeterminate:  don't guess. Warn loudly with exact manual recovery
+        steps, keep the evidence (journal renamed *.stale.<ts>, preserving
+        the log per repo discipline), and let the operator reconcile.
+    """
+    journal = _swap_journal_path()
+    if not journal.exists():
+        return
+
+    stale_reason: str | None = None
+    j: Any = None
+    try:
+        j = read_json(journal)
+    except (json.JSONDecodeError, OSError) as e:
+        stale_reason = f"journal unreadable ({e})"
+    frm = j.get("from") if isinstance(j, dict) else None
+    to = j.get("to") if isinstance(j, dict) else None
+    if stale_reason is None and not to:
+        stale_reason = "journal has no 'to' account"
+
+    landed: str | None = None
+    if stale_reason is None:
+        try:
+            live_ids = _identity_fields(read_json(CLAUDE_JSON)) if CLAUDE_JSON.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            live_ids = {}
+        m_to = _identities_match(live_ids, _dir_identity(to))
+        m_frm = _identities_match(live_ids, _dir_identity(frm)) if frm else None
+        if m_to and not m_frm:
+            landed = "to"
+        elif m_frm and not m_to:
+            landed = "from"
+        elif m_to and m_frm:
+            stale_reason = (f"live identity matches BOTH '{frm}' and '{to}' "
+                            f"(duplicate-identity accounts? see GH #70) — refusing to guess")
+        else:
+            # Identity evidence inconclusive (missing/corrupt .claude.json
+            # somewhere). Fall back to credentials refresh-token lineage.
+            try:
+                live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+            except (json.JSONDecodeError, OSError):
+                live_creds = None
+            if live_creds is not None:
+                verdict, owner, _ = classify_live_creds_owner(live_creds, to, load_state())
+                if verdict == "expected":
+                    landed = "to"
+                elif verdict == "foreign" and owner == frm:
+                    landed = "from"
+            if landed is None:
+                stale_reason = "live files match neither the 'from' nor the 'to' account"
+
+    if stale_reason is not None:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        stale_path = journal.with_name(f"{journal.name}.stale.{ts}")
+        msg = (
+            f"UNRESOLVED crashed swap detected ({frm!r} -> {to!r}): {stale_reason}. "
+            f"Evidence preserved at {stale_path}. Manual recovery steps: "
+            f"(1) `cus whoami` to see which account the live files actually hold; "
+            f"(2) compare with `grep '\"active\"' {STATE_JSON}`; "
+            f"(3) if they disagree, edit state.json's \"active\" to the account the live files hold "
+            f"(record reality — do NOT run a swap first, its save-back would write one account's "
+            f"tokens into another's snapshot); "
+            f"(4) `cus poll` to refresh; "
+            f"(5) if a snapshot was clobbered, `cus restore-creds <name> --list` (GH #79 backups)."
+        )
+        click.echo(f"swap-journal: {msg}", err=True)
+        try:
+            os.replace(journal, stale_path)
+        except OSError:
+            pass
+        try:
+            append_inbox("crash-recovery", "unresolved crashed swap — manual reconciliation needed", msg)
+        except OSError:
+            pass
+        return
+
+    if landed == "to":
+        # Crash after the live mutation (or mid-way through it): finish the
+        # job. If the live creds still carry `from`'s lineage, the crash hit
+        # the window between the identity write and the creds install —
+        # complete the install from `to`'s snapshot.
+        target_creds = ACCOUNTS_DIR / f"account-{to}" / ".credentials.json"
+        try:
+            live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+        except (json.JSONDecodeError, OSError):
+            live_creds = None
+        state = load_state()
+        installed_note = ""
+        if live_creds is not None and target_creds.exists():
+            verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
+            if verdict == "foreign":
+                backup_credentials_file(CREDS_JSON)   # GH #79 choke point
+                atomic_copy(target_creds, CREDS_JSON, mode=0o600)
+                installed_note = " (live creds still held the outgoing account's tokens; completed the install)"
+        if state.get("active") != to:
+            state["active"] = to
+            state.setdefault("swap_history", []).append({
+                "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery",
+            })
+            save_state(state)
+        msg = (f"crashed swap {frm!r} -> {to!r} had completed its live mutation; "
+               f"reconciled state.json active -> {to!r}{installed_note}")
+        click.echo(f"swap-journal: {msg}")
+        try:
+            append_inbox("crash-recovery", "crashed swap reconciled (live had moved)", msg)
+        except OSError:
+            pass
+        _clear_swap_journal()
+        return
+
+    # landed == "from": nothing durable changed hands before the crash.
+    state = load_state()
+    if frm and state.get("active") != frm:
+        # Shouldn't happen (save_state is the LAST step), but if state points
+        # elsewhere while live provably holds `from`, record reality.
+        state["active"] = frm
+        save_state(state)
+    msg = (f"crashed swap {frm!r} -> {to!r} never reached the live mutation; "
+           f"no repair needed (the interrupted swap simply did not happen)")
+    click.echo(f"swap-journal: {msg}")
+    try:
+        append_inbox("crash-recovery", "crashed swap cleared (nothing had moved)", msg)
+    except OSError:
+        pass
+    _clear_swap_journal()
+
+
+def _creds_expires_at(creds: Any) -> int | float | None:
+    """Extract claudeAiOauth.expiresAt (Unix ms) from a credentials payload,
+    tolerating any malformed shape. Used as the FRESHNESS discriminator for
+    GH #77: identity/lineage checks can't tell fresh tokens from dead ones
+    for the SAME account, but a re-login/refresh always advances expiresAt."""
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    exp = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+    return exp if isinstance(exp, (int, float)) else None
+
+
+def _snapshot_fresher_than_live(account_name: str) -> bool:
+    """True when the account's storage snapshot holds strictly NEWER tokens
+    (by claudeAiOauth.expiresAt) than the live ~/.claude/.credentials.json.
+
+    This is the GH #77 signature: the user re-logged in under the storage
+    dir (`CLAUDE_CONFIG_DIR=account-X/ claude`) while X was the ACTIVE
+    account — fresh tokens landed in the snapshot, but Claude keeps reading
+    the (dead) live file. Detection lets poll/SOS point at
+    `cus relogin X --finish` instead of the generic re-login advice, and
+    lets the swap save-back refuse to destroy the fresh snapshot.
+    """
+    snap_path = account_creds_path(account_name)
+    if not snap_path.exists() or not CREDS_JSON.exists():
+        return False
+    try:
+        snap_exp = _creds_expires_at(read_json(snap_path))
+        live_exp = _creds_expires_at(read_json(CREDS_JSON))
+    except (json.JSONDecodeError, OSError):
+        return False
+    return snap_exp is not None and live_exp is not None and snap_exp > live_exp
+
+
 def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> tuple[str, str | None, str]:
     """Identify which account the live credentials file actually belongs to (GH #3).
 
@@ -1631,11 +2061,38 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     Reads from + writes to the post-migration layout (.credentials.json +
     .claude.json inside each account-* dir). Pre-migration storage is
     auto-migrated on first read via migrate_account_dir().
+
+    GH #76: the whole sequence runs under the global swap lock — every entry
+    point (daemon reactive/background, switch, auto-swap, orchestrator
+    sub-paths) is serialized here, at the primitive itself, so no caller can
+    forget. Crash recovery for a previously-interrupted swap runs first,
+    under the same lock. Raises RuntimeError on lock timeout (the exception
+    type every caller already catches).
     """
+    with _swap_lock():
+        _recover_pending_swap()
+        return _execute_swap_locked(target_name, trigger)
+
+
+def _execute_swap_locked(target_name: str, trigger: str) -> dict:
+    """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
+    # State is loaded AFTER the lock is acquired: a concurrent swap that just
+    # finished has already persisted its state.json, so `current` below is
+    # never a stale pre-lock snapshot (the #76 interleaving scenario).
     state = load_state()
     if target_name not in state["accounts"]:
         raise ValueError(f"Unknown account '{target_name}'. Known: {sorted(state['accounts'].keys())}")
     current = state["active"]
+    if current is None:
+        # GH #76 problem 2 edge: a hand-built / partially-initialized
+        # state.json with active=None used to sail through, create
+        # ~/claude-accounts/account-None/, mutate the LIVE files, and only
+        # then crash on the threshold-ladder KeyError — after the damage.
+        # Refuse up front, before any write.
+        raise RuntimeError(
+            "state.json has no active account (active=null) — refusing to swap: the save-back "
+            "would create a bogus 'account-None' snapshot. Run `cus init` (or set \"active\" in "
+            f"{STATE_JSON} to the account the live files currently hold).")
     if target_name == current:
         return state
 
@@ -1657,6 +2114,11 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         live_cj = read_json(CLAUDE_JSON)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"{CLAUDE_JSON} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
+
+    # GH #76: write the intent journal BEFORE the first mutating step. From
+    # here to the post-save_state clear, a crash leaves the journal on disk
+    # and _recover_pending_swap reconciles on the next swap / daemon start.
+    _write_swap_journal(current, target_name, trigger)
 
     # Save current identity + creds back to current's storage. We update the
     # ENTIRE .claude.json in the source dir (not just account-bound keys)
@@ -1705,9 +2167,50 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
             # refresh-token rotation on the active account looks like; the
             # save-back is the only way that rotated token gets persisted, so
             # keep the historical behavior (see classify_live_creds_owner).
-            if verdict == "unknown":
-                click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
-            atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+            #
+            # ---- GH #77: freshness guard ----
+            # Identity/lineage says these live tokens may be saved back — but
+            # if the SNAPSHOT's expiresAt is strictly newer than the live
+            # file's, the snapshot was re-logged-in or refreshed out-of-band
+            # (the #77 scenario: user ran the storage-dir re-login while this
+            # account was ACTIVE, so the fresh tokens landed in the snapshot
+            # and the live file still holds the dead ones). Overwriting would
+            # silently destroy the freshly-minted refresh token at the exact
+            # moment the user is trying to recover from an outage. Note #72's
+            # identity guard structurally cannot catch this: same account,
+            # same-or-rotated lineage — freshness, not identity, is the
+            # discriminator here. The guard compares only when both sides
+            # carry a numeric expiresAt; missing/garbled data falls through
+            # to the historical save-back.
+            snap_exp = None
+            live_exp = _creds_expires_at(live_creds)
+            snap_path = current_dir / ".credentials.json"
+            if live_exp is not None and snap_path.exists():
+                try:
+                    snap_exp = _creds_expires_at(read_json(snap_path))
+                except (json.JSONDecodeError, OSError):
+                    snap_exp = None  # unreadable snapshot can't claim freshness
+            if snap_exp is not None and live_exp is not None and snap_exp > live_exp:
+                msg = (f"FRESHNESS GUARD at swap ({current} -> {target_name}): '{current}' snapshot's tokens "
+                       f"are NEWER than the live file's (snapshot expiresAt {int(snap_exp)} > live {int(live_exp)}) "
+                       f"— the snapshot was re-logged-in/refreshed out-of-band (GH #77). Skipped the save-back "
+                       f"so the fresh tokens survive; the dead live tokens are discarded by the target install. "
+                       f"(If '{current}' polls as token_expired, run `cus relogin {current} --finish` "
+                       f"before swapping back, or just swap to it — the snapshot is the fresh copy.)")
+                click.echo(f"creds-save-back: {msg}")
+                try:
+                    append_inbox("freshness-guard", f"save-back skipped — '{current}' snapshot fresher than live", msg)
+                except OSError:
+                    pass  # inbox is best-effort observability; never fail a swap over it
+            else:
+                # ---- end GH #77 freshness guard ----
+                if verdict == "unknown":
+                    click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
+                # GH #79: keep a rotated backup of the snapshot we're replacing —
+                # if any clobber bug slips past the verdict above, the refresh
+                # token is recoverable via `cus restore-creds`.
+                backup_credentials_file(current_dir / ".credentials.json")
+                atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
         elif verdict == "foreign":
             # THE GH #3 case: a drifted pane's refresh overwrote the live file
             # with a different account's tokens. Two actions:
@@ -1718,6 +2221,9 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
             #      with a fresher access token from the drifted pane's refresh.
             #      Discarding it would strand the owner's snapshot on an older
             #      access token for no benefit; same-lineage writes are safe.
+            # GH #79: the owner-heal is a same-lineage write, but back up the
+            # owner's snapshot anyway — cheap insurance against a wrong verdict.
+            backup_credentials_file(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json")
             atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
                                live_creds_bytes, mode=0o600)
             msg = (f"DRIFT DETECTED at swap ({current} -> {target_name}): {detail}. "
@@ -1759,6 +2265,12 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     for k, v in target_identity.items():
         live_cj[k] = v
     write_json(CLAUDE_JSON, live_cj)
+    # GH #79: the live file's content was (normally) just saved back into the
+    # outgoing snapshot — but the clobber bug class exists precisely because
+    # the save-back sometimes goes to the wrong place or is skipped. A rotated
+    # backup of the live file itself makes the install step independently
+    # recoverable.
+    backup_credentials_file(CREDS_JSON)
     atomic_copy(target_creds, CREDS_JSON, mode=0o600)
 
     # Update state with progressive-threshold bookkeeping
@@ -1781,6 +2293,8 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         "ts": ts, "from": current, "to": target_name, "trigger": trigger,
     })
     save_state(state)
+    # GH #76: swap fully persisted — retire the crash journal.
+    _clear_swap_journal()
     return state
 
 
@@ -2737,16 +3251,115 @@ class SOSCondition:
 def _relogin_command_for(account_name: str, source_dir: str | None = None) -> str:
     """Return the exact shell command to re-login a given account.
 
-    Prefers the managed-tree location (`~/claude-accounts/account-<name>/`)
-    over legacy `~/.claude-<name>/` ad-hoc dirs. If the managed dir doesn't
-    exist yet, this still returns the managed-dir command — running it
-    creates the dir.
+    GH #77: the command must target the file Claude will actually READ for
+    this account, which depends on whether the account is ACTIVE:
+
+      - ACTIVE account (whatever its name): the live `~/.claude/` +
+        `~/.claude.json` are its authoritative slot, so a bare
+        `claude /login` (no CLAUDE_CONFIG_DIR) writes the fresh tokens
+        exactly where they're needed. The old behavior — always pointing at
+        the storage dir — put the fresh tokens in the SNAPSHOT while the
+        live file kept the dead ones: polls stayed 401 (poll reads live for
+        the active account), and the next swap-away's save-back overwrote
+        the fresh snapshot with the dead live tokens. (If the user already
+        did the storage-dir login, `cus relogin <name> --finish` syncs
+        snapshot → live.)
+      - INACTIVE account: log in under its managed storage dir
+        (`CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/`) — the
+        snapshot is the authoritative copy for inactive accounts. This now
+        includes an inactive "default": the old unconditional
+        `claude /login` for default clobbered the ACTIVE account's live
+        tokens whenever default wasn't the one active (the mirror-image bug
+        noted in GH #77).
+
+    If the managed dir doesn't exist yet, the returned command still works —
+    running it creates the dir.
     """
-    if account_name == "default":
-        # default = live ~/.claude/, no env var needed
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    if account_name == state.get("active"):
+        # Live files are the active account's authoritative slot.
         return "claude /login"
     managed = ACCOUNTS_DIR / f"account-{account_name}"
     return f"CLAUDE_CONFIG_DIR={managed}/ claude"
+
+
+def finish_active_relogin(account_name: str) -> None:
+    """Sync a re-logged-in snapshot into the LIVE files (GH #77).
+
+    For when the user re-logged in the ACTIVE account under its storage dir
+    (old instructions, or muscle memory): the fresh tokens sit in
+    `account-<name>/.credentials.json` while Claude keeps reading the dead
+    live `~/.claude/.credentials.json`. This installs snapshot → live
+    (credentials + the account-bound .claude.json keys), completing the
+    recovery.
+
+    Raises RuntimeError (the standard caller-caught type) when the sync
+    would be wrong:
+      - account isn't active: for inactive accounts the snapshot is already
+        authoritative; there is nothing to finish — and installing an
+        inactive account's tokens live would clobber the actual active
+        account.
+      - snapshot is strictly OLDER than live: installing would replace
+        working tokens with deader ones. Equal/incomparable timestamps
+        proceed (a same-second sync is harmless; missing metadata shouldn't
+        block an explicit user request).
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    active = state.get("active")
+    if account_name != active:
+        raise RuntimeError(
+            f"'{account_name}' is not the active account (active: {active}). --finish installs a "
+            f"snapshot into the LIVE files, which belong to the active account only; for an inactive "
+            f"account the snapshot is already authoritative — nothing to finish.")
+    acct_dir = ACCOUNTS_DIR / f"account-{account_name}"
+    snap_creds = acct_dir / ".credentials.json"
+    if not snap_creds.exists():
+        raise RuntimeError(
+            f"{snap_creds} does not exist — run the re-login first: "
+            f"CLAUDE_CONFIG_DIR={acct_dir}/ claude   (then rerun --finish)")
+    try:
+        snap_exp = _creds_expires_at(read_json(snap_creds))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"{snap_creds} unreadable ({e}) — not installing it live")
+    live_exp = None
+    if CREDS_JSON.exists():
+        try:
+            live_exp = _creds_expires_at(read_json(CREDS_JSON))
+        except (json.JSONDecodeError, OSError):
+            live_exp = None  # corrupt live file is no reason to refuse a repair
+    if snap_exp is not None and live_exp is not None and snap_exp < live_exp:
+        raise RuntimeError(
+            f"'{account_name}' snapshot's tokens are OLDER than the live file's (snapshot expiresAt "
+            f"{int(snap_exp)} < live {int(live_exp)}) — installing them would replace working tokens "
+            f"with deader ones. If you just re-logged in under {acct_dir}, the login didn't write "
+            f"there; rerun it. If the LIVE tokens are the good ones, there is nothing to finish.")
+
+    backup_credentials_file(CREDS_JSON)  # GH #79 choke point
+    atomic_copy(snap_creds, CREDS_JSON, mode=0o600)
+
+    # Also carry the account-bound identity keys over, in case the re-login
+    # refreshed them (e.g. a changed oauthAccount payload). Best-effort: a
+    # missing snapshot .claude.json just means there's nothing to merge.
+    snap_cj_path = acct_dir / ".claude.json"
+    if snap_cj_path.exists() and CLAUDE_JSON.exists():
+        try:
+            snap_cj = read_json(snap_cj_path)
+            live_cj = read_json(CLAUDE_JSON)
+        except (json.JSONDecodeError, OSError):
+            return  # creds are synced (the part that matters); skip identity merge
+        merged = False
+        for k in ACCOUNT_BOUND_KEYS:
+            if k in snap_cj and live_cj.get(k) != snap_cj[k]:
+                live_cj[k] = snap_cj[k]
+                merged = True
+        if merged:
+            write_json(CLAUDE_JSON, live_cj)
 
 
 def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
@@ -2774,10 +3387,31 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     for name, acct in accounts.items():
         if acct.get("token_expired"):
             cmd = _relogin_command_for(name)
+            # GH #77 auto-heal: if the ACTIVE account's snapshot is fresher
+            # than the live file, the re-login already happened under the
+            # storage dir — the fix is a one-command sync, not another
+            # browser round-trip. Lead with that instead of the generic
+            # advice (which is what kept the #77 outage loop going).
+            if state.get("active") == name and _snapshot_fresher_than_live(name):
+                action = (f"The '{name}' snapshot holds FRESHER tokens than the live file — a storage-dir "
+                          f"re-login already happened (GH #77). Install it live:\n"
+                          f"      python3 ~/repos/claude-usage-swap/cus.py relogin {name} --finish\n"
+                          f"    then verify:\n      python3 ~/repos/claude-usage-swap/cus.py poll")
+            else:
+                action = f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll"
+            # GH #79: if a rotated credential backup exists, mention its age —
+            # a token that "expired" because a clobber bug replaced it can be
+            # brought back with one command (refresh tokens live ~30 days), no
+            # browser needed. Let the operator weigh restore vs re-login.
+            backups = list_creds_backups(name)
+            if backups:
+                action += (f"\n    Or, if the token died from a credential overwrite (not real expiry), "
+                           f"a restore may be faster:\n      cus restore-creds {name} --list\n"
+                           f"    Newest backup: {_describe_creds_backup(backups[0])}")
             out.append(SOSCondition(
                 severity="urgent",
                 summary=f"{name}: OAuth token expired",
-                action=f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll",
+                action=action,
                 affected=name,
             ))
 
@@ -4844,6 +5478,10 @@ def init(dry_run: bool, force: bool) -> None:
         # 1. Credentials — copy from source to .credentials.json (new layout)
         src_creds = src_dir / ".credentials.json"
         dst_creds = dst / ".credentials.json"
+        # GH #79: an `init --force` re-import can overwrite a managed snapshot
+        # from a possibly-stale legacy dir — keep a rotated backup of the
+        # snapshot being replaced so the newer tokens remain recoverable.
+        backup_credentials_file(dst_creds)
         shutil.copy2(src_creds, dst_creds)
         os.chmod(dst_creds, 0o600)
 
@@ -5392,7 +6030,17 @@ def poll(account: str | None, no_write: bool) -> None:
             click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable and swap-eligible).")
             continue
         if u.token_expired:
-            click.echo(f"  TOKEN EXPIRED — re-auth this account (claude login under its config dir)")
+            # GH #77 auto-heal hint: for the ACTIVE account, poll reads the
+            # LIVE file — if the snapshot holds strictly newer tokens, the
+            # user already re-logged in under the storage dir and only the
+            # snapshot→live sync is missing. Without this branch the generic
+            # advice sends them into a second (useless) re-login loop.
+            if state.get("active") == name and _snapshot_fresher_than_live(name):
+                click.echo(f"  TOKEN EXPIRED (live file) — but the '{name}' snapshot is FRESHER: "
+                           f"a storage-dir re-login already happened. Run `cus relogin {name} --finish` "
+                           f"to install it live (GH #77).")
+                continue
+            click.echo(f"  TOKEN EXPIRED — re-auth this account (`cus relogin {name}` shows the right command)")
             continue
         if u.raw.get("error"):
             click.echo(f"  ERROR: {u.raw['error']}")
@@ -5402,6 +6050,10 @@ def poll(account: str | None, no_write: bool) -> None:
         click.echo(f"  5h: {fh}    7d: {sd}    polled_at: {u.polled_at}")
 
     if not no_write:
+        # GH #75: re-load state after the slow network loop above so a swap
+        # that landed mid-poll isn't reverted by saving a stale snapshot
+        # (same rationale as the daemon's one_cycle re-load).
+        state = load_state()
         update_state_with_usage(state, usage_by_account)
         maybe_reset_thresholds(state, config)
         save_state(state)
@@ -5439,6 +6091,14 @@ def force_poll(account: str) -> None:
     click.echo(f"polling {account}...")
     u = poll_account_usage(account)
     config = load_config()
+    # GH #75: the HTTP call above can take up to USAGE_API_TIMEOUT_SECONDS;
+    # re-load state (and re-bind acct) so the saves below don't revert an
+    # `active`/history update committed by a concurrent swap mid-poll.
+    state = load_state()
+    if account not in state.get("accounts", {}):
+        click.echo(f"  account '{account}' disappeared from state.json mid-poll; not saving")
+        sys.exit(4)
+    acct = state["accounts"][account]
     if u.token_stale:
         minutes = u.raw.get("expired_minutes_ago", "?")
         click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable). State updated to clear any prior token_expired flag.")
@@ -5446,7 +6106,13 @@ def force_poll(account: str) -> None:
         save_state(state)
         sys.exit(0)
     if u.token_expired:
-        click.echo("  TOKEN EXPIRED — re-auth this account (`cus relogin <account>`)")
+        # GH #77 auto-heal hint (same as `cus poll`): a fresher snapshot means
+        # the re-login already happened — only the snapshot→live sync is missing.
+        if state.get("active") == account and _snapshot_fresher_than_live(account):
+            click.echo(f"  TOKEN EXPIRED (live file) — but the '{account}' snapshot is FRESHER: "
+                       f"run `cus relogin {account} --finish` to install it live (GH #77).")
+        else:
+            click.echo(f"  TOKEN EXPIRED — re-auth this account (`cus relogin {account}` shows the right command)")
         update_state_with_usage(state, {account: u})
         save_state(state)
         sys.exit(2)
@@ -5466,6 +6132,77 @@ def force_poll(account: str) -> None:
     update_state_with_usage(state, {account: u})
     maybe_reset_thresholds(state, config)
     save_state(state)
+
+
+# GH #76: fd holding the daemon single-instance flock. Module-level on
+# purpose — the lock must live exactly as long as the process, and a local
+# would be garbage-collected (closing the fd releases the flock).
+_DAEMON_SINGLETON_FD: int | None = None
+
+
+def _acquire_daemon_singleton() -> bool:
+    """Claim the machine-wide "I am THE cus daemon" slot (GH #76 problem 3).
+
+    Takes a non-blocking exclusive flock on daemon.pid and keeps the fd open
+    for the process lifetime. A second persistent daemon (systemd unit +
+    manual launch, double-enabled units, ...) finds the lock held and refuses
+    to start instead of silently doubling every race window.
+
+    Why flock instead of "read pid, kill -0": the probe approach races
+    (two starters can both see a dead pid and both proceed) and misfires on
+    pid reuse; a flock dies with its process, so it is both race-free and
+    self-cleaning after a crash. The pid is still WRITTEN into the file so
+    `cus sos` diagnostics and humans can see who holds it.
+
+    Returns True when the slot was acquired (or when the guard can't run at
+    all because the file is unopenable — preserving the pre-#76 lenient
+    behavior of a best-effort pid write rather than refusing to start).
+    """
+    global _DAEMON_SINGLETON_FD
+    try:
+        DAEMON_PID.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(DAEMON_PID), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return True  # can't guard → behave like the old best-effort pid write
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            os.lseek(fd, 0, 0)
+            holder = os.read(fd, 64).decode(errors="replace").strip() or "(unknown)"
+        except OSError:
+            holder = "(unknown)"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        click.echo(f"Another cus daemon is already running (pid {holder}, flock held on {DAEMON_PID}). "
+                   f"Refusing to start a second instance — two daemons double every swap-race window (GH #76). "
+                   f"Check `systemctl --user status cus.service`.", err=True)
+        return False
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    _DAEMON_SINGLETON_FD = fd
+    return True
+
+
+def _release_daemon_singleton() -> None:
+    """Release the single-instance slot (tests; symmetric cleanup)."""
+    global _DAEMON_SINGLETON_FD
+    if _DAEMON_SINGLETON_FD is None:
+        return
+    try:
+        fcntl.flock(_DAEMON_SINGLETON_FD, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(_DAEMON_SINGLETON_FD)
+    except OSError:
+        pass
+    _DAEMON_SINGLETON_FD = None
 
 
 @cli.command()
@@ -5500,11 +6237,26 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
     # emit a spurious "Daemon pid X recorded but process is gone" warning.
     # `--once` callers (cron, smoke-tests, one-shot polls) don't need the
     # SOS-tracking slot at all; skip the write.
+    #
+    # GH #76 problem 3: the pid write is now also a SINGLE-INSTANCE guard —
+    # the pid file is flock'd for the process lifetime, so a systemd unit +
+    # a manually-launched `cus daemon` can no longer run concurrently and
+    # double the swap/lost-update collision odds. flock (not pid-liveness
+    # probing) because it is race-free and self-cleaning after a crash.
     if not once:
-        try:
-            DAEMON_PID.write_text(str(os.getpid()))
-        except OSError:
-            pass
+        if not _acquire_daemon_singleton():
+            sys.exit(1)
+
+    # GH #76: a swap that crashed mid-flight leaves its intent journal on
+    # disk. Reconcile at startup (under the swap lock) rather than waiting
+    # for the next swap — the desync poisons polling attribution in the
+    # meantime. Short lock timeout: if another process is actively swapping
+    # RIGHT NOW, it owns journal handling; skip quietly.
+    try:
+        with _swap_lock(timeout_seconds=5.0):
+            _recover_pending_swap()
+    except RuntimeError as e:
+        click.echo(f"startup swap-journal check skipped: {e}")
 
     def _emit_sos_after(state: dict, config: dict) -> None:
         conditions = diagnose(state, config)
@@ -5569,6 +6321,19 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 time.sleep(stagger)
             usage_by_account[name] = poll_account_usage(name)
             polled_this_cycle += 1
+
+        # GH #75 (lost-update race): the poll loop above holds the network
+        # for seconds to ~40s (per-account HTTP calls, 10s timeout each). A
+        # swap landing in that window commits active=<new> to state.json —
+        # and saving the pre-poll snapshot below would silently revert it,
+        # desyncing state from the live files and priming the NEXT swap's
+        # save-back to destroy the departed account's refresh token. Re-load
+        # state now, after the slow phase, and apply this cycle's usage
+        # updates to the FRESH copy; the remaining load→save window is
+        # milliseconds of pure local I/O. (The full fix — field-ownership
+        # merge or an active-pointer split — is tracked in #75; this removes
+        # the routinely-armed window.)
+        state = load_state()
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
@@ -6588,20 +7353,49 @@ def add_cmd(name: str, exec_flag: bool) -> None:
 
 @cli.command(name="relogin")
 @click.argument("name")
-@click.option("--exec", "exec_flag", is_flag=True, help="Immediately exec `claude` under the account dir.")
-def relogin_cmd(name: str, exec_flag: bool) -> None:
+@click.option("--exec", "exec_flag", is_flag=True, help="Immediately exec `claude` in the right config context.")
+@click.option("--finish", "finish_flag", is_flag=True,
+              help="GH #77: after a storage-dir re-login of the ACTIVE account, install the fresh snapshot into the live files.")
+def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
     """Print the command to re-login an existing account (refresh OAuth tokens).
 
     Run this when `cus sos` reports a token expired for a given account.
     After the re-login, `cus poll` to update state.
+
+    GH #77: the printed command depends on whether the account is ACTIVE.
+    Active accounts re-login via bare `claude /login` (the live files are
+    their authoritative slot); inactive accounts re-login under their
+    managed storage dir. If you already re-logged an ACTIVE account under
+    its storage dir, `--finish` installs the fresh snapshot into the live
+    files (with an expiresAt freshness check so it can never install older
+    tokens over newer ones).
     """
     dst = ACCOUNTS_DIR / f"account-{name}"
     if name != "default" and not dst.exists():
         click.echo(f"Unknown account '{name}'. Run `cus list` to see configured accounts.")
         sys.exit(1)
+
+    if finish_flag:
+        try:
+            finish_active_relogin(name)
+        except RuntimeError as e:
+            click.echo(f"ERROR: {e}")
+            sys.exit(1)
+        click.echo(f"✓ Installed '{name}' snapshot into the live files ({CREDS_JSON}).")
+        click.echo(f"  Verify with: python3 ~/repos/claude-usage-swap/cus.py poll --account {name}")
+        return
+
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    is_active = state.get("active") == name
     cmd = _relogin_command_for(name)
     click.echo(f"To re-login {name}, run:")
     click.echo(f"  {cmd}")
+    if is_active:
+        click.echo(f"  ('{name}' is the ACTIVE account, so the login writes the live files directly — GH #77.)")
+        click.echo(f"  (Already logged in under {dst}/ instead? Run: cus relogin {name} --finish)")
     click.echo()
     click.echo(f"After logging in:")
     click.echo(f"  python3 ~/repos/claude-usage-swap/cus.py poll")
@@ -6609,11 +7403,118 @@ def relogin_cmd(name: str, exec_flag: bool) -> None:
         click.echo()
         click.echo("Launching claude now...")
         env = os.environ.copy()
-        if name == "default":
+        if is_active:
+            # Live files are the active account's slot — no CLAUDE_CONFIG_DIR,
+            # matching the printed command (GH #77).
             env.pop("CLAUDE_CONFIG_DIR", None)
         else:
             env["CLAUDE_CONFIG_DIR"] = str(dst)
         os.execvpe("claude", ["claude"], env)
+
+
+def _describe_creds_backup(path: Path) -> str:
+    """One human-readable line about a backup generation: timestamp, age,
+    and whether the payload still looks restorable (has a refresh token)."""
+    ts_raw = path.name.rsplit(".bak.", 1)[-1]
+    age = "age unknown"
+    try:
+        ts_dt = datetime.strptime(ts_raw, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - ts_dt
+        hours = delta.total_seconds() / 3600
+        age = f"{hours / 24:.1f}d old" if hours >= 48 else f"{hours:.1f}h old"
+    except ValueError:
+        pass
+    payload = "unreadable"
+    try:
+        oauth = read_json(path).get("claudeAiOauth", {})
+        if isinstance(oauth, dict) and oauth.get("refreshToken"):
+            exp = oauth.get("expiresAt")
+            exp_note = ""
+            if isinstance(exp, (int, float)):
+                exp_dt = datetime.fromtimestamp(exp / 1000, tz=timezone.utc)
+                exp_note = f", access token {'expired' if exp_dt < datetime.now(timezone.utc) else 'valid'} (refresh token may still work)"
+            payload = f"has refresh token{exp_note}"
+        else:
+            payload = "NO refresh token — not restorable"
+    except (json.JSONDecodeError, OSError):
+        pass
+    return f"{ts_raw}  ({age}; {payload})"
+
+
+@cli.command(name="restore-creds")
+@click.argument("account")
+@click.option("--list", "list_flag", is_flag=True, help="List available backup generations and exit.")
+@click.option("--from", "from_ts", default=None, metavar="TS",
+              help="Timestamp of the generation to restore (as shown by --list). Default: newest.")
+@click.option("--live", "live_flag", is_flag=True,
+              help="Also install the restored creds as the live ~/.claude/.credentials.json (only when the account is active).")
+def restore_creds_cmd(account: str, list_flag: bool, from_ts: str | None, live_flag: bool) -> None:
+    """Restore an account's credentials snapshot from a rotated backup (GH #79).
+
+    Every write that replaces a credentials file first preserves the old
+    content as `.credentials.json.bak.<ts>` (newest 5 kept). When a clobber
+    bug (#3/#70/#75/#76/#77 class) destroys a snapshot's refresh token, this
+    command brings back a previous generation — usually faster than an
+    interactive browser re-login, and the only option at 2am.
+
+    Restores are reversible: the current snapshot is backed up before being
+    replaced, so a bad restore is undone by restoring the newest generation.
+    """
+    acct_dir = ACCOUNTS_DIR / f"account-{account}"
+    if not acct_dir.exists():
+        click.echo(f"Unknown account '{account}' ({acct_dir} does not exist). Run `cus list`.")
+        sys.exit(1)
+
+    backups = list_creds_backups(account)
+    if list_flag:
+        if not backups:
+            click.echo(f"No credential backups for '{account}' yet. Backups accumulate as swaps overwrite the snapshot.")
+            return
+        click.echo(f"Credential backups for '{account}' (newest first, keep={CREDS_BACKUP_KEEP}):")
+        for b in backups:
+            click.echo(f"  {_describe_creds_backup(b)}")
+        click.echo()
+        click.echo(f"Restore the newest:  cus restore-creds {account}")
+        click.echo(f"Restore a specific:  cus restore-creds {account} --from <TS>")
+        return
+
+    if not backups:
+        click.echo(f"No credential backups for '{account}' — nothing to restore. "
+                   f"If the account is locked out, re-login instead: `cus relogin {account}`.")
+        sys.exit(1)
+
+    if from_ts:
+        chosen = next((b for b in backups if b.name.endswith(f".bak.{from_ts}")), None)
+        if chosen is None:
+            click.echo(f"No backup with timestamp '{from_ts}'. Available:")
+            for b in backups:
+                click.echo(f"  {b.name.rsplit('.bak.', 1)[-1]}")
+            sys.exit(1)
+    else:
+        chosen = backups[0]
+
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    is_active = state.get("active") == account
+
+    if live_flag and not is_active:
+        click.echo(f"--live refused: '{account}' is not the active account "
+                   f"(active: {state.get('active')}). The live file belongs to the active "
+                   f"account; restoring another account's tokens into it would clobber it.")
+        sys.exit(1)
+
+    click.echo(f"Restoring '{account}' snapshot from: {_describe_creds_backup(chosen)}")
+    restore_creds_backup(account, chosen, into_live=live_flag)
+    click.echo(f"  ✓ snapshot restored -> {acct_dir / '.credentials.json'}")
+    if live_flag:
+        click.echo(f"  ✓ live file replaced -> {CREDS_JSON}")
+    elif is_active:
+        click.echo(f"  NOTE: '{account}' is the ACTIVE account, and Claude reads the LIVE file, "
+                   f"not the snapshot. Re-run with --live to install the restored tokens live.")
+    click.echo("  Restore is best-effort: if the newer refresh token was already used, "
+               "Anthropic may have invalidated this one server-side. Verify with `cus poll`.")
 
 
 @cli.command(name="install")

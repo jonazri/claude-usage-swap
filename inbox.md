@@ -6,6 +6,9 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps](#2026-07-02-decision-gh-77-freshness-guard-active-account-relogin-bare-claude-login-not-storage-dir-sync-guard-covers-the-expected-verdict-too-finish-allows-incomparable-timestamps)
+- [2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast](#2026-07-02-decision-gh-76-swap-lock-crash-journal-journal-is-a-standalone-file-not-a-state-json-key-recovery-auto-reconciles-determinate-crashes-lock-waits-instead-of-failing-fast)
+- [2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant](#2026-07-02-decision-gh-79-backup-rotation-also-back-up-the-live-creds-file-before-target-install-backup-failures-are-not-swallowed-keep-bound-is-a-constant)
 - [2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds](#2026-07-01-decision-gh-3-drift-guard-route-drifted-live-tokens-to-their-true-owner-beyond-skip-log-skip-save-back-of-unparseable-live-creds)
 - [2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found](#2026-05-19-flag-second-hot-swap-test-2026-05-19-21-00-orchestrator-correctness-ok-3-new-bugs-found)
 - [2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch](#2026-05-19-deviation-hot-swap-orchestration-disabled-2026-05-19-after-burning-4-of-user-s-5h-on-bungled-live-session-relaunch)
@@ -17,6 +20,79 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #credentials #relogin #freshness #gh-77 #swap-safety
+
+Judgment calls beyond the literal GH #77 spec, on branch `fix/77-relogin-freshness-guard-20260702`:
+
+1. **For the ACTIVE account, `_relogin_command_for` now returns bare `claude /login`** rather than the issue's sketched storage-dir-login-then-sync flow. Rationale: the live `~/.claude/` + `~/.claude.json` ARE the active account's authoritative slot, so a bare login writes the fresh tokens exactly where Claude reads them — one step, no sync, no window where snapshot and live disagree. The issue's storage-dir+`--finish` flow is still fully supported (for users following old docs/muscle memory): `cus relogin <name> --finish` performs the snapshot→live sync, and poll/force-poll/SOS auto-detect the fresher-snapshot signature and point at it.
+2. **The freshness guard applies to BOTH the "expected" and "unknown" classifier verdicts.** The issue framed it for the re-login case (rotated token → "unknown"), but the same destruction happens with an un-rotated out-of-band refresh (same lineage → "expected", snapshot newer). The discriminator is expiresAt either way, so both branches get the veto; "foreign"/"conflict"/"invalid" verdicts already skip.
+3. **The guard only fires when BOTH sides carry a numeric expiresAt.** Missing/garbled metadata falls through to the historical save-back — absence of evidence must not strand legitimately-refreshed live tokens (same philosophy as #72's "unknown" fallback).
+4. **`--finish` refuses only when the snapshot is STRICTLY older than live; equal or incomparable timestamps proceed.** An explicit user request shouldn't be blocked by missing metadata; the strictly-older case is the only provably-harmful one (installing deader tokens over working ones). It also refuses non-active accounts outright — installing an inactive account's tokens live IS the #70/#77 damage class.
+5. **`relogin --exec` env now matches the active-aware command**: pops CLAUDE_CONFIG_DIR when the account is active (previously only when it was named "default"), sets the storage dir otherwise — including for an inactive default, fixing the mirror-image clobber the issue noted.
+6. Incidental: replacing the generic poll "TOKEN EXPIRED" advice line fixed one pre-existing ruff F541 (cus.py finding count 30 → 29).
+
+### Walk-back path
+1. Restore storage-dir advice for active accounts: in `_relogin_command_for`, drop the `account_name == state.get("active")` branch (revert to the `account_name == "default"` special case) — not recommended, it recreates the #77 loop.
+2. Limit the guard to the "unknown" verdict: wrap the freshness check in `if verdict == "unknown":` inside `_execute_swap_locked`'s save-back and drop `tests/test_relogin_freshness.py::test_freshness_guard_applies_to_expected_verdict_too`.
+3. Make `--finish` strict about missing timestamps: change the `snap_exp < live_exp` refusal in `finish_active_relogin` to also refuse when either side is None.
+4. Full revert: `git revert` the commit titled "fix(relogin): freshness guard on the swap save-back + active-aware re-login flow (GH #77)".
+
+---
+
+
+## 2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #swap-safety #locking #crash-recovery #gh-76 #gh-75 #daemon
+
+Judgment calls beyond the literal GH #76 spec, all on branch `fix/76-swap-lock-journal-daemon-singleton-20260702`:
+
+1. **The crash journal is a standalone `~/claude-accounts/swap.journal` file, not a `swap_pending` key inside state.json** (the issue suggested state.json). Reason: state.json is exactly the file with the #75 lost-update problem — a concurrent whole-file save from a poll-type writer could silently revert/erase a journal key mid-swap, which would defeat the journal at the moment it matters. A standalone file has a single writer (execute_swap, under the swap lock) and survives independently of state.json races.
+2. **Recovery goes beyond "detect and warn."** The two determinate cases are auto-reconciled under the swap lock: live files match the journal's `to` → fix `state.active`, append a `crash-recovery` swap_history entry, and complete the creds install if the crash hit the identity-written-creds-not-yet window; live files match `from` → nothing durable moved, just retire the journal. Only the indeterminate case (live matches neither, creds lineage matches no snapshot, or duplicate identities) stays detect+warn: exact manual steps, journal renamed `swap.journal.stale.<ts>` (annotate-don't-delete), inbox entry.
+3. **The swap lock BLOCKS with a 30s timeout instead of failing fast like ORCHESTRATE_LOCK.** Swaps are sub-second; the right behavior for a `cus switch` that collides with a daemon swap is to wait its turn, not to error at the user. On timeout it raises RuntimeError — the exception type every execute_swap caller already catches. Lock ordering is fixed and documented: ORCHESTRATE_LOCK outer, swap lock inner.
+4. **Lock/journal paths are call-time functions, not import-time constants.** Every test file repoints `cus.ACCOUNTS_DIR` at a temp tree; a path constant captured at import would escape the sandbox and touch the live `~/claude-accounts/` (this actually happened in an intermediate version of this branch — a test-run journal landed in the live dir and was removed; the function-based derivation prevents the whole class).
+5. **GH #75 folded in narrowly:** the three poll-type writers (daemon one_cycle, `cus poll`, `cus force-poll`) re-load state.json after their slow network phase and apply usage updates to the fresh copy, shrinking the routinely-armed seconds-to-40s lost-update window to milliseconds of local I/O. The full fix (field-ownership merge or an active-pointer file split) is deliberately NOT implemented — commented on #75 instead. Side effect: `cus force-poll` for an account deleted mid-poll now exits 4 with a message instead of crashing on KeyError.
+6. **Daemon singleton stays lenient when the pid file itself is unopenable** (returns True and runs unguarded, matching the old best-effort `DAEMON_PID.write_text` semantics) — an unwritable pid file shouldn't take the whole rotation daemon down.
+
+### Walk-back path
+1. Journal into state.json instead: replace `_write_swap_journal`/`_clear_swap_journal` with a `state["swap_pending"]` field written in `_execute_swap_locked` (and re-point `_recover_pending_swap` at it) — not recommended, see #75 interaction.
+2. Detect-and-warn only: in `_recover_pending_swap`, replace the `landed == "to"` / `landed == "from"` reconciliation branches with the stale-path warning block.
+3. Fail-fast lock: in `_swap_lock`, drop the deadline loop and raise on the first `BlockingIOError` (mirrors ORCHESTRATE_LOCK).
+4. Import-time constants: reintroduce `SWAP_LOCK`/`SWAP_JOURNAL` constants and revert `_swap_lock_path`/`_swap_journal_path` call sites (will re-open the test-sandbox leak).
+5. Revert the #75 narrow fix alone: delete the three `state = load_state()` re-load blocks (daemon one_cycle, poll, force-poll) and `tests/test_swap_lock_journal.py::test_poll_does_not_revert_concurrent_swap` + `test_daemon_cycle_does_not_revert_concurrent_swap`.
+6. Full revert: `git revert` the commit titled "fix(swap): global swap lock + crash journal + daemon single-instance (GH #76); narrow the state.json lost-update window (GH #75)".
+
+---
+
+
+## 2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #credentials #backup #gh-79 #swap-safety
+
+Four judgment calls beyond the literal GH #79 spec ("backup before snapshot overwrites + restore command"), all on branch `feature/79-creds-backup-rotation-20260702`:
+
+1. **The live `~/.claude/.credentials.json` is ALSO backed up** before `execute_swap` installs the target's creds over it. The issue argued the live file's content "was just saved back one line earlier, so it's covered" — but explicitly noted that coverage breaks exactly when the clobber bugs strike (save-back skipped, or routed to the wrong dir). An independent backup of the live file makes the install step recoverable regardless of what the save-back did. Backups of the live file land in `~/.claude/` (same-dir convention), not in any account dir.
+2. **Backup failures are NOT swallowed.** `backup_credentials_file` lets exceptions propagate rather than wrapping in try/except. Reasoning: an unwritable directory would fail the primary credentials write two lines later anyway, and a silent backup skip would defeat the feature at exactly the moment it matters. Failure ordering is unchanged in practice: a full-disk/permissions OSError crashed the swap before this change too, just at the write instead of at the backup.
+3. **`restore-creds --live` is refused when the account is not active.** The live file belongs to the active account; restoring another account's tokens into it would BE the clobber this whole PR defends against. The error message says so.
+4. **Keep-bound is a module constant (`CREDS_BACKUP_KEEP = 5`), not a config key.** The issue said "say 5"; a config knob adds a `load_config()` dependency to low-level IO helpers for a number nobody has asked to tune. Trivial to promote to config later (non-breaking: add key with default 5).
+
+### Walk-back path
+1. Live-file backup: delete the `backup_credentials_file(CREDS_JSON)` call before `atomic_copy(target_creds, CREDS_JSON, ...)` in `execute_swap` and drop `tests/test_creds_backup.py::test_live_install_creates_backup_of_live_file`.
+2. Swallow backup failures: wrap the `backup_credentials_file` body in `try/except OSError: return None` (not recommended — see above).
+3. Allow cross-account `--live` restore: delete the `if live_flag and not is_active` guard in `restore_creds_cmd` (strongly not recommended).
+4. Config knob instead of constant: add `backups: {keep: 5}` to `DEFAULT_CONFIG` and thread it through call sites; keep the constant as fallback.
+5. Full revert: `git revert` the commit titled "feat(creds): pre-overwrite backup rotation + cus restore-creds (GH #79)".
+
+---
+
 
 ## 2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds
 
