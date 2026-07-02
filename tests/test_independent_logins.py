@@ -512,6 +512,68 @@ def test_lane_sharing_off_still_refuses_double_book():
         env.restore()
 
 
+# --------------------------------------------------------------------------
+# Track B Phase 3b — #104 lift for a provably-independent 2nd lane
+# --------------------------------------------------------------------------
+
+def test_phase3b_second_independent_lane_allowed_and_installs_login():
+    env = _Env()
+    try:
+        # alpha is live on slot-1; gate on; a distinct independent login exists
+        # for (alpha, slot-8). Launching alpha --lane slot-8 must be ALLOWED and
+        # install that independent family, not alpha's snapshot copy.
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        _make_live_lane(env, "slot-1", "alpha")
+        env.plant_login("alpha", "slot-8", "rt-indep-alpha", "alpha@x")
+        name, d, acct = cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane="slot-8")
+        assert (name, acct) == ("slot-8", "alpha")
+        # slot-8 got the INDEPENDENT family, not the snapshot's rt-alpha.
+        assert cus._credential_refresh_token(cus.read_json(d / ".credentials.json")) == "rt-indep-alpha"
+    finally:
+        env.restore()
+
+
+def test_phase3b_second_lane_refused_without_independent_login():
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        _make_live_lane(env, "slot-1", "alpha")
+        # No login planted for (alpha, slot-8) → still refused (would be a copy).
+        import pytest as _pt
+        with _pt.raises(Exception) as ei:
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane="slot-8")
+        msg = str(ei.value)
+        assert "GH #104" in msg and "login-mount" in msg
+    finally:
+        env.restore()
+
+
+def test_phase3b_gate_off_second_lane_still_refused_even_with_login():
+    env = _Env()
+    try:
+        # Login exists but gate is OFF → the escape hatch is inert, #104 holds.
+        env.set_config({"independent_logins": {"use_independent_logins": False}})
+        _make_live_lane(env, "slot-1", "alpha")
+        env.plant_login("alpha", "slot-8", "rt-indep-alpha", "alpha@x")
+        import pytest as _pt
+        with _pt.raises(Exception):
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane="slot-8")
+    finally:
+        env.restore()
+
+
+def test_launch_bad_lane_shape_rejected():
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        import pytest as _pt
+        with _pt.raises(Exception) as ei:
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane="banana")
+        assert "bad --lane" in str(ei.value)
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

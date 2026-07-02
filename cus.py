@@ -10593,7 +10593,8 @@ def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
 
 
 def _launch_prepare(account: str | None, state: dict, config: dict,
-                    pool: str | None = None, force: bool = False) -> tuple[str, Path, str]:
+                    pool: str | None = None, force: bool = False,
+                    lane: str | None = None) -> tuple[str, Path, str]:
     """Everything `cus launch` does BEFORE the exec: pick account, acquire +
     heal + sync a slot, install the account's credentials into it.
 
@@ -10631,7 +10632,7 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     # We only join a SLOT lane, never the global mount (a slot on the global
     # active would be a genuine second mount of that account → falls through to
     # the #104 guard / independent-login hatch below).
-    if config.get("per_session", {}).get("lane_sharing", False):
+    if lane is None and config.get("per_session", {}).get("lane_sharing", False):
         occ = occupied_slot_accounts(state)  # account -> [live slot names]
         lanes = sorted(occ.get(account, []),
                        key=lambda n: int(n.removeprefix(SLOT_PREFIX)) if n.removeprefix(SLOT_PREFIX).isdigit() else 1 << 30)
@@ -10650,6 +10651,9 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             save_state(state)
             return lane, lane_dir, account
 
+    if lane is not None and not (lane.startswith(SLOT_PREFIX) and lane.removeprefix(SLOT_PREFIX).isdigit()):
+        raise click.ClickException(f"bad --lane '{lane}' — expected slot-<n> (e.g. slot-8).")
+
     # Duplicate-mount guard (GH #104): refuse to launch onto an account already
     # live on another mount (another slot, or the shared mount with live bare
     # sessions) — the two would rotate each other's single-use refresh token
@@ -10658,28 +10662,56 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     if state.get("active") and mount_in_use(CLAUDE_DIR):
         live_mount_accts.add(state["active"])
     if account in live_mount_accts and not force:
-        raise click.ClickException(
-            f"'{account}' is already running on a live mount. Launching a second session on it would rotate "
-            f"its login token and sign one of them out (GH #104). Pick another account (or `cus launch auto`), "
-            f"or pass --force if you really want two sessions sharing '{account}'.")
+        # Phase 3b (#109) escape hatch: a SECOND live mount on one account is
+        # safe only if it uses its OWN independent login family. Allow it when
+        # the gate is on AND the operator named an explicit --lane that already
+        # has an independent login provisioned for this account — the install
+        # below then uses that family (swap_install_source), not a clobbering
+        # copy. Everything else still refuses (lane sharing SHARES a mount, this
+        # hatch adds a distinct one). --force still overrides, but that IS the
+        # clobber.
+        independent_ok = (lane is not None and independent_logins_enabled(config)
+                          and has_independent_login(account, lane))
+        if not independent_ok:
+            raise click.ClickException(
+                f"'{account}' is already running on a live mount. A second session on it would rotate "
+                f"its login token and sign one out (GH #104). Options: pick another account "
+                f"(`cus launch auto`); turn on per_session.lane_sharing to SHARE its lane; or give it a "
+                f"second INDEPENDENT lane — enable independent_logins, run "
+                f"`cus login-mount <free-slot> {account}`, then `cus launch {account} --lane <free-slot>`. "
+                f"(`--force` overrides, but that reintroduces the clobber.)")
+        click.echo(f"launch: '{account}' gets a 2nd independent lane {lane} (its own login — GH #109)")
 
     acct_state = state.get("accounts", {}).get(account, {})
     if acct_state.get("token_expired"):
         click.echo(click.style(f"warning: '{account}' is flagged token_expired — the session may demand /login "
                                f"(fix first: `cus relogin {account}`)", fg="yellow"))
 
-    # acquire_slot persists the reservation itself (under the swap lock), so a
-    # concurrent launch / the daemon's gc already see this slot as claimed —
-    # no save_state here (it would re-write our possibly-staler `state` over
-    # acquire's fresh persist).
-    slot_name, slot_dir = acquire_slot(state, prefer_account=account)
+    if lane is not None:
+        # Explicit lane (Phase 3b escape hatch, or just pinning a launch to a
+        # known slot). Use it as-is instead of auto-picking. Refuse if it's live
+        # on a DIFFERENT account (that would collide); a free or same-account
+        # lane is fine.
+        cur = state.get("slots", {}).get(lane, {}).get("account")
+        slot_dir = slot_path(lane)
+        if slot_dir.exists() and mount_in_use(slot_dir) and cur not in (None, account):
+            raise click.ClickException(f"--lane {lane} is live on '{cur}', not '{account}'. Pick a free lane.")
+        scaffold_mount_dir(slot_dir)  # idempotent
+        slot_name = lane
+    else:
+        # acquire_slot persists the reservation itself (under the swap lock), so
+        # a concurrent launch / the daemon's gc already see this slot as claimed
+        # — no save_state here (it would re-write our possibly-staler `state`
+        # over acquire's fresh persist).
+        slot_name, slot_dir = acquire_slot(state, prefer_account=account)
 
     # Pre-flight: heal the slot's layout quietly (a launch should never come
     # up bare-hooked because a symlink rotted), then align its .claude.json
-    # with the canonical (the slot is free — no live-writer race).
+    # with the canonical — UNLESS the mount has a live writer (an explicit --lane
+    # onto an already-live same-account lane), where a sync would race it.
     for f in doctor_mount(slot_dir, fix=True):
         click.echo(f"launch: doctor healed {slot_name}/{f['entry']} ({f['problem']})")
-    if CLAUDE_JSON.exists():
+    if CLAUDE_JSON.exists() and not mount_in_use(slot_dir):
         try:
             sync_mount_claude_json(slot_dir, read_json(CLAUDE_JSON))
         except (json.JSONDecodeError, OSError) as e:
@@ -10704,8 +10736,9 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
 @click.option("--pool", type=click.Choice(list(VALID_POOLS)), default=None,
               help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
 @click.option("--force", is_flag=True, help="Launch even onto an account already live on another mount (GH #104: normally refused — two live mounts on one account sign one out).")
+@click.option("--lane", default=None, help="Launch into a specific slot (e.g. slot-8) instead of auto-picking. With independent_logins on + an independent login provisioned for (lane, account), this is how you give one account a 2nd independently-swappable lane (GH #109).")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
-def launch_cmd(account: str | None, pool: str | None, force: bool, claude_args: tuple[str, ...]) -> None:
+def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | None, claude_args: tuple[str, ...]) -> None:
     """Launch claude in its own slot, pinned to an account (per_session).
 
     ACCOUNT is an account name, or omitted/'auto' to pick the best by the
@@ -10715,17 +10748,22 @@ def launch_cmd(account: str | None, pool: str | None, force: bool, claude_args: 
         cus launch                       # auto-pick, plain session
         cus launch rayi1 -- --resume X   # explicit account + claude args
         cus launch --pool standard auto  # standard-pool slot (see `cus pool`)
+        cus launch rayi1 --lane slot-8   # pin to slot-8 (see below)
 
     The session keeps its slot (and its pool) for life; the daemon moves
     ACCOUNTS through slots (in-place, no restart), never sessions. Optional
     alias to make every launch slotted:  alias claude='cus launch auto --'
 
     An account already live on another mount is refused (GH #104) — it would
-    sign one of the two out; use `--force` to override, or `auto` to spread.
+    sign one of the two out. Three ways past it: `--force` (accepts the
+    clobber); turn on per_session.lane_sharing to SHARE the existing lane; or,
+    for a second INDEPENDENTLY-swappable lane, enable independent_logins, run
+    `cus login-mount <free-slot> <account>`, then `cus launch <account> --lane
+    <free-slot>` (GH #109).
     """
     state = load_state()
     config = load_config()
-    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force)
+    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force, lane=lane)
     click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
