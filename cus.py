@@ -8263,6 +8263,17 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     _, pin_account = _current_pane_pin(config)
     pin_lbl = _sl_pin_label(pin_account, active, color_on)
 
+    # per_session HARD pin badge: a slot session is physically bound to its
+    # account (its own CLAUDE_CONFIG_DIR), unlike the advisory 📌 pin which in
+    # background-swap mode doesn't actually route creds. 🔒<slot> (green) says
+    # "this pane is locked to its own account and a global swap won't move it."
+    # Re-resolved every render, so it tracks the slot's CURRENT occupant after
+    # an in-place per-slot swap.
+    slot_lbl = ""
+    if is_mount_session and mount_name and mount_name.startswith(SLOT_PREFIX):
+        raw = f"🔒{mount_name}"
+        slot_lbl = click.style(raw, fg="green") if color_on else raw
+
     acct = state.get("accounts", {}).get(active, {})
     fh = acct.get("current_5h_pct", 0)
     sd = acct.get("current_7d_pct", 0)
@@ -8277,7 +8288,8 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         # Compact mode. Render "?" if we don't have reliable data.
         if _pct_is_unknown(acct):
             pin_bit = f" {pin_lbl}" if pin_lbl else ""
-            click.echo(f"cus:{active_lbl}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
+            slot_bit = f" {slot_lbl}" if slot_lbl else ""
+            click.echo(f"cus:{active_lbl}{slot_bit}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
             return
         # GH #59: compact mode must flag a rolled-over 5h window live, exactly
         # like verbose mode already does. The reset countdown elapses between
@@ -8302,6 +8314,10 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         elif max(marker_fh, sd) >= nx * 0.8:
             flag_marker = "·"
         prefix_bits = [f"cus:{active_lbl}"]
+        if slot_lbl:
+            # Hard-pin (slot) badge rides next to the account so "which
+            # account" and "locked to my own slot" read as one glance.
+            prefix_bits.append(slot_lbl)
         if pin_lbl:
             # GH #36: pin badge rides directly next to the account label so
             # "which account" and "is it pinned here" read as one glance.
@@ -8341,7 +8357,8 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         # Restart this pane to pick up the machine-active account.
         pieces_prefix = f"cus this:{this_session_account} →{machine_active}(swap pending—/exit to apply) | "
     else:
-        pieces_prefix = "cus "
+        # Lead verbose with the hard-pin slot badge when this is a slot session.
+        pieces_prefix = f"cus {slot_lbl} " if slot_lbl else "cus "
 
     def fmt_account(name: str, a: dict, is_active: bool) -> str:
         h5 = a.get("current_5h_pct", 0)

@@ -213,6 +213,33 @@ def test_mount_account_from_env():
         env.restore()
 
 
+def test_statusline_shows_slot_hardpin_badge():
+    """A slot session's statusline shows the 🔒<slot> hard-pin badge and the
+    slot's account; a bare session (no CLAUDE_CONFIG_DIR) shows neither."""
+    from click.testing import CliRunner
+    env = _Env()
+    try:
+        state = cus.load_state()
+        name, slot_dir = cus.create_slot(state)
+        cus.execute_swap("alpha", trigger="launch", slot=name)
+        runner = CliRunner()
+
+        # Slot session: badge + slot's account (alpha), color off for asserts.
+        r = runner.invoke(cus.cli, ["statusline", "--compact"],
+                          env={"CLAUDE_CONFIG_DIR": str(slot_dir), "NO_COLOR": "1"})
+        assert r.exit_code == 0, r.output
+        assert f"🔒{name}" in r.output, r.output
+        assert "alpha" in r.output
+
+        # Bare session: no badge, shows global active (gamma).
+        r2 = runner.invoke(cus.cli, ["statusline", "--compact"],
+                           env={"CLAUDE_CONFIG_DIR": None, "NO_COLOR": "1"})
+        assert r2.exit_code == 0, r2.output
+        assert "🔒" not in r2.output, r2.output
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
