@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant](#2026-07-02-decision-gh-79-backup-rotation-also-back-up-the-live-creds-file-before-target-install-backup-failures-are-not-swallowed-keep-bound-is-a-constant)
 - [2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds](#2026-07-01-decision-gh-3-drift-guard-route-drifted-live-tokens-to-their-true-owner-beyond-skip-log-skip-save-back-of-unparseable-live-creds)
 - [2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found](#2026-05-19-flag-second-hot-swap-test-2026-05-19-21-00-orchestrator-correctness-ok-3-new-bugs-found)
 - [2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch](#2026-05-19-deviation-hot-swap-orchestration-disabled-2026-05-19-after-burning-4-of-user-s-5h-on-bungled-live-session-relaunch)
@@ -17,6 +18,29 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #credentials #backup #gh-79 #swap-safety
+
+Four judgment calls beyond the literal GH #79 spec ("backup before snapshot overwrites + restore command"), all on branch `feature/79-creds-backup-rotation-20260702`:
+
+1. **The live `~/.claude/.credentials.json` is ALSO backed up** before `execute_swap` installs the target's creds over it. The issue argued the live file's content "was just saved back one line earlier, so it's covered" — but explicitly noted that coverage breaks exactly when the clobber bugs strike (save-back skipped, or routed to the wrong dir). An independent backup of the live file makes the install step recoverable regardless of what the save-back did. Backups of the live file land in `~/.claude/` (same-dir convention), not in any account dir.
+2. **Backup failures are NOT swallowed.** `backup_credentials_file` lets exceptions propagate rather than wrapping in try/except. Reasoning: an unwritable directory would fail the primary credentials write two lines later anyway, and a silent backup skip would defeat the feature at exactly the moment it matters. Failure ordering is unchanged in practice: a full-disk/permissions OSError crashed the swap before this change too, just at the write instead of at the backup.
+3. **`restore-creds --live` is refused when the account is not active.** The live file belongs to the active account; restoring another account's tokens into it would BE the clobber this whole PR defends against. The error message says so.
+4. **Keep-bound is a module constant (`CREDS_BACKUP_KEEP = 5`), not a config key.** The issue said "say 5"; a config knob adds a `load_config()` dependency to low-level IO helpers for a number nobody has asked to tune. Trivial to promote to config later (non-breaking: add key with default 5).
+
+### Walk-back path
+1. Live-file backup: delete the `backup_credentials_file(CREDS_JSON)` call before `atomic_copy(target_creds, CREDS_JSON, ...)` in `execute_swap` and drop `tests/test_creds_backup.py::test_live_install_creates_backup_of_live_file`.
+2. Swallow backup failures: wrap the `backup_credentials_file` body in `try/except OSError: return None` (not recommended — see above).
+3. Allow cross-account `--live` restore: delete the `if live_flag and not is_active` guard in `restore_creds_cmd` (strongly not recommended).
+4. Config knob instead of constant: add `backups: {keep: 5}` to `DEFAULT_CONFIG` and thread it through call sites; keep the constant as fallback.
+5. Full revert: `git revert` the commit titled "feat(creds): pre-overwrite backup rotation + cus restore-creds (GH #79)".
+
+---
+
 
 ## 2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds
 

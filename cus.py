@@ -107,6 +107,15 @@ INBOX_MD = ACCOUNTS_DIR / "inbox.md"
 SOS_MD = ACCOUNTS_DIR / "SOS.md"
 LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
 
+# GH #79: how many timestamped `.credentials.json.bak.<ts>` files to keep per
+# directory. Each account's OAuth payload (incl. the ~30-day refresh token)
+# lives in exactly ONE authoritative place at a time, so every overwrite of a
+# credentials file is potentially the destruction of the only copy — the
+# terminal event of every clobber bug (#3, #70, #75, #76, #77). Backups are
+# ~500 bytes each; 5 generations costs nothing and converts "account locked
+# out until interactive re-login" into "run `cus restore-creds <name>`".
+CREDS_BACKUP_KEEP = 5
+
 # Hook scripts ship in <repo>/hooks/. Daemon installs them into ~/.claude/settings.json
 # at user request via `cus hooks install`. Source paths discovered relative to cus.py.
 HOOKS_SRC_DIR = Path(__file__).resolve().parent / "hooks"
@@ -427,6 +436,77 @@ def atomic_copy(src: Path, dst: Path, mode: int = 0o644) -> None:
     with src.open("rb") as f:
         content = f.read()
     atomic_write_bytes(dst, content, mode=mode)
+
+
+def backup_credentials_file(path: Path, keep: int = CREDS_BACKUP_KEEP) -> Path | None:
+    """Preserve an about-to-be-overwritten credentials file as a timestamped
+    sibling backup, pruning to the newest `keep` generations (GH #79).
+
+    This is the choke-point last-line defense for the credential-clobber bug
+    class (#3, #70, #75, #76, #77): whatever writer bug slips past the other
+    guards, the destroyed refresh token is still recoverable for a few
+    generations via `cus restore-creds`. Call it immediately before ANY write
+    that replaces an existing `.credentials.json` (snapshot or live).
+
+    Design notes:
+      - Backup name is `<name>.bak.<UTC-ts>` in the SAME directory, so the
+        backup inherits the directory's fate (a deleted account dir takes its
+        backups with it) and never crosses account boundaries.
+      - Timestamp format %Y%m%dT%H%M%S.%fZ is fixed-width and lexically
+        sortable, so pruning can sort filenames without parsing dates.
+      - Mode 0600 always — these files hold OAuth tokens.
+      - Best-effort by contract: returns None if there is nothing to back up.
+        Callers must NOT let a backup failure abort the primary write path —
+        but we deliberately do NOT swallow exceptions here; an unwritable
+        account dir would break the primary write two lines later anyway,
+        and silently skipping backups would defeat the whole feature.
+
+    Returns the backup path, or None if `path` didn't exist.
+    """
+    if not path.exists():
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    bak = path.with_name(f"{path.name}.bak.{ts}")
+    atomic_copy(path, bak, mode=0o600)
+    # Prune oldest generations beyond `keep`. Lexical sort == chronological
+    # sort thanks to the fixed-width timestamp; newest sort last.
+    backups = sorted(path.parent.glob(path.name + ".bak.*"))
+    for old in backups[:-keep] if keep > 0 else backups:
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass  # concurrent pruner got it first — fine
+    return bak
+
+
+def list_creds_backups(account_name: str) -> list[Path]:
+    """All backup generations for an account's snapshot, newest first (GH #79)."""
+    d = ACCOUNTS_DIR / f"account-{account_name}"
+    return sorted(d.glob(".credentials.json.bak.*"), reverse=True)
+
+
+def restore_creds_backup(account_name: str, backup: Path, into_live: bool = False) -> None:
+    """Restore a backup generation into an account's snapshot (GH #79).
+
+    The snapshot being replaced is itself backed up first, so a restore is
+    always reversible (it just becomes the newest generation). With
+    `into_live=True` the backup is also installed as the live
+    `~/.claude/.credentials.json` — only meaningful when the account is the
+    ACTIVE one, because for the active account the live file (not the
+    snapshot) is what Claude actually reads.
+
+    Best-effort by nature: if the backed-up refresh token was rotated
+    server-side after the backup was taken, Anthropic may reject it — but in
+    the clobber scenarios this feature exists for (#3/#70/#75/#76/#77) the
+    destroyed token was never used again after the overwrite, which is
+    exactly when the restore works.
+    """
+    snap = ACCOUNTS_DIR / f"account-{account_name}" / ".credentials.json"
+    backup_credentials_file(snap)  # make the restore itself walk-back-able
+    atomic_copy(backup, snap, mode=0o600)
+    if into_live:
+        backup_credentials_file(CREDS_JSON)
+        atomic_copy(backup, CREDS_JSON, mode=0o600)
 
 
 def read_json(path: Path) -> dict:
@@ -1529,6 +1609,10 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
             # keep the historical behavior (see classify_live_creds_owner).
             if verdict == "unknown":
                 click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
+            # GH #79: keep a rotated backup of the snapshot we're replacing —
+            # if any clobber bug slips past the verdict above, the refresh
+            # token is recoverable via `cus restore-creds`.
+            backup_credentials_file(current_dir / ".credentials.json")
             atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
         elif verdict == "foreign":
             # THE GH #3 case: a drifted pane's refresh overwrote the live file
@@ -1540,6 +1624,9 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
             #      with a fresher access token from the drifted pane's refresh.
             #      Discarding it would strand the owner's snapshot on an older
             #      access token for no benefit; same-lineage writes are safe.
+            # GH #79: the owner-heal is a same-lineage write, but back up the
+            # owner's snapshot anyway — cheap insurance against a wrong verdict.
+            backup_credentials_file(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json")
             atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
                                live_creds_bytes, mode=0o600)
             msg = (f"DRIFT DETECTED at swap ({current} -> {target_name}): {detail}. "
@@ -1581,6 +1668,12 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     for k, v in target_identity.items():
         live_cj[k] = v
     write_json(CLAUDE_JSON, live_cj)
+    # GH #79: the live file's content was (normally) just saved back into the
+    # outgoing snapshot — but the clobber bug class exists precisely because
+    # the save-back sometimes goes to the wrong place or is skipped. A rotated
+    # backup of the live file itself makes the install step independently
+    # recoverable.
+    backup_credentials_file(CREDS_JSON)
     atomic_copy(target_creds, CREDS_JSON, mode=0o600)
 
     # Update state with progressive-threshold bookkeeping
@@ -2581,10 +2674,20 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     for name, acct in accounts.items():
         if acct.get("token_expired"):
             cmd = _relogin_command_for(name)
+            action = f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll"
+            # GH #79: if a rotated credential backup exists, mention its age —
+            # a token that "expired" because a clobber bug replaced it can be
+            # brought back with one command (refresh tokens live ~30 days), no
+            # browser needed. Let the operator weigh restore vs re-login.
+            backups = list_creds_backups(name)
+            if backups:
+                action += (f"\n    Or, if the token died from a credential overwrite (not real expiry), "
+                           f"a restore may be faster:\n      cus restore-creds {name} --list\n"
+                           f"    Newest backup: {_describe_creds_backup(backups[0])}")
             out.append(SOSCondition(
                 severity="urgent",
                 summary=f"{name}: OAuth token expired",
-                action=f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll",
+                action=action,
                 affected=name,
             ))
 
@@ -4641,6 +4744,10 @@ def init(dry_run: bool, force: bool) -> None:
         # 1. Credentials — copy from source to .credentials.json (new layout)
         src_creds = src_dir / ".credentials.json"
         dst_creds = dst / ".credentials.json"
+        # GH #79: an `init --force` re-import can overwrite a managed snapshot
+        # from a possibly-stale legacy dir — keep a rotated backup of the
+        # snapshot being replaced so the newer tokens remain recoverable.
+        backup_credentials_file(dst_creds)
         shutil.copy2(src_creds, dst_creds)
         os.chmod(dst_creds, 0o600)
 
@@ -6374,6 +6481,111 @@ def relogin_cmd(name: str, exec_flag: bool) -> None:
         else:
             env["CLAUDE_CONFIG_DIR"] = str(dst)
         os.execvpe("claude", ["claude"], env)
+
+
+def _describe_creds_backup(path: Path) -> str:
+    """One human-readable line about a backup generation: timestamp, age,
+    and whether the payload still looks restorable (has a refresh token)."""
+    ts_raw = path.name.rsplit(".bak.", 1)[-1]
+    age = "age unknown"
+    try:
+        ts_dt = datetime.strptime(ts_raw, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - ts_dt
+        hours = delta.total_seconds() / 3600
+        age = f"{hours / 24:.1f}d old" if hours >= 48 else f"{hours:.1f}h old"
+    except ValueError:
+        pass
+    payload = "unreadable"
+    try:
+        oauth = read_json(path).get("claudeAiOauth", {})
+        if isinstance(oauth, dict) and oauth.get("refreshToken"):
+            exp = oauth.get("expiresAt")
+            exp_note = ""
+            if isinstance(exp, (int, float)):
+                exp_dt = datetime.fromtimestamp(exp / 1000, tz=timezone.utc)
+                exp_note = f", access token {'expired' if exp_dt < datetime.now(timezone.utc) else 'valid'} (refresh token may still work)"
+            payload = f"has refresh token{exp_note}"
+        else:
+            payload = "NO refresh token — not restorable"
+    except (json.JSONDecodeError, OSError):
+        pass
+    return f"{ts_raw}  ({age}; {payload})"
+
+
+@cli.command(name="restore-creds")
+@click.argument("account")
+@click.option("--list", "list_flag", is_flag=True, help="List available backup generations and exit.")
+@click.option("--from", "from_ts", default=None, metavar="TS",
+              help="Timestamp of the generation to restore (as shown by --list). Default: newest.")
+@click.option("--live", "live_flag", is_flag=True,
+              help="Also install the restored creds as the live ~/.claude/.credentials.json (only when the account is active).")
+def restore_creds_cmd(account: str, list_flag: bool, from_ts: str | None, live_flag: bool) -> None:
+    """Restore an account's credentials snapshot from a rotated backup (GH #79).
+
+    Every write that replaces a credentials file first preserves the old
+    content as `.credentials.json.bak.<ts>` (newest 5 kept). When a clobber
+    bug (#3/#70/#75/#76/#77 class) destroys a snapshot's refresh token, this
+    command brings back a previous generation — usually faster than an
+    interactive browser re-login, and the only option at 2am.
+
+    Restores are reversible: the current snapshot is backed up before being
+    replaced, so a bad restore is undone by restoring the newest generation.
+    """
+    acct_dir = ACCOUNTS_DIR / f"account-{account}"
+    if not acct_dir.exists():
+        click.echo(f"Unknown account '{account}' ({acct_dir} does not exist). Run `cus list`.")
+        sys.exit(1)
+
+    backups = list_creds_backups(account)
+    if list_flag:
+        if not backups:
+            click.echo(f"No credential backups for '{account}' yet. Backups accumulate as swaps overwrite the snapshot.")
+            return
+        click.echo(f"Credential backups for '{account}' (newest first, keep={CREDS_BACKUP_KEEP}):")
+        for b in backups:
+            click.echo(f"  {_describe_creds_backup(b)}")
+        click.echo()
+        click.echo(f"Restore the newest:  cus restore-creds {account}")
+        click.echo(f"Restore a specific:  cus restore-creds {account} --from <TS>")
+        return
+
+    if not backups:
+        click.echo(f"No credential backups for '{account}' — nothing to restore. "
+                   f"If the account is locked out, re-login instead: `cus relogin {account}`.")
+        sys.exit(1)
+
+    if from_ts:
+        chosen = next((b for b in backups if b.name.endswith(f".bak.{from_ts}")), None)
+        if chosen is None:
+            click.echo(f"No backup with timestamp '{from_ts}'. Available:")
+            for b in backups:
+                click.echo(f"  {b.name.rsplit('.bak.', 1)[-1]}")
+            sys.exit(1)
+    else:
+        chosen = backups[0]
+
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    is_active = state.get("active") == account
+
+    if live_flag and not is_active:
+        click.echo(f"--live refused: '{account}' is not the active account "
+                   f"(active: {state.get('active')}). The live file belongs to the active "
+                   f"account; restoring another account's tokens into it would clobber it.")
+        sys.exit(1)
+
+    click.echo(f"Restoring '{account}' snapshot from: {_describe_creds_backup(chosen)}")
+    restore_creds_backup(account, chosen, into_live=live_flag)
+    click.echo(f"  ✓ snapshot restored -> {acct_dir / '.credentials.json'}")
+    if live_flag:
+        click.echo(f"  ✓ live file replaced -> {CREDS_JSON}")
+    elif is_active:
+        click.echo(f"  NOTE: '{account}' is the ACTIVE account, and Claude reads the LIVE file, "
+                   f"not the snapshot. Re-run with --live to install the restored tokens live.")
+    click.echo("  Restore is best-effort: if the newer refresh token was already used, "
+               "Anthropic may have invalidated this one server-side. Verify with `cus poll`.")
 
 
 @cli.command(name="install")
