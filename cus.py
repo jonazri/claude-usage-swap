@@ -2139,19 +2139,26 @@ def _swap_lock(timeout_seconds: float | None = None):
             pass
 
 
-def _write_swap_journal(from_name: str, to_name: str, trigger: str) -> None:
+def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot: str | None = None) -> None:
     """Persist swap intent BEFORE the first mutating step (GH #76).
 
     If the process dies anywhere inside the swap sequence, this file is what
     lets the next start detect it and reconcile, instead of silently running
     with live files pointing at one account and state.json at another — the
     desync whose next-swap save-back destroys a refresh token (#70/#76).
+
+    per_session: `slot` names the mount the swap targets (None = the global
+    ~/.claude/ pair). `from_name` may be None for a swap-into-empty-slot
+    (a `cus launch` install — there is no outgoing account).
     """
-    write_json(_swap_journal_path(), {
+    payload = {
         "from": from_name, "to": to_name, "trigger": trigger, "ts": now_iso(),
         # For a human reading the file after a crash:
         "note": "swap was in flight; if this file exists after a crash, run any cus command — recovery is automatic on next swap/daemon start",
-    })
+    }
+    if slot is not None:
+        payload["slot"] = slot
+    write_json(_swap_journal_path(), payload)
 
 
 def _clear_swap_journal() -> None:
@@ -2236,13 +2243,25 @@ def _recover_pending_swap() -> None:
         stale_reason = f"journal unreadable ({e})"
     frm = j.get("from") if isinstance(j, dict) else None
     to = j.get("to") if isinstance(j, dict) else None
+    slot = j.get("slot") if isinstance(j, dict) else None
     if stale_reason is None and not to:
         stale_reason = "journal has no 'to' account"
+
+    # per_session: a slot journal means the crashed swap was against a slot
+    # mount, so ALL live-file evidence comes from that mount — the global
+    # ~/.claude/ pair is a different mount and says nothing about this swap.
+    if slot:
+        _slot_dir = slot_path(slot)
+        live_cj_path = mount_claude_json_path(_slot_dir)
+        live_creds_path = mount_creds_path(_slot_dir)
+    else:
+        live_cj_path = CLAUDE_JSON
+        live_creds_path = CREDS_JSON
 
     landed: str | None = None
     if stale_reason is None:
         try:
-            live_ids = _identity_fields(read_json(CLAUDE_JSON)) if CLAUDE_JSON.exists() else {}
+            live_ids = _identity_fields(read_json(live_cj_path)) if live_cj_path.exists() else {}
         except (json.JSONDecodeError, OSError):
             live_ids = {}
         m_to = _identities_match(live_ids, _dir_identity(to))
@@ -2258,7 +2277,7 @@ def _recover_pending_swap() -> None:
             # Identity evidence inconclusive (missing/corrupt .claude.json
             # somewhere). Fall back to credentials refresh-token lineage.
             try:
-                live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+                live_creds = read_json(live_creds_path) if live_creds_path.exists() else None
             except (json.JSONDecodeError, OSError):
                 live_creds = None
             if live_creds is not None:
@@ -2267,6 +2286,13 @@ def _recover_pending_swap() -> None:
                     landed = "to"
                 elif verdict == "foreign" and owner == frm:
                     landed = "from"
+            if landed is None and slot and frm is None:
+                # Swap-into-EMPTY-slot crash with no evidence the install
+                # landed: the mount holds no (or unidentifiable) credentials
+                # and its .claude.json carries no identity. Nothing durable
+                # changed hands — same as the global landed=="from" case,
+                # except there is no 'from' account to point state at.
+                landed = "from"
             if landed is None:
                 stale_reason = "live files match neither the 'from' nor the 'to' account"
 
@@ -2297,12 +2323,13 @@ def _recover_pending_swap() -> None:
 
     if landed == "to":
         # Crash after the live mutation (or mid-way through it): finish the
-        # job. If the live creds still carry `from`'s lineage, the crash hit
-        # the window between the identity write and the creds install —
-        # complete the install from `to`'s snapshot.
+        # job. If the live creds still carry `from`'s lineage — or, for a
+        # slot mount, are missing entirely (empty-slot install crashed
+        # between the identity write and the creds copy) — complete the
+        # install from `to`'s snapshot.
         target_creds = ACCOUNTS_DIR / f"account-{to}" / ".credentials.json"
         try:
-            live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+            live_creds = read_json(live_creds_path) if live_creds_path.exists() else None
         except (json.JSONDecodeError, OSError):
             live_creds = None
         state = load_state()
@@ -2310,17 +2337,31 @@ def _recover_pending_swap() -> None:
         if live_creds is not None and target_creds.exists():
             verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
             if verdict == "foreign":
-                backup_credentials_file(CREDS_JSON)   # GH #79 choke point
-                atomic_copy(target_creds, CREDS_JSON, mode=0o600)
+                backup_credentials_file(live_creds_path)   # GH #79 choke point
+                atomic_copy(target_creds, live_creds_path, mode=0o600)
                 installed_note = " (live creds still held the outgoing account's tokens; completed the install)"
-        if state.get("active") != to:
-            state["active"] = to
-            state.setdefault("swap_history", []).append({
-                "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery",
-            })
-            save_state(state)
+        elif live_creds is None and slot and target_creds.exists():
+            atomic_copy(target_creds, live_creds_path, mode=0o600)
+            installed_note = " (slot had no creds yet; completed the install)"
+        if slot:
+            entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
+            if entry.get("account") != to:
+                entry["account"] = to
+                state.setdefault("swap_history", []).append({
+                    "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery", "slot": slot,
+                })
+                save_state(state)
+            where = f"slots.{slot}.account"
+        else:
+            if state.get("active") != to:
+                state["active"] = to
+                state.setdefault("swap_history", []).append({
+                    "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery",
+                })
+                save_state(state)
+            where = "state.json active"
         msg = (f"crashed swap {frm!r} -> {to!r} had completed its live mutation; "
-               f"reconciled state.json active -> {to!r}{installed_note}")
+               f"reconciled {where} -> {to!r}{installed_note}")
         click.echo(f"swap-journal: {msg}")
         try:
             append_inbox("crash-recovery", "crashed swap reconciled (live had moved)", msg)
@@ -2331,7 +2372,12 @@ def _recover_pending_swap() -> None:
 
     # landed == "from": nothing durable changed hands before the crash.
     state = load_state()
-    if frm and state.get("active") != frm:
+    if slot:
+        entry = state.setdefault("slots", {}).get(slot)
+        if entry is not None and frm is not None and entry.get("account") != frm:
+            entry["account"] = frm
+            save_state(state)
+    elif frm and state.get("active") != frm:
         # Shouldn't happen (save_state is the LAST step), but if state points
         # elsewhere while live provably holds `from`, record reality.
         state["active"] = frm
@@ -2468,11 +2514,18 @@ def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> t
             "account's refresh token was rotated since the last swap)")
 
 
-def execute_swap(target_name: str, trigger: str = "manual") -> dict:
+def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = None) -> dict:
     """Atomically swap to `target_name`. Returns updated state dict.
 
     Shared between the CLI `cus switch` command and the daemon's auto-swap.
     Caller is responsible for any preflight (hot-swap orchestration, etc.).
+
+    `slot` selects the live mount (per_session mode): None = the legacy
+    global pair (~/.claude/ + ~/.claude.json) — today's behavior, bit-for-bit.
+    A slot name = that slot dir; the identical two-file in-place swap runs
+    against it, the session on top never restarts, and no other mount is
+    touched. The outgoing account is the slot's occupant (state.slots), not
+    state.active.
 
     Reads from + writes to the post-migration layout (.credentials.json +
     .claude.json inside each account-* dir). Pre-migration storage is
@@ -2481,16 +2534,19 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     GH #76: the whole sequence runs under the global swap lock — every entry
     point (daemon reactive/background, switch, auto-swap, orchestrator
     sub-paths) is serialized here, at the primitive itself, so no caller can
-    forget. Crash recovery for a previously-interrupted swap runs first,
-    under the same lock. Raises RuntimeError on lock timeout (the exception
-    type every caller already catches).
+    forget. Slot swaps share the same lock as global swaps: they never
+    overlap in time, which keeps the journal/recovery model single-slot and
+    is a non-cost (swaps are sub-second, rare). Crash recovery for a
+    previously-interrupted swap runs first, under the same lock. Raises
+    RuntimeError on lock timeout (the exception type every caller already
+    catches).
     """
     with _swap_lock():
         _recover_pending_swap()
-        return _execute_swap_locked(target_name, trigger)
+        return _execute_swap_locked(target_name, trigger, slot=slot)
 
 
-def _execute_swap_locked(target_name: str, trigger: str) -> dict:
+def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None) -> dict:
     """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
     # State is loaded AFTER the lock is acquired: a concurrent swap that just
     # finished has already persisted its state.json, so `current` below is
@@ -2498,26 +2554,41 @@ def _execute_swap_locked(target_name: str, trigger: str) -> dict:
     state = load_state()
     if target_name not in state["accounts"]:
         raise ValueError(f"Unknown account '{target_name}'. Known: {sorted(state['accounts'].keys())}")
-    current = state["active"]
-    if current is None:
-        # GH #76 problem 2 edge: a hand-built / partially-initialized
-        # state.json with active=None used to sail through, create
-        # ~/claude-accounts/account-None/, mutate the LIVE files, and only
-        # then crash on the threshold-ladder KeyError — after the damage.
-        # Refuse up front, before any write.
-        raise RuntimeError(
-            "state.json has no active account (active=null) — refusing to swap: the save-back "
-            "would create a bogus 'account-None' snapshot. Run `cus init` (or set \"active\" in "
-            f"{STATE_JSON} to the account the live files currently hold).")
+    if slot is None:
+        current = state["active"]
+        if current is None:
+            # GH #76 problem 2 edge: a hand-built / partially-initialized
+            # state.json with active=None used to sail through, create
+            # ~/claude-accounts/account-None/, mutate the LIVE files, and only
+            # then crash on the threshold-ladder KeyError — after the damage.
+            # Refuse up front, before any write.
+            raise RuntimeError(
+                "state.json has no active account (active=null) — refusing to swap: the save-back "
+                "would create a bogus 'account-None' snapshot. Run `cus init` (or set \"active\" in "
+                f"{STATE_JSON} to the account the live files currently hold).")
+        live_cj_path = CLAUDE_JSON
+        live_creds_path = CREDS_JSON
+    else:
+        mount_dir = slot_path(slot)
+        if not mount_dir.exists():
+            raise FileNotFoundError(f"slot dir {mount_dir} missing — `cus slot create` (or `cus launch`) first")
+        slot_entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
+        # A slot's outgoing account may legitimately be None: a swap into an
+        # empty slot is `cus launch`'s install primitive. No save-back, no
+        # ladder bump — there is no outgoing account to protect.
+        current = slot_entry.get("account")
+        live_cj_path = mount_claude_json_path(mount_dir)
+        live_creds_path = mount_creds_path(mount_dir)
     if target_name == current:
         return state
 
     target_dir = ACCOUNTS_DIR / f"account-{target_name}"
-    current_dir = ACCOUNTS_DIR / f"account-{current}"
+    current_dir = ACCOUNTS_DIR / f"account-{current}" if current is not None else None
 
     # Auto-migrate if dir is in old layout
     migrate_account_dir(target_dir)
-    migrate_account_dir(current_dir)
+    if current_dir is not None:
+        migrate_account_dir(current_dir)
 
     target_creds = target_dir / ".credentials.json"
     target_cj = target_dir / ".claude.json"
@@ -2527,26 +2598,32 @@ def _execute_swap_locked(target_name: str, trigger: str) -> dict:
         raise FileNotFoundError(f"{target_cj} missing — re-run `cus init --force`")
 
     try:
-        live_cj = read_json(CLAUDE_JSON)
+        # A freshly-scaffolded slot may not have a .claude.json yet (crash
+        # between mkdir and seed) — treat as empty rather than failing the
+        # install that would repair it.
+        live_cj = read_json(live_cj_path) if (slot is None or live_cj_path.exists()) else {}
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"{CLAUDE_JSON} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
+        raise RuntimeError(f"{live_cj_path} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
 
     # GH #76: write the intent journal BEFORE the first mutating step. From
     # here to the post-save_state clear, a crash leaves the journal on disk
     # and _recover_pending_swap reconciles on the next swap / daemon start.
-    _write_swap_journal(current, target_name, trigger)
+    _write_swap_journal(current, target_name, trigger, slot=slot)
 
-    # Save current identity + creds back to current's storage. We update the
-    # ENTIRE .claude.json in the source dir (not just account-bound keys)
-    # so that any per-account state Claude writes there persists.
-    current_identity = {k: live_cj[k] for k in ACCOUNT_BOUND_KEYS if k in live_cj}
-    # Read existing per-account .claude.json (if any), overlay current account-bound keys
-    if (current_dir / ".claude.json").exists():
-        existing = read_json(current_dir / ".claude.json")
-    else:
-        existing = {}
-    existing.update(current_identity)
-    write_json(current_dir / ".claude.json", existing)
+    # Save current identity + creds back to current's storage — skipped
+    # entirely for a swap into an EMPTY slot (current is None: nothing to
+    # save, nowhere to save it). We update the ENTIRE .claude.json in the
+    # source dir (not just account-bound keys) so that any per-account state
+    # Claude writes there persists.
+    if current is not None:
+        current_identity = {k: live_cj[k] for k in ACCOUNT_BOUND_KEYS if k in live_cj}
+        # Read existing per-account .claude.json (if any), overlay current account-bound keys
+        if (current_dir / ".claude.json").exists():
+            existing = read_json(current_dir / ".claude.json")
+        else:
+            existing = {}
+        existing.update(current_identity)
+        write_json(current_dir / ".claude.json", existing)
 
     # ---- GH #3: refresh-time drift detection on the credentials save-back ----
     # The live file is read into memory EXACTLY ONCE and those same bytes are
@@ -2557,24 +2634,27 @@ def _execute_swap_locked(target_name: str, trigger: str) -> dict:
     # atomic; the residual race — a refresh landing between this read and the
     # target-creds install below — existed before this change and only loses
     # at most one access-token refresh, never a snapshot's lineage.)
-    if not CREDS_JSON.exists():
-        # Preserve pre-GH#3 behavior: atomic_copy(CREDS_JSON, ...) raised
+    if current is not None and not live_creds_path.exists():
+        # Preserve pre-GH#3 behavior: atomic_copy(live_creds_path, ...) raised
         # FileNotFoundError here, and `switch`/daemon callers handle exactly
         # that exception type.
-        raise FileNotFoundError(f"{CREDS_JSON} missing — cannot save active account's tokens back to storage")
-    live_creds_bytes = CREDS_JSON.read_bytes()
-    try:
-        live_creds = json.loads(live_creds_bytes)
-    except json.JSONDecodeError as e:
-        # Pre-GH#3 this copied the unparseable bytes into current's snapshot
-        # verbatim, destroying a known-good snapshot with garbage (Claude
-        # mid-write, disk corruption, ...). Skipping the save-back is strictly
-        # safer: the snapshot keeps its last-known-good tokens, and the swap
-        # itself still proceeds (the target install below overwrites the
-        # corrupt live file with a good one — which also happens to repair it).
-        live_creds = None
-        click.echo(f"creds-save-back: SKIPPED — live {CREDS_JSON} unparseable ({e}); "
-                   f"keeping '{current}' snapshot as-is")
+        raise FileNotFoundError(f"{live_creds_path} missing — cannot save active account's tokens back to storage")
+    live_creds = None
+    live_creds_bytes = b""
+    if current is not None:
+        live_creds_bytes = live_creds_path.read_bytes()
+        try:
+            live_creds = json.loads(live_creds_bytes)
+        except json.JSONDecodeError as e:
+            # Pre-GH#3 this copied the unparseable bytes into current's snapshot
+            # verbatim, destroying a known-good snapshot with garbage (Claude
+            # mid-write, disk corruption, ...). Skipping the save-back is strictly
+            # safer: the snapshot keeps its last-known-good tokens, and the swap
+            # itself still proceeds (the target install below overwrites the
+            # corrupt live file with a good one — which also happens to repair it).
+            live_creds = None
+            click.echo(f"creds-save-back: SKIPPED — live {live_creds_path} unparseable ({e}); "
+                       f"keeping '{current}' snapshot as-is")
     if live_creds is not None:
         verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
         if verdict in ("expected", "unknown"):
@@ -2675,39 +2755,47 @@ def _execute_swap_locked(target_name: str, trigger: str) -> dict:
                 pass
     # ---- end GH #3 drift detection ----
 
-    # Merge target's account-bound keys into live ~/.claude.json
+    # Merge target's account-bound keys into the mount's live .claude.json
     target_account_cj = read_json(target_cj)
     target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
     for k, v in target_identity.items():
         live_cj[k] = v
-    write_json(CLAUDE_JSON, live_cj)
+    write_json(live_cj_path, live_cj)
     # GH #79: the live file's content was (normally) just saved back into the
     # outgoing snapshot — but the clobber bug class exists precisely because
     # the save-back sometimes goes to the wrong place or is skipped. A rotated
     # backup of the live file itself makes the install step independently
     # recoverable.
-    backup_credentials_file(CREDS_JSON)
-    atomic_copy(target_creds, CREDS_JSON, mode=0o600)
+    backup_credentials_file(live_creds_path)
+    atomic_copy(target_creds, live_creds_path, mode=0o600)
 
     # Update state with progressive-threshold bookkeeping
     ts = now_iso()
-    state["active"] = target_name
+    if slot is None:
+        state["active"] = target_name
+    else:
+        slot_entry["account"] = target_name
+        slot_entry["last_swap_ts"] = ts
     state["accounts"][target_name]["last_swap_ts"] = ts
 
     # Bump current account's next_swap_at_pct ladder using CONFIG steps.
     # Falls back to the hardcoded default ladder if config is missing.
-    config = load_config()
-    cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
-    ladder = list(cfg_steps) + [100]  # 100 = force sentinel
-    current_acct = state["accounts"][current]
-    cur_step = current_acct.get("next_swap_at_pct", ladder[0])
-    # Find next step strictly greater than cur_step; if none, stay at last (force)
-    next_step = next((s for s in ladder if s > cur_step), ladder[-1])
-    current_acct["next_swap_at_pct"] = next_step
+    # (Skipped for a swap-into-empty-slot: no outgoing account to bump.)
+    if current is not None:
+        config = load_config()
+        cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+        ladder = list(cfg_steps) + [100]  # 100 = force sentinel
+        current_acct = state["accounts"].get(current)
+        if current_acct is not None:
+            cur_step = current_acct.get("next_swap_at_pct", ladder[0])
+            # Find next step strictly greater than cur_step; if none, stay at last (force)
+            next_step = next((s for s in ladder if s > cur_step), ladder[-1])
+            current_acct["next_swap_at_pct"] = next_step
 
-    state.setdefault("swap_history", []).append({
-        "ts": ts, "from": current, "to": target_name, "trigger": trigger,
-    })
+    history_entry = {"ts": ts, "from": current, "to": target_name, "trigger": trigger}
+    if slot is not None:
+        history_entry["slot"] = slot
+    state.setdefault("swap_history", []).append(history_entry)
     save_state(state)
     # GH #76: swap fully persisted — retire the crash journal.
     _clear_swap_journal()
