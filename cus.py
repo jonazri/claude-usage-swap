@@ -63,6 +63,7 @@ authoritative on this point).
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -103,6 +104,14 @@ DAEMON_LOG = ACCOUNTS_DIR / "daemon.log"
 DECISIONS_LOG = ACCOUNTS_DIR / "decisions.jsonl"   # GH #56: one structured record per daemon decision
 DAEMON_PID = ACCOUNTS_DIR / "daemon.pid"
 ORCHESTRATE_LOCK = ACCOUNTS_DIR / "orchestrate.lock"
+# GH #76: how long a second swap waits for the global swap lock before
+# erroring out loudly. Swaps are sub-second; 30s covers even a pathologically
+# slow disk. Module constant (not config) so tests can shrink it without a
+# config file. The lock/journal PATHS are functions (below, next to
+# _swap_lock) rather than constants: tests repoint ACCOUNTS_DIR at a temp
+# tree, and a path captured at import time would silently escape the sandbox
+# and touch the live ~/claude-accounts/.
+SWAP_LOCK_TIMEOUT_SECONDS = 30.0
 INBOX_MD = ACCOUNTS_DIR / "inbox.md"
 SOS_MD = ACCOUNTS_DIR / "SOS.md"
 LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
@@ -1434,6 +1443,315 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 # Swap primitive (callable from daemon, not just CLI)
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# GH #76: swap mutual exclusion + crash journal
+# --------------------------------------------------------------------------
+
+def _swap_lock_path() -> Path:
+    """Path of the global swap lock (GH #76).
+
+    One flock-style lock serializing execute_swap across ALL entry points
+    (daemon reactive + background paths, `cus switch`, `cus auto-swap`,
+    hot-swap orchestrator sub-paths). ORCHESTRATE_LOCK only guards the
+    pane-typing orchestrator; the 4-file swap sequence itself raced freely
+    before this. Lock ordering (fixed, never reversed): ORCHESTRATE_LOCK
+    outer, swap lock inner — the orchestrator holds its lock and calls
+    execute_swap, which takes this one. Nothing takes them in reverse.
+
+    Computed from ACCOUNTS_DIR at call time (not an import-time constant) so
+    tests that repoint ACCOUNTS_DIR at a temp tree can't accidentally lock
+    the live ~/claude-accounts/.
+    """
+    return ACCOUNTS_DIR / "swap.lock"
+
+
+def _swap_journal_path() -> Path:
+    """Path of the write-ahead swap-intent journal (GH #76).
+
+    Present on disk = a swap is in flight (or crashed mid-flight). Written
+    before the first mutating step of execute_swap, removed after state.json
+    is persisted. Call-time derivation for the same test-sandboxing reason
+    as _swap_lock_path.
+    """
+    return ACCOUNTS_DIR / "swap.journal"
+
+
+@contextlib.contextmanager
+def _swap_lock(timeout_seconds: float | None = None):
+    """Global inter-process mutex around the whole swap sequence (GH #76).
+
+    Why: execute_swap is a 5-step, multi-file, non-transactional sequence.
+    Each individual write is atomic, but two interleaved swaps (daemon +
+    manual `cus auto-swap`, or two daemon paths) can each save the live
+    credentials back into the OTHER's outgoing snapshot, destroying a refresh
+    token that exists nowhere else. fcntl.flock is used (same pattern as
+    ORCHESTRATE_LOCK) because it dies with the process — no stale-lockfile
+    cleanup problem after a crash.
+
+    Blocking-with-timeout rather than fail-fast: the common contention case
+    is a sub-second swap already in flight, and the right behavior for the
+    second caller is to wait its turn, not to error a user-invoked
+    `cus switch`. On timeout raises RuntimeError — the exception type every
+    execute_swap caller already catches and reports.
+
+    Lock ordering: ORCHESTRATE_LOCK (hot-swap orchestrator) is always taken
+    OUTSIDE this lock, never the reverse.
+    """
+    timeout = SWAP_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    lock_path = _swap_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    try:
+                        os.lseek(fd, 0, 0)
+                        holder = os.read(fd, 64).decode(errors="replace").strip() or "(unknown)"
+                    except OSError:
+                        holder = "(unknown)"
+                    raise RuntimeError(
+                        f"another swap is in flight (swap lock {lock_path} held by pid {holder}; "
+                        f"waited {timeout:.0f}s). Retry in a moment — if the holder pid is dead the "
+                        f"lock has already been released by the kernel, so a retry will succeed.")
+                time.sleep(0.05)
+        # We hold the lock; record our pid for contention diagnostics.
+        try:
+            os.lseek(fd, 0, 0)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass  # pid note is best-effort; the flock itself is what matters
+        try:
+            yield
+        finally:
+            try:
+                os.lseek(fd, 0, 0)
+                os.ftruncate(fd, 0)
+            except OSError:
+                pass
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _write_swap_journal(from_name: str, to_name: str, trigger: str) -> None:
+    """Persist swap intent BEFORE the first mutating step (GH #76).
+
+    If the process dies anywhere inside the swap sequence, this file is what
+    lets the next start detect it and reconcile, instead of silently running
+    with live files pointing at one account and state.json at another — the
+    desync whose next-swap save-back destroys a refresh token (#70/#76).
+    """
+    write_json(_swap_journal_path(), {
+        "from": from_name, "to": to_name, "trigger": trigger, "ts": now_iso(),
+        # For a human reading the file after a crash:
+        "note": "swap was in flight; if this file exists after a crash, run any cus command — recovery is automatic on next swap/daemon start",
+    })
+
+
+def _clear_swap_journal() -> None:
+    try:
+        _swap_journal_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _identity_fields(cj: Any) -> dict:
+    """Extract the comparable identity facets of a .claude.json payload.
+
+    Used by crash recovery to determine which account the live files belong
+    to. Only non-empty fields participate, so a sparse file still matches on
+    whatever evidence it has.
+    """
+    if not isinstance(cj, dict):
+        return {}
+    oa = cj.get("oauthAccount")
+    oa = oa if isinstance(oa, dict) else {}
+    out: dict = {}
+    for key, val in (("accountUuid", oa.get("accountUuid")),
+                     ("emailAddress", oa.get("emailAddress")),
+                     ("userID", cj.get("userID"))):
+        if val:
+            out[key] = val
+    return out
+
+
+def _identities_match(a: dict, b: dict) -> bool | None:
+    """True/False when the two identity dicts share comparable fields;
+    None when there is no shared evidence (can't say either way)."""
+    shared = set(a) & set(b)
+    if not shared:
+        return None
+    return all(a[k] == b[k] for k in shared)
+
+
+def _dir_identity(account_name: str) -> dict:
+    p = ACCOUNTS_DIR / f"account-{account_name}" / ".claude.json"
+    if not p.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(p))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _recover_pending_swap() -> None:
+    """Detect and reconcile a swap that crashed mid-flight (GH #76).
+
+    Caller MUST hold the swap lock (execute_swap and the daemon startup check
+    both do). No-op when no journal exists — the overwhelmingly common path.
+
+    Reconciliation logic: the journal says a swap `from` → `to` was in
+    flight. Determine how far it got by comparing the live ~/.claude.json
+    identity against both accounts' stored identities (with credentials
+    refresh-token lineage as a fallback when identity evidence is missing):
+
+      - live == `to`:   the live mutation completed but state.json may not
+        have been persisted (crash between install and save_state). Repair:
+        finish the install if the live creds are still `from`'s (crash in the
+        millisecond window between identity write and creds copy), then set
+        state.active = to. This is exactly the #70 "second layer" desync that
+        would otherwise poison the NEXT swap's save-back.
+      - live == `from`: the crash happened before the live mutation — nothing
+        durable changed hands. state.active already says `from`; just clear
+        the journal (the interrupted swap simply never happened).
+      - indeterminate:  don't guess. Warn loudly with exact manual recovery
+        steps, keep the evidence (journal renamed *.stale.<ts>, preserving
+        the log per repo discipline), and let the operator reconcile.
+    """
+    journal = _swap_journal_path()
+    if not journal.exists():
+        return
+
+    stale_reason: str | None = None
+    j: Any = None
+    try:
+        j = read_json(journal)
+    except (json.JSONDecodeError, OSError) as e:
+        stale_reason = f"journal unreadable ({e})"
+    frm = j.get("from") if isinstance(j, dict) else None
+    to = j.get("to") if isinstance(j, dict) else None
+    if stale_reason is None and not to:
+        stale_reason = "journal has no 'to' account"
+
+    landed: str | None = None
+    if stale_reason is None:
+        try:
+            live_ids = _identity_fields(read_json(CLAUDE_JSON)) if CLAUDE_JSON.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            live_ids = {}
+        m_to = _identities_match(live_ids, _dir_identity(to))
+        m_frm = _identities_match(live_ids, _dir_identity(frm)) if frm else None
+        if m_to and not m_frm:
+            landed = "to"
+        elif m_frm and not m_to:
+            landed = "from"
+        elif m_to and m_frm:
+            stale_reason = (f"live identity matches BOTH '{frm}' and '{to}' "
+                            f"(duplicate-identity accounts? see GH #70) — refusing to guess")
+        else:
+            # Identity evidence inconclusive (missing/corrupt .claude.json
+            # somewhere). Fall back to credentials refresh-token lineage.
+            try:
+                live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+            except (json.JSONDecodeError, OSError):
+                live_creds = None
+            if live_creds is not None:
+                verdict, owner, _ = classify_live_creds_owner(live_creds, to, load_state())
+                if verdict == "expected":
+                    landed = "to"
+                elif verdict == "foreign" and owner == frm:
+                    landed = "from"
+            if landed is None:
+                stale_reason = "live files match neither the 'from' nor the 'to' account"
+
+    if stale_reason is not None:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        stale_path = journal.with_name(f"{journal.name}.stale.{ts}")
+        msg = (
+            f"UNRESOLVED crashed swap detected ({frm!r} -> {to!r}): {stale_reason}. "
+            f"Evidence preserved at {stale_path}. Manual recovery steps: "
+            f"(1) `cus whoami` to see which account the live files actually hold; "
+            f"(2) compare with `grep '\"active\"' {STATE_JSON}`; "
+            f"(3) if they disagree, edit state.json's \"active\" to the account the live files hold "
+            f"(record reality — do NOT run a swap first, its save-back would write one account's "
+            f"tokens into another's snapshot); "
+            f"(4) `cus poll` to refresh; "
+            f"(5) if a snapshot was clobbered, `cus restore-creds <name> --list` (GH #79 backups)."
+        )
+        click.echo(f"swap-journal: {msg}", err=True)
+        try:
+            os.replace(journal, stale_path)
+        except OSError:
+            pass
+        try:
+            append_inbox("crash-recovery", "unresolved crashed swap — manual reconciliation needed", msg)
+        except OSError:
+            pass
+        return
+
+    if landed == "to":
+        # Crash after the live mutation (or mid-way through it): finish the
+        # job. If the live creds still carry `from`'s lineage, the crash hit
+        # the window between the identity write and the creds install —
+        # complete the install from `to`'s snapshot.
+        target_creds = ACCOUNTS_DIR / f"account-{to}" / ".credentials.json"
+        try:
+            live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+        except (json.JSONDecodeError, OSError):
+            live_creds = None
+        state = load_state()
+        installed_note = ""
+        if live_creds is not None and target_creds.exists():
+            verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
+            if verdict == "foreign":
+                backup_credentials_file(CREDS_JSON)   # GH #79 choke point
+                atomic_copy(target_creds, CREDS_JSON, mode=0o600)
+                installed_note = " (live creds still held the outgoing account's tokens; completed the install)"
+        if state.get("active") != to:
+            state["active"] = to
+            state.setdefault("swap_history", []).append({
+                "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery",
+            })
+            save_state(state)
+        msg = (f"crashed swap {frm!r} -> {to!r} had completed its live mutation; "
+               f"reconciled state.json active -> {to!r}{installed_note}")
+        click.echo(f"swap-journal: {msg}")
+        try:
+            append_inbox("crash-recovery", "crashed swap reconciled (live had moved)", msg)
+        except OSError:
+            pass
+        _clear_swap_journal()
+        return
+
+    # landed == "from": nothing durable changed hands before the crash.
+    state = load_state()
+    if frm and state.get("active") != frm:
+        # Shouldn't happen (save_state is the LAST step), but if state points
+        # elsewhere while live provably holds `from`, record reality.
+        state["active"] = frm
+        save_state(state)
+    msg = (f"crashed swap {frm!r} -> {to!r} never reached the live mutation; "
+           f"no repair needed (the interrupted swap simply did not happen)")
+    click.echo(f"swap-journal: {msg}")
+    try:
+        append_inbox("crash-recovery", "crashed swap cleared (nothing had moved)", msg)
+    except OSError:
+        pass
+    _clear_swap_journal()
+
+
 def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> tuple[str, str | None, str]:
     """Identify which account the live credentials file actually belongs to (GH #3).
 
@@ -1533,11 +1851,38 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     Reads from + writes to the post-migration layout (.credentials.json +
     .claude.json inside each account-* dir). Pre-migration storage is
     auto-migrated on first read via migrate_account_dir().
+
+    GH #76: the whole sequence runs under the global swap lock — every entry
+    point (daemon reactive/background, switch, auto-swap, orchestrator
+    sub-paths) is serialized here, at the primitive itself, so no caller can
+    forget. Crash recovery for a previously-interrupted swap runs first,
+    under the same lock. Raises RuntimeError on lock timeout (the exception
+    type every caller already catches).
     """
+    with _swap_lock():
+        _recover_pending_swap()
+        return _execute_swap_locked(target_name, trigger)
+
+
+def _execute_swap_locked(target_name: str, trigger: str) -> dict:
+    """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
+    # State is loaded AFTER the lock is acquired: a concurrent swap that just
+    # finished has already persisted its state.json, so `current` below is
+    # never a stale pre-lock snapshot (the #76 interleaving scenario).
     state = load_state()
     if target_name not in state["accounts"]:
         raise ValueError(f"Unknown account '{target_name}'. Known: {sorted(state['accounts'].keys())}")
     current = state["active"]
+    if current is None:
+        # GH #76 problem 2 edge: a hand-built / partially-initialized
+        # state.json with active=None used to sail through, create
+        # ~/claude-accounts/account-None/, mutate the LIVE files, and only
+        # then crash on the threshold-ladder KeyError — after the damage.
+        # Refuse up front, before any write.
+        raise RuntimeError(
+            "state.json has no active account (active=null) — refusing to swap: the save-back "
+            "would create a bogus 'account-None' snapshot. Run `cus init` (or set \"active\" in "
+            f"{STATE_JSON} to the account the live files currently hold).")
     if target_name == current:
         return state
 
@@ -1559,6 +1904,11 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         live_cj = read_json(CLAUDE_JSON)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"{CLAUDE_JSON} unparseable ({e}) — Claude may be mid-write. Retry in 1s.")
+
+    # GH #76: write the intent journal BEFORE the first mutating step. From
+    # here to the post-save_state clear, a crash leaves the journal on disk
+    # and _recover_pending_swap reconciles on the next swap / daemon start.
+    _write_swap_journal(current, target_name, trigger)
 
     # Save current identity + creds back to current's storage. We update the
     # ENTIRE .claude.json in the source dir (not just account-bound keys)
@@ -1696,6 +2046,8 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         "ts": ts, "from": current, "to": target_name, "trigger": trigger,
     })
     save_state(state)
+    # GH #76: swap fully persisted — retire the crash journal.
+    _clear_swap_journal()
     return state
 
 
@@ -5298,6 +5650,10 @@ def poll(account: str | None, no_write: bool) -> None:
         click.echo(f"  5h: {fh}    7d: {sd}    polled_at: {u.polled_at}")
 
     if not no_write:
+        # GH #75: re-load state after the slow network loop above so a swap
+        # that landed mid-poll isn't reverted by saving a stale snapshot
+        # (same rationale as the daemon's one_cycle re-load).
+        state = load_state()
         update_state_with_usage(state, usage_by_account)
         maybe_reset_thresholds(state, config)
         save_state(state)
@@ -5335,6 +5691,14 @@ def force_poll(account: str) -> None:
     click.echo(f"polling {account}...")
     u = poll_account_usage(account)
     config = load_config()
+    # GH #75: the HTTP call above can take up to USAGE_API_TIMEOUT_SECONDS;
+    # re-load state (and re-bind acct) so the saves below don't revert an
+    # `active`/history update committed by a concurrent swap mid-poll.
+    state = load_state()
+    if account not in state.get("accounts", {}):
+        click.echo(f"  account '{account}' disappeared from state.json mid-poll; not saving")
+        sys.exit(4)
+    acct = state["accounts"][account]
     if u.token_stale:
         minutes = u.raw.get("expired_minutes_ago", "?")
         click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable). State updated to clear any prior token_expired flag.")
@@ -5362,6 +5726,77 @@ def force_poll(account: str) -> None:
     update_state_with_usage(state, {account: u})
     maybe_reset_thresholds(state, config)
     save_state(state)
+
+
+# GH #76: fd holding the daemon single-instance flock. Module-level on
+# purpose — the lock must live exactly as long as the process, and a local
+# would be garbage-collected (closing the fd releases the flock).
+_DAEMON_SINGLETON_FD: int | None = None
+
+
+def _acquire_daemon_singleton() -> bool:
+    """Claim the machine-wide "I am THE cus daemon" slot (GH #76 problem 3).
+
+    Takes a non-blocking exclusive flock on daemon.pid and keeps the fd open
+    for the process lifetime. A second persistent daemon (systemd unit +
+    manual launch, double-enabled units, ...) finds the lock held and refuses
+    to start instead of silently doubling every race window.
+
+    Why flock instead of "read pid, kill -0": the probe approach races
+    (two starters can both see a dead pid and both proceed) and misfires on
+    pid reuse; a flock dies with its process, so it is both race-free and
+    self-cleaning after a crash. The pid is still WRITTEN into the file so
+    `cus sos` diagnostics and humans can see who holds it.
+
+    Returns True when the slot was acquired (or when the guard can't run at
+    all because the file is unopenable — preserving the pre-#76 lenient
+    behavior of a best-effort pid write rather than refusing to start).
+    """
+    global _DAEMON_SINGLETON_FD
+    try:
+        DAEMON_PID.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(DAEMON_PID), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return True  # can't guard → behave like the old best-effort pid write
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            os.lseek(fd, 0, 0)
+            holder = os.read(fd, 64).decode(errors="replace").strip() or "(unknown)"
+        except OSError:
+            holder = "(unknown)"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        click.echo(f"Another cus daemon is already running (pid {holder}, flock held on {DAEMON_PID}). "
+                   f"Refusing to start a second instance — two daemons double every swap-race window (GH #76). "
+                   f"Check `systemctl --user status cus.service`.", err=True)
+        return False
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    _DAEMON_SINGLETON_FD = fd
+    return True
+
+
+def _release_daemon_singleton() -> None:
+    """Release the single-instance slot (tests; symmetric cleanup)."""
+    global _DAEMON_SINGLETON_FD
+    if _DAEMON_SINGLETON_FD is None:
+        return
+    try:
+        fcntl.flock(_DAEMON_SINGLETON_FD, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(_DAEMON_SINGLETON_FD)
+    except OSError:
+        pass
+    _DAEMON_SINGLETON_FD = None
 
 
 @cli.command()
@@ -5396,11 +5831,26 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
     # emit a spurious "Daemon pid X recorded but process is gone" warning.
     # `--once` callers (cron, smoke-tests, one-shot polls) don't need the
     # SOS-tracking slot at all; skip the write.
+    #
+    # GH #76 problem 3: the pid write is now also a SINGLE-INSTANCE guard —
+    # the pid file is flock'd for the process lifetime, so a systemd unit +
+    # a manually-launched `cus daemon` can no longer run concurrently and
+    # double the swap/lost-update collision odds. flock (not pid-liveness
+    # probing) because it is race-free and self-cleaning after a crash.
     if not once:
-        try:
-            DAEMON_PID.write_text(str(os.getpid()))
-        except OSError:
-            pass
+        if not _acquire_daemon_singleton():
+            sys.exit(1)
+
+    # GH #76: a swap that crashed mid-flight leaves its intent journal on
+    # disk. Reconcile at startup (under the swap lock) rather than waiting
+    # for the next swap — the desync poisons polling attribution in the
+    # meantime. Short lock timeout: if another process is actively swapping
+    # RIGHT NOW, it owns journal handling; skip quietly.
+    try:
+        with _swap_lock(timeout_seconds=5.0):
+            _recover_pending_swap()
+    except RuntimeError as e:
+        click.echo(f"startup swap-journal check skipped: {e}")
 
     def _emit_sos_after(state: dict, config: dict) -> None:
         conditions = diagnose(state, config)
@@ -5446,6 +5896,19 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 click.echo(f"  skip {name}: in poll-backoff until {until}")
                 continue
             usage_by_account[name] = poll_account_usage(name)
+
+        # GH #75 (lost-update race): the poll loop above holds the network
+        # for seconds to ~40s (per-account HTTP calls, 10s timeout each). A
+        # swap landing in that window commits active=<new> to state.json —
+        # and saving the pre-poll snapshot below would silently revert it,
+        # desyncing state from the live files and priming the NEXT swap's
+        # save-back to destroy the departed account's refresh token. Re-load
+        # state now, after the slow phase, and apply this cycle's usage
+        # updates to the FRESH copy; the remaining load→save window is
+        # milliseconds of pure local I/O. (The full fix — field-ownership
+        # merge or an active-pointer split — is tracked in #75; this removes
+        # the routinely-armed window.)
+        state = load_state()
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)

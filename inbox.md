@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast](#2026-07-02-decision-gh-76-swap-lock-crash-journal-journal-is-a-standalone-file-not-a-state-json-key-recovery-auto-reconciles-determinate-crashes-lock-waits-instead-of-failing-fast)
 - [2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant](#2026-07-02-decision-gh-79-backup-rotation-also-back-up-the-live-creds-file-before-target-install-backup-failures-are-not-swallowed-keep-bound-is-a-constant)
 - [2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds](#2026-07-01-decision-gh-3-drift-guard-route-drifted-live-tokens-to-their-true-owner-beyond-skip-log-skip-save-back-of-unparseable-live-creds)
 - [2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found](#2026-05-19-flag-second-hot-swap-test-2026-05-19-21-00-orchestrator-correctness-ok-3-new-bugs-found)
@@ -18,6 +19,32 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #swap-safety #locking #crash-recovery #gh-76 #gh-75 #daemon
+
+Judgment calls beyond the literal GH #76 spec, all on branch `fix/76-swap-lock-journal-daemon-singleton-20260702`:
+
+1. **The crash journal is a standalone `~/claude-accounts/swap.journal` file, not a `swap_pending` key inside state.json** (the issue suggested state.json). Reason: state.json is exactly the file with the #75 lost-update problem — a concurrent whole-file save from a poll-type writer could silently revert/erase a journal key mid-swap, which would defeat the journal at the moment it matters. A standalone file has a single writer (execute_swap, under the swap lock) and survives independently of state.json races.
+2. **Recovery goes beyond "detect and warn."** The two determinate cases are auto-reconciled under the swap lock: live files match the journal's `to` → fix `state.active`, append a `crash-recovery` swap_history entry, and complete the creds install if the crash hit the identity-written-creds-not-yet window; live files match `from` → nothing durable moved, just retire the journal. Only the indeterminate case (live matches neither, creds lineage matches no snapshot, or duplicate identities) stays detect+warn: exact manual steps, journal renamed `swap.journal.stale.<ts>` (annotate-don't-delete), inbox entry.
+3. **The swap lock BLOCKS with a 30s timeout instead of failing fast like ORCHESTRATE_LOCK.** Swaps are sub-second; the right behavior for a `cus switch` that collides with a daemon swap is to wait its turn, not to error at the user. On timeout it raises RuntimeError — the exception type every execute_swap caller already catches. Lock ordering is fixed and documented: ORCHESTRATE_LOCK outer, swap lock inner.
+4. **Lock/journal paths are call-time functions, not import-time constants.** Every test file repoints `cus.ACCOUNTS_DIR` at a temp tree; a path constant captured at import would escape the sandbox and touch the live `~/claude-accounts/` (this actually happened in an intermediate version of this branch — a test-run journal landed in the live dir and was removed; the function-based derivation prevents the whole class).
+5. **GH #75 folded in narrowly:** the three poll-type writers (daemon one_cycle, `cus poll`, `cus force-poll`) re-load state.json after their slow network phase and apply usage updates to the fresh copy, shrinking the routinely-armed seconds-to-40s lost-update window to milliseconds of local I/O. The full fix (field-ownership merge or an active-pointer file split) is deliberately NOT implemented — commented on #75 instead. Side effect: `cus force-poll` for an account deleted mid-poll now exits 4 with a message instead of crashing on KeyError.
+6. **Daemon singleton stays lenient when the pid file itself is unopenable** (returns True and runs unguarded, matching the old best-effort `DAEMON_PID.write_text` semantics) — an unwritable pid file shouldn't take the whole rotation daemon down.
+
+### Walk-back path
+1. Journal into state.json instead: replace `_write_swap_journal`/`_clear_swap_journal` with a `state["swap_pending"]` field written in `_execute_swap_locked` (and re-point `_recover_pending_swap` at it) — not recommended, see #75 interaction.
+2. Detect-and-warn only: in `_recover_pending_swap`, replace the `landed == "to"` / `landed == "from"` reconciliation branches with the stale-path warning block.
+3. Fail-fast lock: in `_swap_lock`, drop the deadline loop and raise on the first `BlockingIOError` (mirrors ORCHESTRATE_LOCK).
+4. Import-time constants: reintroduce `SWAP_LOCK`/`SWAP_JOURNAL` constants and revert `_swap_lock_path`/`_swap_journal_path` call sites (will re-open the test-sandbox leak).
+5. Revert the #75 narrow fix alone: delete the three `state = load_state()` re-load blocks (daemon one_cycle, poll, force-poll) and `tests/test_swap_lock_journal.py::test_poll_does_not_revert_concurrent_swap` + `test_daemon_cycle_does_not_revert_concurrent_swap`.
+6. Full revert: `git revert` the commit titled "fix(swap): global swap lock + crash journal + daemon single-instance (GH #76); narrow the state.json lost-update window (GH #75)".
+
+---
+
 
 ## 2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant
 
