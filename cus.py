@@ -141,7 +141,36 @@ HOOK_SETTINGS_KEY = "cus"  # signature key in settings.json so we don't clobber 
 #
 # Each account dir is a VALID CLAUDE_CONFIG_DIR. To log in to an account,
 # `CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/ claude /login`.
-SHARED_SYMLINK_SUBDIRS = ["projects", "plugins", "agents", "skills", "commands", "memory", "hooks", "scripts"]
+#
+# 2026-07-02 (per_session plan, Phase 1.1 inventory): extended beyond the
+# original 8 with the transcript-adjacent dirs (file-history, paste-cache,
+# session-env, shell-snapshots, tasks, todos, plans). Rationale per entry in
+# docs/ARCHITECTURE.md "Per-session slot dirs": these are all referenced from
+# projects/ transcripts or keyed by session id, so sharing them is what makes
+# `--resume` + checkpoints work under any mount. Symlinks are only created
+# when the target exists in ~/.claude/ (no dangling links), so installs that
+# lack e.g. todos/ are unaffected.
+SHARED_SYMLINK_SUBDIRS = [
+    "projects", "plugins", "agents", "skills", "commands", "memory", "hooks", "scripts",
+    "plans", "file-history", "paste-cache", "session-env", "shell-snapshots", "tasks", "todos",
+]
+
+# Files (not dirs) symlinked from every mount to the canonical ~/.claude/ copy.
+# settings.json carries hooks + statusline + permission allowlist: a mount
+# without it runs BARE (no SessionStart logging, no statusline) — the
+# account-dir `{"theme": "dark"}` stub found in the 2026-07-02 inventory is
+# exactly this failure. File symlinks have a sharp edge dirs don't: anything
+# that rewrites the file via tempfile+rename (e.g. /config) replaces the
+# symlink with a real file and silently forks that mount off the share.
+# `cus doctor --fix-dirs` detects real-file-where-symlink-expected, folds
+# novel keys back into the shared file, and re-links.
+SHARED_SYMLINK_FILES = ["settings.json", "settings.local.json"]
+
+# per_session mode (docs/plans/2026-07-02-per-session-accounts.md): slot dirs
+# are LIVE mounts — one CLAUDE_CONFIG_DIR per concurrent session, each holding
+# one pool account's credentials, swapped in-place per slot exactly like
+# ~/.claude/ is swapped in global mode. Account dirs stay storage-only.
+SLOT_PREFIX = "slot-"
 
 # The full list of keys that are tied to OAuth identity — verified empirically
 # against the user's two config dirs (2026-05-18). All other keys in
@@ -166,6 +195,14 @@ USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 # --------------------------------------------------------------------------
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    # Which live-mount topology this machine runs (mutually exclusive):
+    #   global      — today's behavior: one live mount (~/.claude/), the daemon
+    #                 swaps it in place, every session follows the active account.
+    #   per_session — N slot dirs under ~/claude-accounts/, one per concurrent
+    #                 session (launched via `cus launch`); the daemon swaps
+    #                 individual slots and NEVER writes ~/.claude/ (bare
+    #                 launches are observe-only). Transition via `cus mode`.
+    "mode": "global",
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
     "thresholds": {
@@ -858,6 +895,369 @@ def migrate_account_dir(account_dir: Path) -> dict:
         details.append(f"symlinked {sub} → {target}")
 
     return {"action": "migrated", "details": details}
+
+
+# --------------------------------------------------------------------------
+# Mounts + slots (per_session mode)
+#
+# A "mount" is any directory a live Claude Code process uses as its
+# CLAUDE_CONFIG_DIR: the legacy global pair (~/.claude/ + ~/.claude.json) or a
+# slot dir (~/claude-accounts/slot-<n>/, .claude.json inside). Slots hold ONE
+# account's credentials at a time and are swapped in place — the same two-file
+# swap as global mode, scoped to one directory, so the session on top never
+# restarts. Plan: docs/plans/2026-07-02-per-session-accounts.md.
+#
+# All paths are computed at call time from module globals (never captured at
+# import) for the same reason as _swap_lock_path: tests repoint ACCOUNTS_DIR /
+# CLAUDE_DIR at temp trees.
+# --------------------------------------------------------------------------
+
+def mount_claude_json_path(mount: Path) -> Path:
+    """Where a mount's .claude.json LIVES (whether or not it exists yet).
+
+    Unlike claude_json_for_config_dir (which returns None for a missing file —
+    right for readers), writers need the destination path: the default mount
+    keeps it at parent level (~/.claude.json), every other mount keeps it
+    inside the dir.
+    """
+    if mount == CLAUDE_DIR:
+        return CLAUDE_JSON
+    return mount / ".claude.json"
+
+
+def mount_creds_path(mount: Path) -> Path:
+    """A mount's live credentials file (~/.claude/.credentials.json shape)."""
+    return mount / ".credentials.json"
+
+
+def slot_path(slot_name: str) -> Path:
+    return ACCOUNTS_DIR / slot_name
+
+
+def list_slot_dirs() -> list[Path]:
+    """Existing slot dirs, sorted by index (slot-2 before slot-10)."""
+    if not ACCOUNTS_DIR.exists():
+        return []
+    def _idx(p: Path) -> int:
+        try:
+            return int(p.name.removeprefix(SLOT_PREFIX))
+        except ValueError:
+            return 1 << 30  # non-numeric suffix sorts last, still listed
+    return sorted((p for p in ACCOUNTS_DIR.glob(SLOT_PREFIX + "*") if p.is_dir()), key=_idx)
+
+
+def mount_pids(mount: Path) -> list[int]:
+    """PIDs of live processes whose CLAUDE_CONFIG_DIR is this mount.
+
+    Ground truth from /proc/<pid>/environ — orchestration-independent, so it
+    catches sessions cus didn't launch and survives state.json drift. Only
+    same-user processes are readable; unreadable ones are skipped, which is
+    correct (another user's session can't be holding our mount).
+
+    Every descendant of a claude process (hook shells, subagent bash) inherits
+    the env var and counts as "using the mount" — deliberately so: a slot is
+    busy while ANY process holds it, not just the top-level claude.
+    """
+    want = str(mount).rstrip("/")
+    pids: list[int] = []
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return []
+    for p in entries:
+        if not p.name.isdigit():
+            continue
+        try:
+            environ = (p / "environ").read_bytes()
+        except (OSError, PermissionError):
+            continue
+        for chunk in environ.split(b"\0"):
+            if chunk.startswith(b"CLAUDE_CONFIG_DIR="):
+                val = chunk.split(b"=", 1)[1].decode("utf-8", "replace").rstrip("/")
+                if val == want:
+                    pids.append(int(p.name))
+                break
+    return pids
+
+
+def mount_in_use(mount: Path) -> bool:
+    return bool(mount_pids(mount))
+
+
+def scaffold_mount_dir(mount: Path) -> list[str]:
+    """Create/heal a mount dir to the canonical layout. Idempotent.
+
+    Creates the dir, the shared-state symlinks (dirs + files, only when the
+    target exists in ~/.claude/ — no dangling links), and an empty {}
+    .claude.json if none exists (Claude Code needs something valid to read;
+    sync_mount_claude_json fills it in properly).
+
+    Returns a list of human-readable actions taken (empty = was already
+    canonical). Does NOT touch existing real files/dirs — that judgment
+    (fold-and-relink vs leave) belongs to doctor --fix-dirs.
+    """
+    actions: list[str] = []
+    if not mount.exists():
+        mount.mkdir(parents=True)
+        actions.append(f"created {mount}")
+    for sub in SHARED_SYMLINK_SUBDIRS + SHARED_SYMLINK_FILES:
+        link = mount / sub
+        target = CLAUDE_DIR / sub
+        if link.is_symlink() or link.exists():
+            continue
+        if not target.exists():
+            continue
+        link.symlink_to(target)
+        actions.append(f"symlinked {sub} → {target}")
+    cj = mount_claude_json_path(mount)
+    if not cj.exists():
+        write_json(cj, {})
+        actions.append("seeded empty .claude.json")
+    return actions
+
+
+def create_slot(state: dict) -> tuple[str, Path]:
+    """Allocate the lowest free slot index, scaffold its dir, register in state.
+
+    "Free" means the index has no existing dir AND no state entry — a gc'd
+    slot's index is reusable. Caller is responsible for save_state().
+    """
+    slots = state.setdefault("slots", {})
+    n = 1
+    while True:
+        name = f"{SLOT_PREFIX}{n}"
+        if name not in slots and not slot_path(name).exists():
+            break
+        n += 1
+    d = slot_path(name)
+    scaffold_mount_dir(d)
+    slots[name] = {"account": None, "created_ts": now_iso()}
+    return name, d
+
+
+def sync_mount_claude_json(mount: Path, canonical: dict) -> dict:
+    """Merge all NON-account-bound top-level keys from `canonical` into a
+    mount's .claude.json, preserving the mount's own identity keys (Phase 1.3).
+
+    The inverse of the swap's surgical merge: swaps move ONLY the account-bound
+    keys, this moves EVERYTHING ELSE (MCP registrations, per-project state,
+    onboarding flags) so N live copies don't drift apart between slot launches.
+
+    MUST NOT run against a mount with a live session — Claude Code rewrites
+    .claude.json itself and a concurrent merge is a lost-update race. Callers
+    gate on mount_in_use(); this function only does the merge.
+
+    Returns {"changed": bool, "keys_updated": [...]}.
+    """
+    cj_path = mount_claude_json_path(mount)
+    existing = read_json(cj_path) if cj_path.exists() else {}
+    merged = dict(existing)
+    updated: list[str] = []
+    for k, v in canonical.items():
+        if k in ACCOUNT_BOUND_KEYS:
+            continue
+        if k not in merged or merged[k] != v:
+            merged[k] = v
+            updated.append(k)
+    # Identity keys always come from the mount itself, never the canonical —
+    # this is what keeps a slot's account pinned through a sync.
+    for k in ACCOUNT_BOUND_KEYS:
+        if k in existing:
+            merged[k] = existing[k]
+    if updated:
+        write_json(cj_path, merged)
+    return {"changed": bool(updated), "keys_updated": updated}
+
+
+def saveback_mount_credentials(mount: Path, expected_account: str | None, state: dict) -> dict:
+    """Save a mount's live credentials back to the owning account dir, with the
+    full clobber-guard stack (GH #3 identity match, GH #77 freshness, GH #79
+    backup rotation). Shared by slot gc, per-slot swap-out, and periodic
+    save-back — one guarded implementation, not three.
+
+    Returns {"action": "saved" | "saved_to_owner" | "skipped", "account": ...,
+    "detail": ...}. Never raises on a missing/invalid live file — a mount with
+    nothing worth saving is a skip, not an error.
+    """
+    creds_path = mount_creds_path(mount)
+    if not creds_path.exists():
+        return {"action": "skipped", "account": expected_account, "detail": "no live credentials in mount"}
+    try:
+        live_creds = json.loads(creds_path.read_bytes())
+    except (json.JSONDecodeError, OSError) as e:
+        return {"action": "skipped", "account": expected_account, "detail": f"unreadable live creds: {e}"}
+
+    verdict, owner, detail = classify_live_creds_owner(live_creds, expected_account or "", state)
+    if verdict in ("invalid", "conflict"):
+        return {"action": "skipped", "account": expected_account, "detail": f"{verdict}: {detail}"}
+    # "foreign" routes to the true owner (GH #3); "expected"/"unknown" go to
+    # the expected account — same routing as _execute_swap_locked.
+    save_to = owner if verdict == "foreign" and owner else expected_account
+    if not save_to:
+        return {"action": "skipped", "account": None, "detail": f"no owner resolvable ({verdict}: {detail})"}
+
+    snap = ACCOUNTS_DIR / f"account-{save_to}" / ".credentials.json"
+    # GH #77: never let an older live file clobber a fresher snapshot (e.g.
+    # the account was re-logged-in out-of-band while this mount sat idle).
+    live_exp = _creds_expires_at(live_creds)
+    if snap.exists():
+        try:
+            snap_exp = _creds_expires_at(read_json(snap))
+        except (json.JSONDecodeError, OSError):
+            snap_exp = None
+        if snap_exp is not None and live_exp is not None and snap_exp > live_exp:
+            return {"action": "skipped", "account": save_to, "detail": "snapshot fresher than live (GH #77)"}
+    backup_credentials_file(snap)
+    atomic_write_bytes(snap, json.dumps(live_creds, indent=2).encode(), mode=0o600)
+    action = "saved_to_owner" if verdict == "foreign" else "saved"
+    return {"action": action, "account": save_to, "detail": detail}
+
+
+def gc_slot(name: str, state: dict, force: bool = False) -> dict:
+    """Reap one slot: refuse if in use, save creds back, remove the dir,
+    drop the state entry. Caller is responsible for save_state().
+
+    force=True skips only the in-use refusal (for cleaning up after a
+    /proc-invisible holder the operator knows is dead) — the save-back and
+    its guards always run.
+    """
+    d = slot_path(name)
+    if not d.exists():
+        state.get("slots", {}).pop(name, None)
+        return {"action": "dropped_stale_entry", "slot": name}
+    if not force and mount_in_use(d):
+        return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
+    expected = state.get("slots", {}).get(name, {}).get("account")
+    saveback = saveback_mount_credentials(d, expected, state)
+    shutil.rmtree(d)
+    state.get("slots", {}).pop(name, None)
+    return {"action": "reaped", "slot": name, "saveback": saveback}
+
+
+def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
+    """Check (and with fix=True, heal) one mount dir against the canonical
+    layout. Idempotent: a healed mount reports no findings on re-run.
+
+    Findings are dicts: {"entry", "problem", "action"} where action is what
+    was done (fix=True) or what --fix-dirs would do (fix=False). The heal
+    rules, per the ARCHITECTURE.md inventory:
+
+      - missing symlink            → create (only if target exists in ~/.claude/)
+      - symlink to wrong target    → repoint
+      - real DIR where symlink expected → move children into the shared target
+        (skip name collisions — uuid-keyed dirs make these rare), then relink.
+        If collisions remain, leave the dir and report; merging colliding
+        session state is operator judgment, not doctor's.
+      - real FILE where symlink expected (settings.json stub) → fold keys the
+        shared file doesn't have into it, keep a timestamped .stub-bak of the
+        original beside the mount (preserve-the-log), then relink. On key
+        CONFLICTS the shared value wins — the stub was never intentionally
+        maintained; it's a snapshot of whatever `claude /login` seeded.
+      - .credentials.json not 0600 → chmod
+    """
+    findings: list[dict] = []
+
+    def note(entry: str, problem: str, action: str) -> None:
+        findings.append({"entry": entry, "problem": problem, "action": action})
+
+    for sub in SHARED_SYMLINK_SUBDIRS:
+        link = mount / sub
+        target = CLAUDE_DIR / sub
+        if not target.exists():
+            continue
+        if link.is_symlink():
+            if link.resolve() != target.resolve():
+                old_target = os.readlink(link)
+                if fix:
+                    link.unlink()
+                    link.symlink_to(target)
+                note(sub, f"symlink → {old_target}", f"repoint{'ed' if fix else ''} → {target}")
+            continue
+        if link.is_dir():
+            moved, collisions = 0, 0
+            if fix:
+                for child in list(link.iterdir()):
+                    dst = target / child.name
+                    if dst.exists():
+                        collisions += 1
+                        continue
+                    shutil.move(str(child), str(dst))
+                    moved += 1
+                if not any(link.iterdir()):
+                    link.rmdir()
+                    link.symlink_to(target)
+                    note(sub, "real dir where symlink expected", f"moved {moved} entries into shared, relinked")
+                else:
+                    note(sub, "real dir where symlink expected", f"moved {moved}, {collisions} collisions remain — left as real dir, resolve manually")
+            else:
+                note(sub, "real dir where symlink expected", "would merge into shared target and relink")
+            continue
+        if not link.exists():
+            if fix:
+                link.symlink_to(target)
+            note(sub, "missing symlink", f"link{'ed' if fix else ''} → {target}")
+
+    shared_settings_changed = False
+    for fname in SHARED_SYMLINK_FILES:
+        link = mount / fname
+        target = CLAUDE_DIR / fname
+        if not target.exists():
+            continue
+        if link.is_symlink():
+            if link.resolve() != target.resolve():
+                if fix:
+                    link.unlink()
+                    link.symlink_to(target)
+                note(fname, "symlink to wrong target", f"repoint{'ed' if fix else ''} → {target}")
+            continue
+        if link.is_file():
+            if fix:
+                try:
+                    stub = read_json(link)
+                    shared = read_json(target)
+                except (json.JSONDecodeError, OSError) as e:
+                    note(fname, f"real file, unparseable ({e})", "left in place — resolve manually")
+                    continue
+                folded = [k for k in stub if k not in shared]
+                conflicts = [k for k in stub if k in shared and shared[k] != stub[k]]
+                if folded:
+                    shared.update({k: stub[k] for k in folded})
+                    write_json(target, shared)
+                    shared_settings_changed = True
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                link.rename(link.with_name(f"{fname}.stub-bak.{ts}"))
+                link.symlink_to(target)
+                detail = f"folded {folded or 'nothing'} into shared"
+                if conflicts:
+                    detail += f"; kept shared values for {conflicts}"
+                note(fname, "real file where symlink expected", f"{detail}; stub kept as {fname}.stub-bak.{ts}; relinked")
+            else:
+                note(fname, "real file where symlink expected", "would fold novel keys into shared and relink")
+            continue
+        if not link.exists():
+            if fix:
+                link.symlink_to(target)
+            note(fname, "missing symlink", f"link{'ed' if fix else ''} → {target}")
+
+    creds = mount_creds_path(mount)
+    if creds.exists() and not creds.is_symlink():
+        mode = creds.stat().st_mode & 0o777
+        if mode != 0o600:
+            if fix:
+                os.chmod(creds, 0o600)
+            note(".credentials.json", f"mode {oct(mode)}", f"chmod{'ed' if fix else ''} 0600")
+
+    cj = mount_claude_json_path(mount)
+    if cj.exists():
+        try:
+            read_json(cj)
+        except (json.JSONDecodeError, OSError) as e:
+            note(".claude.json", f"unparseable: {e}", "left in place — resolve manually (swap/sync would fail against it)")
+
+    if shared_settings_changed:
+        note("(shared settings.json)", "gained folded keys from a stub", "review ~/.claude/settings.json")
+    return findings
 
 
 def account_in_backoff(state: dict, account_name: str) -> tuple[bool, str | None]:
@@ -7795,6 +8195,159 @@ def rename_cmd(old_name: str, new_name: str) -> None:
     click.echo()
     click.echo(click.style(f"Done. Account '{old_name}' is now '{new_name}'.", fg="green"))
     click.echo("If the daemon is running, restart it: systemctl --user restart cus.service")
+
+
+# --------------------------------------------------------------------------
+# per_session commands — slot / doctor / sync-config
+# (docs/plans/2026-07-02-per-session-accounts.md, Phases 1.2 + 1.3)
+# --------------------------------------------------------------------------
+
+@cli.group()
+def slot() -> None:
+    """Manage slot dirs — per-session live mounts (per_session mode)."""
+
+
+@slot.command("create")
+def slot_create_cmd() -> None:
+    """Create a new slot dir (lowest free index) with the canonical layout.
+
+    The slot starts empty (no account credentials) — `cus launch` installs an
+    account into it. Walk-back: `cus slot gc --slot <name>`.
+    """
+    state = load_state()
+    name, d = create_slot(state)
+    save_state(state)
+    sync_result = None
+    if CLAUDE_JSON.exists():
+        try:
+            sync_result = sync_mount_claude_json(d, read_json(CLAUDE_JSON))
+        except (json.JSONDecodeError, OSError) as e:
+            click.echo(click.style(f"  warning: could not seed .claude.json from canonical: {e}", fg="yellow"))
+    click.echo(f"Created {click.style(name, bold=True)} at {d}")
+    if sync_result and sync_result["changed"]:
+        click.echo(f"  seeded .claude.json with {len(sync_result['keys_updated'])} keys from ~/.claude.json")
+    click.echo(f"  launch under it: CLAUDE_CONFIG_DIR={d} claude   (or `cus launch`)")
+
+
+@slot.command("list")
+def slot_list_cmd() -> None:
+    """List slot dirs: account held, live PIDs, state registration."""
+    state = load_state()
+    reg = state.get("slots", {})
+    dirs = list_slot_dirs()
+    if not dirs and not reg:
+        click.echo("No slots. `cus slot create` or `cus launch` makes one.")
+        return
+    seen: set[str] = set()
+    for d in dirs:
+        seen.add(d.name)
+        entry = reg.get(d.name, {})
+        pids = mount_pids(d)
+        status = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+        acct = entry.get("account") or "(empty)"
+        unreg = "" if d.name in reg else click.style("  [not in state — doctor?]", fg="yellow")
+        click.echo(f"  {d.name:<10} account={acct:<12} {status}{unreg}")
+    for name in reg:
+        if name not in seen:
+            click.echo(f"  {name:<10} " + click.style("[state entry, dir missing — gc will drop]", fg="yellow"))
+
+
+@slot.command("gc")
+@click.option("--slot", "slot_name_opt", default=None, help="Reap one slot by name (default: all idle slots).")
+@click.option("--force", is_flag=True, help="Skip the in-use refusal (save-back guards still run).")
+def slot_gc_cmd(slot_name_opt: str | None, force: bool) -> None:
+    """Reap idle slots: save credentials back to the owning account dir, remove.
+
+    A slot whose session exited stays on disk holding real credentials until
+    gc'd. The daemon runs this each cycle in per_session mode; the command is
+    for manual cleanup.
+    """
+    state = load_state()
+    names = [slot_name_opt] if slot_name_opt else sorted(set(list(state.get("slots", {}))) | {d.name for d in list_slot_dirs()})
+    if not names:
+        click.echo("Nothing to gc.")
+        return
+    for name in names:
+        result = gc_slot(name, state, force=force)
+        action = result["action"]
+        if action == "refused_in_use":
+            click.echo(f"  {name}: in use (pids {result['pids']}) — skipped")
+        elif action == "dropped_stale_entry":
+            click.echo(f"  {name}: state entry with no dir — dropped")
+        else:
+            sb = result["saveback"]
+            click.echo(f"  {name}: reaped (creds save-back: {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")")
+    save_state(state)
+
+
+@cli.command(name="doctor")
+@click.option("--fix-dirs", is_flag=True, help="Heal findings (create/repoint symlinks, fold settings stubs, merge stray dirs).")
+def doctor_cmd(fix_dirs: bool) -> None:
+    """Check account dirs + slot dirs against the canonical mount layout.
+
+    Read-only by default; --fix-dirs heals idempotently (re-run is a no-op).
+    Layout rationale: docs/ARCHITECTURE.md "Per-session slot dirs".
+    """
+    mounts: list[Path] = []
+    if ACCOUNTS_DIR.exists():
+        mounts += [p for p in sorted(ACCOUNTS_DIR.glob("account-*")) if p.is_dir()]
+    mounts += list_slot_dirs()
+    if not mounts:
+        click.echo("No account or slot dirs found.")
+        return
+    total = 0
+    for m in mounts:
+        findings = doctor_mount(m, fix=fix_dirs)
+        if not findings:
+            continue
+        total += len(findings)
+        click.echo(click.style(m.name, bold=True))
+        for f in findings:
+            click.echo(f"  {f['entry']}: {f['problem']} — {f['action']}")
+    if total == 0:
+        click.echo(click.style("✓ all mounts canonical", fg="green"))
+    elif not fix_dirs:
+        click.echo(f"\n{total} finding(s). Re-run with --fix-dirs to heal.")
+        sys.exit(1)
+
+
+@cli.command(name="sync-config")
+@click.option("--from", "from_path", default=None, help="Canonical .claude.json (default: ~/.claude.json).")
+@click.option("--dry-run", is_flag=True, help="Show what would change without writing.")
+def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
+    """Sync non-account keys of the canonical .claude.json into every slot.
+
+    Account-bound keys (userID, oauthAccount) are preserved per slot — this
+    moves everything ELSE (MCP registrations, per-project state, onboarding
+    flags) so N live copies don't diverge. Slots with a live session are
+    skipped (Claude Code rewrites its own .claude.json; concurrent merge =
+    lost-update race) — they pick the sync up at next launch.
+    """
+    canonical_path = Path(from_path).expanduser() if from_path else CLAUDE_JSON
+    if not canonical_path.exists():
+        click.echo(f"Canonical {canonical_path} does not exist.", err=True)
+        sys.exit(1)
+    try:
+        canonical = read_json(canonical_path)
+    except (json.JSONDecodeError, OSError) as e:
+        click.echo(f"Canonical {canonical_path} unreadable: {e}", err=True)
+        sys.exit(1)
+    slots = list_slot_dirs()
+    if not slots:
+        click.echo("No slots to sync.")
+        return
+    for d in slots:
+        if mount_in_use(d):
+            click.echo(f"  {d.name}: live session — skipped (syncs at next launch)")
+            continue
+        if dry_run:
+            cj_path = mount_claude_json_path(d)
+            existing = read_json(cj_path) if cj_path.exists() else {}
+            would = [k for k, v in canonical.items() if k not in ACCOUNT_BOUND_KEYS and existing.get(k) != v]
+            click.echo(f"  {d.name}: would update {len(would)} keys" + (f" ({', '.join(sorted(would)[:8])}{'…' if len(would) > 8 else ''})" if would else ""))
+            continue
+        result = sync_mount_claude_json(d, canonical)
+        click.echo(f"  {d.name}: {'updated ' + str(len(result['keys_updated'])) + ' keys' if result['changed'] else 'already in sync'}")
 
 
 @cli.command(name="init-systemd")
