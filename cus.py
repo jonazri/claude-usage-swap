@@ -2858,22 +2858,32 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             ))
 
     # Condition 4: stale poll
-    poll_freshness_seconds = config.get("poll_interval_seconds", 300) * 4  # 4 cycles of staleness = real problem
+    # Differential cadence (2026-07-02): staleness must be judged per-account
+    # against the cadence that account is actually polled on — fast active /
+    # slow inactive / legacy flat (_account_poll_interval). Judging every
+    # account against the flat poll_interval_seconds would permanently flag
+    # every idle account as "stale" whenever polling.inactive_interval_seconds
+    # exceeds 4x the flat interval (e.g. flat 180s + inactive 900s), turning
+    # the daemon-down detector into constant false SOS noise. 4 missed cycles
+    # of an account's OWN cadence = real problem, same tolerance as before.
     stale_accounts: list[str] = []
+    stale_worst_minutes = 0
     for name, acct in accounts.items():
         last_poll = acct.get("last_poll_ts")
         if not last_poll:
             continue
+        poll_freshness_seconds = _account_poll_interval(state, config, name) * 4
         try:
             ts = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
             if (now - ts).total_seconds() > poll_freshness_seconds:
                 stale_accounts.append(name)
+                stale_worst_minutes = max(stale_worst_minutes, int(poll_freshness_seconds) // 60)
         except ValueError:
             continue
     if stale_accounts and any(accounts.keys()) and accounts.get(list(accounts.keys())[0], {}).get("last_poll_ts"):
         out.append(SOSCondition(
             severity="warning",
-            summary=f"Stale usage data for: {', '.join(stale_accounts)} (no fresh poll in >{poll_freshness_seconds // 60} min)",
+            summary=f"Stale usage data for: {', '.join(stale_accounts)} (no fresh poll within 4x each account's poll cadence; worst allowance {stale_worst_minutes} min)",
             action="Daemon may be down. Check: `systemctl --user status cus.service` or restart `python3 ~/repos/claude-usage-swap/cus.py daemon`.",
             affected="daemon",
         ))
