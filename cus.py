@@ -946,13 +946,28 @@ def list_slot_dirs() -> list[Path]:
     return sorted((p for p in ACCOUNTS_DIR.glob(SLOT_PREFIX + "*") if p.is_dir()), key=_idx)
 
 
+def _pid_config_dir(pid: int) -> str | None:
+    """CLAUDE_CONFIG_DIR from one process's /proc environ, or None.
+
+    Orchestration-independent ground truth for which mount a live process is
+    using — readable only for same-user processes, which is exactly the set
+    that could be holding our mounts.
+    """
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except (OSError, PermissionError):
+        return None
+    for chunk in environ.split(b"\0"):
+        if chunk.startswith(b"CLAUDE_CONFIG_DIR="):
+            return chunk.split(b"=", 1)[1].decode("utf-8", "replace")
+    return None
+
+
 def mount_pids(mount: Path) -> list[int]:
     """PIDs of live processes whose CLAUDE_CONFIG_DIR is this mount.
 
     Ground truth from /proc/<pid>/environ — orchestration-independent, so it
-    catches sessions cus didn't launch and survives state.json drift. Only
-    same-user processes are readable; unreadable ones are skipped, which is
-    correct (another user's session can't be holding our mount).
+    catches sessions cus didn't launch and survives state.json drift.
 
     Every descendant of a claude process (hook shells, subagent bash) inherits
     the env var and counts as "using the mount" — deliberately so: a slot is
@@ -968,17 +983,108 @@ def mount_pids(mount: Path) -> list[int]:
     for p in entries:
         if not p.name.isdigit():
             continue
-        try:
-            environ = (p / "environ").read_bytes()
-        except (OSError, PermissionError):
-            continue
-        for chunk in environ.split(b"\0"):
-            if chunk.startswith(b"CLAUDE_CONFIG_DIR="):
-                val = chunk.split(b"=", 1)[1].decode("utf-8", "replace").rstrip("/")
-                if val == want:
-                    pids.append(int(p.name))
-                break
+        val = _pid_config_dir(int(p.name))
+        if val is not None and val.rstrip("/") == want:
+            pids.append(int(p.name))
     return pids
+
+
+def mount_account_from_env(state: dict) -> tuple[str | None, str | None]:
+    """Resolve (mount_name, account) from this process's own CLAUDE_CONFIG_DIR.
+
+    Hooks and the statusline run as children of the claude process, so the
+    env var is inherited — this is how the session side learns which account
+    it is on WITHOUT trusting global state (Phase 2.3). Returns:
+
+      - ("slot-N", account-or-None)  when the env points at a slot dir; the
+        account is the slot's CURRENT occupant per state.slots — callers must
+        re-resolve on every render, because a swap changes it under a live
+        session while the env var stays the same.
+      - ("account-X", "X")           when it points at an account dir (a
+        relogin-style launch — the dir IS the account).
+      - (None, None)                 bare launch / env unset / unrecognized.
+    """
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg_dir:
+        return (None, None)
+    p = Path(cfg_dir).expanduser()
+    candidates = [p]
+    try:
+        candidates.append(p.resolve())
+    except OSError:
+        pass
+    for c in candidates:
+        if c.parent != ACCOUNTS_DIR:
+            continue
+        if c.name.startswith(SLOT_PREFIX):
+            return (c.name, state.get("slots", {}).get(c.name, {}).get("account"))
+        if c.name.startswith("account-"):
+            return (c.name, c.name.removeprefix("account-"))
+    return (None, None)
+
+
+def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
+    """Pick the best account for a NEW session (Phase 2.2 `cus launch auto`).
+
+    Reuses pick_swap_target's full filter+scoring stack (token-expired /
+    saturation / hard-7d / would-re-trip / strategy preferences, GH #69
+    included) over the WHOLE pool by shimming a sentinel "active" — a swap
+    picker excludes the active account, but for a launch every account is a
+    candidate.
+
+    Spreading: accounts already occupying a slot (or the global active, which
+    bare sessions burn) are excluded on the first pass so N sessions land on
+    N accounts; if that empties the pool, the second pass allows doubling up.
+    Final fallback (e.g. a strategy that can't handle the sentinel): lowest
+    estimated effective %.
+    """
+    occupied = {e.get("account") for e in state.get("slots", {}).values() if e.get("account")}
+    if state.get("active"):
+        occupied.add(state["active"])
+
+    def _try(excluded: set) -> SwapTarget | None:
+        shim = dict(state)
+        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in excluded}
+        shim["active"] = "\x00launch-sentinel"  # never a real account name
+        if not shim["accounts"]:
+            return None
+        try:
+            return pick_swap_target(shim, config)
+        except Exception:
+            return None
+
+    target = _try(occupied) or _try(set())
+    if target is None:
+        cands = [(n, a) for n, a in state.get("accounts", {}).items()
+                 if not a.get("token_expired") and not a.get("poll_error")]
+        if cands:
+            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
+    return target
+
+
+def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, Path]:
+    """Find a free slot for a launch (create one if none). Caller save_state()s.
+
+    Preference order: a free slot ALREADY holding prefer_account (no swap
+    needed — cheapest launch), then any free slot, then a new slot. A slot
+    dir on disk with no state entry (orphan) is adopted rather than ignored.
+    """
+    slots_state = state.setdefault("slots", {})
+    free: list[Path] = []
+    for d in list_slot_dirs():
+        if mount_in_use(d):
+            continue
+        if d.name not in slots_state:
+            slots_state[d.name] = {"account": None, "created_ts": now_iso()}
+        free.append(d)
+    if prefer_account:
+        for d in free:
+            if slots_state[d.name].get("account") == prefer_account:
+                return d.name, d
+    if free:
+        return free[0].name, free[0]
+    return create_slot(state)
 
 
 def mount_in_use(mount: Path) -> bool:
@@ -7493,16 +7599,30 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             if e.get("session_id") == this_session_id:
                 this_session_account = e.get("account")
                 break
+    # per_session (Phase 2.3): a slot-launched session carries
+    # CLAUDE_CONFIG_DIR in its env (the statusline runs as a child of the
+    # claude process, so it's inherited). The slot's CURRENT occupant per
+    # state.slots beats every other signal — and must be re-resolved on
+    # every render, because a per-slot swap changes the account under the
+    # live session while the env var stays the same. Bare launches resolve
+    # (None, None) and fall through to the global logic below.
+    mount_name, mount_account = mount_account_from_env(state)
+    is_mount_session = mount_account is not None
     # In background-swap mode the live session follows the global active
     # account on its next request, so the recorded SessionStart account is not
     # where it actually is. Only hot-swap mode has a genuine "loaded creds vs
     # machine-active" mismatch worth surfacing.
     hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
-    if not hot_swap_on:
+    if is_mount_session:
+        this_session_account = mount_account
+    elif not hot_swap_on:
         this_session_account = machine_active
     # Display PRIMARY = this session's account if known, else machine-active.
     active = this_session_account or machine_active
-    pending_swap = this_session_account and this_session_account != machine_active
+    # A mount session differing from machine_active is NORMAL in per_session
+    # mode (that's the point) — the pending-swap hint is a hot-swap-mode
+    # concept only.
+    pending_swap = (not is_mount_session) and this_session_account and this_session_account != machine_active
 
     # GH #36: is THIS pane pinned, and to which account? Computed once and
     # surfaced in both compact and verbose modes (SOS/warning early-returns
@@ -8436,6 +8556,84 @@ def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
             continue
         result = sync_mount_claude_json(d, canonical)
         click.echo(f"  {d.name}: {'updated ' + str(len(result['keys_updated'])) + ' keys' if result['changed'] else 'already in sync'}")
+
+
+def _launch_prepare(account: str | None, state: dict, config: dict) -> tuple[str, Path, str]:
+    """Everything `cus launch` does BEFORE the exec: pick account, acquire +
+    heal + sync a slot, install the account's credentials into it.
+
+    Factored out of the command so tests can exercise the whole flow (the
+    exec itself is untestable in-process). Returns (slot_name, slot_dir,
+    account). Raises click.ClickException with an operator-readable message
+    on every refusal.
+    """
+    if account in (None, "auto"):
+        target = pick_launch_account(state, config)
+        if target is None:
+            raise click.ClickException("no launchable account (all expired/saturated?) — see `cus status` / `cus sos`")
+        account = target.name
+        click.echo(f"launch: picked '{account}' ({target.reason})")
+    elif account not in state.get("accounts", {}):
+        raise click.ClickException(f"unknown account '{account}'. Known: {sorted(state.get('accounts', {}))}")
+
+    acct_state = state.get("accounts", {}).get(account, {})
+    if acct_state.get("token_expired"):
+        click.echo(click.style(f"warning: '{account}' is flagged token_expired — the session may demand /login "
+                               f"(fix first: `cus relogin {account}`)", fg="yellow"))
+
+    slot_name, slot_dir = acquire_slot(state, prefer_account=account)
+    save_state(state)
+
+    # Pre-flight: heal the slot's layout quietly (a launch should never come
+    # up bare-hooked because a symlink rotted), then align its .claude.json
+    # with the canonical (the slot is free — no live-writer race).
+    for f in doctor_mount(slot_dir, fix=True):
+        click.echo(f"launch: doctor healed {slot_name}/{f['entry']} ({f['problem']})")
+    if CLAUDE_JSON.exists():
+        try:
+            sync_mount_claude_json(slot_dir, read_json(CLAUDE_JSON))
+        except (json.JSONDecodeError, OSError) as e:
+            click.echo(click.style(f"warning: canonical .claude.json sync skipped: {e}", fg="yellow"))
+
+    # Install the account into the slot — the same in-place swap primitive the
+    # daemon uses (no-op when the slot already holds it). Reloads and persists
+    # state itself, under the swap lock.
+    if state.get("slots", {}).get(slot_name, {}).get("account") != account:
+        execute_swap(account, trigger="launch", slot=slot_name)
+
+    state = load_state()
+    entry = state.setdefault("slots", {}).setdefault(slot_name, {"account": account, "created_ts": now_iso()})
+    entry["last_launch_ts"] = now_iso()
+    save_state(state)
+    return slot_name, slot_dir, account
+
+
+@cli.command(name="launch", context_settings={"ignore_unknown_options": True})
+@click.argument("account", required=False)
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def launch_cmd(account: str | None, claude_args: tuple[str, ...]) -> None:
+    """Launch claude in its own slot, pinned to an account (per_session).
+
+    ACCOUNT is an account name, or omitted/'auto' to pick the best by the
+    same headroom scoring swaps use. Everything after `--` passes through to
+    claude:
+
+        cus launch                       # auto-pick, plain session
+        cus launch rayi1 -- --resume X   # explicit account + claude args
+
+    The session keeps its slot for life; the daemon moves ACCOUNTS through
+    slots (in-place, no restart), never sessions. Optional alias to make
+    every launch slotted:  alias claude='cus launch auto --'
+    """
+    state = load_state()
+    config = load_config()
+    slot_name, slot_dir, account = _launch_prepare(account, state, config)
+    click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
+    # execvpe replaces this process — claude runs as if launched directly
+    # from the shell (signals, tty, exit code all pass through untouched).
+    os.execvpe("claude", ["claude", *claude_args], env)
 
 
 @cli.command(name="init-systemd")
