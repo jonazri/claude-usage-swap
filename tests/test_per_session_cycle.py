@@ -593,6 +593,74 @@ def test_launch_prepare_refuses_explicit_live_account():
         env.restore()
 
 
+def test_decide_slot_swaps_holds_when_pool_exhausted_no_double_book():
+    """Two hot slots, ONE free target: first slot takes it, second HOLDS on its
+    account instead of doubling up (2026-07-03 — the double-up fallback put one
+    token family on two live mounts, the #104 clobber; slot-3/slot-4 incident)."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 85.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(85.0, 20.0), "beta": _usage(10.0, 10.0)}
+
+        moves = cus.decide_slot_swaps(state, _config(), usage)
+        assert len(moves) == 1, f"exactly one slot moves; the other holds — got {moves}"
+        assert moves[0]["to"] == "beta"
+        assert moves[0]["slot"] in {s1, s2}
+    finally:
+        env.restore()
+
+
+def test_ladder_hysteresis_reads_auto_swap_clock_only():
+    """The ladder cooldown is armed by last_auto_swap_ts (daemon swaps), not
+    last_swap_ts (which launches also bump) — 2026-07-03: launches kept
+    re-arming a 50-min cooldown and parked hot slots while they climbed."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({
+            "current_5h_pct": 85.0, "current_7d_pct": 20.0,
+            "last_swap_ts": cus.now_iso(),  # a launch just installed alpha somewhere
+        })
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(85.0, 20.0), "beta": _usage(10.0, 10.0)}
+        cfg = _config(swap_hysteresis={"enabled": True, "min_seconds_between_swaps": 3000})
+
+        d = cus.decide_swap(state, cfg, usage, {})
+        assert d is not None and d.target == "beta", \
+            "a fresh LAUNCH must not defer the ladder"
+
+        state["accounts"]["alpha"]["last_auto_swap_ts"] = cus.now_iso()
+        d = cus.decide_swap(state, cfg, usage, {})
+        assert d is None, "a fresh DAEMON swap arms the cooldown"
+    finally:
+        env.restore()
+
+
+def test_duplicate_live_mount_families_detects_shared_family():
+    """Two LIVE mounts holding one refresh-token family are the #104 clobber;
+    idle duplicates aren't flagged (nothing refreshes an idle mount).
+    2026-07-03: this condition existed on slot-3/slot-4 while `cus sos` said
+    all-clear — the store-based check only sees provisioned logins."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)  # same snapshot copy → same family
+        state = cus.load_state()
+        dups = cus.duplicate_live_mount_families(state)
+        assert len(dups) == 1, dups
+        assert set(dups[0]["mounts"]) == {f"{s1} (alpha)", f"{s2} (alpha)"}
+
+        env.live_slots.discard(s2)  # session exits → duplicate is idle → no clobber risk
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        assert cus.duplicate_live_mount_families(state) == []
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
