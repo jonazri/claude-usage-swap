@@ -65,6 +65,9 @@ class _Env:
         cus.mount_pids = lambda mount: [1] if Path(mount).name in self.live_slots else []
         cus._OCCUPIED_SLOTS_CACHE.clear()
 
+    def set_config(self, cfg: dict) -> None:
+        cus.write_yaml(cus.CONFIG_YAML, cfg)
+
     def plant_family(self, account: str, family_id: str, refresh: str, usable: bool = True) -> None:
         """Write a pooled family's creds (usable=carries a refresh token)."""
         d = cus.login_family_dir(account, family_id)
@@ -73,9 +76,14 @@ class _Env:
         cus.login_family_creds_path(account, family_id).write_text(json.dumps(blob))
 
     def make_slot(self, account: str, live: bool, family_id: str | None = None) -> str:
-        """Create a slot holding `account`, optionally leasing a pooled family."""
+        """Create a slot holding `account` (with live creds in its mount dir),
+        optionally leasing a pooled family."""
         state = cus.load_state()
-        name, _ = cus.create_slot(state)
+        name, d = cus.create_slot(state)
+        # Live mount creds = the account's snapshot family by default (a plain
+        # copy), matching a slot that swapped in via the copy path.
+        (d / ".credentials.json").write_text(json.dumps(_creds(f"rt-{account}")))
+        (d / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": f"{account}@x"}}))
         state["slots"][name]["account"] = account
         if family_id:
             state["slots"][name]["login_family"] = f"{account}/{family_id}"
@@ -155,6 +163,133 @@ def test_pool_exhaustion_reports_no_free_family():
         assert cus.has_free_login_family("beta", state) is False
     finally:
         env.restore()
+
+
+# --------------------------------------------------------------------------
+# End-to-end: swap claim / lease / save-back (P3) + decision rescue (P4)
+# --------------------------------------------------------------------------
+
+def test_execute_swap_claims_free_family_and_records_lease():
+    """A slot swapping onto an account HELD by another live mount claims a free
+    pooled family — installs THAT family's creds (not a clobbering snapshot copy)
+    and records the lease. This is the credential-safety core of the feature."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)          # will swap onto beta
+        env.make_slot("beta", live=True)                    # beta already held → held
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        # Live creds are the pooled family's DISTINCT token, not beta's snapshot.
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta-fam1", f"expected pooled family creds, got {live_rt}"
+        # Lease recorded so other slots won't claim the same family.
+        state = cus.load_state()
+        assert state["slots"][mover]["login_family"] == "beta/family-1"
+        # beta's account snapshot is untouched (still its own family).
+        snap_rt = cus._credential_refresh_token(cus.read_json(env.accounts_dir / "account-beta" / ".credentials.json"))
+        assert snap_rt == "rt-beta"
+    finally:
+        env.restore()
+
+
+def test_execute_swap_refuses_when_pool_exhausted():
+    """Held target + gate on + NO free family ⇒ execute_swap RAISES rather than
+    install a clobbering copy. The daemon logs this as a failed move; SOS surfaces
+    the exhaustion. Never silently clobber."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)  # beta held, and NO family planted
+        raised = False
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised = "pool exhausted" in str(e)
+        assert raised, "must refuse to clobber when the pool is exhausted"
+        # The mover stayed on alpha (no partial move).
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+    finally:
+        env.restore()
+
+
+def test_execute_swap_onto_free_account_uses_snapshot_no_lease():
+    """When the target is NOT held by another mount, the swap uses the plain
+    snapshot (today's path) and records no lease — the pool is only for the
+    double-book case."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")  # exists but beta not held
+        cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta", "un-held target should install the snapshot, not a pooled family"
+        assert "login_family" not in cus.load_state()["slots"][mover]
+    finally:
+        env.restore()
+
+
+def test_saveback_routes_rotated_tokens_to_leased_family():
+    """A leased slot's rotated live tokens save back to the FAMILY dir on swap-out,
+    never to the account snapshot."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cus.execute_swap("beta", trigger="auto-ladder", slot=mover)  # claims beta/family-1
+        # Session rotates the family token in the live mount, then swaps away.
+        d = cus.slot_path(mover)
+        (d / ".credentials.json").write_text(json.dumps(_creds("rt-beta-fam1-rotated", expires_at=3_000_000_000_000)))
+        cus.execute_swap("alpha", trigger="auto-ladder", slot=mover)
+        # Rotated token saved to the family dir; beta snapshot untouched.
+        fam_rt = cus._credential_refresh_token(cus.read_json(cus.login_family_creds_path("beta", "family-1")))
+        assert fam_rt == "rt-beta-fam1-rotated"
+        snap_rt = cus._credential_refresh_token(cus.read_json(env.accounts_dir / "account-beta" / ".credentials.json"))
+        assert snap_rt == "rt-beta"
+    finally:
+        env.restore()
+
+
+def test_decide_slot_swaps_pool_rescue_relaxes_exclusion():
+    """P4: with the gate on, decide_slot_swaps un-drops a held account that has a
+    free pooled family, so a hot lane whose only headroom is behind held accounts
+    gets a rescue move (gate off ⇒ holds)."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        mover = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 90.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 15.0, "current_7d_pct": 10.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage(90.0, 20.0), "beta": _usage(15.0, 10.0)}
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        excl = {"beta", "gamma"}  # all headroom held elsewhere
+        base = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "lowest_usage",
+            "swap_hysteresis": {"enabled": False}, "usage_growth_gate": {"enabled": False},
+            "defer_swap_near_5h_reset": {"enabled": False}, "lazy_swap": {"enabled": False},
+        })
+        # Gate OFF ⇒ no target, holds.
+        off = cus.deep_merge(base, {"independent_logins": {"use_independent_logins": False}})
+        assert cus.decide_slot_swaps(state, off, usage, exclude_accounts=excl) == []
+        # Gate ON ⇒ rescues onto beta (the pooled-family account).
+        on = cus.deep_merge(base, {"independent_logins": {"use_independent_logins": True}})
+        moves = cus.decide_slot_swaps(state, on, usage, exclude_accounts=excl)
+        assert len(moves) == 1 and moves[0]["slot"] == mover and moves[0]["to"] == "beta", moves
+    finally:
+        env.restore()
+
+
+def _usage(five_h: float, seven_d: float) -> "cus.AccountUsage":
+    return cus.AccountUsage(
+        five_hour=cus.UsageWindow(utilization=five_h, resets_at=None),
+        seven_day=cus.UsageWindow(utilization=seven_d, resets_at=None),
+    )
 
 
 if __name__ == "__main__":

@@ -1256,6 +1256,23 @@ def has_free_login_family(account: str, state: dict) -> bool:
     return free_login_family(account, state) is not None
 
 
+def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None) -> bool:
+    """True iff `account` is currently live on a mount OTHER than `this_slot` — a
+    live slot or the shared ~/.claude mount.
+
+    Installing a plain snapshot COPY of an account onto a SECOND live mount is
+    the #104 clobber (both refresh the one shared token family). So this gates
+    whether a swap must claim a DISTINCT pooled family instead of copying."""
+    for s in occupied_slot_accounts(state).get(account, []):
+        if s != this_slot:
+            return True
+    # The shared mount counts too: a slot copying merkos while the shared mount
+    # is live on merkos double-books it exactly the same way.
+    if state.get("active") == account and mount_in_use(CLAUDE_DIR):
+        return True
+    return False
+
+
 def read_login_provenance(account: str, slot: str) -> dict | None:
     """Provenance record for a provisioned login, or None if unreadable."""
     path = login_store_provenance_path(account, slot)
@@ -1557,9 +1574,16 @@ def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path
     return (snapshot_creds, False)
 
 
-def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_bytes: bytes) -> str:
-    """Save a slot's live creds back into its (account, slot) independent-login
-    store entry, instead of the shared account snapshot (Phase 3a, #109).
+def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_bytes: bytes,
+                            dest_path: Path | None = None) -> str:
+    """Save a slot's live creds back into its independent-login store entry,
+    instead of the shared account snapshot (Phase 3a, #109).
+
+    `dest_path` (2026-07-03 pool model): the exact store file to write. When
+    given (the pool case) it targets the LEASED family's creds
+    (login_family_creds_path); when omitted it falls back to the legacy
+    per-(account, slot) path. Either way the freshness guard + backup are the
+    same — only the destination differs.
 
     WHY this must NOT go through classify_live_creds_owner: an independent login
     deliberately carries a refresh token that matches NO account snapshot, so the
@@ -1571,7 +1595,7 @@ def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_byte
 
     Carries the GH #77 freshness guard (never overwrite a newer stored login,
     e.g. one just re-provisioned) and the GH #79 backup. Returns a status word."""
-    store_path = login_store_creds_path(account, slot)
+    store_path = dest_path if dest_path is not None else login_store_creds_path(account, slot)
     live_exp = _creds_expires_at(live_creds)
     if store_path.exists() and live_exp is not None:
         try:
@@ -3651,8 +3675,25 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # below never sees it, verdicts "unknown", and clobbers current's shared
     # snapshot with the independent family (handoff §5.5). Gated: with the gate
     # off this branch is never taken and behavior is unchanged.
+    _lease = slot_leased_family(state, slot) if slot is not None else None
     if (live_creds is not None and slot is not None and current is not None
+            and independent_logins_enabled(config) and _lease is not None and _lease[0] == current):
+        # Pool model: this mount runs a LEASED family for the outgoing account.
+        # Its live refresh token belongs to that family (not the account
+        # snapshot), so save it straight back to the family dir — never through
+        # classify_live_creds_owner, which would clobber the shared snapshot.
+        _fam = _lease[1]
+        status_word = saveback_to_login_store(current, slot, live_creds, live_creds_bytes,
+                                              dest_path=login_family_creds_path(current, _fam))
+        if status_word == "skipped-stale":
+            click.echo(f"creds-save-back: SKIPPED — stored family {current}/{_fam} is newer than "
+                       f"the live file; kept the store entry (GH #77-style guard)")
+        else:
+            click.echo(f"creds-save-back: saved {slot} live tokens back to pooled login {current}/{_fam} (#109 pool)")
+    elif (live_creds is not None and slot is not None and current is not None
             and independent_logins_enabled(config) and has_independent_login(current, slot)):
+        # Legacy per-(slot, account) store (superseded by the pool; retained
+        # until the P5 cleanup so nothing that still keys per-slot regresses).
         status_word = saveback_to_login_store(current, slot, live_creds, live_creds_bytes)
         if status_word == "skipped-stale":
             click.echo(f"creds-save-back: SKIPPED — stored login for ({slot}, {current}) is newer "
@@ -3771,12 +3812,40 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # backup of the live file itself makes the install step independently
     # recoverable.
     backup_credentials_file(live_creds_path)
-    # Phase 2 (#109): pick the install source — the (target, slot) independent
-    # login when the gate is on and one is provisioned, else the shared snapshot
-    # (today's copy path). See swap_install_source for the full rationale.
-    install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # Install source. Pool model (2026-07-03): if the gate is on and the target
+    # is ALREADY live on another mount, a plain snapshot copy would clobber its
+    # shared token family (#104) — so CLAIM a free pooled family (a distinct
+    # family) instead. If the pool is exhausted (no free family AND no legacy
+    # per-slot login), REFUSE rather than clobber: raise, and _execute_slot_moves
+    # logs it as a failed move (SOS surfaces the exhaustion). When the target is
+    # NOT double-booked, fall through to swap_install_source — the shared
+    # snapshot (today's copy path) or a legacy per-slot login. Gate off ⇒ the
+    # whole claim block is skipped, so behavior is bit-for-bit unchanged.
+    claimed_family = None
+    install_src = None
+    used_independent = False
+    if (slot is not None and independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot)):
+        claimed_family = free_login_family(target_name, state)
+        if claimed_family is not None:
+            install_src = login_family_creds_path(target_name, claimed_family)
+            used_independent = True
+        elif has_independent_login(target_name, slot):
+            # Legacy per-slot family (superseded; retained until P5).
+            install_src = login_store_creds_path(target_name, slot)
+            used_independent = True
+        else:
+            raise RuntimeError(
+                f"pool exhausted for '{target_name}': it is live on another mount and has no free "
+                f"independent login family to claim — refusing to install a clobbering copy. "
+                f"Provision another: `cus login-mount {target_name}`.")
+    if install_src is None:
+        install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
     atomic_copy(install_src, live_creds_path, mode=0o600)
-    if used_independent:
+    if claimed_family is not None:
+        click.echo(f"creds-install: claimed pooled login {target_name}/{claimed_family} for {slot} "
+                   f"(distinct family, no clobber — #109 pool)")
+    elif used_independent:
         click.echo(f"creds-install: installed independent login for ({slot}, {target_name}) — GH #109")
 
     # Update state with progressive-threshold bookkeeping
@@ -3786,6 +3855,14 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     else:
         slot_entry["account"] = target_name
         slot_entry["last_swap_ts"] = ts
+        # Record/clear the pool lease (2026-07-03): a claimed family binds this
+        # slot to (target, family) so leased_families() excludes it from other
+        # slots' free set and save-back routes there. Moving onto a primary /
+        # snapshot (no claim) releases any prior lease.
+        if claimed_family is not None:
+            slot_entry["login_family"] = f"{target_name}/{claimed_family}"
+        else:
+            slot_entry.pop("login_family", None)
     state["accounts"][target_name]["last_swap_ts"] = ts
     # Ladder hysteresis clock (2026-07-03): only DAEMON-decided swaps arm it.
     # A launch installing an account into a slot isn't churn, but it used to
@@ -4885,6 +4962,18 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # Drop cross-mount-excluded accounts from the candidate pool for THIS
         # group's decision (keep the group's own account — it's being left).
         drop = exclude - {acct_name}
+        # Independent-login POOL rescue (2026-07-03): an account is only excluded
+        # because a COPY onto a second live mount would clobber its shared token
+        # family (#104). If that account has a FREE pooled login family, a swap
+        # can claim it (distinct family) — so it's a legal target, un-drop it.
+        # Without this a hot lane whose only headroom sits behind held accounts
+        # had NO target and held forever (the "no swaps since lanes" symptom).
+        # Execution (_execute_swap_locked) does the actual claim + lease and
+        # REFUSES if the pool turns out exhausted, so this can't cause a clobber.
+        # Gated on use_independent_logins — OFF (default) leaves drop unchanged.
+        if drop and independent_logins_enabled(config):
+            rescuable = {x for x in drop if has_free_login_family(x, state)}
+            drop = drop - rescuable
         if drop:
             shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
         trace: dict = {}
@@ -4905,14 +4994,18 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 retry = pick_swap_target(shim2, cfg_view)
                 if retry is not None:
                     target = retry.name
-                elif not (independent_logins_enabled(cfg_view) and has_independent_login(target, slot_name)):
+                elif not (independent_logins_enabled(cfg_view)
+                          and (has_free_login_family(target, state)
+                               or has_independent_login(target, slot_name))):
                     # Pool exhausted. Pre-2026-07-03 this doubled up on the
                     # original target — installing one token family on two live
                     # mounts, the exact clobber #104 forbids (hit live on
                     # slot-3/slot-4, 2026-07-03: one refresh logs the other
                     # out). HOLD instead: a parked hot slot degrades gracefully.
-                    # A slot holding its own independent login for the target
-                    # is the one safe double-book (distinct family, #109 3b).
+                    # The safe double-book is a target with a FREE pooled family
+                    # (2026-07-03 pool) or a legacy per-slot login (#109 3b) —
+                    # either gives this mount a distinct family. Execution claims
+                    # it and re-checks, so an over-optimistic pick can't clobber.
                     click.echo(f"  {slot_name}: pool exhausted — holding on '{acct_name}' "
                                f"(won't double-book '{target}' onto a second live mount — GH #104)")
                     continue
@@ -4991,7 +5084,15 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         shim["active"] = acct
         # Keep the slot's own account present (pick excludes the active anyway);
         # drop this-round targets + cross-mount exclusions.
-        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in taken}
+        drop = {n for n in taken if n != acct}
+        # Independent-login POOL rescue (2026-07-03): a 429'd slot may escape
+        # onto a held account that has a FREE pooled family — the swap claims a
+        # distinct family (no clobber). Same relaxation as the proactive ladder
+        # path; execution does the claim + refuses if the pool is exhausted.
+        # Gated on use_independent_logins (off ⇒ drop unchanged).
+        if drop and independent_logins_enabled(config):
+            drop = {x for x in drop if not has_free_login_family(x, state)}
+        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in drop}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
         # a premium slot's may not.
