@@ -294,6 +294,46 @@ def _usage(five_h: float, seven_d: float) -> "cus.AccountUsage":
 
 
 # --------------------------------------------------------------------------
+# SOS Condition 2b (P5): pool-aware lane target-starvation
+# --------------------------------------------------------------------------
+
+def _lane_starvation_summaries(conds) -> list[str]:
+    return [c.summary for c in conds if "with no swap target" in c.summary]
+
+
+def test_sos_starvation_suppressed_when_pool_can_rescue():
+    """A hot lane whose only headroom is a held account with a FREE pooled family
+    is NOT reported starved (it can rescue). Without the family it IS reported,
+    with a pool-provisioning hint."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.make_slot("alpha", live=True)   # hot lane
+        env.make_slot("beta", live=True)    # beta held, has headroom
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"next_swap_at_pct": 80, "current_5h_pct": 100.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"next_swap_at_pct": 80, "current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "lowest_usage",
+            "independent_logins": {"use_independent_logins": True}})
+
+        # No pooled family for beta ⇒ alpha lane is genuinely starved, WITH hint.
+        starved = _lane_starvation_summaries(cus.diagnose(state, cfg))
+        assert any("alpha" in s for s in starved), starved
+        hinted = [c for c in cus.diagnose(state, cfg)
+                  if "alpha" in c.summary and "login-mount" in c.action]
+        assert hinted, "gate-on starvation should hint cus login-mount"
+
+        # Provision a free family for beta ⇒ alpha can rescue ⇒ NOT starved.
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        starved2 = _lane_starvation_summaries(cus.diagnose(state, cfg))
+        assert not any("alpha" in s for s in starved2), starved2
+    finally:
+        env.restore()
+
+
+# --------------------------------------------------------------------------
 # Provisioning command (P2): `cus login-mount <account>` account-keyed, repeatable
 # --------------------------------------------------------------------------
 

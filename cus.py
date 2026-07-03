@@ -5819,6 +5819,12 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             # live-mount account (the lane's own account is retained — it's the
             # one being left). Then run the real picker.
             drop = exclude - {acct_name}
+            # Mirror the pool rescue (2026-07-03): a held account with a FREE
+            # pooled family is a legal target (execution claims a distinct
+            # family), so it must NOT count toward starvation — else Condition 2b
+            # false-positives on a lane that can actually rescue.
+            if drop and independent_logins_enabled(config):
+                drop = drop - {x for x in drop if has_free_login_family(x, state)}
             shim = dict(state)
             if drop:
                 shim["accounts"] = {n: a for n, a in accounts.items() if n not in drop}
@@ -5829,6 +5835,13 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
             if not starved:
                 continue
+            # Remedy hint. With the pool feature ON, the starvation means every
+            # headroom account is held AND has no free family — so provisioning
+            # another family (raising a pool's depth) is the login-free unlock,
+            # alongside add-account / free-a-lane / wait-for-reset.
+            pool_hint = (" Or provision another independent login for a headroom account "
+                         "(`cus login-mount <account>`) so this lane can borrow it."
+                         if independent_logins_enabled(config) else "")
             # Tier severity: at/above saturation the lane is effectively frozen
             # and burning a live session → urgent; merely over the first ladder
             # step (still has headroom) → warning, an early nudge to add capacity.
@@ -5840,7 +5853,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         f"held by another live mount (GH #104 forbids double-booking — it clobbers "
                         f"the OAuth token) or is saturated, so this lane cannot rotate. Add another "
                         f"account (`cus add <name>`), free a live lane, or wait for another account's "
-                        f"5h/7d window to reset."),
+                        f"5h/7d window to reset." + pool_hint),
                 affected=acct_name,
             ))
 
