@@ -1256,6 +1256,47 @@ def has_free_login_family(account: str, state: dict) -> bool:
     return free_login_family(account, state) is not None
 
 
+def login_family_provenance_path(account: str, family_id: str) -> Path:
+    return login_family_dir(account, family_id) / "provenance.json"
+
+
+def scaffold_login_family_dir(account: str, family_id: str) -> Path:
+    """Create (idempotently) a minimal CLAUDE_CONFIG_DIR to `/login` into for one
+    pooled family, and return it. Mirrors scaffold_login_store_dir (empty
+    .claude.json + shared symlinks) but keyed by family, not slot."""
+    dst = login_family_dir(account, family_id)
+    dst.mkdir(parents=True, exist_ok=True)
+    if not (dst / ".claude.json").exists():
+        write_json(dst / ".claude.json", {})
+    for sub in SHARED_SYMLINK_SUBDIRS:
+        link = dst / sub
+        target = CLAUDE_DIR / sub
+        if target.exists() and not link.exists():
+            link.symlink_to(target)
+    return dst
+
+
+def latest_family_id(account: str) -> str | None:
+    """Highest-index family subdir for an account (usable or not) — the one a
+    just-completed `cus login-mount <account>` scaffolded, for `--finish` to
+    verify. None if the pool has no family dirs yet."""
+    d = login_pool_dir(account)
+    fams = [p.name for p in d.iterdir()
+            if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)] if d.exists() else []
+    return max(fams, key=_family_index) if fams else None
+
+
+def family_identity(account: str, family_id: str) -> dict:
+    """Identity facets `/login` recorded in a family dir's .claude.json."""
+    path = login_family_dir(account, family_id) / ".claude.json"
+    if not path.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(path))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None) -> bool:
     """True iff `account` is currently live on a mount OTHER than `this_slot` — a
     live slot or the shared ~/.claude mount.
@@ -10388,6 +10429,108 @@ def _login_mount_status_line(rec: dict, config: dict) -> str:
     return f"  {account:<12} {slot:<10} {email:<28} {fp}  {fresh}"
 
 
+def _write_family_provenance(account: str, family_id: str, email: str | None,
+                             bootstrapped: bool = False) -> dict:
+    """Record provenance for a pooled family and return it."""
+    rt = _credential_refresh_token(read_json(login_family_creds_path(account, family_id)))
+    prov = {
+        "account": account,
+        "family_id": family_id,
+        "minted_ts": now_iso(),
+        "source_email": email or "unknown",
+        "refresh_fp": _refresh_fingerprint(rt) if rt else None,
+        "bootstrapped": bootstrapped,
+    }
+    write_json(login_family_provenance_path(account, family_id), prov)
+    return prov
+
+
+def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: bool,
+                      force: bool, from_existing: bool) -> None:
+    """Account-keyed pool provisioning for `cus login-mount <account>` (2026-07-03).
+
+    Provisions the account's NEXT backup family. Run it pool_size times at
+    onboarding to build a pool a lane can borrow from without per-lane setup."""
+    account_dir = ACCOUNTS_DIR / f"account-{account}"
+    if not account_dir.exists():
+        raise click.ClickException(
+            f"Unknown account '{account}' — no {account_dir}. Run `cus list`, or `cus add {account}` first.")
+    want = config.get("independent_logins", {}).get("pool_size", 3)
+
+    if from_existing:
+        # Seed family-1 from the snapshot (no browser). Only clobber-safe as the
+        # PRIMARY (the account's own live mount) — a 2nd simultaneous mount needs
+        # a real /login for a distinct family. Refuse if a pool already exists.
+        if list_login_families(account):
+            raise click.ClickException(
+                f"{account} already has pooled families; --from-existing only seeds the first. "
+                f"Add more with a real login: `cus login-mount {account}`.")
+        snap = account_creds_path(account)
+        try:
+            ok = _credential_refresh_token(read_json(snap)) is not None
+        except (json.JSONDecodeError, OSError):
+            ok = False
+        if not ok:
+            raise click.ClickException(f"{account}'s snapshot ({snap}) has no usable creds to bootstrap from.")
+        fam = "family-1"
+        scaffold_login_family_dir(account, fam)
+        atomic_copy(snap, login_family_creds_path(account, fam), mode=0o600)
+        snap_cj = account_dir / ".claude.json"
+        if snap_cj.exists():
+            atomic_copy(snap_cj, login_family_dir(account, fam) / ".claude.json", mode=0o600)
+        email = account_canonical_identity(account).get("emailAddress")
+        prov = _write_family_provenance(account, fam, email, bootstrapped=True)
+        click.echo(click.style(f"✓ Seeded {account}/{fam} from the on-disk snapshot (bootstrapped copy).", fg="green"))
+        click.echo(f"  identity: {email or 'unknown'}   fingerprint: {prov['refresh_fp']}")
+        click.echo(f"  This is NOT independent from the snapshot — for a 2nd live mount, add a real login.")
+        return
+
+    if finish_flag:
+        fam = latest_family_id(account)
+        if fam is None or not _family_creds_usable(account, fam):
+            raise click.ClickException(
+                f"No usable freshly-logged-in family for '{account}'. Did the /login complete? "
+                f"Re-run `cus login-mount {account}` and log in as '{account}' first.")
+        logged = family_identity(account, fam)
+        canonical = account_canonical_identity(account)
+        match = _identities_match(logged, canonical)
+        logged_email = logged.get("emailAddress") or "unknown"
+        canon_email = canonical.get("emailAddress") or "unknown"
+        if match is False and not force:
+            raise click.ClickException(
+                f"Login identity mismatch: you logged in as '{logged_email}' but account '{account}' is "
+                f"'{canon_email}' (the wrong-account trap, 2026-07-01). Re-login as '{account}', or --force.")
+        if match is None:
+            click.echo(click.style("  (could not verify identity — recording anyway)", fg="yellow"))
+        prov = _write_family_provenance(account, fam, logged_email)
+        n = len(list_login_families(account))
+        click.echo(click.style(f"✓ Recorded {account}/{fam} (pool now {n} family(ies)).", fg="green"))
+        click.echo(f"  identity: {logged_email}   fingerprint: {prov['refresh_fp']}")
+        if n < want:
+            click.echo(f"  {want - n} more to reach pool_size {want}: run `cus login-mount {account}` again.")
+        if not independent_logins_enabled(config):
+            click.echo("Note: swaps still copy the snapshot until you set "
+                       "independent_logins.use_independent_logins: true.")
+        return
+
+    # --- provision (print/exec) mode: scaffold the next family ---
+    fam = next_family_id(account)
+    dst = scaffold_login_family_dir(account, fam)
+    have = len(list_login_families(account))
+    login_cmd = f"CLAUDE_CONFIG_DIR={dst}/ claude"
+    click.echo(f"Provisioning {account}/{fam} (pool currently {have}, target pool_size {want}).")
+    click.echo(f"Store dir: {dst}")
+    click.echo()
+    click.echo(f"1. Run this and log in AS '{account}' (a NEW independent session for the same account):")
+    click.echo(f"     {login_cmd}")
+    click.echo("2. After the login completes and you /exit, record it:")
+    click.echo(f"     python3 ~/repos/claude-usage-swap/cus.py login-mount {account} --finish")
+    if exec_flag:
+        click.echo()
+        click.echo(f"(--exec) launching claude under {dst} …")
+        os.execvp("claude", ["claude"])
+
+
 @cli.command(name="login-mount")
 @click.argument("slot", required=False)
 @click.argument("account", required=False)
@@ -10436,19 +10579,47 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
     """
     config = load_config()
 
+    def _is_slot_name(s: str) -> bool:
+        return s.startswith(SLOT_PREFIX) and s.removeprefix(SLOT_PREFIX).isdigit()
+
+    # POOL model (2026-07-03): `cus login-mount <account>` (single positional
+    # that is NOT a slot name) provisions the account's NEXT backup family. Run
+    # it pool_size times per account at onboarding — no per-lane setup. The
+    # legacy two-arg `cus login-mount <slot> <account>` form still works below.
+    if account is None and slot is not None and not _is_slot_name(slot):
+        account, slot = slot, None
+    pool_mode = slot is None and account is not None
+
     if list_flag:
+        # Pool view: families per account (the onboarding-facing shape).
+        root = login_store_root()
+        pool_accts = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+        pool_accts = [a for a in pool_accts if list_login_families(a)]
+        if pool_accts:
+            click.echo("Independent-login pools (GH #109):")
+            want = config.get("independent_logins", {}).get("pool_size", 3)
+            for a in pool_accts:
+                fams = list_login_families(a)
+                short = "  ".join(f"{f}[{login_expiry_state(a, f, config)[0]}]" for f in fams)
+                flag = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
+                click.echo(f"  {a}: {len(fams)} family(ies)  {short}{flag}")
+        # Legacy per-(slot,account) entries, if any remain.
         recs = list_provisioned_logins()
-        if not recs:
+        if recs:
+            click.echo("Legacy per-slot logins:")
+            for rec in recs:
+                click.echo(_login_mount_status_line(rec, config))
+        if not pool_accts and not recs:
             click.echo("No independent logins provisioned yet.")
-            click.echo("Provision one with: cus login-mount <slot> <account>")
-            return
-        click.echo("Independent logins (GH #109):")
-        for rec in recs:
-            click.echo(_login_mount_status_line(rec, config))
+            click.echo("Provision a pool with: cus login-mount <account>   (run pool_size times)")
+        return
+
+    if pool_mode:
+        _login_mount_pool(account, config, exec_flag, finish_flag, force, from_existing)
         return
 
     if not slot or not account:
-        raise click.UsageError("login-mount needs a SLOT and an ACCOUNT (e.g. `cus login-mount slot-3 rayi1`), "
+        raise click.UsageError("login-mount needs an ACCOUNT (e.g. `cus login-mount merkos`), "
                                "or use --list.")
 
     # Validate the slot name shape. We allow a slot dir that doesn't exist yet:

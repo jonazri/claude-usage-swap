@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cus  # noqa: E402
+from click.testing import CliRunner  # noqa: E402
 
 
 def _creds(refresh: str, expires_at: int = 2_000_000_000_000) -> dict:
@@ -290,6 +291,84 @@ def _usage(five_h: float, seven_d: float) -> "cus.AccountUsage":
         five_hour=cus.UsageWindow(utilization=five_h, resets_at=None),
         seven_day=cus.UsageWindow(utilization=seven_d, resets_at=None),
     )
+
+
+# --------------------------------------------------------------------------
+# Provisioning command (P2): `cus login-mount <account>` account-keyed, repeatable
+# --------------------------------------------------------------------------
+
+def test_login_mount_account_provisions_next_family():
+    env = _Env()
+    try:
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha"])
+        assert r.exit_code == 0, r.output
+        assert "alpha/family-1" in r.output and "CLAUDE_CONFIG_DIR" in r.output
+        assert cus.login_family_dir("alpha", "family-1").exists()  # scaffolded
+        # A second provision (before finishing #1) targets family-2.
+        r2 = CliRunner().invoke(cus.cli, ["login-mount", "alpha"])
+        assert "alpha/family-2" in r2.output, r2.output
+    finally:
+        env.restore()
+
+
+def test_login_mount_finish_records_family_provenance():
+    env = _Env()
+    try:
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])  # scaffolds family-1
+        # Simulate the completed /login: creds + identity land in the family dir.
+        env.plant_family("alpha", "family-1", "rt-a-fam1")
+        (cus.login_family_dir("alpha", "family-1") / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "alpha@x"}}))
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish"])
+        assert r.exit_code == 0, r.output
+        assert "alpha/family-1" in r.output and "pool now 1" in r.output
+        prov = cus.read_json(cus.login_family_provenance_path("alpha", "family-1"))
+        assert prov["account"] == "alpha" and prov["family_id"] == "family-1"
+        assert prov["refresh_fp"] == cus._refresh_fingerprint("rt-a-fam1")
+    finally:
+        env.restore()
+
+
+def test_login_mount_finish_refuses_wrong_account():
+    env = _Env()
+    try:
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])
+        env.plant_family("alpha", "family-1", "rt-wrong")
+        (cus.login_family_dir("alpha", "family-1") / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "someone-else@x"}}))
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish"])
+        assert r.exit_code != 0 and "mismatch" in r.output.lower(), r.output
+        # --force overrides.
+        r2 = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish", "--force"])
+        assert r2.exit_code == 0, r2.output
+    finally:
+        env.restore()
+
+
+def test_login_mount_from_existing_seeds_family_1_only():
+    env = _Env()
+    try:
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--from-existing"])
+        assert r.exit_code == 0 and "family-1" in r.output, r.output
+        assert cus.list_login_families("alpha") == ["family-1"]
+        # A second --from-existing is refused (only seeds the first).
+        r2 = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--from-existing"])
+        assert r2.exit_code != 0, r2.output
+    finally:
+        env.restore()
+
+
+def test_login_mount_list_shows_pool_depth():
+    env = _Env()
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        env.plant_family("alpha", "family-2", "rt-a2")
+        r = CliRunner().invoke(cus.cli, ["login-mount", "--list"])
+        assert r.exit_code == 0
+        assert "alpha: 2 family" in r.output, r.output
+        assert "pool_size" in r.output  # 2 < default 3 → nudge shown
+    finally:
+        env.restore()
 
 
 if __name__ == "__main__":
