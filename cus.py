@@ -270,6 +270,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # per the non-breaking-by-default rule).
     "independent_logins": {
         "use_independent_logins": False,
+        # Per-account POOL depth (2026-07-03, login-pool model): how many
+        # INDEPENDENT backup login families to provision per account at
+        # onboarding (`cus login-mount <account>` run this many times). A lane
+        # that must swap onto an account another live mount already holds borrows
+        # a FREE family from this pool — a distinct refresh-token family, so no
+        # #104 clobber. pool_size does NOT hard-cap families (you may log in
+        # more); it only guides onboarding + the pool-exhaustion SOS "provision
+        # another" target. N backups ⇒ up to N+1 concurrent live mounts can
+        # safely share one account's quota (primary snapshot + N families).
+        "pool_size": 3,
         # Assumed OAuth refresh-token lifetime. UNCONFIRMED — the #109 Phase 0
         # to-CONFIRM list still owes a measured idle-expiry number; 30 days is
         # the community-reported figure and only drives the sos near-expiry
@@ -1121,6 +1131,129 @@ def has_independent_login(account: str, slot: str) -> bool:
         return _credential_refresh_token(read_json(path)) is not None
     except (json.JSONDecodeError, OSError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Per-account login POOL (2026-07-03, supersedes per-(slot,account) keying).
+#
+# A pool is ~/claude-accounts/logins/<account>/family-<N>/ — one INDEPENDENT
+# OAuth login family per subdir. The account's canonical snapshot is the implicit
+# "primary" (used when the account isn't held anywhere); family-1..N are the
+# backups the operator mints once at onboarding. A lane needing to swap onto a
+# HELD account borrows a FREE family (one not currently leased to a live slot),
+# so the same account can back several live mounts without a shared token family
+# to clobber (#104). Lease = state.slots[<slot>].login_family = "<account>/family-<N>".
+#
+# This reuses the login_store_root() + fingerprint primitives above; the
+# per-(slot,account) helpers (login_store_dir, has_independent_login, …) remain
+# until the P5 cleanup but are no longer the swap-path source of truth.
+# ---------------------------------------------------------------------------
+
+LOGIN_FAMILY_PREFIX = "family-"
+
+
+def login_pool_dir(account: str) -> Path:
+    """Root of one account's independent-login pool: logins/<account>/."""
+    return login_store_root() / account
+
+
+def login_family_dir(account: str, family_id: str) -> Path:
+    """Dir holding one pooled family. `family_id` is the subdir name
+    (e.g. 'family-2')."""
+    return login_pool_dir(account) / family_id
+
+
+def login_family_creds_path(account: str, family_id: str) -> Path:
+    return login_family_dir(account, family_id) / ".credentials.json"
+
+
+def _family_creds_usable(account: str, family_id: str) -> bool:
+    """True iff this family's creds parse and carry a refresh token — the same
+    'usable' bar as has_independent_login (an access-token-only or logout-shaped
+    file can't seed a swap)."""
+    path = login_family_creds_path(account, family_id)
+    if not path.exists():
+        return False
+    try:
+        return _credential_refresh_token(read_json(path)) is not None
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def list_login_families(account: str) -> list[str]:
+    """Usable family ids in an account's pool, sorted by numeric index.
+
+    Only families with parseable creds carrying a refresh token count — a
+    half-scaffolded dir (mid-`login-mount`, no `/login` yet) is not usable."""
+    d = login_pool_dir(account)
+    if not d.exists():
+        return []
+    fams = [p.name for p in d.iterdir()
+            if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)
+            and _family_creds_usable(account, p.name)]
+    return sorted(fams, key=_family_index)
+
+
+def _family_index(family_id: str) -> int:
+    """Numeric index of 'family-<N>' for deterministic lowest-free ordering;
+    unparseable names sort last."""
+    try:
+        return int(family_id.removeprefix(LOGIN_FAMILY_PREFIX))
+    except ValueError:
+        return 1 << 30
+
+
+def next_family_id(account: str) -> str:
+    """The family id `cus login-mount <account>` should scaffold next: one past
+    the highest EXISTING family index (usable or not, so a half-finished mint
+    isn't reused). Pools start at family-1."""
+    d = login_pool_dir(account)
+    existing = [p.name for p in d.iterdir()
+                if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)] if d.exists() else []
+    hi = max((_family_index(f) for f in existing), default=0)
+    return f"{LOGIN_FAMILY_PREFIX}{hi + 1}"
+
+
+def slot_leased_family(state: dict, slot: str) -> tuple[str, str] | None:
+    """(account, family_id) a slot currently leases, or None. Stored as
+    'account/family-N' on state.slots[slot].login_family."""
+    entry = (state.get("slots", {}) or {}).get(slot, {}) or {}
+    ref = entry.get("login_family")
+    if not ref or "/" not in ref:
+        return None
+    account, family_id = ref.split("/", 1)
+    return (account, family_id)
+
+
+def leased_families(account: str, state: dict) -> set[str]:
+    """Family ids of `account` currently leased by a LIVE slot — the in-use set
+    a claim must avoid. Idle slots don't count: with no session refreshing the
+    token, their lease can't clobber, and the family is reclaimable."""
+    live = set(occupied_slot_accounts(state).get(account, []))
+    out: set[str] = set()
+    for slot in live:
+        lease = slot_leased_family(state, slot)
+        if lease and lease[0] == account:
+            out.add(lease[1])
+    return out
+
+
+def free_login_family(account: str, state: dict) -> str | None:
+    """Lowest-index usable family of `account` not leased to a live slot, or None
+    if the pool is empty or fully leased (exhausted). This is the family a rescue
+    swap claims."""
+    leased = leased_families(account, state)
+    for fam in list_login_families(account):  # already sorted lowest-first
+        if fam not in leased:
+            return fam
+    return None
+
+
+def has_free_login_family(account: str, state: dict) -> bool:
+    """True iff a rescue swap onto `account` could claim a distinct login family
+    (so double-booking it would not clobber). The pool-model replacement for the
+    per-slot has_independent_login predicate."""
+    return free_login_family(account, state) is not None
 
 
 def read_login_provenance(account: str, slot: str) -> dict | None:
