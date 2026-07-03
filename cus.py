@@ -2572,28 +2572,124 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
     expiresAt is the Unix milliseconds at which the stored access token
-    expires (per the OAuth flow). Returns (None, None) if the file can't be
+    expires (per the OAuth flow). Returns (None, None) if no file can be
     read. The expiresAt is used to detect "token stale, not actually expired"
     (GH #13) — when an inactive account's stored access token has aged out
     but its refresh token is still valid, polling will 401 even though the
     account is fully usable.
+
+    Credential source preference (2026-07-03 token-stale blindness incident,
+    GH #130). We poll with the FRESHEST credential we can find for this
+    account, in order:
+      1. the live shared mount (CREDS_JSON) when this account is the
+         shared-active one — Claude Code refreshes it transparently on use;
+      2. any SLOT that backs this account whose dir exists — a live LANE's
+         own `.credentials.json` is kept fresh by the running Claude Code
+         session on top of it, so it is the best token to poll with and it
+         exists precisely when the primary account store is most likely to be
+         stale (the exact condition that blinded `rayi2` for 3.7h). Live slots
+         (a session actually running, `mount_in_use`) are preferred over idle
+         ones; among live slots order is arbitrary (any live token is fresh);
+      3. the account's primary store (`account_creds_path`) — the historical
+         fallback.
+    We return the FIRST candidate whose access token is not already past its
+    expiresAt (same 30s-grace staleness convention the caller in
+    poll_account_usage applies). If EVERY candidate is stale, we return the
+    primary store's pair exactly as before so `token_stale` detection still
+    fires downstream (and, if the primary is missing, the first stale pair we
+    did find, so an active account still reads as token_stale rather than
+    "no access_token").
+
+    READ-ONLY by contract: this NEVER writes, refreshes, or rotates a token.
+    OAuth refresh tokens are single-use — refreshing the wrong file here would
+    log a live session out (GH #104). We only CHOOSE which existing file to
+    read; the return contract stays (accessToken, expiresAt).
     """
     try:
         state = load_state() if STATE_JSON.exists() else {}
     except Exception:
         state = {}
+
+    def _read_pair(path: Path) -> tuple[str | None, int | None]:
+        """(accessToken, expiresAt) from a creds file, or (None, None).
+
+        Missing/corrupt files are swallowed silently (same try/except style as
+        the historical single-path read) so one bad slot creds file never
+        blocks the daemon from finding a good one — the whole point of having
+        multiple candidates. GH #130 failure mode: a slot whose
+        `.credentials.json` is absent or half-written must simply be skipped.
+        """
+        try:
+            if not path.exists():
+                return None, None
+            creds = read_json(path)
+            oauth = creds.get("claudeAiOauth", {})
+            return oauth.get("accessToken"), oauth.get("expiresAt")
+        except (json.JSONDecodeError, OSError):
+            return None, None
+
+    def _is_fresh(expires_at) -> bool:
+        """Mirror poll_account_usage's staleness test: fresh iff expiresAt is
+        not more than 30s in the past. An unknown/unparseable expiresAt counts
+        as fresh — we can't prove it stale, and the live HTTP call will still
+        surface a real 401 as token_expired if the token is actually dead."""
+        if expires_at is None:
+            return True
+        try:
+            now_ms = int(time.time() * 1000)
+            return int(expires_at) >= now_ms - 30_000
+        except (TypeError, ValueError):
+            return True
+
+    # Assemble candidate creds paths in preference order (see docstring).
+    candidates: list[Path] = []
+    # (1) live shared mount, only when this account is the shared-active one.
     if state.get("active") == account_name and CREDS_JSON.exists():
-        creds_path = CREDS_JSON
-    else:
-        creds_path = account_creds_path(account_name)
-    if not creds_path.exists():
-        return None, None
-    try:
-        creds = read_json(creds_path)
-        oauth = creds.get("claudeAiOauth", {})
-        return oauth.get("accessToken"), oauth.get("expiresAt")
-    except (json.JSONDecodeError, OSError):
-        return None, None
+        candidates.append(CREDS_JSON)
+    # (2) slots backing this account; live slots first, idle slots after. A
+    # live slot's creds are refreshed by the session running on it, so they
+    # beat both an idle slot and (usually) the primary store for freshness.
+    live_slot_creds: list[Path] = []
+    idle_slot_creds: list[Path] = []
+    for slot_name, entry in state.get("slots", {}).items():
+        if (entry or {}).get("account") != account_name:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists():
+            continue
+        cred = d / ".credentials.json"
+        if not cred.exists():
+            continue
+        try:
+            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
+            # per cycle, but a direct call here is cheap enough (one slot) and
+            # a few seconds of staleness only picks idle-vs-live ordering, not
+            # correctness — both get tried.
+            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
+        except Exception:
+            idle_slot_creds.append(cred)
+    candidates.extend(live_slot_creds)
+    candidates.extend(idle_slot_creds)
+    # (3) primary account store — historical fallback, always last.
+    primary = account_creds_path(account_name)
+    candidates.append(primary)
+
+    # First non-stale candidate wins. Track the primary's pair (task contract:
+    # all-stale returns the primary) and the first present-but-stale pair (so a
+    # missing primary still yields token_stale rather than a false "no token").
+    primary_pair: tuple[str | None, int | None] = (None, None)
+    first_stale_pair: tuple[str | None, int | None] = (None, None)
+    for path in candidates:
+        token, expires_at = _read_pair(path)
+        if path == primary:
+            primary_pair = (token, expires_at)
+        if token is None:
+            continue
+        if _is_fresh(expires_at):
+            return token, expires_at
+        if first_stale_pair[0] is None:
+            first_stale_pair = (token, expires_at)
+    return primary_pair if primary_pair[0] is not None else first_stale_pair
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -2929,13 +3025,20 @@ def estimate_window_pct(acct: dict, window: str, config: dict, now=None) -> floa
     if not est_cfg.get("enabled", True):
         return polled
     rate = acct.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
-    last_poll = acct.get("last_poll_ts")
-    if rate <= 0 or not last_poll:
+    # Extrapolate forward from the last real OBSERVATION of `polled`, not the
+    # last poll ATTEMPT (2026-07-03 token-stale blindness incident, GH #130).
+    # `polled` (current_{window}_pct) is only refreshed on a successful poll;
+    # anchoring dt at an error-branch-restamped last_poll_ts would make the
+    # value look freshly-observed and UNDER-extrapolate (picker less
+    # conservative than reality). `or last_poll_ts` preserves today's behavior
+    # for legacy state that predates the field.
+    last_observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    if rate <= 0 or not last_observed:
         return polled
     if now is None:
         now = datetime.now(timezone.utc)
     try:
-        t0 = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
+        t0 = datetime.fromisoformat(last_observed.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return polled
     # Cap how far we trust a stale rate: a burn rate measured one interval ago
@@ -5798,7 +5901,15 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         # the post-reset base. Stored on the account for estimate_window_pct().
         old_5h = acct.get("current_5h_pct")
         old_7d = acct.get("current_7d_pct")
-        old_poll_ts = acct.get("last_poll_ts")
+        # Anchor the burn-rate window at the PRIOR real OBSERVATION, not the
+        # prior poll ATTEMPT (2026-07-03 token-stale blindness incident, GH
+        # #130). old_5h/old_7d are the last OBSERVED percentages — they survive
+        # the error branches above (which `continue` without touching
+        # current_*_pct) but `last_poll_ts` gets restamped by those same error
+        # branches. Using last_poll_ts here would understate dt across a stale
+        # gap and overstate %/min. `last_observed_ts or last_poll_ts` falls
+        # back to today's behavior for legacy state that predates the field.
+        old_poll_ts = acct.get("last_observed_ts") or acct.get("last_poll_ts")
         old_5h_resets = acct.get("five_hour_resets_at")
         old_7d_resets = acct.get("seven_day_resets_at")
         new_5h_val = u.five_hour.utilization if u.five_hour else old_5h
@@ -5823,6 +5934,15 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
         acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else acct.get("current_7d_pct", 0.0)
         acct["last_poll_ts"] = u.polled_at
+        # last_observed_ts = "last time we actually OBSERVED real usage data",
+        # written ONLY on this success branch (2026-07-03 token-stale blindness
+        # incident, GH #130). Distinct from last_poll_ts = "last time we
+        # attempted/settled a poll", which the error branches above keep
+        # restamping without observing anything. `_five_hour_rolled_since_poll`
+        # and the burn-rate estimator read last_observed_ts so a token_stale
+        # account (Branch 0) can no longer masquerade as freshly-observed and
+        # defeat the GH #59 countdown reset inference.
+        acct["last_observed_ts"] = u.polled_at
         if u.five_hour and u.five_hour.resets_at:
             acct["five_hour_resets_at"] = u.five_hour.resets_at
         if u.seven_day and u.seven_day.resets_at:
@@ -9979,12 +10099,22 @@ def _five_hour_rolled_since_poll(acct: dict) -> bool:
     if secs_to_reset is None or secs_to_reset > 0:
         return False  # reset still in the future (or unparseable) — nothing rolled
     reset_age = -secs_to_reset                 # seconds since the reset fired
-    last_poll = acct.get("last_poll_ts")
-    if not last_poll:
-        return True                            # never polled → can't have seen post-reset
-    poll_age = _time_since(last_poll)          # seconds since the last poll
-    # Stale iff the last poll predates the reset (poll older than the reset).
-    return poll_age is not None and poll_age > reset_age
+    # Use last real OBSERVATION, not last poll ATTEMPT (2026-07-03 token-stale
+    # blindness incident, GH #130). This is the crux of the bug: a token_stale
+    # account's Branch 0 keeps restamping last_poll_ts every cycle without ever
+    # observing usage, so `poll_age` stayed tiny and this returned False
+    # forever — the account's 5h window rolled over but the GH #59 countdown
+    # inference never fired, leaving it frozen at a stale-high % (rayi2 sat at
+    # ~99% for 3.7h). last_observed_ts only advances on a SUCCESSFUL poll, so
+    # it correctly ages past the reset. `or last_poll_ts` keeps legacy state
+    # files (written before last_observed_ts existed) on today's behavior until
+    # their first successful poll populates the new field.
+    last_observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    if not last_observed:
+        return True                            # never observed → can't have seen post-reset
+    obs_age = _time_since(last_observed)       # seconds since the last real observation
+    # Stale iff the last observation predates the reset (older than the reset).
+    return obs_age is not None and obs_age > reset_age
 
 
 def _apply_countdown_reset_inference(state: dict, config: dict) -> list[str]:
