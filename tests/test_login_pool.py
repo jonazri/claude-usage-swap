@@ -304,6 +304,33 @@ def test_double_booked_safe_when_a_mount_holds_a_pool_lease():
         env.restore()
 
 
+def test_periodic_saveback_routes_leased_slot_to_family():
+    """Regression, 2026-07-03 ~16:21Z: the PERIODIC save-back (and slot gc)
+    share saveback_mount_credentials, which had no lease branch — minutes
+    after slot-2 claimed rayi3/family-1, the periodic pass stomped
+    account-rayi3's snapshot with the family's rotated tokens (log symptom:
+    'save-back slot-2: saved → account-rayi3'). A leased mount's tokens must
+    land in the family store; the account snapshot stays untouched."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        slot = env.make_slot("beta", live=True, family_id="family-1")
+        # Simulate the live session rotating its (family) token since install:
+        # newer expiresAt so the only_if_fresher periodic gate sees fresh work.
+        (cus.slot_path(slot) / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta-fam1-rotated", expires_at=3_000_000_000_000)))
+        r = cus.saveback_mount_credentials(cus.slot_path(slot), "beta", cus.load_state(),
+                                           only_if_fresher=True)
+        assert r["action"] == "saved" and r.get("family") == "family-1", r
+        fam_rt = cus._credential_refresh_token(cus.read_json(cus.login_family_creds_path("beta", "family-1")))
+        assert fam_rt == "rt-beta-fam1-rotated", fam_rt
+        snap_rt = cus._credential_refresh_token(cus.read_json(env.accounts_dir / "account-beta" / ".credentials.json"))
+        assert snap_rt == "rt-beta", f"account snapshot was stomped with family tokens: {snap_rt}"
+    finally:
+        env.restore()
+
+
 def test_saveback_routes_rotated_tokens_to_leased_family():
     """A leased slot's rotated live tokens save back to the FAMILY dir on swap-out,
     never to the account snapshot."""

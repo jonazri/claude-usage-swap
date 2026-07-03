@@ -2083,6 +2083,42 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
     except (json.JSONDecodeError, OSError) as e:
         return {"action": "skipped", "account": expected_account, "detail": f"unreadable live creds: {e}"}
 
+    # Pool model (#109): a LEASED mount's live tokens belong to its claimed
+    # login family, not the account snapshot — route the save-back to the
+    # family dir, mirroring the swap-path save-back in _execute_swap_locked.
+    # Regression fixed 2026-07-03: this shared function (periodic save-back +
+    # slot gc) lacked the branch, so minutes after slot-2 claimed
+    # rayi3/family-1 the PERIODIC save-back stomped account-rayi3's snapshot
+    # with the family's tokens — leaving the snapshot family's freshest
+    # tokens existing only on slot-7's live mount, and any future
+    # snapshot-install double-booking family-1 with slot-2 (#104). Bypasses
+    # classify_live_creds_owner by design: a pooled family's refresh token
+    # matches no snapshot, so classification can only mis-route it.
+    slot_name = mount.name if mount.name.startswith(SLOT_PREFIX) else None
+    lease = slot_leased_family(state, slot_name) if slot_name else None
+    if (lease is not None and expected_account and lease[0] == expected_account
+            and independent_logins_enabled()):
+        fam_path = login_family_creds_path(*lease)
+        live_exp = _creds_expires_at(live_creds)
+        fam_exp = None
+        if fam_path.exists():
+            try:
+                fam_exp = _creds_expires_at(read_json(fam_path))
+            except (json.JSONDecodeError, OSError):
+                fam_exp = None
+        # Same GH #77 freshness guards as the snapshot path below, applied to
+        # the family store file instead.
+        if fam_exp is not None and live_exp is not None and fam_exp > live_exp:
+            return {"action": "skipped", "account": expected_account,
+                    "detail": f"family store fresher than live ({lease[0]}/{lease[1]})"}
+        if only_if_fresher and not (fam_exp is not None and live_exp is not None and live_exp > fam_exp):
+            return {"action": "skipped", "account": expected_account,
+                    "detail": "live not fresher than family store (periodic no-op)"}
+        backup_credentials_file(fam_path)
+        atomic_write_bytes(fam_path, json.dumps(live_creds, indent=2).encode(), mode=0o600)
+        return {"action": "saved", "account": expected_account, "family": lease[1],
+                "detail": f"pooled login {lease[0]}/{lease[1]} (#109 pool)"}
+
     verdict, owner, detail = classify_live_creds_owner(live_creds, expected_account or "", state)
     if verdict in ("invalid", "conflict"):
         return {"action": "skipped", "account": expected_account, "detail": f"{verdict}: {detail}"}
@@ -2685,6 +2721,22 @@ def _model_weekly_cap_for_config(config: dict) -> float:
     return float(cap) if cap is not None else _hard_7d_cap_for_config(config)
 
 
+def _model_weekly_target_cap_for_config(config: dict) -> float:
+    """Target-side bar for the per-model weekly gate (2026-07-03, user request).
+
+    The gate's two uses want DIFFERENT thresholds: swapping AWAY should wait
+    for cap_pct (drain the week's allotment you already have — evacuating a
+    lane at 87% wastes the last 10%), but swapping ONTO an account should stop
+    much earlier — arriving work immediately burns the model's remaining
+    headroom, so landing a fresh lane on an 87%-Fable account (the `default`
+    case: severity already "warning" upstream) just schedules the next
+    depletion. `per_model_weekly.target_cap_pct` sets the target-side bar;
+    unset falls back to cap_pct — symmetric, byte-identical pre-change
+    behavior."""
+    cap = config.get("per_model_weekly", {}).get("target_cap_pct")
+    return float(cap) if cap is not None else _model_weekly_cap_for_config(config)
+
+
 def _account_effective_pct(acct: dict, config: dict) -> float:
     """Apply thresholds.{five_hour,seven_day} config when computing an
     account's "effective" usage % — i.e. the value the ladder logic actually
@@ -2911,9 +2963,10 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # to any tracked per-model weekly — so we never swap ONTO an account whose
     # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
     # when the gate is off, so this is exactly the old aggregate-7d filter then.
-    # The per-model comparison uses its own cap (per_model_weekly.cap_pct,
-    # falling back to hard_7d) so the two ceilings can differ.
-    model_cap = _model_weekly_cap_for_config(config)
+    # The per-model comparison uses the TARGET-side cap (target_cap_pct,
+    # falling back to cap_pct, falling back to hard_7d): swap-away drains to
+    # cap_pct, but arrivals stop earlier — see _model_weekly_target_cap_for_config.
+    model_cap = _model_weekly_target_cap_for_config(config)
     safe_7d = [
         (n, a) for n, a in candidates
         if a.get("current_7d_pct", 0) < hard_7d
@@ -5285,7 +5338,12 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
         if acct and d.exists():
             r = saveback_mount_credentials(d, acct, state, only_if_fresher=True)
             if r["action"] != "skipped":
-                click.echo(f"  save-back {name}: {r['action']} → account-{r['account']}")
+                # Leased mounts save to their pooled family dir, not the
+                # account snapshot — say which, so the log doesn't read as a
+                # snapshot stomp (the pre-fix 2026-07-03 symptom line).
+                dest = (f"logins/{r['account']}/{r['family']}" if r.get("family")
+                        else f"account-{r['account']}")
+                click.echo(f"  save-back {name}: {r['action']} → {dest}")
 
     # Slot gc (risk #5 in the plan: dead mounts holding real credentials).
     # Only long-idle slots — a slot free for minutes is a REUSE candidate for
