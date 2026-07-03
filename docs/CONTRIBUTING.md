@@ -16,7 +16,7 @@ Dependencies: Python 3.11+, `click`, `pyyaml`. If you have `uv`, `uv run cus.py`
 
 ## Code style
 
-- **Single file**: `cus.py` is monolithic on purpose. Section headers (`# --- Foo ---`) separate concerns; navigate by them. ~2000 LOC fits comfortably; no need to split.
+- **Single file**: `cus.py` is monolithic on purpose. Section headers (`# --- Foo ---`) separate concerns; navigate by them. It's grown to ~11k LOC; the single-file deployment story (below) is why it hasn't been split.
 - **Comprehensive docstrings on functions** — every public function explains *why*, not just *what*. Reasoning is the load-bearing artifact.
 - **Atomic IO**: any write to `~/claude-accounts/` or `~/.claude/` uses `atomic_write_bytes()` (tempfile + `os.replace`). Don't reach for `open(path, 'w')` directly; use `write_json` / `write_yaml`.
 - **No new external dependencies** without a strong reason. The whole point of single-file PEP 723 is "scp it to any machine and it works."
@@ -55,7 +55,7 @@ Big ones:
 - **Lift cux patterns in Python, don't fork the Go binary** — single-file Python over a Go process wrapper
 - **File-copy swap, not `CLAUDE_CONFIG_DIR` env-var swap** — `~/.claude/` is always the active mount point
 - **Direct OAuth usage API, not ccusage** — ccusage doesn't track plan caps as percentages
-- **Single-file (~2000 LOC) over multi-module package** — single-file is the deployment story
+- **Single-file (~11k LOC) over multi-module package** — single-file is the deployment story
 - **Unified tree at `~/claude-accounts/`** — each account is a full `CLAUDE_CONFIG_DIR`
 
 ## PR checklist
