@@ -1227,6 +1227,87 @@ def duplicate_login_families() -> list[dict]:
             for fp, pairs in by_fp.items() if len(pairs) > 1]
 
 
+def duplicate_live_mount_families(state: dict) -> list[dict]:
+    """One refresh-token family live on TWO+ mounts — the #104 clobber itself,
+    measured at the LIVE mounts (slot dirs + the global ~/.claude pair) rather
+    than the independent-login store (duplicate_login_families only sees
+    provisioned logins). Catches double-books however they arose: the daemon's
+    pre-2026-07-03 fan-out double-up (slot-3/slot-4 incident — `cus sos` said
+    all-clear while one token refresh away from a forced logout), `cus launch
+    --force`, or hand-copied credential files. Idle mounts are skipped: with
+    no session to refresh the token, a duplicate can't clobber yet.
+    Returns [{"refresh_fp", "mounts": ["slot-3 (rayi2)", ...]}]."""
+    by_fp: dict[str, list[str]] = {}
+    mounts: list[tuple[str, Path, str | None]] = [
+        (d.name, d, state.get("slots", {}).get(d.name, {}).get("account"))
+        for d in list_slot_dirs()
+    ]
+    mounts.append(("shared-mount", CLAUDE_DIR, state.get("active")))
+    for name, path, acct in mounts:
+        if not mount_in_use(path):
+            continue
+        try:
+            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if rt:
+            by_fp.setdefault(_refresh_fingerprint(rt), []).append((f"{name} ({acct or '?'})", acct))
+    return [{"refresh_fp": fp,
+             "mounts": sorted(label for label, _ in ms),
+             "accounts": sorted({a for _, a in ms if a})}
+            for fp, ms in sorted(by_fp.items()) if len(ms) > 1]
+
+
+def double_booked_live_accounts(state: dict) -> list[dict]:
+    """Accounts live on 2+ mounts without enough independent logins to make
+    the extra mounts safe — the #104 condition tracked by ACCOUNT, catching
+    both phases of the clobber that duplicate_live_mount_families (same-family)
+    only sees before the first rotation:
+
+      phase "will_clobber":   families still identical — the next token
+                              refresh on either mount logs the other out;
+      phase "already_rotated": families diverged — one mount already refreshed,
+                              so the mount(s) still on the old family hold a
+                              DEAD refresh token and fail at next refresh (the
+                              2026-07-01 duplicate-identity incident shape;
+                              seen again on slot-3/slot-4, 2026-07-03).
+
+    Lane sharing is one mount hosting many sessions, so 2+ live MOUNTS on one
+    account is never lane sharing; it's safe only when each extra mount has
+    its own independent login (distinct family, GH #109). Slots with a
+    provisioned login are subtracted before flagging.
+    Returns [{"account", "phase", "mounts": ["slot-3", ...]}]."""
+    mounts: list[tuple[str, Path, str | None]] = [
+        (d.name, d, state.get("slots", {}).get(d.name, {}).get("account"))
+        for d in list_slot_dirs()
+    ]
+    mounts.append(("shared-mount", CLAUDE_DIR, state.get("active")))
+    by_account: dict[str, list[tuple[str, str | None]]] = {}
+    for name, path, acct in mounts:
+        if not acct or not mount_in_use(path):
+            continue
+        try:
+            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            rt = None
+        by_account.setdefault(acct, []).append((name, _refresh_fingerprint(rt) if rt else None))
+    out: list[dict] = []
+    for acct, ms in sorted(by_account.items()):
+        # Mounts covered by their own independent login are safe; the shared
+        # mount can't have one (logins are per-slot) and counts as unsafe.
+        unsafe = [(n, fp) for n, fp in ms
+                  if n == "shared-mount" or not has_independent_login(acct, n)]
+        if len(unsafe) < 2:
+            continue
+        fps = {fp for _, fp in unsafe if fp}
+        out.append({
+            "account": acct,
+            "phase": "will_clobber" if len(fps) <= 1 else "already_rotated",
+            "mounts": sorted(n for n, _ in unsafe),
+        })
+    return out
+
+
 def login_age_days(account: str, slot: str) -> float | None:
     """Days since this login was minted (per provenance), or None if unknown."""
     prov = read_login_provenance(account, slot)
@@ -1484,11 +1565,19 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
 
     Spreading: accounts on ANOTHER mount are excluded on the first pass so N
     sessions land on N accounts. The fallback narrows to only LIVE-mount
-    accounts as the hard floor — an account on a live mount is NEVER returned
-    (two live mounts on one account rotate its single-use token and log one
-    out — GH #104), but an IDLE slot's account is fair game to reuse (no live
-    mount holds it). If even that leaves nothing, returns None so the caller
-    reports "all healthy accounts are in use" instead of double-booking.
+    accounts as the hard floor — an account on a live mount is never returned
+    as a NEW mount (two live mounts on one account rotate its single-use token
+    and log one out — GH #104), but an IDLE slot's account is fair game to
+    reuse (no live mount holds it).
+
+    Lane-share final fallback (2026-07-03, supersedes the pre-lanes "never
+    return a live-mount account" hard floor): with per_session.lane_sharing on,
+    a live-mounted account IS a legal target — the launch JOINS its existing
+    mount (same dir, same login family, no second mount, no clobber) instead
+    of minting a new one. So when every healthy account is live (the saturated
+    regime that used to refuse), return the lowest-estimated-usage live
+    account and let _launch_prepare route it to the join path. Returns None
+    only when every account is expired/erroring (or lane_sharing is off).
     """
     # Spread preference: any account a slot entry names, plus the shared active.
     spread_occupied = {e.get("account") for e in state.get("slots", {}).values() if e.get("account")}
@@ -1519,6 +1608,17 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         if cands:
             n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
+    # Lane-share final fallback (GH #109 lanes, 2026-07-03): every healthy
+    # account is on a live mount. Joining a live mount is safe (shared dir,
+    # shared login family), so pick the healthiest live account rather than
+    # refusing — the refusal predates lanes and left `cus launch auto` dead
+    # whenever slots saturated the pool, even with a 4%-used account joinable.
+    if target is None and config.get("per_session", {}).get("lane_sharing", False):
+        cands = [(n, a) for n, a in state.get("accounts", {}).items()
+                 if not a.get("token_expired") and not a.get("poll_error") and n in live_occupied]
+        if cands:
+            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
     return target
 
 
@@ -3554,6 +3654,16 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         slot_entry["account"] = target_name
         slot_entry["last_swap_ts"] = ts
     state["accounts"][target_name]["last_swap_ts"] = ts
+    # Ladder hysteresis clock (2026-07-03): only DAEMON-decided swaps arm it.
+    # A launch installing an account into a slot isn't churn, but it used to
+    # bump last_swap_ts and re-arm the anti-ping-pong cooldown — with a long
+    # min_seconds_between_swaps, every launch parked the ladder for all slots
+    # on that account while they climbed (2026-07-03: slot-6/slot-7 stuck at
+    # 84-88% behind a 50-min lockout that launches kept resetting). The ladder
+    # check reads last_auto_swap_ts; last_swap_ts stays for display and the
+    # 60s reactive/cap spacings (where counting launches is harmless).
+    if trigger != "launch":
+        state["accounts"][target_name]["last_auto_swap_ts"] = ts
 
     # Bump current account's next_swap_at_pct ladder using CONFIG steps.
     # Falls back to the hardcoded default ladder if config is missing.
@@ -4191,14 +4301,20 @@ def decide_swap(
     hyst_cfg = config.get("swap_hysteresis", {})
     if hyst_cfg.get("enabled", True):
         min_seconds = hyst_cfg.get("min_seconds_between_swaps", 300)
-        last_swap = active_acct.get("last_swap_ts")
+        # last_auto_swap_ts, NOT last_swap_ts (2026-07-03): this gate exists to
+        # stop ladder ping-pong between DAEMON swaps, so only daemon swaps arm
+        # it. Launches used to arm it via last_swap_ts, deferring the ladder
+        # for every slot on a freshly-launched account (see _execute_swap_locked).
+        # Missing field (pre-upgrade state) = no recent auto swap; the ladder
+        # threshold + min_improvement_pct still gate the swap itself.
+        last_swap = active_acct.get("last_auto_swap_ts")
         if last_swap:
             try:
                 last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
                 elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
                 if elapsed < min_seconds:
                     msg = (
-                        f"ladder check deferred: last swap was {int(elapsed)}s ago "
+                        f"ladder check deferred: last auto swap was {int(elapsed)}s ago "
                         f"(< min_seconds_between_swaps={min_seconds}s)"
                     )
                     click.echo(f"  {msg}")
@@ -4573,8 +4689,13 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     "deferrable", "reason", "pool"}. Multiple slots on the same hot account
     FAN OUT to distinct targets (best-headroom-first — each pick excludes
     targets already taken this round) rather than piling onto one; when the
-    account pool runs out of distinct targets, remaining slots share the last
-    pick (doubling up beats staying on a tripped account).
+    account pool runs out of distinct targets, remaining slots HOLD on their
+    current account. (Superseded 2026-07-03: the original "doubling up beats
+    staying on a tripped account" fallback put one account's token family on
+    two live mounts — the exact #104 clobber, hit live on slot-3/slot-4 that
+    day. A parked hot slot degrades gracefully; a clobbered one logs a session
+    out. Exception: a slot with its own independent login for the target may
+    still double-book — distinct family, no clobber, GH #109 Phase 3b.)
 
     Slots are grouped by (account, pool): slots on the same account but in
     different rotation-set pools get DIFFERENT decisions — a premium slot
@@ -4633,7 +4754,17 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 retry = pick_swap_target(shim2, cfg_view)
                 if retry is not None:
                     target = retry.name
-                # else: pool exhausted — double up on the original target.
+                elif not (independent_logins_enabled(cfg_view) and has_independent_login(target, slot_name)):
+                    # Pool exhausted. Pre-2026-07-03 this doubled up on the
+                    # original target — installing one token family on two live
+                    # mounts, the exact clobber #104 forbids (hit live on
+                    # slot-3/slot-4, 2026-07-03: one refresh logs the other
+                    # out). HOLD instead: a parked hot slot degrades gracefully.
+                    # A slot holding its own independent login for the target
+                    # is the one safe double-book (distinct family, #109 3b).
+                    click.echo(f"  {slot_name}: pool exhausted — holding on '{acct_name}' "
+                               f"(won't double-book '{target}' onto a second live mount — GH #104)")
+                    continue
             taken.add(target)
             moves.append({
                 "slot": slot_name, "from": acct_name, "to": target,
@@ -4791,7 +4922,7 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
             result = gc_slot(name, state)
             if result["action"] == "reaped":
                 sb = result["saveback"]
-                click.echo(f"  slot-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
+                click.echo(f"  lane-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
 
 
 def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute: bool) -> None:
@@ -4816,10 +4947,10 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"]},
             ))
             continue
-        click.echo(f"  slot move: {label} ({move['gate']})")
+        click.echo(f"  lane move: {label} ({move['gate']})")
         click.echo(f"    reason: {move['reason']}")
         if no_execute:
-            click.echo("    (--no-execute) skipping slot move")
+            click.echo("    (--no-execute) skipping lane move")
             _log_decision(_build_decision_record(
                 state, config, action="would_swap", gate=move["gate"], reason=move["reason"],
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
@@ -4835,7 +4966,7 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
             ))
         except (RuntimeError, FileNotFoundError, ValueError) as e:
-            click.echo(f"    slot move FAILED: {type(e).__name__}: {e}", err=True)
+            click.echo(f"    lane move FAILED: {type(e).__name__}: {e}", err=True)
             _log_decision(_build_decision_record(
                 state, config, action="error", gate=move["gate"],
                 reason=f"{move['reason']} — FAILED: {e}",
@@ -4921,7 +5052,7 @@ def _execute_global_mount_swap(decision: "SwapDecision", state: dict, config: di
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
     else:
         execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
-        click.echo(f"    swapped shared mount (bare sessions follow; slots unaffected)")
+        click.echo(f"    swapped shared mount (bare sessions follow; lanes unaffected)")
     _log_decision(_build_decision_record(
         state, config, action="swap", gate=decision.gate,
         reason=decision.reason, target=decision.target, tier=decision.tier,
@@ -5450,7 +5581,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         match = _identities_match(slot_ids, _dir_identity(acct))
         if match is False:  # None = no shared evidence — can't say, stay quiet
             out.append(SOSCondition(
-                severity="critical",
+                severity="urgent",
                 summary=f"{slot_name} identity does not match its assigned account '{acct}' (slot↔state drift, GH #2 class)",
                 action=(f"The slot's live files hold a different account than state.json claims. "
                         f"Check `python3 ~/repos/claude-usage-swap/cus.py slot list` and the slot's .claude.json oauthAccount; "
@@ -5512,7 +5643,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             expiring.append(f"{slot}->{acct}")
     if mismatched:
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"Independent login(s) stored under the wrong account: {', '.join(mismatched)}",
             action=("A stored login's identity does not match its account. Re-provision it: "
                     "`cus login-mount <slot> <account>` and log in as the correct account."),
@@ -5541,12 +5672,48 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # the gate, because the operator has provisioned them expecting safety.
     for dup in duplicate_login_families():
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"Independent-login families collide across mounts: {', '.join(dup['pairs'])} share one token family",
             action=("Two live mounts on one refresh-token family clobber on rotation. Give the extra "
                     "mount(s) their OWN login: `cus login-mount <slot> <account>` (a real /login, "
                     "NOT --from-existing — only the browser flow mints a distinct family)."),
             affected="system",
+        ))
+    # Same invariant measured at the LIVE mounts (2026-07-03). The store check
+    # above only sees provisioned independent logins; a double-book created by
+    # `--force` or the daemon's legacy fan-out double-up has NO store entry and
+    # was silent (slot-3/slot-4 incident: sos said all-clear while two live
+    # mounts shared rayi2's family — one refresh from a forced logout).
+    for dup in duplicate_live_mount_families(state):
+        if len(dup.get("accounts", [])) <= 1:
+            continue  # single-account double-book: the by-account check below reports it with phase detail
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=f"One login family live on {len(dup['mounts'])} mounts: {', '.join(dup['mounts'])}",
+            action=("These mounts share ONE refresh token — the next rotation logs the others out. "
+                    "Exit the extra session(s); relaunch joins the surviving lane (lane sharing) "
+                    "or gets its own family via `cus login-mount <slot> <account>`."),
+            affected="system",
+        ))
+    # By-account view of the same invariant (2026-07-03): catches the
+    # POST-rotation phase too — once a doubled-up account's token rotates on
+    # one mount, the families diverge (so the same-family check above goes
+    # quiet) but the other mount now holds a dead refresh token and fails at
+    # its next refresh (2026-07-01 duplicate-identity incident shape).
+    for db in double_booked_live_accounts(state):
+        if db["phase"] == "will_clobber":
+            detail = "families still identical — the next token refresh logs the other(s) out"
+        else:
+            detail = ("families already DIVERGED — the mount(s) on the old family hold a dead "
+                      "refresh token and will fail their next refresh")
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=f"'{db['account']}' is live on {len(db['mounts'])} mounts without independent logins "
+                    f"({', '.join(db['mounts'])}): {detail}",
+            action=("Exit the extra session(s) — relaunching then JOINS the surviving lane (lane sharing) "
+                    "instead of copying. For deliberate multi-lane use of one account, provision "
+                    "independent logins: `cus login-mount <slot> <account>`."),
+            affected=db["account"],
         ))
 
     # Condition 11: Phase 2 gate is ON but some occupied slots have no
@@ -7780,7 +7947,7 @@ def status() -> None:
     if per_session:
         click.echo(f"Mode: per_session (global mount observe-only). Bare-launch account: {state['active']}")
     elif mode == "hybrid":
-        click.echo(f"Mode: hybrid (slots + shared mount both managed). Shared-mount account: {state['active']}")
+        click.echo(f"Mode: hybrid (lanes + shared mount both managed). Shared-mount account: {state['active']}")
     else:
         click.echo(f"Active account: {state['active']}")
     click.echo()
@@ -7820,11 +7987,15 @@ def status() -> None:
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
-    # Slots (per_session): slot → account → live pids, with any orphan dirs.
+    # Lanes (per_session): lane → account → live pids, with any orphan dirs.
+    # "Lane" is the operator-facing name (GH #109 Phase 4); the slot-N
+    # identifiers underneath stay — they're on-disk dir names and live
+    # sessions' CLAUDE_CONFIG_DIR paths, so renaming THEM is a breaking
+    # migration (tracked separately), not a display fix.
     slots_state = state.get("slots", {}) or {}
     slot_dirs_on_disk = list_slot_dirs()
     if slots_state or slot_dirs_on_disk:
-        click.echo("Slots:")
+        click.echo("Lanes:")
         seen = set()
         locked_slot_names = _locked_slots(config)
         # GH #109 independent-login annotation. Stay invisible until the feature
@@ -8795,7 +8966,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
-    "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
+    "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
@@ -10616,8 +10787,9 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         target = pick_launch_account(state, _config_for_pool(config, pool))
         if target is None:
             raise click.ClickException(
-                "no launchable account: every account is already on a live mount, expired, or saturated "
-                "(GH #104 — won't double-book a live account). Exit a session, wait for a 5h/weekly reset, "
+                "no launchable account: every account is expired, erroring, or on a live mount with "
+                "per_session.lane_sharing off (GH #104 — won't double-book a live account; lane sharing "
+                "makes live accounts joinable). Exit a session, wait for a 5h/weekly reset, fix logins, "
                 "or add an account. See `cus status` / `cus sos`.")
         account = target.name
         click.echo(f"launch: picked '{account}' ({target.reason})")
@@ -10650,6 +10822,16 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             entry["last_launch_ts"] = now_iso()
             save_state(state)
             return lane, lane_dir, account
+        if account == state.get("active") and mount_in_use(CLAUDE_DIR):
+            # Shared-mount join (2026-07-03): the account's only live mount is
+            # the global ~/.claude pair. A bare session already IS that mount,
+            # so joining it is the same move as joining a slot lane — same dir,
+            # same login family, no second mount, no clobber. The session runs
+            # bare (no CLAUDE_CONFIG_DIR override; launch_cmd skips the env var
+            # for the shared dir) and the daemon manages it with the other bare
+            # sessions. No slot bookkeeping: the shared mount isn't a slot.
+            click.echo(f"launch: joining the shared mount already on '{account}' (lane sharing — bare session, swaps with the shared mount)")
+            return "shared", CLAUDE_DIR, account
 
     if lane is not None and not (lane.startswith(SLOT_PREFIX) and lane.removeprefix(SLOT_PREFIX).isdigit()):
         raise click.ClickException(f"bad --lane '{lane}' — expected slot-<n> (e.g. slot-8).")
@@ -10766,7 +10948,15 @@ def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | N
     slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force, lane=lane)
     click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
     env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
+    if slot_dir != CLAUDE_DIR:
+        env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
+    else:
+        # Shared-mount join (2026-07-03 lane sharing): run BARE so hooks and
+        # statusline classify the session as shared-mount, exactly like a
+        # hand-launched `claude`. Pop rather than set — a launch issued from
+        # INSIDE a slotted session inherits that slot's CLAUDE_CONFIG_DIR,
+        # which would silently re-slot this "bare" session.
+        env.pop("CLAUDE_CONFIG_DIR", None)
     # execvpe replaces this process — claude runs as if launched directly
     # from the shell (signals, tty, exit code all pass through untouched).
     os.execvpe("claude", ["claude", *claude_args], env)
