@@ -1982,30 +1982,6 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     return target
 
 
-def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, Path]:
-    """Find a free slot for a launch (create one if none). Caller save_state()s.
-
-    Preference order: a free slot ALREADY holding prefer_account (no swap
-    needed — cheapest launch), then any free slot, then a new slot. A slot
-    dir on disk with no state entry (orphan) is adopted rather than ignored.
-    """
-    slots_state = state.setdefault("slots", {})
-    free: list[Path] = []
-    for d in list_slot_dirs():
-        if mount_in_use(d):
-            continue
-        if d.name not in slots_state:
-            slots_state[d.name] = {"account": None, "created_ts": now_iso()}
-        free.append(d)
-    if prefer_account:
-        for d in free:
-            if slots_state[d.name].get("account") == prefer_account:
-                return d.name, d
-    if free:
-        return free[0].name, free[0]
-    return create_slot(state)
-
-
 def mount_in_use(mount: Path) -> bool:
     return bool(mount_pids(mount))
 
