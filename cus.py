@@ -6650,6 +6650,34 @@ def _latest_stops_per_session() -> dict[str, str]:
 _TRANSCRIPT_INDEX_CACHE: dict[str, tuple[float, dict]] = {}
 
 
+class _TranscriptIndexData(dict):
+    """Transcript index: the GH #91 by-stem dict[str, Path] (stem -> path,
+    last-seen-wins) PLUS an `.exact` set of (project_dirname, stem) pairs
+    captured in the SAME scan (GH #90/#95).
+
+    Why a dict subclass: every existing caller and test relies on the plain
+    by-stem mapping contract (`idx[stem]`, `idx.get(stem)`, `set(idx)`,
+    `idx == {}`), so the fallback-lookup shape must not change. Subclassing
+    keeps all of that intact while piggybacking the extra set from the same
+    directory walk at no additional syscall cost.
+
+    Why `.exact` exists: after GH #91 removed the per-session glob, the
+    RESIDUAL scaling term in `cus status` (GH #90/#95) was the cwd-first
+    candidate probe in _resolve_transcript — one live `.exists()` stat per
+    UNIQUE session id ever logged. sessions.log is append-only, so status
+    cost grew with total HISTORY (~13.5k unique ids -> ~13.5k stats ->
+    multi-second, 100%-CPU status on the 2026-07-02 incident box) instead of
+    with the transcripts actually on disk. The scan already visits every
+    existing transcript, so "does <cwd-encoded-dir>/<sid>.jsonl exist?" can
+    be answered by set membership at zero syscalls — see the
+    `live_candidate_stat=False` path in _resolve_transcript.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.exact: set[tuple[str, str]] = set()
+
+
 def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     """One-shot {session_id: transcript_path} index of ~/.claude/projects.
 
@@ -6680,15 +6708,26 @@ def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     if hit and now - hit[0] < max_age_seconds:
         return hit[1]
     projects_root = CLAUDE_DIR / "projects"
-    index: dict[str, Path] = {}
+    index = _TranscriptIndexData()
     if projects_root.exists():
         for jsonl in projects_root.glob("*/*.jsonl"):
             index[jsonl.stem] = jsonl
+            # GH #90/#95: record the (project_dirname, stem) pair so bulk
+            # scans can answer the cwd-first existence question by set
+            # membership instead of a per-session-id stat. Same walk, no
+            # extra syscalls — glob already enumerated this entry.
+            index.exact.add((jsonl.parent.name, jsonl.stem))
     _TRANSCRIPT_INDEX_CACHE[key] = (now, index)
     return index
 
 
-def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Path | None:
+def _resolve_transcript(
+    session_id: str,
+    cwd: str,
+    index: dict[str, Path],
+    *,
+    live_candidate_stat: bool = True,
+) -> Path | None:
     """Deterministic cwd-first transcript resolution with an O(1) index
     fallback (GH #91 + review finding 2026-07-02).
 
@@ -6697,11 +6736,49 @@ def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Pa
     by a same-id duplicate from another project dir. Only when that direct
     candidate is absent do we fall back to the prebuilt index (O(1)), never
     to the minutes-long full-tree glob that _find_transcript's fallback runs.
+
+    `live_candidate_stat` (GH #90/#95) selects HOW the cwd-first candidate's
+    existence is checked:
+
+      True (default) — a live Path.exists() stat, exactly the pre-#90 code
+        path. Kept as the default for the swap/orchestration callers
+        (find_live_panes' _validate + step-1.5 loop): those probe a BOUNDED
+        set (live panes x recent entries), so per-call stats are cheap, and
+        freshness matters there — a transcript written milliseconds ago
+        (the GH #23 SessionStart->first-JSONL race) must be seen the moment
+        it lands, because a swap decision hangs on it.
+
+      False — membership in the index's `.exact` set captured by the same
+        scan that built the by-stem fallback map. Used by the BULK scan in
+        find_live_sessions, where the candidate probe runs once per unique
+        session id ever logged and was therefore the history-proportional
+        cost behind the GH #90/#95 status hang. Within one call the index
+        is built milliseconds earlier, so results are identical to the live
+        stat modulo the same in-flight-file races the exists()->stat()
+        sequence already had; across cached calls (daemon cycles sharing
+        the 5s-TTL scan) a transcript CREATED inside the TTL window is
+        seen up to 5s late — the same staleness bound the GH #91 review
+        already accepted for the fallback map, and irrelevant to the
+        one-shot `cus status` process where the cache is always cold.
+
+    A plain-dict index (defensive: tests or callers holding a pre-#90-shape
+    map) has no `.exact` set, so it always gets the live stat regardless of
+    the flag — degraded to the old cost, never to wrong results.
     """
     if cwd:
-        candidate = CLAUDE_DIR / "projects" / cwd.replace("/", "-") / f"{session_id}.jsonl"
-        if candidate.exists():
-            return candidate
+        dirname = cwd.replace("/", "-")
+        if live_candidate_stat or not isinstance(index, _TranscriptIndexData):
+            candidate = CLAUDE_DIR / "projects" / dirname / f"{session_id}.jsonl"
+            if candidate.exists():
+                return candidate
+        elif (dirname, session_id) in index.exact:
+            # Construct the Path only AFTER the membership hit: on the bulk
+            # path this function runs once per unique session id ever logged
+            # and almost all of them miss (~10.6k of 13.5k on the incident
+            # box), so building a 4-segment pathlib object per miss was
+            # itself a measurable chunk of the scan (~µs each x tens of
+            # thousands). A set probe on an interned tuple is ~100x cheaper.
+            return CLAUDE_DIR / "projects" / dirname / f"{session_id}.jsonl"
     return index.get(session_id)
 
 
@@ -6748,11 +6825,29 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
         # never the minutes-long glob that _find_transcript's fallback runs
         # (see _resolve_transcript / _transcript_index for the incident
         # numbers and the duplicate-id correctness note).
-        transcript = _resolve_transcript(sid, e.get("cwd", ""), transcripts)
-        if transcript and transcript.exists():
-            mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
-            if (now - mtime).total_seconds() < 3600:
-                is_live = True
+        #
+        # GH #90/#95: live_candidate_stat=False — this loop runs once per
+        # UNIQUE session id ever logged (append-only sessions.log, ~13.5k on
+        # the incident box), so a live stat here made status cost grow with
+        # history. Resolution now rides entirely on the index built at the
+        # top of this call: zero syscalls per historical id.
+        transcript = _resolve_transcript(
+            sid, e.get("cwd", ""), transcripts, live_candidate_stat=False
+        )
+        if transcript:
+            # Single guarded stat replaces the old exists()+stat() pair:
+            # halves the syscalls for resolved ids (bounded by transcripts
+            # on disk, not by history) AND closes the latent TOCTOU crash
+            # where the file vanished between exists() and stat() — the old
+            # sequence would have raised an unhandled OSError there. A
+            # vanished file now just contributes no liveness signal, which
+            # is exactly what exists()==False meant before.
+            try:
+                mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+                if (now - mtime).total_seconds() < 3600:
+                    is_live = True
+            except OSError:
+                pass
 
         if is_live:
             live.append(LiveSession(
@@ -7340,12 +7435,23 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     now = datetime.now(timezone.utc)
 
     # Group by pane; latest entry overwrites (entries are oldest-first).
+    # GH #90/#95: entries_by_pane keeps the FULL per-pane entry list (same
+    # oldest-first order) for the step-1.5 cmdline-staleness sweep below.
+    # That sweep used to re-scan ALL of `entries` once per live pane —
+    # filtering on pane inside the loop and fromisoformat-parsing every
+    # line's timestamp each time — an O(total_entries x live_panes) pass
+    # over an append-only log (~14.6k lines on the incident box). Grouping
+    # here is one O(total_entries) pass; the sweep then touches only its
+    # own pane's entries. Identical subset, identical order, no semantic
+    # change — pure loop restructure.
     by_pane: dict[str, dict] = {}
+    entries_by_pane: dict[str, list[dict]] = {}
     for e in entries:
         pane = e.get("pane", "")
         if not pane or pane == "no-tmux":
             continue
         by_pane[pane] = e
+        entries_by_pane.setdefault(pane, []).append(e)
 
     # GH #22: count how many panes share each cwd. The newest-mtime
     # fallback (step 3 below) is CWD-wide and can't disambiguate between
@@ -7474,9 +7580,12 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         # uncompetitive (best_mtime stays 0 and any newer-than-1h pe wins).
         if best_mtime > 0 and (now_ts - best_mtime) > active_mtime_window:
             best_mtime = 0.0
-        for pe in entries:
-            if pe.get("pane") != pane:
-                continue
+        # GH #90/#95: iterate only THIS pane's entries (pre-grouped above in
+        # the same pass that built by_pane) instead of re-scanning the whole
+        # log per pane. The old `if pe.get("pane") != pane: continue` filter
+        # is exactly what the grouping applied, so subset and order are
+        # unchanged — this is the O(n x panes) -> O(n) half of the fix.
+        for pe in entries_by_pane.get(pane, ()):
             pe_ts_str = pe.get("ts")
             if not pe_ts_str:
                 continue
