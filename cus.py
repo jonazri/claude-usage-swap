@@ -4879,6 +4879,14 @@ def decide_swap(
     agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
+        # Preserve the FORCING caps before the display reassignment below stomps
+        # `hard_7d_cap`. The anti-pingpong guard (further down) compares the chosen
+        # target against these swap-AWAY caps — the ones that actually tripped —
+        # NOT the target-side caps pick_swap_target filters arrivals with (those
+        # can sit higher, which is how a target at/over the forcing cap slips
+        # through the picker un-degraded, PR #139 ping-pong).
+        _forcing_agg_cap = hard_7d_cap
+        _forcing_model_cap = model_cap
         # For the operator-facing messages below: show whichever signal tripped
         # (the model % when only the model cap tripped, else the aggregate).
         cur_7d = cur_7d if agg_tripped else cur_model
@@ -4933,6 +4941,49 @@ def decide_swap(
             )
             click.echo(f"  {msg}")
             _note("hard_7d_cap_degraded", "hold", msg)
+            return None
+        # ---- Anti-pingpong guard (fix 2026-07-05, PR #139) ----
+        # A hard-cap FORCED swap must land on an account that GENUINELY RELIEVES
+        # the cap forcing us — i.e. is STRICTLY BELOW that cap on the same
+        # dimension. A lateral move onto an equally-or-more-capped account relieves
+        # nothing and bounces straight back next cycle. Live trace: `default` at
+        # Fable 100% (>= 97 cap) swaps toward its best below-cap target (rayi1),
+        # but that move FAILS (pool exhausted, no free login family — see the
+        # over-subscription fix in this same PR); with rayi1 unreachable, the
+        # picker's headroom fallback returned rayi2 at Fable 97% (== cap → also
+        # capped), so default→rayi2→default oscillated forever. min_seconds_between_*
+        # only throttles the rate, it doesn't stop the loop.
+        #
+        # The existing "[DEGRADED: no targets below 7d cap]" check above catches
+        # only the AGGREGATE fallback, and only when the picker itself marked the
+        # pick degraded. It misses the per-model case because pick_swap_target
+        # filters ARRIVALS with the target-side model cap (target_cap_pct), which
+        # can sit ABOVE the swap-away cap_pct that tripped here — so rayi2 at 97
+        # passes the picker un-degraded even though it clears nothing. This guard
+        # compares the chosen target's value on the FORCING dimension directly
+        # against the forcing cap, independent of annotation wording, covering both
+        # the aggregate hard_7d_cap and the per-model weekly cap. Boundary:
+        # target_pct >= cap is NOT relief (rayi2 at exactly 97 is rejected); only a
+        # STRICTLY-below-cap target is a genuine escape. When both signals tripped,
+        # the target must clear BOTH. If nothing reachable clears the cap, HOLD and
+        # let SOS surface the all-capped condition (holding on the current capped
+        # account is strictly no worse than a churning lateral move). Backward-
+        # compatible: `_max_model_weekly_from_acct` is 0.0 with the per-model gate
+        # off, so that branch is inert on unmodified installs.
+        target_acct = state["accounts"].get(target.name, {})
+        capped_dims: list[str] = []
+        if agg_tripped and target_acct.get("current_7d_pct", 0.0) >= _forcing_agg_cap:
+            capped_dims.append(f"7d {target_acct.get('current_7d_pct', 0.0):.0f}% >= {_forcing_agg_cap:.0f}%")
+        if model_tripped and _max_model_weekly_from_acct(target_acct, config) >= _forcing_model_cap:
+            capped_dims.append(f"model {_max_model_weekly_from_acct(target_acct, config):.0f}% >= {_forcing_model_cap:.0f}%")
+        if capped_dims:
+            gate_word = "hard_7d_cap" if agg_tripped else "per-model weekly"
+            shown_cap = _forcing_agg_cap if agg_tripped else _forcing_model_cap
+            msg = (f"hold {current}: all reachable targets at/over the {gate_word} cap "
+                   f"({shown_cap:.0f}%) — swapping wouldn't relieve it (anti-pingpong); "
+                   f"best target '{target.name}' still capped [{'; '.join(capped_dims)}]")
+            click.echo(f"  {msg}")
+            _note("hard_cap_pingpong", "hold", msg)
             return None
         reason = f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}"
         _note("hard_7d_cap", "swap", reason)
