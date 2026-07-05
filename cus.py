@@ -8908,6 +8908,323 @@ def status() -> None:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
 
 
+# --------------------------------------------------------------------------
+# `cus sessions` — one-shot per-pane → slot → account → binding-limit view
+# --------------------------------------------------------------------------
+# Motivation (GH #137): diagnosing "3 panes maxed out" used to take ~6 manual
+# probes (status, slot list, force-poll, /proc greps) AND `cus status`'s Live-
+# sessions column showed the WRONG account — it printed the sessions.log launch-
+# time label (or, in background/hybrid mode, machine_active) for panes that were
+# actually mounted on a different slot's account. This command resolves the TRUE
+# mount from live /proc ground truth and folds usage + pool + the binding
+# constraint into a single read-only table. See docs/DIAGNOSTICS.md.
+
+
+def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
+    """Plain-words BINDING constraint for a lane's account under its pool.
+
+    Returns (severity, text) with severity in {"blocked", "warn", "ok"}:
+      - "blocked": the lane cannot make progress on some axis right now — 5h/7d
+        saturated, a dead/expired token, or (premium pool only) a per-model
+        weekly cap over the gate. This is the wall a maxed-out pane is hitting.
+      - "warn": at/over a ladder step — the daemon wants to swap this lane away
+        soon, but it still works right now.
+      - "ok": headroom on every axis the config enforces.
+
+    Two-dimensional exhaustion (see docs/DIAGNOSTICS.md): the 5h/7d windows and
+    the per-model weekly budget are INDEPENDENT walls. A premium lane under its
+    5h cap can still be blocked by a Fable weekly cap; a STANDARD lane ignores
+    the model gate entirely (its work doesn't touch the exhausted model — see
+    _config_for_pool), so we surface the number but say it's ignored rather than
+    hide it. Pure function of (account-state dict, pool, config) so the daemon-
+    less unit tests can exercise every branch without /proc or tmux.
+    """
+    # Blocker flags first — a stale/expired token means the stored % may be a
+    # lie (last-known-good, possibly hours old), so the token state IS the
+    # binding fact, not whatever number happens to be cached.
+    if acct.get("token_expired"):
+        return ("blocked", "token expired (no live creds — relogin needed)")
+    if acct.get("poll_error"):
+        return ("blocked", "poll error (usage unknown)")
+    if acct.get("rate_limited"):
+        return ("blocked", "rate-limited (429)")
+
+    five = acct.get("current_5h_pct", 0.0) or 0.0
+    seven = acct.get("current_7d_pct", 0.0) or 0.0
+    # Effective % honors thresholds.{five_hour,seven_day} exactly like the
+    # ladder logic (current_max_pct / _account_effective_pct), so this reads the
+    # same window the daemon actually swaps on. Label it by whichever window is
+    # the higher of the two enabled ones for an at-a-glance "which wall".
+    eff = _account_effective_pct(acct, config)
+    win = "5h" if five >= seven else "7d"
+
+    # 5h/7d hard wall — never_swap_to_pct is the "fully saturated, do not use"
+    # line (default 100). At/over it the lane is churning context and re-tripping
+    # 429s; that's the maxed-out signature the operator is chasing.
+    full_line = config.get("never_swap_to_pct", 100)
+    if eff >= full_line:
+        return ("blocked", f"{win} {eff:.0f}% (hard cap {full_line:.0f}%)")
+
+    # Per-model weekly gate. Only PREMIUM lanes honor it; standard lanes treat a
+    # model-exhausted account as still usable (aggregate headroom serves
+    # standard-model work). Gate must be enabled in config for this to bind.
+    gate_enabled = config.get("per_model_weekly", {}).get("gate_enabled", False)
+    pm = acct.get("per_model_weekly_pct") or {}
+    top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
+    model_cap = _model_weekly_cap_for_config(config)
+    if gate_enabled and top_model is not None and top_pct >= model_cap:
+        if pool == "standard":
+            # Surface the number but make clear it does NOT bind this lane.
+            return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
+        return ("blocked", f"weekly-{top_model} {top_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
+
+    # Graduated ladder pressure (swap-away, not a hard block). The highest
+    # tripped step is what the daemon reacts to.
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    tripped = [s for s in steps if eff >= s]
+    if tripped:
+        return ("warn", f"{win} {eff:.0f}% >= ladder step {max(tripped):.0f}% (swap-away due)")
+
+    # Headroom on every enforced axis.
+    txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
+    if pm:
+        txt += f", {top_model} {top_pct:.0f}%"
+        if gate_enabled and pool == "standard":
+            txt += " [std: model gate off]"
+    txt += ")"
+    return ("ok", txt)
+
+
+def _resolve_mount_account(mount: str | None, state: dict) -> tuple[str | None, str]:
+    """Resolve a live mount's TRUE account + the evidence source used.
+
+    Ground-truth ladder for GH #137, strongest evidence first:
+      1. on-disk oauthAccount — the slot/account dir's .claude.json is what
+         Claude Code actually authenticates as, independent of BOTH sessions.log
+         (launch-time label) and state.slots (the daemon's record, which itself
+         lags an in-place move by up to a cycle). Reverse-mapped to an account
+         name via each account's canonical snapshot identity.
+      2. state.slots[mount].account — the daemon's recorded occupant, used when
+         the on-disk identity matches no known account (e.g. a pooled backup
+         login the snapshots don't cover).
+      3. account-<name> mount — a relogin-style launch where the dir IS the
+         account name.
+
+    Returns (account_or_None, source) where source is one of
+    {"disk-identity", "state-slot", "account-dir", "unresolved"}.
+    """
+    if not mount:
+        return (None, "unresolved")
+    if mount.startswith("account-"):
+        # A relogin/login-mount launch: the dir name is the account. Still
+        # prefer the on-disk identity if it resolves (catches a mislabeled dir).
+        disk = _account_for_mount_identity(slot_path(mount), state)
+        if disk:
+            return (disk, "disk-identity")
+        return (mount.removeprefix("account-"), "account-dir")
+    # Slot mount: on-disk identity wins, else the daemon's recorded occupant.
+    disk = _account_for_mount_identity(slot_path(mount), state)
+    if disk:
+        return (disk, "disk-identity")
+    recorded = (state.get("slots", {}).get(mount, {}) or {}).get("account")
+    if recorded:
+        return (recorded, "state-slot")
+    return (None, "unresolved")
+
+
+def _account_for_mount_identity(mount: Path, state: dict) -> str | None:
+    """Reverse-map a live mount's ON-DISK oauthAccount to an account name.
+
+    The slot dir's .claude.json oauthAccount is the authoritative account
+    identity (the 2026-07-01 duplicate-identity incident proved meta.yaml can
+    lie while oauthAccount holds truth). Matches on accountUuid/emailAddress
+    against each account's canonical snapshot. Returns None when the mount has
+    no readable identity or nothing matches (a login family the snapshots don't
+    cover — the caller falls back to state.slots)."""
+    cj = mount / ".claude.json"
+    if not cj.exists():
+        return None
+    try:
+        ident = _identity_fields(read_json(cj))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not ident:
+        return None
+    for name in state.get("accounts", {}):
+        if _identities_match(ident, _dir_identity(name)) is True:
+            return name
+    return None
+
+
+def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[dict]:
+    """Assemble display rows from already-resolved sessions. PURE (no I/O).
+
+    Each `resolved` entry carries the /proc-resolved facts the command gathered:
+      {session_id, pane, cwd, logged_account, mount, resolved_account, source}
+    where `mount` is 'slot-N'/'account-X'/None, `logged_account` is the
+    sessions.log launch-time label, and `resolved_account` is the TRUE account
+    from _resolve_mount_account. Factored out so the drift + binding logic is
+    unit-testable without tmux/proc (see tests/test_sessions_view.py).
+    """
+    default_pool = config.get("per_session", {}).get("default_pool", "premium")
+    rows: list[dict] = []
+    for r in resolved:
+        mount = r.get("mount")
+        is_slot = bool(mount) and mount.startswith(SLOT_PREFIX)
+        resolved_account = r.get("resolved_account")
+        acct = state.get("accounts", {}).get(resolved_account, {}) if resolved_account else {}
+        pool = _slot_pool(state, mount, config) if is_slot else None
+
+        if resolved_account and acct:
+            sev, binding = _session_binding(acct, pool or default_pool, config)
+        elif resolved_account:
+            sev, binding = ("unknown", "no usage state for resolved account")
+        else:
+            sev, binding = ("unknown", "mount unresolved (bare/global — observe-only)")
+
+        # DRIFT (GH #137): sessions.log's launch-time label disagrees with the
+        # account the live mount actually resolves to. Only meaningful when we
+        # resolved a real mount — a bare/global pane has no mount to compare and
+        # "follows global creds" by design, which is not the #137 defect.
+        logged = r.get("logged_account")
+        drift = bool(mount) and bool(resolved_account) and logged != resolved_account
+
+        rows.append({
+            "session_id": r.get("session_id"),
+            "pane": r.get("pane"),
+            "cwd": r.get("cwd"),
+            "mount": mount,
+            "slot": mount if is_slot else None,
+            "bare": mount is None,
+            "pool": pool,
+            "logged_account": logged,
+            "account": resolved_account,
+            "resolution_source": r.get("source", "unresolved"),
+            "drift": drift,
+            "five_h_pct": acct.get("current_5h_pct"),
+            "seven_d_pct": acct.get("current_7d_pct"),
+            "per_model_weekly": dict(acct.get("per_model_weekly_pct") or {}),
+            "binding_severity": sev,
+            "binding": binding,
+        })
+    return rows
+
+
+def detect_slot_orphans(slot_pids: dict[str, int], panes_on_slot: set) -> list[dict]:
+    """Slots holding live /proc pids that NO live tmux pane owns. PURE.
+
+    Two shapes of the same leak (see docs/DIAGNOSTICS.md): a slot whose owning
+    pane was closed while a subprocess kept the mount's CLAUDE_CONFIG_DIR alive,
+    or a stray process carrying a slot's config dir with no pane at all. Both
+    read as "the mount is in use, but nobody is driving it" — the slot won't be
+    reaped by idle-gc and won't accept a fresh session cleanly.
+
+    `slot_pids` is {slot_name: pid_count} for slots with >=1 live pid;
+    `panes_on_slot` is the set of slot names a live pane currently resolves to.
+    """
+    return [{"slot": s, "pids": n}
+            for s, n in sorted(slot_pids.items()) if s not in panes_on_slot]
+
+
+@cli.command(name="sessions")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+def sessions_cmd(as_json: bool) -> None:
+    """Per-pane -> slot -> account -> binding-limit view of live sessions.
+
+    Resolves each live Claude pane's TRUE account from the live mount (/proc
+    ground truth), NOT the stale sessions.log launch-time label, and shows in
+    one shot: the slot it's mounted in, that account's 5h/7d/per-model usage,
+    the slot's pool, and the BINDING constraint in plain words. Flags DRIFT
+    (sessions.log account disagrees with the resolved mount — GH #137) and
+    ORPHAN slots (live pids, no owning pane). READ-ONLY.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    state = read_json(STATE_JSON)
+    config = load_config()
+    color_on = sys.stdout.isatty() and not as_json
+
+    # Resolve every live session's TRUE mount from /proc, then hand the pure
+    # facts to build_session_rows. pane_mount_name is the same primitive `status`
+    # per_session mode trusts (~8886) — reused here across ALL modes, which is
+    # the actual #137 fix (the non-per_session branches ignored the mount).
+    live = find_live_sessions()
+    resolved_inputs: list[dict] = []
+    panes_on_slot: set[str] = set()
+    for s in live:
+        mount = pane_mount_name(s.pane)
+        if mount and mount.startswith(SLOT_PREFIX):
+            panes_on_slot.add(mount)
+        acct, source = _resolve_mount_account(mount, state)
+        resolved_inputs.append({
+            "session_id": s.session_id,
+            "pane": s.pane,
+            "cwd": s.cwd,
+            "logged_account": s.account,
+            "mount": mount,
+            "resolved_account": acct,
+            "source": source,
+        })
+    rows = build_session_rows(resolved_inputs, state, config)
+
+    # Orphan sweep: slots with live pids that no live pane resolves to.
+    slot_pids: dict[str, int] = {}
+    for d in list_slot_dirs():
+        pids = mount_pids(d)
+        if pids:
+            slot_pids[d.name] = len(pids)
+    orphans = detect_slot_orphans(slot_pids, panes_on_slot)
+
+    if as_json:
+        click.echo(json.dumps({
+            "mode": config.get("mode", "global"),
+            "active": state.get("active"),
+            "sessions": rows,
+            "orphans": orphans,
+        }, indent=2, default=str))
+        return
+
+    mode = config.get("mode", "global")
+    click.echo(f"Mode: {mode}   Machine-active (bare-launch) account: {state.get('active', '?')}")
+    click.echo()
+    if not rows:
+        click.echo("No live Claude sessions detected.")
+    else:
+        click.echo(f"Live sessions ({len(rows)}):")
+        for r in rows:
+            sid = (r["session_id"] or "????????")[:8]
+            where = r["slot"] or (r["mount"] or click.style("bare", fg="yellow"))
+            pool = f" [{r['pool']}]" if r["pool"] else ""
+            acct = r["account"] or "?"
+            # Line 1: identity + where mounted.
+            drift_tag = ""
+            if r["drift"]:
+                drift_tag = click.style(f"  DRIFT: sessions.log said '{r['logged_account']}'", fg="red", bold=True)
+            click.echo(f"  {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
+            # Line 2: usage numbers.
+            five = "?" if r["five_h_pct"] is None else f"{r['five_h_pct']:.0f}%"
+            seven = "?" if r["seven_d_pct"] is None else f"{r['seven_d_pct']:.0f}%"
+            pm = r["per_model_weekly"]
+            pm_txt = ("  " + " ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))) if pm else ""
+            click.echo(f"            5h={five:<5} 7d={seven:<5}{pm_txt}")
+            # Line 3: the binding constraint, colored by severity.
+            sev = r["binding_severity"]
+            color = {"blocked": "red", "warn": "yellow", "ok": "green"}.get(sev)
+            label = click.style(r["binding"], fg=color) if (color_on and color) else r["binding"]
+            click.echo(f"            -> {label}")
+            click.echo(f"            cwd={r['cwd']}")
+    click.echo()
+
+    if orphans:
+        click.echo(click.style(f"Orphan slots ({len(orphans)}) — live pids, no owning pane:", fg="yellow"))
+        for o in orphans:
+            click.echo(f"  {o['slot']:<10} {o['pids']} pid(s) held; no live tmux pane resolves here")
+        click.echo("  -> a closed pane left a subprocess holding the mount, or a stray CLAUDE_CONFIG_DIR process.")
+        click.echo("     idle-gc won't reap it and a fresh session won't mount cleanly. Investigate the pids.")
+        click.echo()
+
+
 @cli.command(name="check-orchestrate")
 @click.option("--target", default=None, help="Pretend we're swapping to this account (for relaunch-command preview).")
 def check_orchestrate_cmd(target: str | None) -> None:
