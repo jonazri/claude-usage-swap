@@ -420,10 +420,11 @@ def test_decide_swap_model_cap_pct_trips_independently_of_hard_cap():
 
 def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
     # Sole candidate 'b' has Fable at 85% (aggregate 10%). Under a 90% model
-    # cap it is a SAFE pick (no degraded fallback); once the model cap drops
-    # to 80% it is filtered and only survives via the degraded "no targets
-    # below cap" fallback. Ladder steps parked at [95] so the would-re-trip
-    # filter stays out of the way — this isolates the cap filter itself.
+    # cap it is a SAFE pick (no degraded fallback); once the model cap drops to
+    # 80% it is filtered with NO degraded fallback. Per-model weekly exhaustion
+    # means "unusable for that model until reset", unlike the aggregate 7d cap's
+    # degraded fallback. Ladder steps parked at [95] so the would-re-trip filter
+    # stays out of the way — this isolates the cap filter itself.
     accounts = {
         "a": {"current_5h_pct": 90.0, "current_7d_pct": 50.0, "next_swap_at_pct": 95},
         "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 95,
@@ -435,7 +436,7 @@ def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
     picked_loose = cus.pick_swap_target(st, loose)
     picked_tight = cus.pick_swap_target(st, tight)
     assert picked_loose.name == "b" and "[DEGRADED:" not in picked_loose.reason
-    assert picked_tight.name == "b" and "no targets below 7d cap" in picked_tight.reason
+    assert picked_tight is None
 
 
 def test_per_model_does_not_ladder_below_its_cap():

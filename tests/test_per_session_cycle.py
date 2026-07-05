@@ -169,6 +169,22 @@ def test_decide_slot_swaps_holds_below_threshold():
         env.restore()
 
 
+def test_decide_slot_swaps_never_targets_account_on_another_live_slot():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 85.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(85.0, 20.0), "beta": _usage(10.0, 10.0)}
+
+        moves = cus.decide_slot_swaps(state, _config(), usage)
+        assert moves == [], f"must hold rather than double-book live beta: {moves}"
+    finally:
+        env.restore()
+
+
 def test_reactive_429_attributes_to_slot_account():
     env = _Env()
     try:
@@ -198,6 +214,31 @@ def test_reactive_429_attributes_to_slot_account():
 
             # Watermark advanced → same entries don't re-trigger.
             assert cus.check_rate_limit_reactive_per_session(state, _config()) == []
+        finally:
+            cus.session_current_slot = _orig_scs
+    finally:
+        env.restore()
+
+
+def test_reactive_429_never_targets_account_on_another_live_slot():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        from datetime import datetime, timedelta, timezone
+        def _iso(minutes_ago: float) -> str:
+            return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
+        cus.SESSIONS_LOG.write_text(f"{_iso(10)},sA,alpha,%1,/tmp\n")
+        cus.RATE_LIMIT_LOG.write_text(f"{_iso(1)},sA,429 rate limit\n")
+        state["last_429_check_ts"] = _iso(5)
+        _orig_scs = cus.session_current_slot
+        cus.session_current_slot = lambda sid: {"sA": s1}.get(sid)
+        try:
+            moves = cus.check_rate_limit_reactive_per_session(state, _config())
+            assert moves == [], f"must hold rather than double-book live beta: {moves}"
         finally:
             cus.session_current_slot = _orig_scs
     finally:

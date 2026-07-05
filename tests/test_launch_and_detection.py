@@ -270,6 +270,39 @@ def test_pick_launch_account_lane_share_fallback():
         env.restore()
 
 
+def test_pick_launch_account_fallback_respects_saturation_filter():
+    env = _Env()
+    try:
+        config = cus.deep_merge(cus.load_config(), {"never_swap_to_pct": 100})
+        state = cus.load_state()
+        for acct in state["accounts"].values():
+            acct.update({"current_5h_pct": 100.0, "current_7d_pct": 10.0})
+
+        assert cus.pick_launch_account(state, config) is None
+    finally:
+        env.restore()
+
+
+def test_pick_launch_account_fallback_respects_per_model_weekly_gate():
+    env = _Env()
+    try:
+        config = cus.deep_merge(cus.load_config(), {
+            "per_model_weekly": {"gate_enabled": True, "models": ["Fable"], "cap_pct": 97},
+        })
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({
+            "current_5h_pct": 10.0,
+            "current_7d_pct": 10.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+        })
+        state["accounts"]["beta"].update({"current_5h_pct": 100.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 100.0, "current_7d_pct": 10.0})
+
+        assert cus.pick_launch_account(state, config) is None
+    finally:
+        env.restore()
+
+
 def test_launch_prepare_joins_shared_mount():
     """Launching the shared-mount active with live bare sessions: lane_sharing
     on JOINS the global pair (bare session — 'merkos should be a legal

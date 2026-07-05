@@ -1952,33 +1952,28 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         except Exception:
             return None
 
-    # Operator-disabled accounts are out of rotation for launches too — and
-    # these two raw fallbacks below BYPASS pick_swap_target's universal
-    # filters, so they need the exclusion explicitly (2026-07-03).
-    disabled = _disabled_accounts(config)
-
     # First: spread across all mounts. Fallback: allow reusing idle-slot
     # accounts, but still never a live-mount account.
     target = _try(spread_occupied) or _try(live_occupied)
-    if target is None:
-        cands = [(n, a) for n, a in state.get("accounts", {}).items()
-                 if not a.get("token_expired") and not a.get("poll_error")
-                 and n not in live_occupied and n not in disabled]
-        if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
-            target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
     # Lane-share final fallback (GH #109 lanes, 2026-07-03): every healthy
     # account is on a live mount. Joining a live mount is safe (shared dir,
     # shared login family), so pick the healthiest live account rather than
     # refusing — the refusal predates lanes and left `cus launch auto` dead
     # whenever slots saturated the pool, even with a 4%-used account joinable.
     if target is None and config.get("per_session", {}).get("lane_sharing", False):
-        cands = [(n, a) for n, a in state.get("accounts", {}).items()
-                 if not a.get("token_expired") and not a.get("poll_error")
-                 and n in live_occupied and n not in disabled]
-        if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
-            target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
+        shim = dict(state)
+        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n in live_occupied}
+        shim["active"] = "\x00launch-sentinel"
+        if shim["accounts"]:
+            try:
+                joined = pick_swap_target(shim, config)
+            except Exception:
+                joined = None
+            if joined is not None:
+                target = SwapTarget(
+                    name=joined.name,
+                    reason=f"lane-share fallback: all healthy accounts on live mounts; joining lane; {joined.reason}",
+                )
     return target
 
 
@@ -3187,24 +3182,23 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         return None
     candidates = not_saturated
 
-    # Universal filter (GH #17, all strategies): exclude candidates above
-    # the user-stated weekly ceiling. Previously only headroom/smart applied
-    # this — lowest_usage/drain/round_robin would happily pick an exhausted
-    # account. Falls back to "any candidate" if ALL are above cap (system
-    # is degraded; swap somewhere rather than stay on a hot active).
+    # Model-week exhaustion is a hard target cap; aggregate 7d keeps its fallback.
     hard_7d = _hard_7d_cap_for_config(config)
-    # The weekly ceiling applies to the aggregate 7d AND (when the gate is on)
-    # to any tracked per-model weekly — so we never swap ONTO an account whose
-    # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
-    # when the gate is off, so this is exactly the old aggregate-7d filter then.
-    # The per-model comparison uses the TARGET-side cap (target_cap_pct,
-    # falling back to cap_pct, falling back to hard_7d): swap-away drains to
-    # cap_pct, but arrivals stop earlier — see _model_weekly_target_cap_for_config.
     model_cap = _model_weekly_target_cap_for_config(config)
+    if _per_model_weekly_gate(config)[0]:
+        model_safe = [(n, a) for n, a in candidates if _max_model_weekly_from_acct(a, config) < model_cap]
+        if not model_safe:
+            return None
+        candidates = model_safe
+
+    # Universal filter (GH #17, all strategies): exclude candidates above
+    # the user-stated aggregate weekly ceiling. Previously only headroom/smart
+    # applied this — lowest_usage/drain/round_robin would happily pick an
+    # exhausted account. Falls back to "any candidate" if ALL are above cap
+    # (system is degraded; swap somewhere rather than stay on a hot active).
     safe_7d = [
         (n, a) for n, a in candidates
         if a.get("current_7d_pct", 0) < hard_7d
-        and _max_model_weekly_from_acct(a, config) < model_cap
     ]
     cap_fallback = not safe_7d
     if safe_7d:
@@ -5336,13 +5330,17 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
 
     `traces` (optional): "account:pool" → decide_swap trace dict, for logs.
     """
+    occupied = occupied_slot_accounts(state)
     exclude = set(exclude_accounts or ())
+    # Never copy credentials onto an account another live mount already holds.
+    exclude.update(occupied.keys())
+    if state.get("active") and mount_in_use(CLAUDE_DIR):
+        exclude.add(state["active"])
     moves: list[dict] = []
     # Seed with the cross-mount exclusions so BOTH the primary pick (via the
     # per-group accounts shim below) and the fan-out re-pick avoid them.
     taken: set[str] = set(exclude)
     locked = _locked_slots(config)
-    occupied = occupied_slot_accounts(state)
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
     # — dropped here so a group whose slots are all locked never burns a
     # decide_swap and fan-out never counts them.
@@ -5500,6 +5498,9 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
     # Seed with cross-mount exclusions (GH #104): even an urgent 429 escape must
     # not land on an account another live mount holds.
     taken: set[str] = set(exclude_accounts or ())
+    taken.update(occupied_slot_accounts(state).keys())
+    if state.get("active") and mount_in_use(CLAUDE_DIR):
+        taken.add(state["active"])
     for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
