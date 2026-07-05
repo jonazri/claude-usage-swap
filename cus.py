@@ -340,6 +340,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # logic ("below 100% is a judgment call" — user). 100 = only block truly
     # exhausted accounts; lower it to keep a wider safety margin.
     "never_swap_to_pct": 100,
+    # 72-hour seven_day reset detection (field finding 2026-07-05, gist:
+    # monperrus/3ac4b303a84946bbeaf2b1123ee99491). The Claude `seven_day`
+    # "weekly" cap actually REFRESHES every ~72h at a fixed UTC anchor
+    # (~04:50-05:00 UTC), NOT every 7 days — observed 72.0h ±0.6h over three
+    # cycles. The API's seven_day.resets_at is misleading: it reports ~7 days
+    # out (when the oldest tokens age off), not when you actually get fresh
+    # budget. We detect the REAL reset from its observable signature — a sharp
+    # DROP in current_7d_pct between two consecutive real observations — and
+    # project the next one 72h forward. Both knobs are exposed so they stay
+    # tunable if Anthropic changes the cadence.
+    "seven_day_reset_hours": 72,       # projected gap between real 7d refreshes
+    "seven_day_reset_drop_pct": 15,    # min pct-point drop that counts as a reset (not noise)
     "smart_strategy": {
         "hard_7d_cap_pct": 80,           # force-swap active when 7d crosses this; never SWAP TO an account above
         "burn_window_hours": 2,          # if 5h resets within N hours and clock is ticking, boost score
@@ -3265,6 +3277,88 @@ def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> floa
     # exhausted account is still excluded as a target by pick_swap_target's
     # explicit model-cap filter, so it can never be picked.
     return max(vals) if vals else 0.0
+
+
+def _is_seven_day_reset_drop(prev_pct, new_pct, config: dict) -> bool:
+    """True when a poll-over-poll change in current_7d_pct is a REAL 72h reset.
+
+    Field finding 2026-07-05 (gist: monperrus/3ac4b303a84946bbeaf2b1123ee99491):
+    the `seven_day` "weekly" budget actually refreshes every ~72h at a fixed UTC
+    anchor, not every 7 days. We can't read that boundary from the API (its
+    resets_at points ~7 days out, when the oldest tokens age off), so we infer
+    the reset from its only observable signature: utilization dropping SHARPLY
+    between two consecutive real observations.
+
+    Pure + side-effect-free so it's trivially testable in isolation from the
+    poll I/O. Guards against noise: a small downward fluctuation (measurement
+    jitter, or the gradual oldest-tokens-age-off trickle) is NOT a reset — only
+    a drop of at least `seven_day_reset_drop_pct` points counts. Cold start
+    (either value missing) returns False so the caller falls back to the API
+    timestamp until a real drop is observed.
+    """
+    if prev_pct is None or new_pct is None:
+        return False
+    drop_threshold = float(config.get("seven_day_reset_drop_pct", 15))
+    try:
+        return (float(prev_pct) - float(new_pct)) >= drop_threshold
+    except (TypeError, ValueError):
+        return False
+
+
+def projected_seven_day_reset(acct: dict, config: dict, now=None) -> str | None:
+    """Best estimate (ISO-8601 str) of when this account's 7d budget REALLY
+    refreshes — the value display + reset-proximity logic should prefer over the
+    raw API `seven_day_resets_at`.
+
+    Field finding 2026-07-05 (gist: monperrus/3ac4b303a84946bbeaf2b1123ee99491):
+    the real ~72h refresh lands BEFORE the API's ~7-day boundary, and the
+    earlier moment is the one operators care about — that's when budget frees up
+    and when a near-cap account becomes usable again.
+
+    Resolution order:
+      1. If we've OBSERVED a reset drop (`seven_day_last_reset_ts` is set),
+         project forward by `seven_day_reset_hours` (default 72). Because the
+         cadence is a FIXED anchor, a stale last-reset spanning several missed
+         cycles is rolled forward by whole 72h periods until the projection is
+         in the future.
+      2. Fall back to the API `seven_day_resets_at` on cold start (no drop seen
+         yet) — preserving pre-change behavior until we learn the real anchor.
+      3. When BOTH a projection and the API value exist, return the EARLIER of
+         the two (the real refresh precedes the oldest-tokens boundary).
+
+    Pure helper (reads state, no writes) so it's testable and safe to call from
+    any display/scoring path.
+    """
+    reset_hours = float(config.get("seven_day_reset_hours", 72))
+    api_ts = acct.get("seven_day_resets_at")
+    last_reset = acct.get("seven_day_last_reset_ts")
+
+    projected_ts: str | None = None
+    if last_reset:
+        try:
+            t0 = datetime.fromisoformat(str(last_reset).replace("Z", "+00:00"))
+            if now is None:
+                now = datetime.now(timezone.utc)
+            nxt = t0 + timedelta(hours=reset_hours)
+            # Fixed-anchor cadence: advance whole periods until future, so a
+            # last_reset_ts left behind by several missed polls still yields the
+            # NEXT upcoming refresh rather than a stale past timestamp.
+            while nxt <= now:
+                nxt = nxt + timedelta(hours=reset_hours)
+            projected_ts = nxt.isoformat()
+        except (ValueError, AttributeError, TypeError):
+            projected_ts = None
+
+    candidates = [c for c in (projected_ts, api_ts) if c]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Both present → return the earlier (the real refresh comes first).
+    try:
+        return min(candidates, key=lambda c: datetime.fromisoformat(str(c).replace("Z", "+00:00")))
+    except (ValueError, AttributeError, TypeError):
+        return projected_ts or api_ts
 
 
 def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
@@ -6294,6 +6388,17 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["five_hour_resets_at"] = u.five_hour.resets_at
         if u.seven_day and u.seven_day.resets_at:
             acct["seven_day_resets_at"] = u.seven_day.resets_at
+        # 72h seven_day reset detection (2026-07-05, gist: monperrus). The
+        # `seven_day` budget really refreshes every ~72h at a fixed UTC anchor,
+        # NOT every 7 days, and the API resets_at doesn't mark it. Infer the
+        # real reset from its observable signature — a sharp DROP in 7d
+        # utilization between two consecutive OBSERVATIONS — and stamp when it
+        # happened so projected_seven_day_reset() can project the next one 72h
+        # out. old_7d is the last observed % (captured above before overwrite);
+        # new_7d_val is this poll's %. Kept as a call to the pure helper so the
+        # detection logic stays unit-testable apart from the poll I/O.
+        if _is_seven_day_reset_drop(old_7d, new_7d_val, config):
+            acct["seven_day_last_reset_ts"] = u.polled_at
         # Per-model WEEKLY utilization (GH: fable/sonnet tracking). Persisted as
         # a flat {model: pct} dict so `cus status` and the weekly-cap gate can
         # read it from state.json without a live poll. Only written on a
@@ -9414,8 +9519,18 @@ def status() -> None:
     else:
         click.echo(f"Active account: {state['active']}")
     click.echo()
-    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
-    click.echo("-" * 104)
+    # Ladder steps are IDENTICAL across accounts — they're the config's
+    # thresholds.steps progression, not a per-account value — so printing the
+    # first step ("Next swap") on every row was pure noise. Show the whole
+    # ladder ONCE here as a legend; the per-row value only reappears below for
+    # an account whose next_swap_at_pct has advanced off the first step
+    # (mid-ladder / non-default), which genuinely IS per-account.
+    cfg_steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    first_step = cfg_steps[0] if cfg_steps else 50
+    click.echo("Ladder steps: " + " → ".join(f"{s}%" for s in cfg_steps))
+    click.echo()
+    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
+    click.echo("-" * 91)
     disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
         marker = " *" if name == state["active"] else ""
@@ -9444,7 +9559,13 @@ def status() -> None:
             if est - polled >= 1.0:
                 rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
                 est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
+        # Show next_swap_at_pct ONLY when it's advanced off the shared first
+        # ladder step (the legend above already prints that) — i.e. this account
+        # is mid-ladder / carries a non-default value, which is the only case
+        # worth a per-row callout.
+        nxt_val = a.get("next_swap_at_pct", first_step)
+        nxt_note = f"  [next-swap: {nxt_val:.0f}%]" if nxt_val != first_step else ""
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {status_col:<24} {last:<28}{nxt_note}{est_note}")
         # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
         # sub-line only for accounts that have any, sorted highest-first so a
         # model nearing its own weekly cap is the first thing the eye lands on.
@@ -10771,6 +10892,8 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
     "thresholds": "Progressive per-account thresholds. `steps: [70, 85, 95]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
+    "seven_day_reset_hours": "72h seven_day reset detection (2026-07-05, gist: monperrus/3ac4b303a84946bbeaf2b1123ee99491). The Claude `seven_day` \"weekly\" budget actually REFRESHES every ~72h at a fixed UTC anchor (~04:50-05:00 UTC), not every 7 days; the API's seven_day.resets_at is misleading (it points ~7 days out at the oldest-tokens-age-off boundary). cus detects the real reset from a sharp DROP in current_7d_pct and projects the next one this many hours forward (default 72). Tunable if Anthropic changes the cadence.",
+    "seven_day_reset_drop_pct": "Min pct-point DROP in current_7d_pct between two consecutive polls to count as a real 72h seven_day reset rather than noise/jitter (default 15). Pairs with `seven_day_reset_hours`. Raise it if normal fluctuation trips false resets; lower it if a genuine reset is being missed.",
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
     "lazy_swap": "Cache-aware lazy background swap (GH #56). Consulted ONLY when `hot_swap.enabled` is false. A background swap never interrupts a session; its only cost is a one-time prompt-cache rebuild on the live sessions that migrate. So `enabled: true` (default) DEFERS a non-urgent swap (ladder below saturation, burn-before-reset) while any live session's last activity is younger than `cache_window_seconds: 300` (≈ Anthropic's prompt-cache TTL) — it re-fires once the cache is cold (free) or the swap turns urgent. Urgent swaps (hard 7d cap, 5h saturation, reactive 429) are never deferred. Set `enabled: false` to swap immediately on every ladder trip (old behavior). Inspect deferrals with `cus decisions`.",
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
@@ -11567,7 +11690,12 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         pct7 = "?" if unknown7 else _sl_pct(h7, nxt, color_on)
         if show_resets:
             r5 = _time_until(a.get("five_hour_resets_at"))
-            r7 = _time_until(a.get("seven_day_resets_at"))
+            # 7d reset countdown uses the PROJECTED 72h refresh, not the raw API
+            # resets_at (2026-07-05, gist: monperrus). The API points ~7 days out
+            # at the oldest-tokens-age-off boundary; the real budget refresh lands
+            # at the ~72h anchor, which is the number the operator actually wants.
+            # Falls back to the API value on cold start (no observed drop yet).
+            r7 = _time_until(projected_seven_day_reset(a, config))
             r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown7 else ""
             r7_str = click.style(r7_raw, dim=True) if color_on and r7_raw else r7_raw
             rolled5 = _five_hour_rolled_since_poll(a)
