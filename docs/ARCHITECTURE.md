@@ -147,6 +147,57 @@ All file writes use the tempfile-in-same-dir + `os.rename()` pattern for atomici
 
 Our list is tighter because we use the canonical `~/.claude/` location for everything except the 2 swapped files — no symlinks, no profile dirs to maintain in lockstep. The trade-off: we cannot run two accounts simultaneously on one machine. AIMUX can.
 
+> **Annotation 2026-07-02 (superseded in per_session / hybrid modes):** the "cannot run two accounts simultaneously" trade-off holds only for `mode: global`. `mode: per_session` and `mode: hybrid` (plan: `docs/plans/2026-07-02-per-session-accounts.md`, GH #99) add slot dirs — one `CLAUDE_CONFIG_DIR` mount per concurrent session, each holding one account's credentials, swapped in-place per slot. `hybrid` additionally keeps swapping the shared `~/.claude/` mount for bare sessions, so a machine with a mix of slotted and bare sessions has both managed. Global mode remains the default and this section stays accurate for it. See "Per-session slot dirs" below for the full config-dir inventory that replaces the "no profile dirs" simplification in those modes.
+>
+> **No double-booking invariant (GH #104):** with more than one live mount, every mount must hold a *distinct* account — two live mounts on one account both refresh its single-use OAuth token, rotating it out from under the other and logging that session out. The daemon enforces this in its target picker (a slot swap skips accounts the shared mount or another live slot holds; the shared-mount swap skips accounts any live slot holds), and `cus switch` / `cus launch` refuse to land on a live-mount account unless `--force`. `cus launch` auto-pick spreads across free accounts first.
+>
+> **Annotation 2026-07-03 (three tightenings):** (1) `cus launch auto` no longer errors when every healthy account is live — with `per_session.lane_sharing` on it returns the lowest-usage live account and the launch **joins** that account's existing mount (slot lane, or the shared `~/.claude/` pair as a bare session): one mount, one login family, so the invariant is *satisfied by sharing*, not violated. (2) The per-slot fan-out's "pool exhausted → double up on the last target" fallback is removed — it installed one token family on two live mounts, the exact clobber this invariant forbids (bitten live: slot-3/slot-4 on one account, 2026-07-03). Slots with no distinct target now hold on their current account. (3) `cus sos` verifies the invariant at the mounts themselves (refresh-token fingerprint per live mount), not just in the independent-login store, so a violation is loud however it was created.
+
+## Per-session slot dirs (`mode: per_session`) — config-dir inventory (2026-07-02)
+
+Storage roles in per_session mode:
+
+| Path | Role | Swapped in place? |
+|---|---|---|
+| `~/claude-accounts/account-<name>/` | Storage: canonical creds snapshot + identity + meta for one account | No — save-back target only |
+| `~/claude-accounts/slot-<n>/` | Live mount: `CLAUDE_CONFIG_DIR` for one session | **Yes** — where per-slot swaps happen |
+| `~/.claude/` | Live mount for bare launches (the only mount in global mode) | Global mode: yes. per_session mode: observe-only |
+
+### What lives under a config dir — shared vs per-mount classification
+
+Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), diff against all five `account-<name>/` dirs (which have run real `relogin` sessions since 2026-05-19), plus a scratch-`CLAUDE_CONFIG_DIR` `claude --print` run to observe what Claude Code creates from nothing (it created `projects/<cwd>/`, `sessions/`, `backups/.claude.json.backup.<ts>`, `mcp-needs-auth-cache.json`, `.last-cleanup` — confirming slots must be scaffolded with symlinks *before* first launch, or Claude Code plants real dirs where symlinks belong).
+
+**Shared — symlink to `~/.claude/<entry>`** (one canonical copy; what breaks if per-mount: listed per row):
+
+| Entry | Why shared |
+|---|---|
+| `settings.json`, `settings.local.json` | Hooks, statusline, permission allowlist. A mount without them runs bare — no SessionStart logging, no statusline, no permissions (today's account dirs have a `{"theme": "dark"}` stub: exactly this bug). Symlinked as *files*. |
+| `projects/` | Transcripts keyed by cwd. Sharing is what makes `--resume` work regardless of which mount a session started under (2026-05-19 unified-tree decision, verified then). |
+| `file-history/` | Checkpoint/file-history blobs referenced from transcripts; must travel with `projects/`. |
+| `paste-cache/` | Pasted-content blobs referenced from transcripts. |
+| `plans/` | Plan-mode documents, cross-session. |
+| `session-env/` | Per-session-id dirs (uuid-keyed — no cross-mount collision). Needed when a session is resumed under a different mount than it started on. |
+| `shell-snapshots/` | Shell-env snapshots referenced by session state; same resume argument. |
+| `tasks/`, `todos/` | Task/todo lists keyed by session id; travel with transcripts. |
+| `commands/`, `hooks/`, `plugins/`, `scripts/`, `skills/`, `agents/`, `memory/` | User config, account-independent (already in `SHARED_SYMLINK_SUBDIRS`). |
+
+**Per-mount** (each mount its own copy):
+
+| Entry | Why per-mount |
+|---|---|
+| `.credentials.json` | The account credential — the point of the mount. |
+| `.claude.json` | Account-bound keys (`userID`, `oauthAccount`) must differ per mount; the ~37 non-account keys are kept aligned by `cus sync-config`. Lives *inside* non-default config dirs (vs `~/.claude.json` at parent level for the default). |
+| `sessions/` | Pid-keyed, process-scoped JSON (observed: `1687352.json`). |
+| `backups/` | Claude Code writes its own `.claude.json.backup.<ts>` here (observed in scratch run) and cus rotates creds backups here; both are mount-scoped by meaning. |
+| `history.jsonl` | Prompt history. Deliberately NOT shared: Claude Code rewrites it, and a tempfile+rename rewrite would silently replace a symlink with a real file and fork the share. Divergent arrow-up history is a trivial cost; a silently-broken share is not. |
+| `cache/`, `stats-cache.json`, `statsig/`, `telemetry/` | Ephemeral / account-scoped caches; refresh from server. |
+| `mcp-needs-auth-cache.json`, `policy-limits.json`, `remote-settings.json` | Account/org-scoped server state (observed created fresh per config dir). |
+| `.last-cleanup`, `.last-update-result.json`, `daemon*`, `jobs/` | Process-scoped markers and Claude Code background-jobs state; don't-care. |
+
+**Global-only, never seen via `CLAUDE_CONFIG_DIR`:** `validator.log`, `loops.md`, `loops-events.log`, `reconciliations.json`, `projects-hook-archive` — written by user hooks/scripts with absolute `~/.claude/...` paths; they never resolve through a mount.
+
+**Known sharp edge:** anything that rewrites a shared *file* symlink via tempfile+rename (e.g. `/config` writing `settings.json`) replaces the symlink with a real file and silently forks that mount off the share. `cus doctor --fix-dirs` detects real-file-where-symlink-expected, folds any non-default keys back into the shared file, and re-links.
+
 ## State machine — per-account thresholds
 
 State is `~/claude-accounts/state.json` (atomic JSON, tempfile+rename):

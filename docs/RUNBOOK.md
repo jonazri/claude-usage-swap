@@ -126,7 +126,64 @@ To disable: flip `hot_swap.enabled: false`, restart daemon. Hot-swap-related con
 | `hot_swap.shell_return_timeout_seconds` | `10` | Max poll for pane to return to shell after `/exit` |
 | `hot_swap.relaunch_flags` | `""` | Flags passed to relaunched `claude` — set to `"--dangerously-skip-permissions"` if you use it |
 
-## Starting / stopping the daemon
+## Per-session mode (slots) — one account per concurrent session
+
+Added 2026-07-02 (plan: `docs/plans/2026-07-02-per-session-accounts.md`). Each session gets its own slot dir as `CLAUDE_CONFIG_DIR`; the daemon swaps individual slots in place (sessions never restart) and never touches `~/.claude/`.
+
+### Enter / leave
+
+```bash
+cus mode                 # show current mode
+cus mode per-session     # validate pool (doctor-heal + refresh-token check), create first slot, flip config
+cus mode hybrid          # like per-session, but ALSO swaps the shared ~/.claude/ mount for bare sessions (GH #99)
+cus mode global          # reap idle slots (creds saved back), flip config — restores today's exact behavior
+```
+
+Both directions print what changed. `cus mode global` refuses while slot sessions are live (exit them, or `--force` to leave them running unmanaged).
+
+**Which mode?** `per_session` if every session is launched via `cus launch` (bare sessions are observe-only, never swapped). `hybrid` if you have a MIX of slotted and plain `claude` sessions and want both managed — slots move independently, bare sessions follow the shared-mount swap. `global` (default) if you don't use slots.
+
+> **No double-booking (automatic, GH #104):** every live mount stays on a distinct account — two mounts on one account rotate its single-use OAuth refresh token and log one session out. The daemon enforces this in global and hybrid modes (the shared-mount swap skips accounts a live slot holds; slot swaps skip the shared mount's and other slots' accounts), and `cus switch <acct>` refuses to move the shared mount onto a live-slot account (use `--force` to override). Manual recovery if you ever force it into that state: move the shared mount to a free account with `cus switch <free>` (save-back preserves the valid token), then relaunch the affected slot session.
+>
+> **Annotation 2026-07-03:** when a hot slot's fan-out finds no distinct target (more hot slots than free accounts), the daemon now **holds** that slot on its current account instead of doubling up onto an already-taken target — the double-up installed one token family on two live mounts, exactly the clobber above. A parked hot slot degrades gracefully; a clobbered one logs a session out. `cus sos` flags any live same-family duplication ("One login family live on N mounts"), and in the fully-saturated regime (every account on a live mount) `cus launch auto` joins the lowest-usage lane instead of refusing (needs `per_session.lane_sharing: true`).
+
+### Slot locks & rotation-set pools
+
+```bash
+cus lock <slot>          # freeze a slot: daemon never swaps its account or gc's it (per_session/hybrid)
+cus unlock <slot>        # remove the lock
+cus pool <slot>          # show a slot's rotation-set pool
+cus pool <slot> standard # standard pool: ignore the per-model weekly cap (keep using model-exhausted accounts)
+cus pool <slot> premium  # premium pool (default): swap off an account when its tracked model hits per_model_weekly.cap_pct
+cus launch --pool standard auto   # launch straight into the standard pool
+```
+
+**`cus lock` (slot) vs `cus pin` (session)** — two different protections: `lock` freezes a *slot's account* so the daemon never swaps or gc's it (protects the credential mount); `pin` marks a *session/pane* so hot-swap orchestration won't restart it (protects the running session). You can lock a slot without pinning its session, and vice-versa.
+
+**Rollout note (429 budget):** N occupied accounts poll at the fast cadence — start with `polling.active_interval_seconds` relaxed (e.g. 300) and tighten only after a week of clean 429 logs. Do NOT shorten intervals to compensate for anything (2026-06-19 burnout).
+
+### Launching sessions
+
+```bash
+cus launch                        # auto-pick best account (spreads across accounts), new/reused slot
+cus launch rayi1                  # explicit account
+cus launch rayi1 -- --resume ID   # args after -- pass through to claude
+alias claude='cus launch auto --' # optional: make every launch slotted (documented opt-in, never auto-installed)
+```
+
+A launch heals the slot (doctor), syncs `.claude.json` from the canonical, installs the account's creds (in-place swap primitive), and `exec`s claude with `CLAUDE_CONFIG_DIR` set. Bare `claude` still works — it rides `~/.claude/`, is shown as `bare` in `cus status`, and is never swapped in this mode.
+
+### Day-to-day
+
+```bash
+cus status               # Slots section: slot → account → live/idle; live sessions show pane → slot → account
+cus slot list            # slot inventory with pids
+cus slot gc              # reap idle slots now (creds save back first); daemon gc's after per_session.slot_gc_idle_hours (72h)
+cus doctor [--fix-dirs]  # check/heal account dirs + slots against the canonical symlink layout
+cus sync-config          # push canonical ~/.claude.json non-account keys to idle slots (live slots sync at next launch)
+```
+
+Statuslines resolve their own slot's account every render, so a per-slot swap shows up immediately in the pane that moved — and only there.
 
 If installed via systemd (`cus init-systemd --enable`):
 
@@ -149,6 +206,52 @@ cus daemon --once --no-execute         # decide but don't actually swap (dry-run
 
 The daemon writes its logs to `~/claude-accounts/daemon.log` either way.
 
+## Independent-login pools — swap onto a held account without a clobber
+
+**The problem it solves.** When you run as many live lanes as you have accounts, a hot lane can have *nowhere to swap*: every other account is already held by another live mount, and cus refuses to double-book one (two live mounts copied from one account's snapshot share a single OAuth refresh token and clobber each other on rotation — the #104 failure). `cus sos` reports this as `lane … with no swap target`.
+
+**The fix.** Give each account a small **pool** of *independent* login families (each a separate `/login` of the same Anthropic account → a distinct refresh-token family). A hot lane then borrows a free family from the target account's pool: distinct family, no clobber. Log in a few times per account **once** at onboarding; no per-lane setup.
+
+This does **not** add quota — families of one account share that account's 5h/7d limits. It unlocks headroom that's *trapped* behind a held account; for genuine capacity, add more accounts (`cus add`).
+
+### Onboarding: build the pools
+
+For each account you want to be borrowable (start with the ones that carry the most concurrent load), run this `pool_size` times (default 3):
+
+```bash
+cus login-mount merkos            # scaffolds the next family, prints a CLAUDE_CONFIG_DIR=… claude command
+# → run that command in a fresh terminal and /login AS merkos (a new independent session of the SAME account)
+cus login-mount merkos --finish   # verifies the login landed on merkos, records it
+# repeat for family-2, family-3 …
+```
+
+- `cus login-mount --list` — show each account's pool depth and per-family freshness; flags pools below `pool_size`.
+- `cus login-mount merkos --from-existing` — seed *family-1* from the on-disk snapshot with **no** browser login. Clobber-safe only as the account's primary mount; a second simultaneous mount still needs a real `/login`.
+- `cus status` grows a **Login pools** section (accounts, family count, how many are free) once any pool exists.
+
+### Turn it on
+
+The whole feature is gated off by default. After provisioning:
+
+```yaml
+# ~/claude-accounts/config.yaml
+independent_logins:
+  use_independent_logins: true    # off (default) = swaps always copy the snapshot; on = borrow a free family when the target is held
+  pool_size: 3                    # onboarding target + the "provision more" nudge; not a hard cap
+```
+
+```bash
+systemctl --user restart cus.service   # pick up the config AND the pool code
+```
+
+### What happens after
+
+- A hot (or 429'd) lane whose only headroom is a held account now **claims a free family** from that account's pool, records the lease on its slot, and swaps in place — the `cus status` lane line shows `[pool family-N]`.
+- If a lane needs to rescue but the pool is **exhausted** (every family already leased to a live lane), cus **refuses to swap** rather than clobber, and `cus sos` says so — provision another family (`cus login-mount <account>`) or add an account.
+- `N` backup families ⇒ up to `N+1` live mounts can safely share one account's quota (its primary snapshot + the N families).
+
+Rotated tokens for a borrowed family are saved back to that family's store dir on swap-out (never to the account snapshot), so families and the canonical snapshot never reconcile into one clobbering token line.
+
 ## Tuning thresholds + strategy
 
 Edit `~/claude-accounts/config.yaml`. Common changes:
@@ -163,6 +266,10 @@ Edit `~/claude-accounts/config.yaml`. Common changes:
 | Never swap mid-subagent | `subagent_skip.defer_below_tier: 100` (effectively always defer) |
 | Swap on every ladder trip (disable cache-aware deferral) | `lazy_swap.enabled: false` |
 | Wait longer for a cold cache before swapping | `lazy_swap.cache_window_seconds: 600` |
+| Track a model's WEEKLY cap (e.g. Fable) and leave the account when it's hit | `per_model_weekly.gate_enabled: true`, `per_model_weekly.models: [Fable]` |
+| Swap off (and stop returning to) an account when Fable's week hits 97% | `per_model_weekly.cap_pct: 97` (null = inherit `hard_7d_cap_pct`) |
+
+**Per-model weekly cap** is a hard cap, not a ladder step — a tracked model swaps its account off (and out of rotation until the week resets) *only* at `cap_pct`, not gradually at the `thresholds.steps` rungs. Full behavior + how the premium/standard pools interact with it: `docs/STRATEGIES.md` § "Per-model weekly cap".
 
 Restart the daemon after editing: `systemctl --user restart cus.service`. (`cus daemon` re-reads config on every cycle, so no restart needed if running foreground — but systemd-managed processes don't pick up config changes until restart.)
 

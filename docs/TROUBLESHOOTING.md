@@ -74,9 +74,79 @@ systemctl --user restart cus.service
 rm ~/claude-accounts/daemon.pid
 ```
 
+### `slot-N identity does not match its assigned account` (per_session)
+
+The slot's on-disk `.claude.json` identity differs from what `state.json` `slots.<name>.account` claims — the GH #2 drift class, reframed for slots. Usage attribution and swap decisions for that slot are against the wrong account until fixed.
+
+```bash
+cus slot list                    # what state believes
+# what the slot actually holds:
+python3 -c "import json; print(json.load(open('$HOME/claude-accounts/slot-N/.claude.json'))['oauthAccount']['emailAddress'])"
+# Fix state.json slots.slot-N.account to match REALITY (record reality — do
+# NOT run a swap first; its save-back would write one account's tokens into
+# another's snapshot).
+```
+
+### `Bare session(s) on ~/.claude/ are burning '<name>'` (per_session)
+
+A session launched as plain `claude` (not `cus launch`) rides the global mount, and per_session mode never swaps that mount (that would move every bare session at once — the cache bust this mode eliminates). The session will run its account into the caps. Exit it and relaunch slotted (`cus launch`), or add `alias claude='cus launch auto --'`.
+
+### `Orphan slot dir slot-N holds credentials` (per_session)
+
+A slot dir exists on disk with real credentials but no `state.json` entry (crash between mkdir and state save, or a hand-made dir). Reap it — credentials are saved back to the owning account dir first:
+
+```bash
+cus slot gc --slot slot-N
+```
+
+### `Independent-login families collide across mounts: <slot>-><acct>, …` (GH #109)
+
+Two lanes hold the **same** login family (e.g. an account bootstrapped with `--from-existing` onto two slots, or a hand-copied store entry). Two live mounts on one refresh-token family clobber on rotation — the exact thing independent logins prevent. Give the extra lane its **own** login (a real `/login`, not `--from-existing`, which only copies):
+
+```bash
+cus login-mount <slot> <account>          # run the printed cmd, log in, then:
+cus login-mount <slot> <account> --finish
+```
+
+### `Independent login(s) … wrong account / past assumed lifetime / expiring soon` (GH #109)
+
+A provisioned independent login (`cus login-mount --list`) needs attention: it was recorded for the wrong account (`--finish` normally refuses this — a hand-edit or `--force` slipped one through), or it's near/past the assumed refresh-token lifetime (`independent_logins.refresh_token_ttl_days`, a soft estimate). Re-provision it:
+
+```bash
+cus login-mount <slot> <account>          # log in as the correct account, then --finish
+```
+
+Expiry is an assumption, not a measured fact (see #109 Phase 0) — it only drives this soft nudge, never a hard action.
+
 ---
 
 ## Non-SOS issues
+
+### Some sessions say "Not logged in · Please run /login" (GH #103 / #104)
+
+Two distinct causes, both about a live credential mount going bad:
+
+- **All *bare* (non-slotted) sessions at once** → the shared `~/.claude/.credentials.json` was blanked to a logged-out shape (a bare session ran `/logout`, or a token refresh failed). Every bare session shares that one file. Fix by re-installing a healthy account into the shared mount: `cus switch <account>` (pick one no live slot holds — see below).
+- **One slotted session, while another session runs the same account** → two live mounts on one account rotate its single-use OAuth refresh token; whichever refreshes first invalidates the other, logging it out. The daemon, `cus switch`, and `cus launch` now *refuse* to create this (GH #104) — but if you forced it (or hit it before the guard shipped), recover by moving one mount to a free account: `cus switch <free-account>` for the shared mount (its save-back preserves the valid token), then relaunch the affected slot session. Keep every live mount on a distinct account.
+
+If you're launching more concurrent sessions than you have healthy accounts: with `per_session.lane_sharing: true` (2026-07-03), `cus launch auto` **joins** the lowest-usage live lane instead of refusing — same mount, same login family, no clobber (this also covers the shared mount: joining the active account launches a bare session). With lane sharing off, launch still refuses with "no launchable account" rather than double-book — exit a session, wait for a 5h/weekly reset, or `cus add` another account.
+
+`cus sos` now also flags "One login family live on N mounts" (2026-07-03) — the clobber condition measured at the live mounts themselves, whatever created it (`--force`, a pre-fix daemon double-up, hand-copied credentials). If it fires: exit the extra session(s); the relaunch joins the surviving lane (lane sharing) or gets its own family via `cus login-mount`.
+
+When every account is on a live mount, per-slot ladder swaps have no legal target (a swap onto a live account would be a *copy* onto a second mount — the very clobber the guard exists for, unlike a lane *join* which shares one mount). Hot slots then hold and their usage climbs; that's the designed degradation. Relief: exit a session, add an account, or provision independent logins (`independent_logins` + `cus login-mount`) so hot slots can rotate onto in-use accounts safely.
+
+### per_session: `sync-config` says "live session — skipped"
+
+Deliberate: Claude Code rewrites its own `.claude.json`, so merging into a live mount is a lost-update race. The slot picks up the canonical sync at its next `cus launch`. Nothing to fix.
+
+### per_session: a slot session came up with no hooks/statusline
+
+A shared-state symlink in the slot broke — most likely something rewrote `settings.json` via tempfile+rename, which replaces the symlink with a real file and forks the slot off the share. Heal and re-check:
+
+```bash
+cus doctor            # shows exactly which entries drifted
+cus doctor --fix-dirs # folds novel keys back into the shared file, relinks
+```
 
 ### Daemon is running but not swapping when I think it should
 

@@ -6,6 +6,12 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-125-merge-same-cause-as-123-124-entries)
+- [2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-124-merge-same-cause-as-123-entry)
+- [2026-07-03 — flag — Gym record loop for PR #123 merge blocked: repo not gym-initialized](#2026-07-03-flag-gym-record-loop-for-pr-123-merge-blocked-repo-not-gym-initialized)
+- [2026-07-03 — flag — gym record loop for PR #114 merge blocked: repo has no initialized gym DB](#2026-07-03-flag-gym-record-loop-for-pr-114-merge-blocked-repo-has-no-initialized-gym-db)
+- [2026-07-02 — decision — Built #109 Phase 1 (per-(slot,account) independent-login store + `cus login-mount`) + Phase 0 harness on a fresh branch off main; swap path untouched (gate off)](#2026-07-02-decision-built-109-phase-1-per-slot-account-independent-login-store-cus-login-mount-phase-0-harness-on-a-fresh-branch-off-main-swap-path-untouched-gate-off)
+- [2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted](#2026-07-02-decision-built-pr-93-plan-per-session-slots-same-day-on-the-plan-s-own-branch-production-untouched-three-plan-deviations-noted)
 - [2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed](#2026-07-02-flag-gym-record-loop-unavailable-for-pr-86-review-pr-88-merge-cus-is-not-gym-initialized-hook-99-v2-guidance-needed)
 - [2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps](#2026-07-02-decision-gh-77-freshness-guard-active-account-relogin-bare-claude-login-not-storage-dir-sync-guard-covers-the-expected-verdict-too-finish-allows-incomparable-timestamps)
 - [2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast](#2026-07-02-decision-gh-76-swap-lock-crash-journal-journal-is-a-standalone-file-not-a-state-json-key-recovery-auto-reconciles-determinate-crashes-lock-waits-instead-of-failing-fast)
@@ -21,6 +27,121 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr-125
+
+**What happened:** PR #125 (per-account `disabled: true` out-of-rotation flag, for the Fable-depleted `default` account) merged as `154daa4`. The MCP-discipline hook (#99 v2) again requires the gym record loop; still blocked — claude-usage-swap has no initialized gym database. Third occurrence today; the open question from the PR #123 flag (gym-init this repo vs exempt non-gym repos in the hook) covers all three merges: `b315334`, `15dc7a9`, `154daa4`.
+
+### Walk-back path
+1. Same as the PR #123 flag: `gym init` here, then record all three merges retroactively; or accept the audit-gap report + these flags as the exemption record.
+
+---
+
+
+## 2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr-124 #pool #clobber
+
+**What happened:** PR #124 (clobber guard read stale 5s-TTL occupancy cache → slot-2/slot-7 double-landed on rayi3's snapshot family at 16:10Z, slot-2 logged out) merged as `15dc7a9`; daemon restarted on the fixed code at 16:18Z. The MCP-discipline hook (#99 v2) again requires the gym record loop, and it is blocked by the same condition flagged earlier today: claude-usage-swap has no initialized gym database (`gym_session_start` refuses — no `alembic_version` table at `gym.db`).
+
+**Open question (unchanged, from the PR #123 flag):** gym-init this repo so coding-fleet merges get gym records, or exempt non-gym repos in the discipline hook? Until answered, merges `b315334` (#123) and `15dc7a9` (#124) have inbox flags as their provenance trail, per the hook's cannot-complete instruction.
+
+### Walk-back path
+1. Same as the PR #123 flag: if gym is wanted here, run `gym init` in /home/rayi/repos/claude-usage-swap, then record both merges retroactively (gym_session_start → gym_design cluster=AVC_RUN → gym_drill → gym_run with SHAs b315334 and 15dc7a9).
+2. If not, the `python scripts/mcp_discipline_audit.py --days 1` gap report plus these two flags document the exemption case.
+
+---
+
+
+## 2026-07-03 — flag — Gym record loop for PR #123 merge blocked: repo not gym-initialized
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr-123 #pool
+
+**What happened:** The MCP-discipline hook (#99 v2) requires the gym record loop (gym_design → gym_drill → gym_run with merge SHA) after merging a PR via gh CLI. PR #123 (fix for the 08:57Z slot-2 → rayi3@99% rate-limit incident: pool-rescued pick died at the taken-veto in `decide_slot_swaps`) was merged as `b315334` and the daemon restarted on the fixed code.
+
+**Blocker:** `gym_session_start` fails: `database_path '/home/rayi/repos/claude-usage-swap/gym.db' has no 'alembic_version' table — this is not an initialized gym database.` claude-usage-swap has never been gym-initialized; per cross-repo CLAUDE.md, gym is scoped to research/ML/gym-using repos, which this is not.
+
+**Question for the user:** Should claude-usage-swap be gym-initialized (`gym init`) so coding-fleet PR merges here get gym records, or should the discipline hook exempt non-gym repos? Until decided, the PR #123 merge has no gym record — this entry is the provenance trail. Per the hook's instruction, this is posted instead of skip-and-annotate.
+
+### Walk-back path
+1. If gym records are wanted here: run `gym init` in /home/rayi/repos/claude-usage-swap, then re-run the loop for merge b315334 (gym_session_start → gym_design cluster=AVC_RUN experiment_id=pool-rescue-taken-veto-fix-20260703 → gym_drill → gym_run).
+2. If not wanted: no action; this flag documents the gap for the #99 v2 audit (`python scripts/mcp_discipline_audit.py --days 1` will surface it).
+
+---
+
+
+## 2026-07-03 — flag — gym record loop for PR #114 merge blocked: repo has no initialized gym DB
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr114
+
+The MCP-discipline hook (#99 v2) requires gym_design → gym_drill → gym_run after a `gh pr merge` (PR #114, merge commit 1eec16c). The loop is blocked at the first write: `gym_session_start` fails with "Configured database_path '/home/rayi/repos/claude-usage-swap/gym.db' has no 'alembic_version' table — the path did not exist" — i.e. claude-usage-swap has never been gym-initialized.
+
+**Question for the operator:** should claude-usage-swap be gym-initialized (`gym init` here), or should the discipline hook exempt non-gym repos (top-level CLAUDE.md says non-research repos can skip gym_general.md, which suggests this repo is out of gym's intended scope)? Not initializing unilaterally — creating a new canonical experiment store for a repo is an infrastructure decision, not a session-level call.
+
+Per the hook's instruction this is posted as an inbox entry rather than skip-and-annotate (umbrella vibeCoding#197). PR #114 itself is merged and verified conventionally: 254/254 pytest, live `cus sos` / `cus status` / `pick_launch_account` checks against production state.
+
+---
+
+
+## 2026-07-02 — decision — Built #109 Phase 1 (per-(slot,account) independent-login store + `cus login-mount`) + Phase 0 harness on a fresh branch off main; swap path untouched (gate off)
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #gh-109 #independent-logins #slots #login-mount #phase-1 #clobber
+
+**Context.** Executing the handoff `docs/plans/2026-07-02-seamless-swap-independent-logins.md`. The "mounts" of that handoff are the existing per_session **slots**; today a slot's live `.credentials.json` is a COPY of one account snapshot, so two slots on one account share a single OAuth refresh-token family and clobber on rotation (#104/#103/#3). #109 proved independent `/login` flows for the same account yield independent families that don't invalidate each other.
+
+**What I decided / did (autonomous):**
+1. **Wrong base → rebased the worktree.** The worktree was on the stale `poll-throttle-and-per-model` branch — 39 commits behind main, 0 ahead (its work already merged), and missing EVERY touchpoint the handoff builds on (slots/launch/mode/pools, the #104 refusal, the newer `classify_live_creds_owner`). Created `feature/seamless-swap-independent-logins-20260702` off `origin/main` in this same worktree (user chose "rebase this worktree onto main"). Untracked plan doc carried over.
+2. **Built Phase 1 only** (additive, non-breaking): per-(slot,account) store at `~/claude-accounts/logins/<account>/<slot>/` (creds + provenance.json + identity), `cus login-mount` (lazy two-step provisioning), status/sos surfacing, config block `independent_logins` with the Phase 2 gate `use_independent_logins:false`. Left a **seam comment** at the swap install site in `_execute_swap_locked` — the swap path is bit-for-bit unchanged.
+3. **Design calls worth review:** (a) the interactive `/login` writes DIRECTLY into the store dir, so there's no separate capture/copy step to drift; (b) `--finish` **refuses a wrong-account login** by comparing the store's `oauthAccount` to the account's canonical `.claude.json` (the 2026-07-01 duplicate-identity guard), `--force` overrides; (c) SOS/status stay **silent until the feature is in use** (no nag for default-config users) — the "missing login" SOS only fires when the gate is ON; (d) `refresh_token_ttl_days:30` is an explicit UNCONFIRMED assumption driving only a soft nudge (Phase 0 owes the real number).
+4. **Phase 0 harness scaffolded** (`experiments/109-phase0/`) but the experiments are **not yet run** — they need interactive `/login` flows. Automated: `multi` (>2-login independence), `ledger` (idle-expiry), `files` (filesystem-severing demo); printed procedures for read-cadence + drift-writeback.
+
+**Verification.** New suite `tests/test_independent_logins.py` (17 tests); full suite **235 passing**; `cus.py` ruff at baseline (32 pre-existing F541s, +0 mine); harness ruff-clean. Nothing installed/committed to production — the live daemon runs the main checkout, not this worktree, and the gate is off.
+
+### Walk-back path
+1. To drop the whole feature: it lives only on branch `feature/seamless-swap-independent-logins-20260702` (unmerged). Delete the branch, or `git checkout main`.
+2. To drop just the code but keep the plan/harness: revert the single implementation commit on the branch (the `cus.py` + `tests/` diff); the plan-doc annotation and `experiments/109-phase0/` are separate.
+3. Nothing to undo on the machine: no swap-path change (gate `use_independent_logins` defaults false), no store populated, no install/systemd change — the running daemon uses `/home/rayi/repos/claude-usage-swap/cus.py` (main), not this worktree.
+4. If Phase 2 later proves the store design wrong: the store is purely additive on disk (`~/claude-accounts/logins/`); `rm -rf ~/claude-accounts/logins` removes it with zero effect on accounts/slots/state.
+
+---
+
+
+## 2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #per-session #pr-93 #slots #claude-config-dir
+
+**What I decided.** The user asked to "build the plan in PR 93". I implemented all four phases as commits on the SAME branch (`feature/per-session-accounts-20260702`), turning the docs-only PR into plan+implementation, rather than opening a separate implementation PR. Rationale: the worktree was already checked out on that branch for this session, and reviewing the plan next to its implementation is easier than cross-referencing two PRs.
+
+**Autonomous calls worth review:**
+1. **PR #93 scope change** (docs → docs+code). Title/body updated to match.
+2. **Production left in `mode: global` and `cus doctor --fix-dirs` NOT run against the live tree** — read-only doctor confirms the drift (4 settings stubs, missing symlinks), but healing live account dirs while the daemon runs and sessions are active is an operator step (it's also the first step of `cus mode per-session`).
+3. **Plan deviations** (annotated in the plan doc header): launch auto-pick shims `pick_swap_target` with a sentinel active instead of a new scorer; per-session reactive 429 got its own attribution function (sessions.log-based) instead of reusing `check_rate_limit_reactive`; slot gc got a 72h idle grace (`per_session.slot_gc_idle_hours`) because eager reaping defeats launch slot-reuse.
+4. **Filed GH #95** for a pre-existing `cus status` hang (`find_live_sessions` with 1.3MB sessions.log) found during smoke — reproduced on unmodified main, so logged as an issue, not fixed in this PR.
+
+**Verification.** Suite 177 passing (146 pre-existing unmodified + 31 new); `daemon --once --no-execute` against live state runs global mode bit-for-bit; slot-swap isolation invariant (global mount + state.active never touched) is under test.
+
+### Walk-back path
+1. To make PR #93 docs-only again: `git revert a600806 aa64676 9c8519a fa43acb a57821f 5567846` on the branch (or interactive-rebase them out) — the two plan-doc commits (e9fd807, bf4e90a) stay.
+2. To back out only the behavior change risk: nothing changed in production — `mode: global` is still set, no `--fix-dirs` was run, the daemon binary in use is the installed main checkout. There is nothing to revert on the machine.
+3. If merged and per_session misbehaves later: `cus mode global` restores today's exact behavior (global-mode code paths untouched — verified by the 146 pre-existing tests passing unmodified).
+4. GH #95 can be closed as wontfix if the hang is judged sandbox-only.
+
+---
+
 
 ## 2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed
 

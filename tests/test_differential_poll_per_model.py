@@ -239,24 +239,36 @@ def test_gate_off_is_a_noop_on_current_max_pct():
     assert cus.current_max_pct(u, DIFF_CFG) == 40.0  # key absent entirely
 
 
-def test_gate_on_folds_max_model_week_into_current_max_pct():
+def test_ladder_signal_excludes_per_model_week():
+    # Behavior change 2026-07-02 (supersedes the prior fold): current_max_pct
+    # is the progressive-LADDER signal and no longer counts per-model weekly,
+    # even with the gate on. A Fable week at 95% must NOT drag the ladder
+    # signal up to 95% — that would trip a ladder swap at steps[0] long before
+    # Fable's own cap. Per-model is enforced on the hard-cap path instead.
     u = _usage(per_model={"Fable": cus.UsageWindow(utilization=95.0, resets_at=None),
                           "Sonnet": cus.UsageWindow(utilization=20.0, resets_at=None)})
-    assert cus.current_max_pct(u, GATE_ON) == 95.0
+    assert cus.current_max_pct(u, GATE_ON) == 40.0   # aggregate 7d only
+    assert cus.current_max_pct(u, GATE_OFF) == 40.0
 
 
-def test_gate_allowlist_filters_models_case_insensitively():
+def test_allowlist_filters_models_in_hard_cap_signal():
+    # The models allowlist still governs WHICH model feeds the hard-cap signal
+    # (_max_model_weekly_from_usage), which is where per-model now acts. Sonnet
+    # is not allowlisted, so only fable's 50% counts.
     u = _usage(per_model={"Sonnet": cus.UsageWindow(utilization=95.0, resets_at=None),
                           "fable": cus.UsageWindow(utilization=50.0, resets_at=None)})
-    # Sonnet is NOT in the allowlist → only fable's 50% counts, and the
-    # aggregate 7d 40% loses to it.
-    assert cus.current_max_pct(u, GATE_ALLOW) == 50.0
+    assert cus._max_model_weekly_from_usage(u, GATE_ALLOW) == 50.0
+    # ...and it does NOT leak into the ladder signal.
+    assert cus.current_max_pct(u, GATE_ALLOW) == 40.0
 
 
-def test_gate_folds_into_account_effective_pct_from_state():
+def test_effective_pct_excludes_per_model_week():
+    # Dict-level twin of the ladder signal: also no longer folds per-model
+    # weekly (2026-07-02). The hard-cap target filter in pick_swap_target
+    # excludes model-exhausted candidates on its own.
     acct = {"current_5h_pct": 10.0, "current_7d_pct": 20.0,
             "per_model_weekly_pct": {"Fable": 88.0}}
-    assert cus._account_effective_pct(acct, GATE_ON) == 88.0
+    assert cus._account_effective_pct(acct, GATE_ON) == 20.0
     assert cus._account_effective_pct(acct, GATE_OFF) == 20.0
 
 
@@ -365,3 +377,86 @@ def test_flat_config_staleness_unchanged():
     })
     conds = _stale_conditions(st, FLAT_CFG)
     assert len(conds) == 1
+
+
+# --------------------------------------------------------------------------
+# per_model_weekly.cap_pct — separate threshold for the model gate
+# --------------------------------------------------------------------------
+
+def _cap_cfg(cap_pct, hard_cap=80, steps=None):
+    """Gate on, model cap set explicitly, aggregate hard cap independent."""
+    return dict(
+        GATE_ON,
+        strategy="smart",
+        smart_strategy={"hard_7d_cap_pct": hard_cap},
+        per_model_weekly={"gate_enabled": True, "models": [], "cap_pct": cap_pct},
+        swap_hysteresis={"enabled": False},
+        thresholds={"five_hour": True, "seven_day": True, "steps": steps or [50, 75, 90]},
+    )
+
+
+def test_model_cap_pct_none_inherits_hard_cap():
+    assert cus._model_weekly_cap_for_config(_cap_cfg(None, hard_cap=80)) == 80
+    assert cus._model_weekly_cap_for_config(_cap_cfg(90, hard_cap=80)) == 90
+
+
+def test_decide_swap_model_cap_pct_trips_independently_of_hard_cap():
+    # Aggregate 7d 40% is under the 80% hard cap; Fable week 85% is under a
+    # 90% model cap → hold. Raise Fable to 92% → the model cap (not the
+    # aggregate one) force-swaps. Ladder is parked at 95 so only the hard-cap
+    # trigger can fire.
+    accounts = {
+        "a": {"current_5h_pct": 30.0, "current_7d_pct": 40.0, "next_swap_at_pct": 95},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 50},
+    }
+    cfg = _cap_cfg(90, hard_cap=80)
+    st = _state(active="a", accounts=accounts)
+    usage_under = {"a": _usage(per_model={"Fable": cus.UsageWindow(utilization=85.0, resets_at=None)})}
+    assert cus.decide_swap(st, cfg, usage_under) is None
+    usage_over = {"a": _usage(per_model={"Fable": cus.UsageWindow(utilization=92.0, resets_at=None)})}
+    decision = cus.decide_swap(st, cfg, usage_over)
+    assert decision is not None and decision.gate == "hard_7d_cap" and decision.target == "b"
+
+
+def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
+    # Sole candidate 'b' has Fable at 85% (aggregate 10%). Under a 90% model
+    # cap it is a SAFE pick (no degraded fallback); once the model cap drops
+    # to 80% it is filtered and only survives via the degraded "no targets
+    # below cap" fallback. Ladder steps parked at [95] so the would-re-trip
+    # filter stays out of the way — this isolates the cap filter itself.
+    accounts = {
+        "a": {"current_5h_pct": 90.0, "current_7d_pct": 50.0, "next_swap_at_pct": 95},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 95,
+              "per_model_weekly_pct": {"Fable": 85.0}},
+    }
+    st = _state(active="a", accounts=accounts)
+    loose = dict(_cap_cfg(90, steps=[95]), strategy="lowest_usage")
+    tight = dict(_cap_cfg(80, steps=[95]), strategy="lowest_usage")
+    picked_loose = cus.pick_swap_target(st, loose)
+    picked_tight = cus.pick_swap_target(st, tight)
+    assert picked_loose.name == "b" and "[DEGRADED:" not in picked_loose.reason
+    assert picked_tight.name == "b" and "no targets below 7d cap" in picked_tight.reason
+
+
+def test_per_model_does_not_ladder_below_its_cap():
+    # The user's exact ask: with steps [80, 90] and Fable capped at 97, Fable
+    # climbing to 85% or 92% must NOT trigger a ladder swap — the account
+    # switches (and leaves rotation) ONLY at 97%. Aggregate 7d is low the whole
+    # time, so nothing but per-model could trip. Ladder step sits at 80.
+    accounts = {
+        "a": {"current_5h_pct": 10.0, "current_7d_pct": 15.0, "next_swap_at_pct": 80},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 50},
+    }
+    cfg = _cap_cfg(97, hard_cap=80, steps=[80, 90])
+    st = _state(active="a", accounts=accounts)
+    # Fable at 85% and 92%: over steps[0]=80 but under the 97 cap → HOLD
+    # (pre-2026-07-02 this laddered at 80%).
+    for fable in (85.0, 92.0):
+        u = {"a": _usage(five_hour=10.0, seven_day=15.0,
+                         per_model={"Fable": cus.UsageWindow(utilization=fable, resets_at=None)})}
+        assert cus.decide_swap(st, cfg, u) is None, f"Fable {fable}% must not ladder below cap"
+    # Fable at 97%: hard-cap force-swap fires.
+    u = {"a": _usage(five_hour=10.0, seven_day=15.0,
+                     per_model={"Fable": cus.UsageWindow(utilization=97.0, resets_at=None)})}
+    d = cus.decide_swap(st, cfg, u)
+    assert d is not None and d.gate == "hard_7d_cap" and d.target == "b"
