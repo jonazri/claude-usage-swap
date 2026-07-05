@@ -2668,6 +2668,28 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     except (ValueError, AttributeError):
         return True, "unparseable last_poll_ts"
     role = "active" if _account_on_fast_cadence(state, config, account_name) else "inactive"
+    # token_stale fast-track (2026-07-05 incident): a token_stale account
+    # (stored access token aged out, refresh token still valid) must be
+    # re-polled PROMPTLY, not left sitting on a stale cached % for hours.
+    # poll_account_usage()'s self-refresh preflight (_refresh_account_token)
+    # can only mint a fresh token and re-fetch REAL usage when the account is
+    # actually polled — but Branch 0 restamps last_poll_ts every stale cycle,
+    # so an INACTIVE spare then waits the full slow inactive_interval before
+    # the next attempt, leaving its cached value looking authoritative. Force
+    # such accounts onto the FAST (active) cadence so a valid refresh token
+    # clears token_stale within one active interval instead of a whole slow
+    # cycle. Graceful-degrade preserved: a genuinely dead refresh token stays
+    # token_stale and simply retries at the fast (NOT every-cycle) cadence — no
+    # crash, no busy-loop, and the 429 poll-backoff gate still runs first in
+    # the daemon loop. Only ever SHORTENS the interval (min()), so a stale
+    # account already on the fast cadence is unaffected.
+    if acct.get("token_stale"):
+        polling_cfg = config.get("polling", {})
+        flat = config.get("poll_interval_seconds", 300)
+        fast_interval = polling_cfg.get("active_interval_seconds") or flat
+        if fast_interval < interval:
+            interval = fast_interval
+            role = f"{role}/token_stale-fast"
     # GH #59 composition: a 5h window that reset AFTER our last poll means the
     # stored usage is pre-reset garbage — poll now regardless of cadence class,
     # so the adaptive early wake actually refreshes the account it woke for.
@@ -3092,10 +3114,37 @@ def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
 def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
     per_model_weekly_pct from state.json. Used to fold per-model weekly caps
-    into swap-target selection (_account_effective_pct)."""
+    into swap-target selection (_account_effective_pct).
+
+    Stale-guard (2026-07-05 incident): a token_stale (or otherwise un-observable
+    — rate_limited / token_expired / poll_error) account's cached
+    per_model_weekly_pct is last-known-good, possibly HOURS old or even
+    post-rollover — it is NOT a current reading. Treat it as UNKNOWN (return
+    0.0), never as a hard cap. Per-model weekly is a 7-day-window concept, so it
+    shares current_7d_pct's staleness fate (`_pct_is_unknown`).
+
+    Why this direction is the safe one: returning 0.0 for a stale account means
+    a STALE per-model % neither (a) EXCLUDES the account from swap-target
+    selection via pick_swap_target's `_max_model_weekly_from_acct(a) < model_cap`
+    filter (the "refused a target on a stale reading" error), nor (b) makes the
+    hard-cap anti-pingpong guard treat a chosen target as "still capped" on a
+    number we couldn't reconfirm. The incident: an operator+agent trusted a
+    token_stale account's cached `Fable=100%` as authoritative and moved a live
+    Fable session off it — but the account actually had Fable headroom.
+
+    The swap-AWAY force (decide_swap Trigger 1) is already safe WITHOUT this
+    guard: it reads FRESH usage via `_max_model_weekly_from_usage`, which is 0.0
+    for a token_stale account (its AccountUsage this cycle is empty), so a stale
+    per-model can never force a live lane OFF an account. This guard only closes
+    the CACHED-dict path used by target selection / the pingpong guard.
+    """
     enabled, allow = _per_model_weekly_gate(config)
     pm = acct.get("per_model_weekly_pct") or {}
     if not enabled or not pm:
+        return 0.0
+    # Per-model shares the 7d window's staleness: if we can't trust current_7d
+    # for this account, we can't trust its per-model weekly numbers either.
+    if _pct_is_unknown(acct, "current_7d_pct"):
         return 0.0
     vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
     return max(vals) if vals else 0.0
@@ -6779,6 +6828,182 @@ def _auto_heal_live_mount(state: dict, config: dict, no_execute: bool = False) -
     return True
 
 
+# ---------------------------------------------------------------------------
+# LANE-mount blank detection + auto-heal (2026-07-05, GH #141 follow-up).
+#
+# The GH #141 fix above heals only the SHARED mount (~/.claude/.credentials.json).
+# But a per-slot LANE has its OWN mount creds (slot-N/.credentials.json) — the
+# file the running Claude Code session on that lane actually reads — and it can be
+# blanked the exact same way by an EXTERNAL writer (Claude's own logout, a crash
+# mid-write). That is precisely what happened to slot-2 on 2026-07-05: its mount
+# creds went blank and had to be fixed by hand, because neither `cus sos` nor the
+# daemon's auto-heal looked at anything but the shared mount. These helpers are the
+# lane analogue of Condition 0 + `_auto_heal_live_mount`: same predicate
+# (`_live_mount_creds_invalid`), same atomic-write + rotated-backup + never-write-
+# a-blank discipline, but scoped to each LIVE lane's own mount.
+# ---------------------------------------------------------------------------
+
+def _blanked_live_lanes(state: dict, config: dict) -> list[tuple[str, str]]:
+    """(slot, account) for every LIVE lane whose OWN mount creds are blanked/invalid.
+
+    A "live lane" is a slot with a registered account (`state.slots[slot].account`)
+    AND a live session on its mount (`occupied_slot_accounts` → `mount_in_use` /proc
+    ground truth). The file a lane's session reads is the slot mount's own
+    `.credentials.json` (`mount_creds_path`) — NOT the leased pooled-family store,
+    which is only the swap SOURCE / save-back target. When THAT mount file is
+    blanked (empty accessToken / expiresAt<=0, the 2026-07-05 slot-2 signature) the
+    session shows "not logged in".
+
+    Deliberately excludes the cases the task calls out as NOT-a-fault:
+      * Only lane-serving modes (per_session/hybrid) have first-class lanes — the
+        complement of the shared-mount check, which is global/hybrid. In global the
+        daemon does not manage lanes, so it does not heal them here.
+      * IDLE / observe-only slots (no live session on the mount) are skipped:
+        occupied_slot_accounts only returns slots with a live PID, so a blank in an
+        idle slot — expected, it holds no session — never surfaces.
+      * Slots with no registered account are skipped (nothing authoritative to
+        reinstall; also covers a slot mid-swap that hasn't committed an account).
+    """
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    out: list[tuple[str, str]] = []
+    # account -> [live slot names]; already /proc-gated and account-gated.
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            cred = mount_creds_path(slot_path(slot))
+            try:
+                creds = read_json(cred) if cred.exists() else None
+            except (json.JSONDecodeError, OSError):
+                creds = None  # unreadable == unusable from the session's point of view
+            if _live_mount_creds_invalid(creds):
+                out.append((slot, account))
+    return out
+
+
+def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Path | None:
+    """Newest USABLE creds file to reinstall into a blanked live lane mount, or
+    None when nothing usable exists (needs a real relogin → escalate to SOS).
+
+    Honors the GH #104/#109 login-family discipline, which is the ONE thing that
+    differs from the shared-mount heal's source pick:
+      * If the lane LEASES a pooled family (`state.slots[slot].login_family`, and
+        the independent-logins gate is on), the only safe source is THAT family's
+        own creds. Installing the account's shared snapshot instead would put a
+        DIFFERENT refresh-token family on the live lane and clobber every other
+        holder of that snapshot the next time either side refreshes (#104). So a
+        pooled lane whose family store is itself blanked/missing heals from
+        NOTHING here (returns None) rather than cross-contaminating — it escalates
+        to the relogin SOS, same as the shared-mount "no usable backup" case.
+      * A plain (non-pooled) lane is a shared-snapshot copy, so it heals from the
+        account's newest usable snapshot/backup — the exact same
+        `_newest_usable_creds_source` the shared-mount heal uses.
+
+    "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
+    swap install-point guard and the shared-mount heal apply — so whatever this
+    returns is safe to atomic-copy into the mount without re-blanking it.
+    """
+    lease = slot_leased_family(state, slot)
+    if lease is not None and lease[0] == account and independent_logins_enabled(config):
+        fam_path = login_family_creds_path(*lease)
+        if fam_path.exists():
+            try:
+                if not _live_mount_creds_invalid(read_json(fam_path)):
+                    return fam_path
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Leased family store blanked/missing → NO cross-family fallback (#104).
+        return None
+    return _newest_usable_creds_source(account)
+
+
+def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
+    """SOS for a blanked LIVE lane mount (GH #141 follow-up, 2026-07-05 slot-2).
+
+    Only reached when the daemon's in-cycle heal (`_auto_heal_live_lanes`) could
+    NOT fix the lane — i.e. no usable credential source exists for `account`
+    (snapshot + backups, and any leased login family, are all blanked), which is
+    the one case that genuinely needs a human `cus relogin`.
+    """
+    return SOSCondition(
+        severity="urgent",
+        summary=(f"lane {slot} ({account}) mount creds are blanked — "
+                 f"session will show 'not logged in'"),
+        action=(
+            f"The live lane mount {slot}/.credentials.json has been blanked/invalidated "
+            f"(empty accessToken or expiresAt <= 0), the 2026-07-05 slot-2 signature "
+            f"(GH #141 lane follow-up). The Claude Code session running on lane {slot} is "
+            f"locked out even though other accounts may be fine, and the daemon could NOT "
+            f"self-heal it — '{account}' has no usable credential source (its snapshot and "
+            f"backups, and any leased login family, are all blanked). Re-login the account:\n"
+            f"      cus relogin {account}   # then: cus poll\n"
+            f"    or restore a good backup if one exists:\n"
+            f"      cus restore-creds {account} --list"),
+        affected=account,
+    )
+
+
+def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Self-heal blanked live LANE mounts in-daemon (GH #141 follow-up, 2026-07-05).
+
+    The lane analogue of `_auto_heal_live_mount`: for every LIVE lane whose own
+    mount creds are blanked (`_blanked_live_lanes`), reinstall its owning account's
+    newest USABLE credential source (`_lane_heal_source` — the leased family store
+    if pooled, else the account snapshot/backup) into the lane mount, with the SAME
+    atomic-write + rotated-backup + never-write-a-blank discipline the shared-mount
+    heal uses. Runs in `_emit_sos_after` BEFORE `diagnose()`, so a healable blank
+    never reaches the operator as an SOS — the heal fixes the mount and diagnose
+    then sees it valid. Only a lane with NO usable source falls through to the
+    URGENT relogin SOS (`_lane_mount_sos`).
+
+    Idempotent (a healthy lane is byte-for-byte untouched — the invalid-check gates
+    the whole thing), never clobbers a healthy lane, and honors login-family
+    discipline (a pooled lane heals only from its own family — see
+    `_lane_heal_source`). Returns the list of healed slot names. `no_execute` logs
+    the intended heal without writing, for `cus daemon --once --no-execute`.
+    """
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    healed: list[str] = []
+    for slot, account in _blanked_live_lanes(state, config):
+        source = _lane_heal_source(slot, account, state, config)
+        dest = mount_creds_path(slot_path(slot))
+        if source is None:
+            # No usable snapshot/backup/family: cannot self-heal without a browser
+            # relogin. Leave the blank so diagnose() surfaces the URGENT SOS.
+            click.echo(f"  auto-heal: live lane {slot} ({account}) mount is blanked but there is NO "
+                       f"usable credential source — leaving it for the URGENT relogin SOS "
+                       f"(GH #141 lane follow-up)")
+            continue
+        if no_execute:
+            click.echo(f"  auto-heal (--no-execute): WOULD restore '{account}' creds from {source} "
+                       f"into live lane {slot} (GH #141 lane follow-up)")
+            continue
+        # Install-point guard mirror (#141): never write a blank. The source was
+        # already validated by _lane_heal_source, but re-check at the install point
+        # so a source that went bad between pick and copy can't re-blank the mount.
+        try:
+            if _live_mount_creds_invalid(read_json(source)):
+                continue
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Same discipline as _auto_heal_live_mount / restore_creds_backup: back up
+        # the (blank) lane mount first so the heal is itself reversible, then
+        # atomic-copy the validated source over it. Only the lane mount is touched
+        # — the family store / snapshot is a heal SOURCE here, never a write target.
+        backup_credentials_file(dest)
+        atomic_copy(source, dest, mode=0o600)
+        msg = (f"live lane {slot} ({account}) mount creds were blanked/invalid (GH #141 lane "
+               f"follow-up) — auto-restored '{account}' credentials from {source} into {dest}; "
+               f"the lane's session is usable again without a human (2026-07-05 slot-2 incident).")
+        click.echo(f"  AUTO-HEAL: {msg}")
+        try:
+            append_inbox("auto-heal", f"blanked live lane {slot} self-healed (GH #141 follow-up)", msg)
+        except OSError:
+            pass  # inbox is best-effort observability; never fail the heal over it
+        healed.append(slot)
+    return healed
+
+
 def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
     """Human label for WHY a reachable account is NOT a valid premium swap target.
 
@@ -7031,6 +7256,20 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             live_creds, live_mode, live_active, live_ident, active_ident)
         if live_cond is not None:
             out.append(live_cond)
+
+    # Condition 0b (2026-07-05, GH #141 follow-up): a LIVE LANE's own mount creds
+    # are blanked. Condition 0 above only inspects the SHARED mount; a slot lane's
+    # own slot-N/.credentials.json can be blanked independently (Claude's logout,
+    # a crash mid-write) — the 2026-07-05 slot-2 incident, which `cus sos` reported
+    # as all-clear because nothing scanned lane mounts. Only in lane-serving modes
+    # (per_session/hybrid); `_blanked_live_lanes` self-gates on mode and returns
+    # only LIVE lanes with a registered account whose mount is actually invalid
+    # (idle/observe-only slots and mid-swap slots are excluded there). In the
+    # daemon, `_emit_sos_after` auto-heals blanked lanes BEFORE this diagnose runs,
+    # so a lane only reaches here when it has NO usable source (genuine relogin
+    # needed); an ad-hoc `cus sos` still reports the blank so an operator sees it.
+    for _lane_slot, _lane_acct in _blanked_live_lanes(state, config):
+        out.append(_lane_mount_sos(_lane_slot, _lane_acct))
 
     # Condition 1: token expired anywhere
     for name, acct in accounts.items():
@@ -9733,7 +9972,12 @@ def status() -> None:
         # 5h is intentionally absent — the API has no per-model 5h window.
         pm = a.get("per_model_weekly_pct") or {}
         if pm:
-            parts = "  ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+            # Mark per-model numbers stale (dim + trailing '~') for any account
+            # we couldn't freshly observe — a token_stale account's cached
+            # `Fable=100%` printed bare read as an authoritative current value
+            # and drove a wrong swap (2026-07-05 incident). See _fmt_model_pct.
+            parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
+                              for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
@@ -9931,7 +10175,15 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     pm = acct.get("per_model_weekly_pct") or {}
     top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
     model_cap = _model_weekly_cap_for_config(config)
-    if gate_enabled and top_model is not None and top_pct >= model_cap:
+    # A token_stale account passes the blocker-flag checks above (token_stale is
+    # NOT among them — its 5h is still last-known-good), so it reaches here with
+    # a cached per_model_weekly_pct that may be hours old. Never let a STALE
+    # per-model % drive a hard "premium gate" block: that is exactly the verdict
+    # that moved a live Fable session off an account which actually had Fable
+    # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
+    # surface the number marked '~' in the headroom line below instead.
+    model_stale = _model_pct_is_stale(acct)
+    if gate_enabled and not model_stale and top_model is not None and top_pct >= model_cap:
         if pool == "standard":
             # Surface the number but make clear it does NOT bind this lane.
             return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
@@ -9947,9 +10199,16 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # Headroom on every enforced axis.
     txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
     if pm:
-        txt += f", {top_model} {top_pct:.0f}%"
+        # _fmt_model_pct marks the number '~' when it's stale (token_stale et
+        # al.) so it never reads as an authoritative current value (2026-07-05).
+        txt += f", {top_model} {_fmt_model_pct(acct, top_pct)}"
         if gate_enabled and pool == "standard":
             txt += " [std: model gate off]"
+        elif model_stale:
+            # Stale per-model was skipped by the gate above — say so, so the
+            # operator repolls before trusting it rather than reading "ok" as
+            # "Fable confirmed clear".
+            txt += " [stale — repoll to confirm]"
     txt += ")"
     return ("ok", txt)
 
@@ -10722,6 +10981,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # the diagnose() below then sees it valid. Only a mount with NO usable
         # backup falls through to the URGENT re-login SOS (needs a human).
         _auto_heal_live_mount(state, config, no_execute=no_execute)
+        # GH #141 follow-up (2026-07-05 slot-2): the shared-mount heal above never
+        # looked at per-slot LANE mounts, so a blanked lane (Claude's own logout /
+        # a crash mid-write) sat locked out until fixed by hand. Same funnel, same
+        # discipline: heal every LIVE lane whose own creds are blanked BEFORE
+        # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
+        # global mode / when no lane is blanked.
+        _auto_heal_live_lanes(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
         maybe_write_sos(conditions, state)
         if conditions:
@@ -11327,6 +11593,43 @@ def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool
         padded = f"{raw:>{width}}"
         return click.style(padded, dim=True) if color_on else padded
     return f"{val:>{width}.{prec}f}"
+
+
+def _model_pct_is_stale(acct: dict) -> bool:
+    """True when an account's per-model WEEKLY numbers can't be trusted as a
+    CURRENT reading (2026-07-05 incident).
+
+    Per-model weekly values are 7-day-window numbers, so they share the 7d
+    window's staleness fate: whenever we can't freshly observe the account
+    (token_stale / rate_limited / token_expired / poll_error — exactly the
+    `_pct_is_unknown(acct, "current_7d_pct")` set) the cached
+    per_model_weekly_pct is last-known-good and may be hours old, or even
+    post-rollover — never an authoritative current number.
+
+    The incident: an operator (and an agent) trusted a token_stale account's
+    cached `Fable=100%` as current and moved a live Fable session off it — but
+    the account actually had Fable headroom; the 100% was a STALE cached value.
+    Bug 1 (this helper) is the DISPLAY half of the fix — mark such numbers stale
+    everywhere they're shown so they can never look current. The DECISION half
+    lives in `_max_model_weekly_from_acct`, which returns 0.0 under the same
+    condition so a stale reading never forces or refuses a swap.
+    """
+    return _pct_is_unknown(acct, "current_7d_pct")
+
+
+def _fmt_model_pct(acct: dict, val: float, color_on: bool = False) -> str:
+    """Render a per-model weekly % with the SAME staleness treatment the
+    aggregate 7d line uses (see `_fmt_pct`): a bare `NN%` only when freshly
+    observed, a dim trailing `~` (`NN%~`) when it's last-known-but-unreconfirmed
+    under token_stale et al. The `~` carries the "not reconfirmed" meaning even
+    with NO_COLOR / a non-color terminal — mirrors `_sl_mark_stale`. Mirroring
+    `_fmt_pct` guarantees a per-model number can never look more current than
+    the aggregate 7d it derives from."""
+    txt = f"{val:.0f}%"
+    if _model_pct_is_stale(acct):
+        marked = f"{txt}~"
+        return click.style(marked, dim=True) if color_on else marked
+    return txt
 
 
 def _fmt_duration(seconds: float) -> str:
