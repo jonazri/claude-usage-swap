@@ -6349,6 +6349,211 @@ def _diagnose_live_mount_creds(
     return None
 
 
+def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
+    """Human label for WHY a reachable account is NOT a valid premium swap target.
+
+    Used only to name the LOST capacity in the pre-emptive headroom SOS
+    (`_diagnose_premium_headroom`) — it does not drive the decision, it just
+    tells the operator which lever to pull ("rayi3 TOKEN_STALE = revive it").
+    The order mirrors the hard-then-soft filter order in `pick_swap_target`, and
+    every branch is computed with the SAME helper the picker uses so the label
+    can never disagree with the actual eligibility verdict.
+    """
+    # token_stale is the offline-spare signature from the 2026-07-05 incident:
+    # the account still LOOKS pickable (pick_swap_target does not filter it) but
+    # its usage is frozen and a swap onto it can fail. We exclude it in the
+    # counter, so it must be nameable here too.
+    if acct.get("token_stale"):
+        return "TOKEN_STALE"
+    if acct.get("token_expired"):
+        return "TOKEN_EXPIRED"
+    if acct.get("poll_error"):
+        return "POLL_ERROR"
+    if acct.get("rate_limited"):
+        return "RATE_LIMITED"
+    est = _account_estimated_effective_pct(acct, config)
+    if est >= config.get("never_swap_to_pct", 100):
+        return f"SATURATED ({est:.0f}%)"
+    hard_7d = _hard_7d_cap_for_config(config)
+    if acct.get("current_7d_pct", 0) >= hard_7d:
+        return f"over 7d cap ({acct.get('current_7d_pct', 0):.0f}% ≥ {hard_7d:.0f}%)"
+    if _max_model_weekly_from_acct(acct, config) >= _model_weekly_target_cap_for_config(config):
+        return "over per-model weekly cap"
+    if _target_would_immediately_re_trip(acct, config):
+        eff = _account_effective_pct(acct, config)
+        return f"at ladder step ({eff:.0f}% ≥ {acct.get('next_swap_at_pct', 50):.0f}%)"
+    return "unavailable"
+
+
+def _candidate_is_valid_premium_target(
+    leaver: str, candidate: str, state: dict, accounts: dict, premium_config: dict) -> bool:
+    """True iff `candidate` is a GENUINE swap target for a premium lane leaving
+    `leaver`, per the exact predicate the daemon's picker uses.
+
+    Rather than re-implement the eligibility filters (token_expired / poll_error
+    / rate_limited / saturation / 7d cap / per-model weekly cap / would-re-trip),
+    we hand `pick_swap_target` a two-account shim — {leaver (active), candidate}
+    under the PREMIUM pool config — so the only account it can possibly return is
+    `candidate`. If it returns it CLEANLY (no `[DEGRADED: ...]` note) the account
+    is really below every cap; a degraded pick means the picker only reached the
+    candidate via a fallback tier (no target below 7d cap, or all candidates
+    would re-trip their own ladder) — i.e. it is NOT below the caps that would
+    force it back off, so it is not a valid pre-emptive target. This matches the
+    "BELOW the caps that would force it off" definition in the SOS spec and is a
+    stricter cousin of Condition 2b's `"[DEGRADED:" ... "no targets below"` test.
+    token_stale is handled by the caller (pick_swap_target does not filter it).
+    """
+    shim = dict(state)
+    shim["accounts"] = {leaver: accounts[leaver], candidate: accounts[candidate]}
+    shim["active"] = leaver
+    tgt = pick_swap_target(shim, premium_config)
+    if tgt is None:
+        return False
+    if "[DEGRADED:" in tgt.reason:
+        return False
+    return tgt.name == candidate
+
+
+def _diagnose_premium_headroom(
+    state: dict,
+    config: dict,
+    occupied: dict[str, list[str]],
+    free_family_accounts: set[str],
+) -> SOSCondition | None:
+    """Pre-emptive alarm: premium lanes are live but the pool of accounts they
+    could swap ONTO has collapsed, so a lane will 429 the moment it caps (GH #150).
+
+    Why this exists separately from Condition 2b: 2b only fires once a lane is
+    ALREADY at/over its ladder step ("this lane cannot rotate NOW"). By then a
+    live premium session is often already wedged. This check fires EARLY — while
+    lanes are still climbing — the instant the count of VALID swap targets for
+    the premium pool drops to zero (URGENT) or to a single target while a lane is
+    already past the high-water step (WARNING). It is the exact 2026-07-05 shape:
+    the one spare account went token_stale, so when live premium sessions hit
+    their 5h caps the daemon had nowhere to swap and they 429'd.
+
+    Pure predicate (mirrors `_diagnose_live_mount_creds`): the impure inputs —
+    which accounts are LIVE-occupied (`occupied`, from /proc) and which of them
+    carry a FREE pooled login family (`free_family_accounts`, from the login
+    store on disk) — are computed by the caller and injected, so this function
+    is unit-testable with plain dicts and never touches the filesystem.
+
+    Returns one SOSCondition or None. None whenever there is headroom (>=1 valid
+    target and no hot lane), in any global-only / no-premium-lane setup, and in
+    every mode that does not serve slot lanes.
+    """
+    mode = config.get("mode", "global")
+    # Only lane-serving modes have per-slot lanes; global-only never fires.
+    if mode not in ("hybrid", "per_session"):
+        return None
+    accounts = state.get("accounts", {})
+
+    # 1. Identify LIVE PREMIUM lanes: occupied accounts with >=1 premium-pool slot.
+    #    Standard-pool lanes are excluded — they are not gated onto the scarce
+    #    Fable-clean accounts, so their target scarcity is a different question.
+    premium_lanes: dict[str, list[str]] = {}
+    for acct_name, slots in occupied.items():
+        prem = sorted(s for s in slots if _slot_pool(state, s, config) == "premium")
+        if prem:
+            premium_lanes[acct_name] = prem
+    if not premium_lanes:
+        return None  # no premium lanes to protect → nothing to warn about
+
+    # 2. Double-booking exclusion (GH #104), mirroring Condition 2b: an account
+    #    held by a LIVE mount cannot be a fresh swap target — a second live mount
+    #    on one refresh-token family clobbers it — UNLESS it has a FREE pooled
+    #    login family (then a lane can borrow a distinct family). In hybrid the
+    #    shared-mount active account is also a live holder.
+    shared_active = state.get("active")
+    live_held = set(occupied.keys()) | (
+        {shared_active} if (mode == "hybrid" and shared_active) else set())
+    if independent_logins_enabled(config):
+        blocking = {a for a in live_held if a not in free_family_accounts}
+    else:
+        blocking = set(live_held)
+
+    # 3. Count VALID targets and NAME the lost capacity. A candidate is any known
+    #    account that is not blocked by a live mount. For each, we drive the real
+    #    picker with a distinct premium-lane leaver (cap/headroom filters do not
+    #    depend on WHICH lane departs, so any premium leaver != candidate serves).
+    premium_config = _config_for_pool(config, "premium")
+    valid_targets: list[str] = []
+    lost: list[str] = []  # reachable-but-unusable accounts = visible lost capacity
+    for name, acct in sorted(accounts.items()):
+        if name in blocking:
+            continue  # held by a live mount, no free family → would double-book
+        leavers = [a for a in premium_lanes if a != name]
+        if not leavers:
+            continue  # the only premium lane IS this account; nothing swaps onto it
+        leaver = leavers[0]
+        if acct.get("token_stale"):
+            # Excluded up front: the picker would happily return a token_stale
+            # account (it filters token_EXPIRED, not stale), but a stale token is
+            # the offline-spare that caused the incident. Count it as lost, not valid.
+            lost.append(f"{name} TOKEN_STALE")
+            continue
+        if _candidate_is_valid_premium_target(leaver, name, state, accounts, premium_config):
+            valid_targets.append(name)
+        else:
+            lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+
+    n_lanes = len(premium_lanes)
+    m = len(valid_targets)
+
+    # High-water step: reuse thresholds.steps' top step (~90%), config-driven.
+    steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    top_step = max(steps) if steps else 90
+    hot_lanes = []  # premium lanes already past the high-water mark
+    for acct_name, prem_slots in sorted(premium_lanes.items()):
+        eff = _account_effective_pct(accounts.get(acct_name, {}), config)
+        if eff >= top_step:
+            hot_lanes.append((acct_name, prem_slots, eff))
+
+    # Nothing to say while there is genuine target-pool headroom AND no lane is
+    # already hot — this is the backward-compatible "no false positives when
+    # there IS headroom" guarantee.
+    if m >= 1 and not hot_lanes:
+        return None
+    if m > 1:
+        return None  # >1 valid target = healthy pool, even with a hot lane
+
+    lane_desc = "; ".join(
+        f"{a} ({'/'.join(premium_lanes[a])} @ {_account_effective_pct(accounts.get(a, {}), config):.0f}%)"
+        for a in sorted(premium_lanes)
+    )
+    lost_desc = (f" Lost capacity: {', '.join(lost)}." if lost else "")
+    levers = (
+        "Premium lanes rotate onto scarce Fable-clean accounts and the pool of viable "
+        "targets has collapsed — when a live lane hits its 5h/7d cap it will have nowhere "
+        "to swap and the session 429s. Levers: revive stale/offline accounts "
+        "(`cus relogin <acct>`, or wait for auto-refresh), add capacity (`cus add <name>`), "
+        "or reduce concurrent premium load (exit a premium session)."
+        + lost_desc
+        + f" Live premium lanes: {lane_desc}."
+    )
+
+    if m == 0:
+        # The pool of viable targets is fully collapsed. The next lane to cap
+        # 429s with no recourse — URGENT even before any lane is hot.
+        return SOSCondition(
+            severity="urgent",
+            summary=(f"{n_lanes} premium lane(s) live, 0 valid swap targets — "
+                     f"a premium lane will 429 when it caps"),
+            action=levers,
+            affected="system",
+        )
+    # m == 1 AND a lane is already past the high-water step: a single mistake
+    # (that last target caps, or the hot lane trips) away from the wall → WARNING.
+    hot_names = ", ".join(f"{a} @ {eff:.0f}%" for a, _s, eff in hot_lanes)
+    return SOSCondition(
+        severity="warning",
+        summary=(f"{n_lanes} premium lane(s) live, only 1 valid swap target — "
+                 f"lane(s) past {top_step:.0f}% ({hot_names}) are near the wall"),
+        action=levers,
+        affected="system",
+    )
+
+
 def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
     """Scan state + system for conditions requiring human intervention.
 
@@ -6555,6 +6760,25 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         f"5h/7d window to reset." + pool_hint),
                 affected=acct_name,
             ))
+
+    # Condition 2c (2026-07-05, GH #150): PRE-EMPTIVE premium-headroom alarm.
+    # Condition 2b above only fires once a lane is ALREADY at/over its ladder
+    # step — too late (a live premium session is usually wedged by then). This
+    # fires EARLY: while lanes are still climbing, the instant the count of VALID
+    # swap targets for the premium pool collapses. Exactly the 2026-07-05 shape —
+    # the one spare account went token_stale, so live premium sessions 429'd at
+    # their 5h caps with nowhere to swap. Impure inputs (which accounts are
+    # live-occupied, which carry a free pooled family) are gathered here and
+    # handed to the pure, unit-tested predicate. Only for lane-serving modes;
+    # the pure helper re-checks mode and premium-lane presence and returns None
+    # in every no-lane / global-only case.
+    if config.get("mode") in ("hybrid", "per_session"):
+        occ = occupied_slot_accounts(state)
+        free_fam = ({a for a in occ if has_free_login_family(a, state)}
+                    if independent_logins_enabled(config) else set())
+        headroom_cond = _diagnose_premium_headroom(state, config, occ, free_fam)
+        if headroom_cond is not None:
+            out.append(headroom_cond)
 
     # Condition 3b (GH #9): account stuck in 429 poll-backoff for > 30 min.
     # The polling endpoint is per-IP throttled; another machine hammering it
