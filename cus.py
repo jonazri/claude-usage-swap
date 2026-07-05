@@ -4307,6 +4307,39 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     if not target_cj.exists():
         raise FileNotFoundError(f"{target_cj} missing — re-run `cus init --force`")
 
+    # ---- GH #141 root-cause guard (early / no-partial-state path) ----
+    # The 2026-07-05 blanked-live-mount incident (3× in one day) traced to a
+    # swap installing the TARGET account's snapshot into the live mount even
+    # when that snapshot itself was BLANK — empty accessToken + expiresAt<=0
+    # (hypothesis a). A blanked live ~/.claude/.credentials.json logs out every
+    # bare session on the shared mount. Refusing HERE — before the swap journal,
+    # save-back, or any live write below — leaves the live mount bit-for-bit
+    # untouched (its current, valid creds survive), which is exactly the
+    # "keep the current valid creds rather than install a blank" contract. The
+    # daemon's picker moves to a different target on the next cycle.
+    #
+    # Scoped to the DEFAULT (non-pool) path: with independent logins off the
+    # install source below is always `target_creds` (the snapshot), so checking
+    # it here is precise. When the pool gate is on the install source is chosen
+    # later (a claimed login family, possibly valid even if the snapshot is not),
+    # so that path relies on the definitive guard right before the atomic_copy.
+    # Reuses `_live_mount_creds_invalid` — the same predicate the detector/SOS use.
+    if not independent_logins_enabled(config):
+        try:
+            _target_snapshot_creds = read_json(target_creds)
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(
+                f"refusing to swap to '{target_name}': its snapshot {target_creds} is unreadable "
+                f"({e}) — installing it would blank the live mount and lock out bare sessions "
+                f"(GH #141). Re-login (`cus relogin {target_name}`) or restore a backup "
+                f"(`cus restore-creds {target_name}`).")
+        if _live_mount_creds_invalid(_target_snapshot_creds):
+            raise RuntimeError(
+                f"refusing to swap to '{target_name}': its snapshot credentials are blank/expired "
+                f"(empty accessToken or expiresAt<=0) — installing them would blank the live mount "
+                f"and lock out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or "
+                f"restore a backup (`cus restore-creds {target_name}`).")
+
     if live_cj_path.exists():
         # Read the live .claude.json when present — its non-account keys (MCP
         # registrations, per-project state, sync'd from canonical) must survive
@@ -4559,6 +4592,28 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 f"Provision another: `cus login-mount {target_name}`.")
     if install_src is None:
         install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # ---- GH #141 root-cause guard (definitive install-point gate) ----
+    # This is THE line that writes creds to the live mount; every swap path
+    # (snapshot copy, claimed pool family, legacy per-slot login) funnels through
+    # it. Validate the actual bytes about to be installed and REFUSE to write a
+    # blank/expired payload, so no swap can ever leave the live mount logged out
+    # (GH #141). The early guard above already covers the default snapshot path
+    # with zero partial state; this backstops the pool paths (independent-login
+    # families) whose source is resolved only here. `live_creds_path` is still
+    # untouched at this point — the atomic_copy below is its first and only write
+    # — so raising keeps the mount's current, valid creds intact.
+    try:
+        _install_src_creds = read_json(install_src)
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(
+            f"refusing to install '{target_name}' creds: source {install_src} is unreadable "
+            f"({e}) — writing it would blank the live mount (GH #141).")
+    if _live_mount_creds_invalid(_install_src_creds):
+        raise RuntimeError(
+            f"refusing to install '{target_name}' creds: source {install_src.name} is blank/expired "
+            f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
+            f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
+            f"backup (`cus restore-creds {target_name}`).")
     atomic_copy(install_src, live_creds_path, mode=0o600)
     if claimed_family is not None:
         click.echo(f"creds-install: claimed pooled login {target_name}/{claimed_family} for {slot} "
@@ -6616,6 +6671,112 @@ def _diagnose_live_mount_creds(
             affected=active_account or "system",
         )
     return None
+
+
+def _newest_usable_creds_source(account_name: str) -> Path | None:
+    """Newest credential FILE for `account_name` whose payload is a usable OAuth
+    token, or None if nothing usable exists (GH #141 auto-heal source picker).
+
+    Searches, newest-first: the account's live snapshot `.credentials.json`, then
+    its rotated `.credentials.json.bak.*` generations (which are, by construction,
+    always OLDER than the snapshot — a backup is the pre-overwrite copy). The
+    snapshot is therefore the freshest candidate and is tried first. "Usable" is
+    the negation of `_live_mount_creds_invalid` — the exact predicate the swap
+    guard and the SOS detector use — so a source this returns is safe to install
+    into the live mount without re-blanking it. Unreadable / unparseable files
+    are skipped, not fatal.
+
+    This is the backup-selection half of `cus restore-creds <account> --live`,
+    factored so the daemon can pick a heal source without shelling out. It also
+    considers the snapshot itself (which `restore-creds` does not) because in the
+    observed incident the snapshot stayed HEALTHY while only the live file was
+    blanked — copying the snapshot back is then the direct, freshest heal.
+    """
+    candidates: list[Path] = []
+    snap = account_creds_path(account_name)
+    if snap.exists():
+        candidates.append(snap)
+    # list_creds_backups returns newest-first already; snapshot stays ahead of
+    # every backup since backups predate it.
+    candidates.extend(list_creds_backups(account_name))
+    for path in candidates:
+        try:
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue  # a corrupt candidate can't heal anything; try the next
+        if not _live_mount_creds_invalid(creds):
+            return path
+    return None
+
+
+def _auto_heal_live_mount(state: dict, config: dict, no_execute: bool = False) -> bool:
+    """Self-heal a blanked/invalid live shared mount in-daemon (GH #141).
+
+    In `global`/`hybrid` mode the live ~/.claude/.credentials.json is what BARE
+    sessions on the shared mount read. When it gets blanked (empty accessToken /
+    expiresAt<=0) every bare session locks out. Detection already exists
+    (`_diagnose_live_mount_creds`); this is the automatic REMEDY that used to
+    require a human running `cus restore-creds <active> --live` — the ask in
+    GH #141 ("make it never need a human").
+
+    Behavior — the in-daemon equivalent of `cus restore-creds <active> --live`:
+      * No-op unless the mount is actually blanked/invalid (idempotent; safe to
+        call every cycle — a healthy mount is never touched).
+      * Only runs in shared-mount-serving modes (global/hybrid). In per_session
+        the shared mount is observe-only/authless by design, so a blank there is
+        expected and must NOT be "healed" — matches `_diagnose_live_mount_creds`.
+      * Restores the ACTIVE account's newest USABLE credential source
+        (`_newest_usable_creds_source`: snapshot, else newest valid backup) into
+        the live file, with the SAME atomic-write + rotated-backup discipline as
+        `restore_creds_backup`'s --live install: back up the (blank) live file
+        first so the heal is itself reversible, then atomically copy.
+      * NEVER installs a blank (the source is validated by the picker) and never
+        clobbers a healthy mount (the invalid-check gates the whole thing).
+      * When NO usable source exists, does nothing and returns False, so the
+        URGENT re-login SOS in diagnose() still fires (genuine human needed).
+
+    Returns True iff it healed. `no_execute` makes it log the intended heal
+    without writing, for `cus daemon --once --no-execute` dry-runs.
+    """
+    if config.get("mode", "global") not in ("global", "hybrid"):
+        return False
+    active = state.get("active")
+    if not active:
+        return False  # no active account recorded → nothing authoritative to install
+    try:
+        live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+    except (json.JSONDecodeError, OSError):
+        live_creds = None  # unreadable == unusable, treat as blanked
+    if not _live_mount_creds_invalid(live_creds):
+        return False  # mount is healthy — no-op
+    source = _newest_usable_creds_source(active)
+    if source is None:
+        # No usable snapshot or backup anywhere: cannot self-heal without a
+        # browser re-login. Leave the blank in place so diagnose() surfaces the
+        # URGENT re-login SOS — the one case that still needs a human.
+        click.echo(f"  auto-heal: live shared mount is blanked but '{active}' has NO usable "
+                   f"credential backup — leaving it for the URGENT re-login SOS (GH #141)")
+        return False
+    if no_execute:
+        click.echo(f"  auto-heal (--no-execute): WOULD restore '{active}' creds from {source.name} "
+                   f"into the live shared mount (GH #141)")
+        return False
+    # Same discipline as restore_creds_backup(into_live=True): back up the live
+    # file (even blanked, it is one more recoverable generation) then atomic-copy
+    # the validated source over it. Only the live file is touched — the snapshot
+    # is a heal SOURCE here, never a write target, so a healthy snapshot is
+    # preserved untouched.
+    backup_credentials_file(CREDS_JSON)
+    atomic_copy(source, CREDS_JSON, mode=0o600)
+    msg = (f"live shared mount ~/.claude/.credentials.json was blanked/invalid (GH #141) — "
+           f"auto-restored '{active}' credentials from {source.name} into the live file; "
+           f"bare sessions on the shared mount are usable again without a human.")
+    click.echo(f"  AUTO-HEAL: {msg}")
+    try:
+        append_inbox("auto-heal", "blanked live shared mount self-healed (GH #141)", msg)
+    except OSError:
+        pass  # inbox is best-effort observability; never fail the heal over it
+    return True
 
 
 def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
@@ -10553,6 +10714,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         click.echo(f"startup swap-journal check skipped: {e}")
 
     def _emit_sos_after(state: dict, config: dict) -> None:
+        # GH #141 self-heal: BEFORE diagnosing, try to auto-restore a blanked
+        # live shared mount (global/hybrid only; no-op elsewhere or when healthy).
+        # Running it here — the one place every served-mount cycle path funnels
+        # through after the existing detection — means a healable blank never
+        # reaches the operator as an URGENT SOS: the heal fixes the live file and
+        # the diagnose() below then sees it valid. Only a mount with NO usable
+        # backup falls through to the URGENT re-login SOS (needs a human).
+        _auto_heal_live_mount(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
         maybe_write_sos(conditions, state)
         if conditions:
