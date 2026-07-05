@@ -9519,8 +9519,18 @@ def status() -> None:
     else:
         click.echo(f"Active account: {state['active']}")
     click.echo()
-    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
-    click.echo("-" * 104)
+    # Ladder steps are IDENTICAL across accounts — they're the config's
+    # thresholds.steps progression, not a per-account value — so printing the
+    # first step ("Next swap") on every row was pure noise. Show the whole
+    # ladder ONCE here as a legend; the per-row value only reappears below for
+    # an account whose next_swap_at_pct has advanced off the first step
+    # (mid-ladder / non-default), which genuinely IS per-account.
+    cfg_steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    first_step = cfg_steps[0] if cfg_steps else 50
+    click.echo("Ladder steps: " + " → ".join(f"{s}%" for s in cfg_steps))
+    click.echo()
+    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
+    click.echo("-" * 91)
     disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
         marker = " *" if name == state["active"] else ""
@@ -9549,7 +9559,13 @@ def status() -> None:
             if est - polled >= 1.0:
                 rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
                 est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
+        # Show next_swap_at_pct ONLY when it's advanced off the shared first
+        # ladder step (the legend above already prints that) — i.e. this account
+        # is mid-ladder / carries a non-default value, which is the only case
+        # worth a per-row callout.
+        nxt_val = a.get("next_swap_at_pct", first_step)
+        nxt_note = f"  [next-swap: {nxt_val:.0f}%]" if nxt_val != first_step else ""
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {status_col:<24} {last:<28}{nxt_note}{est_note}")
         # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
         # sub-line only for accounts that have any, sorted highest-first so a
         # model nearing its own weekly cap is the first thing the eye lands on.
