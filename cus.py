@@ -1285,6 +1285,43 @@ def has_free_login_family(account: str, state: dict) -> bool:
     return free_login_family(account, state) is not None
 
 
+def _free_family_count(account: str, state: dict) -> int:
+    """How many usable pooled families of `account` are NOT leased to a live slot
+    — i.e. how many ADDITIONAL live mounts the pool can back without a clobber,
+    beyond the ones already covered. The counting twin of free_login_family
+    (which returns just the lowest free one)."""
+    leased = leased_families(account, state)
+    return sum(1 for fam in list_login_families(account) if fam not in leased)
+
+
+def _distinct_family_capacity(account: str, state: dict, config: dict | None, slot: str | None) -> int:
+    """Max concurrent live mounts `account` can back WITHOUT a GH #104 token-family
+    clobber: one plain-snapshot 'primary' mount IF the account isn't already live
+    anywhere, PLUS one per FREE pooled login family (plus a legacy per-slot
+    independent login for this slot, if present).
+
+    This is the invariant EVERY daemon swap path must respect: never create more
+    live mounts of an account than it has distinct login families to cover them,
+    or the mounts share one single-use OAuth refresh token and the next rotation
+    logs one out. Both the proactive ladder and the reactive-429 path consult this
+    before committing a same-cycle move (see decide_slot_swaps /
+    check_rate_limit_reactive_per_session) so an over-subscription is HELD at the
+    decision layer with a clear log line, not left to the execution layer's
+    downstream 'pool exhausted' refusal (which strands the lane just the same,
+    only noisier). Incident 2026-07-05: the reactive path piled 6 lanes onto rayi1
+    (2 families) because nothing counted families before committing.
+
+    Gate off (default, no pool): capacity is 1 (or 0 if the account is already
+    live on a mount) — i.e. 'never double-book', the pre-pool #104 rule, bit-for-
+    bit unchanged."""
+    cap = 0 if _account_held_by_other_live_mount(state, account, slot) else 1
+    if independent_logins_enabled(config):
+        cap += _free_family_count(account, state)
+        if slot is not None and has_independent_login(account, slot):
+            cap += 1
+    return cap
+
+
 def _oauth_refresh_grant(refresh_token: str) -> tuple[str, dict | None]:
     """Probe a refresh token's liveness via the OAuth refresh grant (#127).
 
@@ -4842,6 +4879,14 @@ def decide_swap(
     agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
+        # Preserve the FORCING caps before the display reassignment below stomps
+        # `hard_7d_cap`. The anti-pingpong guard (further down) compares the chosen
+        # target against these swap-AWAY caps — the ones that actually tripped —
+        # NOT the target-side caps pick_swap_target filters arrivals with (those
+        # can sit higher, which is how a target at/over the forcing cap slips
+        # through the picker un-degraded, PR #139 ping-pong).
+        _forcing_agg_cap = hard_7d_cap
+        _forcing_model_cap = model_cap
         # For the operator-facing messages below: show whichever signal tripped
         # (the model % when only the model cap tripped, else the aggregate).
         cur_7d = cur_7d if agg_tripped else cur_model
@@ -4896,6 +4941,49 @@ def decide_swap(
             )
             click.echo(f"  {msg}")
             _note("hard_7d_cap_degraded", "hold", msg)
+            return None
+        # ---- Anti-pingpong guard (fix 2026-07-05, PR #139) ----
+        # A hard-cap FORCED swap must land on an account that GENUINELY RELIEVES
+        # the cap forcing us — i.e. is STRICTLY BELOW that cap on the same
+        # dimension. A lateral move onto an equally-or-more-capped account relieves
+        # nothing and bounces straight back next cycle. Live trace: `default` at
+        # Fable 100% (>= 97 cap) swaps toward its best below-cap target (rayi1),
+        # but that move FAILS (pool exhausted, no free login family — see the
+        # over-subscription fix in this same PR); with rayi1 unreachable, the
+        # picker's headroom fallback returned rayi2 at Fable 97% (== cap → also
+        # capped), so default→rayi2→default oscillated forever. min_seconds_between_*
+        # only throttles the rate, it doesn't stop the loop.
+        #
+        # The existing "[DEGRADED: no targets below 7d cap]" check above catches
+        # only the AGGREGATE fallback, and only when the picker itself marked the
+        # pick degraded. It misses the per-model case because pick_swap_target
+        # filters ARRIVALS with the target-side model cap (target_cap_pct), which
+        # can sit ABOVE the swap-away cap_pct that tripped here — so rayi2 at 97
+        # passes the picker un-degraded even though it clears nothing. This guard
+        # compares the chosen target's value on the FORCING dimension directly
+        # against the forcing cap, independent of annotation wording, covering both
+        # the aggregate hard_7d_cap and the per-model weekly cap. Boundary:
+        # target_pct >= cap is NOT relief (rayi2 at exactly 97 is rejected); only a
+        # STRICTLY-below-cap target is a genuine escape. When both signals tripped,
+        # the target must clear BOTH. If nothing reachable clears the cap, HOLD and
+        # let SOS surface the all-capped condition (holding on the current capped
+        # account is strictly no worse than a churning lateral move). Backward-
+        # compatible: `_max_model_weekly_from_acct` is 0.0 with the per-model gate
+        # off, so that branch is inert on unmodified installs.
+        target_acct = state["accounts"].get(target.name, {})
+        capped_dims: list[str] = []
+        if agg_tripped and target_acct.get("current_7d_pct", 0.0) >= _forcing_agg_cap:
+            capped_dims.append(f"7d {target_acct.get('current_7d_pct', 0.0):.0f}% >= {_forcing_agg_cap:.0f}%")
+        if model_tripped and _max_model_weekly_from_acct(target_acct, config) >= _forcing_model_cap:
+            capped_dims.append(f"model {_max_model_weekly_from_acct(target_acct, config):.0f}% >= {_forcing_model_cap:.0f}%")
+        if capped_dims:
+            gate_word = "hard_7d_cap" if agg_tripped else "per-model weekly"
+            shown_cap = _forcing_agg_cap if agg_tripped else _forcing_model_cap
+            msg = (f"hold {current}: all reachable targets at/over the {gate_word} cap "
+                   f"({shown_cap:.0f}%) — swapping wouldn't relieve it (anti-pingpong); "
+                   f"best target '{target.name}' still capped [{'; '.join(capped_dims)}]")
+            click.echo(f"  {msg}")
+            _note("hard_cap_pingpong", "hold", msg)
             return None
         reason = f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}"
         _note("hard_7d_cap", "swap", reason)
@@ -5341,6 +5429,11 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     # Seed with the cross-mount exclusions so BOTH the primary pick (via the
     # per-group accounts shim below) and the fan-out re-pick avoid them.
     taken: set[str] = set(exclude)
+    # Per-cycle family-consumption tally (fix 2026-07-05): how many moves this
+    # round have already been aimed at each target, so a same-cycle pool double-
+    # book can't exceed the target's distinct login families (see the can_pool
+    # gate below). Mirrors the reactive path's round_claims.
+    round_claims: dict[str, int] = {}
     locked = _locked_slots(config)
     occupied = occupied_slot_accounts(state)
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
@@ -5413,9 +5506,16 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 # Hence "healthy" gate on the retry: a re-pick that would
                 # re-trip on arrival loses to a pooled family on the account
                 # the strategy actually scored best.
+                # can_pool is capacity-aware (2026-07-05): the target may be
+                # double-booked only while it still has a DISTINCT login family
+                # free AFTER the moves already queued this cycle. Checking the
+                # static has_free_login_family (as before) let several slots on
+                # one hot account fan out onto a SINGLE free family in the same
+                # cycle — the GH #104 clobber (2026-07-05 rayi1 pile-up). Gate
+                # off ⇒ capacity 0 ⇒ can_pool False ⇒ HOLD, exactly as before.
                 can_pool = (independent_logins_enabled(cfg_view)
-                            and (has_free_login_family(target, state)
-                                 or has_independent_login(target, slot_name)))
+                            and round_claims.get(target, 0) < _distinct_family_capacity(
+                                target, state, cfg_view, slot_name))
                 shim2 = dict(shim)
                 shim2["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
                 retry = pick_swap_target(shim2, cfg_view)
@@ -5439,6 +5539,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                                f"(won't double-book '{target}' onto a second live mount — GH #104)")
                     continue
             taken.add(target)
+            round_claims[target] = round_claims.get(target, 0) + 1
             moves.append({
                 "slot": slot_name, "from": acct_name, "to": target,
                 "gate": decision.gate, "tier": decision.tier,
@@ -5500,6 +5601,14 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
     # Seed with cross-mount exclusions (GH #104): even an urgent 429 escape must
     # not land on an account another live mount holds.
     taken: set[str] = set(exclude_accounts or ())
+    # Per-cycle family-consumption tally (fix 2026-07-05): how many moves this
+    # round have already been aimed at each target. A target may be picked only
+    # while it still has a DISTINCT login family free AFTER the moves already
+    # queued this cycle (each will claim one). Without this, two 429s in one cycle
+    # both saw the same single free family in the static snapshot and both
+    # committed onto it — the exact GH #104 clobber the pool exists to prevent
+    # (execution refuses the 2nd, but noisily, and the lane is stranded anyway).
+    round_claims: dict[str, int] = {}
     for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
@@ -5514,13 +5623,21 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         # Keep the slot's own account present (pick excludes the active anyway);
         # drop this-round targets + cross-mount exclusions.
         drop = {n for n in taken if n != acct}
-        # Independent-login POOL rescue (2026-07-03): a 429'd slot may escape
-        # onto a held account that has a FREE pooled family — the swap claims a
-        # distinct family (no clobber). Same relaxation as the proactive ladder
-        # path; execution does the claim + refuses if the pool is exhausted.
-        # Gated on use_independent_logins (off ⇒ drop unchanged).
+        # Independent-login POOL rescue (2026-07-03), now with same-round capacity
+        # accounting (2026-07-05): a 429'd slot may escape onto a held account only
+        # while that account still has a DISTINCT login family free AFTER the moves
+        # already queued this cycle — each queued move onto it will claim one. The
+        # swap installs that distinct family (no clobber). A held account whose
+        # remaining capacity has reached zero stays EXCLUDED, so the picker never
+        # returns it and the lane holds instead of over-subscribing. Same relaxation
+        # as the proactive ladder path; execution does the claim + refuses if the
+        # pool turns out exhausted. Gated on use_independent_logins: off ⇒ no
+        # families ⇒ held accounts have capacity 0 ⇒ drop is unchanged (never
+        # double-book — the pre-pool #104 rule), so gate-off behavior is identical.
         if drop and independent_logins_enabled(config):
-            drop = {x for x in drop if not has_free_login_family(x, state)}
+            drop = {x for x in drop
+                    if _distinct_family_capacity(x, state, config, slot_name)
+                       - round_claims.get(x, 0) <= 0}
         shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in drop}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
@@ -5529,6 +5646,22 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         target = pick_swap_target(shim, _config_for_pool(config, pool))
         if target is None:
             continue  # nowhere safe to go; SOS handles the all-full case
+        # Authoritative capacity HOLD (fix 2026-07-05, GH #104 reactive over-
+        # subscribe): never commit a move that would put more concurrent live
+        # mounts on `target` than it has distinct login families to cover them.
+        # The un-drop above already keeps exhausted HELD accounts out of the
+        # candidate pool, so pick rarely returns one — but this also catches an
+        # unheld account picked twice in one cycle, and makes the reactive path
+        # degrade with a clear HOLD line rather than relying on the execution
+        # layer's downstream 'pool exhausted' refusal (which strands the 429'd
+        # lane on its hot account just the same, only noisier). Incident 2026-07-05:
+        # 6 lanes landed on rayi1's 2 families and the shared token diverged.
+        if round_claims.get(target.name, 0) >= _distinct_family_capacity(target.name, state, config, slot_name):
+            click.echo(f"  reactive-429 on {slot_name}: HOLDING on '{acct}' — no distinct login "
+                       f"family free for '{target.name}' (a 2nd live mount would clobber its shared "
+                       f"token family — GH #104). Provision one: `cus login-mount {target.name}`")
+            continue
+        round_claims[target.name] = round_claims.get(target.name, 0) + 1
         taken.add(target.name)
         moves.append({
             "slot": slot_name, "from": acct, "to": target.name,
@@ -5671,12 +5804,32 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     """
     _slot_saveback_and_gc(state, config, no_execute)
 
+    # Cross-mount exclusions (GH #104), fix 2026-07-05. In per_session mode every
+    # live slot holds its own account, and no lane may move onto an account ANOTHER
+    # live slot already holds — two mounts on one account rotate its single-use
+    # OAuth refresh token and log one out. Hybrid mode has always computed and
+    # passed this exclusion (see _hybrid_cycle's exclude_for_slots); per_session —
+    # the PRIMARY live mode — never did, so decide_slot_swaps and
+    # check_rate_limit_reactive_per_session ran with an EMPTY exclusion set. Their
+    # #104 clobber guards only fire for an account already in `taken`, so with an
+    # empty seed they never engaged for accounts held by OTHER live slots: the
+    # first lane to best-target a low-usage account already live elsewhere sailed
+    # straight past the HOLD/pool-rescue logic into a plain double-book. That let
+    # the reactive-429 and ladder paths pile several lanes onto one account past
+    # its login families — the 2026-07-05 rayi1 pile-up (6 lanes, 2 families →
+    # the shared refresh token diverged and clobbered the losers, GH #104). Seed
+    # the exclusion exactly as hybrid does so both paths' pool-rescue/HOLD logic
+    # engages. Unconditional (not gated on the pool feature), matching hybrid: with
+    # the pool off it simply excludes every already-live account (never double-book).
+    exclude_for_slots = _live_slot_accounts(state)
+
     # Urgent reactive-429 moves preempt ladder moves (same precedence as the
     # global cycle's step 0).
-    moves = check_rate_limit_reactive_per_session(state, config)
+    moves = check_rate_limit_reactive_per_session(state, config, exclude_accounts=exclude_for_slots)
     traces: dict = {}
     if not moves:
-        moves = decide_slot_swaps(state, config, usage_by_account, traces)
+        moves = decide_slot_swaps(state, config, usage_by_account, traces,
+                                  exclude_accounts=exclude_for_slots)
 
     # Persist usage + 429 watermark + gc'd slots BEFORE acting, so a crash
     # mid-move leaves valid state (same ordering as the global path).
@@ -8906,6 +9059,323 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+# --------------------------------------------------------------------------
+# `cus sessions` — one-shot per-pane → slot → account → binding-limit view
+# --------------------------------------------------------------------------
+# Motivation (GH #137): diagnosing "3 panes maxed out" used to take ~6 manual
+# probes (status, slot list, force-poll, /proc greps) AND `cus status`'s Live-
+# sessions column showed the WRONG account — it printed the sessions.log launch-
+# time label (or, in background/hybrid mode, machine_active) for panes that were
+# actually mounted on a different slot's account. This command resolves the TRUE
+# mount from live /proc ground truth and folds usage + pool + the binding
+# constraint into a single read-only table. See docs/DIAGNOSTICS.md.
+
+
+def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
+    """Plain-words BINDING constraint for a lane's account under its pool.
+
+    Returns (severity, text) with severity in {"blocked", "warn", "ok"}:
+      - "blocked": the lane cannot make progress on some axis right now — 5h/7d
+        saturated, a dead/expired token, or (premium pool only) a per-model
+        weekly cap over the gate. This is the wall a maxed-out pane is hitting.
+      - "warn": at/over a ladder step — the daemon wants to swap this lane away
+        soon, but it still works right now.
+      - "ok": headroom on every axis the config enforces.
+
+    Two-dimensional exhaustion (see docs/DIAGNOSTICS.md): the 5h/7d windows and
+    the per-model weekly budget are INDEPENDENT walls. A premium lane under its
+    5h cap can still be blocked by a Fable weekly cap; a STANDARD lane ignores
+    the model gate entirely (its work doesn't touch the exhausted model — see
+    _config_for_pool), so we surface the number but say it's ignored rather than
+    hide it. Pure function of (account-state dict, pool, config) so the daemon-
+    less unit tests can exercise every branch without /proc or tmux.
+    """
+    # Blocker flags first — a stale/expired token means the stored % may be a
+    # lie (last-known-good, possibly hours old), so the token state IS the
+    # binding fact, not whatever number happens to be cached.
+    if acct.get("token_expired"):
+        return ("blocked", "token expired (no live creds — relogin needed)")
+    if acct.get("poll_error"):
+        return ("blocked", "poll error (usage unknown)")
+    if acct.get("rate_limited"):
+        return ("blocked", "rate-limited (429)")
+
+    five = acct.get("current_5h_pct", 0.0) or 0.0
+    seven = acct.get("current_7d_pct", 0.0) or 0.0
+    # Effective % honors thresholds.{five_hour,seven_day} exactly like the
+    # ladder logic (current_max_pct / _account_effective_pct), so this reads the
+    # same window the daemon actually swaps on. Label it by whichever window is
+    # the higher of the two enabled ones for an at-a-glance "which wall".
+    eff = _account_effective_pct(acct, config)
+    win = "5h" if five >= seven else "7d"
+
+    # 5h/7d hard wall — never_swap_to_pct is the "fully saturated, do not use"
+    # line (default 100). At/over it the lane is churning context and re-tripping
+    # 429s; that's the maxed-out signature the operator is chasing.
+    full_line = config.get("never_swap_to_pct", 100)
+    if eff >= full_line:
+        return ("blocked", f"{win} {eff:.0f}% (hard cap {full_line:.0f}%)")
+
+    # Per-model weekly gate. Only PREMIUM lanes honor it; standard lanes treat a
+    # model-exhausted account as still usable (aggregate headroom serves
+    # standard-model work). Gate must be enabled in config for this to bind.
+    gate_enabled = config.get("per_model_weekly", {}).get("gate_enabled", False)
+    pm = acct.get("per_model_weekly_pct") or {}
+    top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
+    model_cap = _model_weekly_cap_for_config(config)
+    if gate_enabled and top_model is not None and top_pct >= model_cap:
+        if pool == "standard":
+            # Surface the number but make clear it does NOT bind this lane.
+            return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
+        return ("blocked", f"weekly-{top_model} {top_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
+
+    # Graduated ladder pressure (swap-away, not a hard block). The highest
+    # tripped step is what the daemon reacts to.
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    tripped = [s for s in steps if eff >= s]
+    if tripped:
+        return ("warn", f"{win} {eff:.0f}% >= ladder step {max(tripped):.0f}% (swap-away due)")
+
+    # Headroom on every enforced axis.
+    txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
+    if pm:
+        txt += f", {top_model} {top_pct:.0f}%"
+        if gate_enabled and pool == "standard":
+            txt += " [std: model gate off]"
+    txt += ")"
+    return ("ok", txt)
+
+
+def _resolve_mount_account(mount: str | None, state: dict) -> tuple[str | None, str]:
+    """Resolve a live mount's TRUE account + the evidence source used.
+
+    Ground-truth ladder for GH #137, strongest evidence first:
+      1. on-disk oauthAccount — the slot/account dir's .claude.json is what
+         Claude Code actually authenticates as, independent of BOTH sessions.log
+         (launch-time label) and state.slots (the daemon's record, which itself
+         lags an in-place move by up to a cycle). Reverse-mapped to an account
+         name via each account's canonical snapshot identity.
+      2. state.slots[mount].account — the daemon's recorded occupant, used when
+         the on-disk identity matches no known account (e.g. a pooled backup
+         login the snapshots don't cover).
+      3. account-<name> mount — a relogin-style launch where the dir IS the
+         account name.
+
+    Returns (account_or_None, source) where source is one of
+    {"disk-identity", "state-slot", "account-dir", "unresolved"}.
+    """
+    if not mount:
+        return (None, "unresolved")
+    if mount.startswith("account-"):
+        # A relogin/login-mount launch: the dir name is the account. Still
+        # prefer the on-disk identity if it resolves (catches a mislabeled dir).
+        disk = _account_for_mount_identity(slot_path(mount), state)
+        if disk:
+            return (disk, "disk-identity")
+        return (mount.removeprefix("account-"), "account-dir")
+    # Slot mount: on-disk identity wins, else the daemon's recorded occupant.
+    disk = _account_for_mount_identity(slot_path(mount), state)
+    if disk:
+        return (disk, "disk-identity")
+    recorded = (state.get("slots", {}).get(mount, {}) or {}).get("account")
+    if recorded:
+        return (recorded, "state-slot")
+    return (None, "unresolved")
+
+
+def _account_for_mount_identity(mount: Path, state: dict) -> str | None:
+    """Reverse-map a live mount's ON-DISK oauthAccount to an account name.
+
+    The slot dir's .claude.json oauthAccount is the authoritative account
+    identity (the 2026-07-01 duplicate-identity incident proved meta.yaml can
+    lie while oauthAccount holds truth). Matches on accountUuid/emailAddress
+    against each account's canonical snapshot. Returns None when the mount has
+    no readable identity or nothing matches (a login family the snapshots don't
+    cover — the caller falls back to state.slots)."""
+    cj = mount / ".claude.json"
+    if not cj.exists():
+        return None
+    try:
+        ident = _identity_fields(read_json(cj))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not ident:
+        return None
+    for name in state.get("accounts", {}):
+        if _identities_match(ident, _dir_identity(name)) is True:
+            return name
+    return None
+
+
+def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[dict]:
+    """Assemble display rows from already-resolved sessions. PURE (no I/O).
+
+    Each `resolved` entry carries the /proc-resolved facts the command gathered:
+      {session_id, pane, cwd, logged_account, mount, resolved_account, source}
+    where `mount` is 'slot-N'/'account-X'/None, `logged_account` is the
+    sessions.log launch-time label, and `resolved_account` is the TRUE account
+    from _resolve_mount_account. Factored out so the drift + binding logic is
+    unit-testable without tmux/proc (see tests/test_sessions_view.py).
+    """
+    default_pool = config.get("per_session", {}).get("default_pool", "premium")
+    rows: list[dict] = []
+    for r in resolved:
+        mount = r.get("mount")
+        is_slot = bool(mount) and mount.startswith(SLOT_PREFIX)
+        resolved_account = r.get("resolved_account")
+        acct = state.get("accounts", {}).get(resolved_account, {}) if resolved_account else {}
+        pool = _slot_pool(state, mount, config) if is_slot else None
+
+        if resolved_account and acct:
+            sev, binding = _session_binding(acct, pool or default_pool, config)
+        elif resolved_account:
+            sev, binding = ("unknown", "no usage state for resolved account")
+        else:
+            sev, binding = ("unknown", "mount unresolved (bare/global — observe-only)")
+
+        # DRIFT (GH #137): sessions.log's launch-time label disagrees with the
+        # account the live mount actually resolves to. Only meaningful when we
+        # resolved a real mount — a bare/global pane has no mount to compare and
+        # "follows global creds" by design, which is not the #137 defect.
+        logged = r.get("logged_account")
+        drift = bool(mount) and bool(resolved_account) and logged != resolved_account
+
+        rows.append({
+            "session_id": r.get("session_id"),
+            "pane": r.get("pane"),
+            "cwd": r.get("cwd"),
+            "mount": mount,
+            "slot": mount if is_slot else None,
+            "bare": mount is None,
+            "pool": pool,
+            "logged_account": logged,
+            "account": resolved_account,
+            "resolution_source": r.get("source", "unresolved"),
+            "drift": drift,
+            "five_h_pct": acct.get("current_5h_pct"),
+            "seven_d_pct": acct.get("current_7d_pct"),
+            "per_model_weekly": dict(acct.get("per_model_weekly_pct") or {}),
+            "binding_severity": sev,
+            "binding": binding,
+        })
+    return rows
+
+
+def detect_slot_orphans(slot_pids: dict[str, int], panes_on_slot: set) -> list[dict]:
+    """Slots holding live /proc pids that NO live tmux pane owns. PURE.
+
+    Two shapes of the same leak (see docs/DIAGNOSTICS.md): a slot whose owning
+    pane was closed while a subprocess kept the mount's CLAUDE_CONFIG_DIR alive,
+    or a stray process carrying a slot's config dir with no pane at all. Both
+    read as "the mount is in use, but nobody is driving it" — the slot won't be
+    reaped by idle-gc and won't accept a fresh session cleanly.
+
+    `slot_pids` is {slot_name: pid_count} for slots with >=1 live pid;
+    `panes_on_slot` is the set of slot names a live pane currently resolves to.
+    """
+    return [{"slot": s, "pids": n}
+            for s, n in sorted(slot_pids.items()) if s not in panes_on_slot]
+
+
+@cli.command(name="sessions")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+def sessions_cmd(as_json: bool) -> None:
+    """Per-pane -> slot -> account -> binding-limit view of live sessions.
+
+    Resolves each live Claude pane's TRUE account from the live mount (/proc
+    ground truth), NOT the stale sessions.log launch-time label, and shows in
+    one shot: the slot it's mounted in, that account's 5h/7d/per-model usage,
+    the slot's pool, and the BINDING constraint in plain words. Flags DRIFT
+    (sessions.log account disagrees with the resolved mount — GH #137) and
+    ORPHAN slots (live pids, no owning pane). READ-ONLY.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    state = read_json(STATE_JSON)
+    config = load_config()
+    color_on = sys.stdout.isatty() and not as_json
+
+    # Resolve every live session's TRUE mount from /proc, then hand the pure
+    # facts to build_session_rows. pane_mount_name is the same primitive `status`
+    # per_session mode trusts (~8886) — reused here across ALL modes, which is
+    # the actual #137 fix (the non-per_session branches ignored the mount).
+    live = find_live_sessions()
+    resolved_inputs: list[dict] = []
+    panes_on_slot: set[str] = set()
+    for s in live:
+        mount = pane_mount_name(s.pane)
+        if mount and mount.startswith(SLOT_PREFIX):
+            panes_on_slot.add(mount)
+        acct, source = _resolve_mount_account(mount, state)
+        resolved_inputs.append({
+            "session_id": s.session_id,
+            "pane": s.pane,
+            "cwd": s.cwd,
+            "logged_account": s.account,
+            "mount": mount,
+            "resolved_account": acct,
+            "source": source,
+        })
+    rows = build_session_rows(resolved_inputs, state, config)
+
+    # Orphan sweep: slots with live pids that no live pane resolves to.
+    slot_pids: dict[str, int] = {}
+    for d in list_slot_dirs():
+        pids = mount_pids(d)
+        if pids:
+            slot_pids[d.name] = len(pids)
+    orphans = detect_slot_orphans(slot_pids, panes_on_slot)
+
+    if as_json:
+        click.echo(json.dumps({
+            "mode": config.get("mode", "global"),
+            "active": state.get("active"),
+            "sessions": rows,
+            "orphans": orphans,
+        }, indent=2, default=str))
+        return
+
+    mode = config.get("mode", "global")
+    click.echo(f"Mode: {mode}   Machine-active (bare-launch) account: {state.get('active', '?')}")
+    click.echo()
+    if not rows:
+        click.echo("No live Claude sessions detected.")
+    else:
+        click.echo(f"Live sessions ({len(rows)}):")
+        for r in rows:
+            sid = (r["session_id"] or "????????")[:8]
+            where = r["slot"] or (r["mount"] or click.style("bare", fg="yellow"))
+            pool = f" [{r['pool']}]" if r["pool"] else ""
+            acct = r["account"] or "?"
+            # Line 1: identity + where mounted.
+            drift_tag = ""
+            if r["drift"]:
+                drift_tag = click.style(f"  DRIFT: sessions.log said '{r['logged_account']}'", fg="red", bold=True)
+            click.echo(f"  {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
+            # Line 2: usage numbers.
+            five = "?" if r["five_h_pct"] is None else f"{r['five_h_pct']:.0f}%"
+            seven = "?" if r["seven_d_pct"] is None else f"{r['seven_d_pct']:.0f}%"
+            pm = r["per_model_weekly"]
+            pm_txt = ("  " + " ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))) if pm else ""
+            click.echo(f"            5h={five:<5} 7d={seven:<5}{pm_txt}")
+            # Line 3: the binding constraint, colored by severity.
+            sev = r["binding_severity"]
+            color = {"blocked": "red", "warn": "yellow", "ok": "green"}.get(sev)
+            label = click.style(r["binding"], fg=color) if (color_on and color) else r["binding"]
+            click.echo(f"            -> {label}")
+            click.echo(f"            cwd={r['cwd']}")
+    click.echo()
+
+    if orphans:
+        click.echo(click.style(f"Orphan slots ({len(orphans)}) — live pids, no owning pane:", fg="yellow"))
+        for o in orphans:
+            click.echo(f"  {o['slot']:<10} {o['pids']} pid(s) held; no live tmux pane resolves here")
+        click.echo("  -> a closed pane left a subprocess holding the mount, or a stray CLAUDE_CONFIG_DIR process.")
+        click.echo("     idle-gc won't reap it and a fresh session won't mount cleanly. Investigate the pids.")
+        click.echo()
 
 
 @cli.command(name="check-orchestrate")
