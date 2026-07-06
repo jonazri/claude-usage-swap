@@ -442,6 +442,34 @@ def test_standard_pool_falls_back_to_safe_account_when_model_exhausted_target_de
         env.restore()
 
 
+def test_non_gated_install_does_not_reserve_model_exhausted_targets():
+    # REQUIRED-FIX regression (reviewer 2026-07-06): reserve_safe_for_premium
+    # must be INACTIVE when the per-model gate is off (a non-gated install, the
+    # default). The key lives only in the standard-pool VIEW that _config_for_pool
+    # builds for a GATED install — it is not in DEFAULT_CONFIG — so a non-gated
+    # install never steers toward model-exhausted accounts. pick_swap_target here
+    # must pick by usage (gamma, lowest), NOT the model-exhausted beta.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        # beta: model-exhausted (Fable=100) but aggregate-healthy — a non-gated
+        # install must NOT prefer it just because its per-model week is spent.
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 12.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        # gamma: Fable-fresh and lowest usage — the correct lowest_usage pick.
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 8.0,
+                                           "per_model_weekly_pct": {"Fable": 10.0}})
+        # _config() is a non-gated install (per_model_weekly.gate_enabled False).
+        target = cus.pick_swap_target(state, _config())
+        assert target is not None
+        assert target.name == "gamma", f"non-gated install must not reserve; got {target.name}"
+    finally:
+        env.restore()
+
+
 def test_reserve_skips_would_re_trip_model_spent_target():
     # REQUIRED-FIX regression (reviewer 2026-07-06): the reserve guard is
     # `7d-under-cap AND not-would-immediately-re-trip`, not 7d-only. A standard

@@ -873,6 +873,40 @@ def test_sos_starvation_message_names_per_model_cap_when_premium_gate_blocks():
         env.restore()
 
 
+def test_sos_starvation_not_mislabeled_per_model_when_aggregate_saturated():
+    """REQUIRED-FIX regression (reviewer 2026-07-06): with the per-model gate ON,
+    a lane starved because every target is over the 7d hard cap (aggregate
+    saturation) must be reported as 7d/saturation — NOT mislabeled per-model.
+    The per-model branch fires only when the standard-pool retry finds a CLEAN
+    (non-degraded) target, i.e. aggregate headroom genuinely remains; here the
+    standard retry can only return a degraded over-cap target, so it must not."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.make_slot("alpha", live=True)   # lane; beta idle (NOT held)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"next_swap_at_pct": 50, "current_5h_pct": 100.0, "current_7d_pct": 20.0})
+        # beta over the 80% 7d hard cap: even the standard-pool retry can only
+        # return a DEGRADED (over-cap) target, so the blocker is aggregate
+        # saturation, not the per-model gate — despite the gate being ON.
+        state["accounts"]["beta"].update({"next_swap_at_pct": 50, "current_5h_pct": 0.0, "current_7d_pct": 85.0,
+                                           "per_model_weekly_pct": {"Fable": 100.0}})
+        cus.save_state(state)
+        state = cus.load_state()
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "smart",
+            "smart_strategy": {"hard_7d_cap_pct": 80},
+            "per_model_weekly": {"gate_enabled": True, "models": ["Fable"], "cap_pct": 97}})
+
+        starved = [c for c in cus.diagnose(state, cfg)
+                   if "with no swap target" in c.summary and "alpha" in c.summary]
+        assert starved, [c.summary for c in cus.diagnose(state, cfg)]
+        action = starved[0].action
+        assert "per-model" not in action and "Fable" not in action, action
+        assert ("7d" in action or "saturated" in action), action
+    finally:
+        env.restore()
+
+
 # --------------------------------------------------------------------------
 # Provisioning command (P2): `cus login-mount <account>` account-keyed, repeatable
 # --------------------------------------------------------------------------

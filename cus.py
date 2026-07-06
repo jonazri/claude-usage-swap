@@ -620,10 +620,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # that level) while the aggregate-7d cap keeps its own value — lets
         # "swap when Fable hits 90%" coexist with a lower aggregate ceiling.
         "cap_pct": None,
-        # When a STANDARD slot ignores the per-model gate, prefer accounts that
-        # are already model-exhausted so Fable-safe accounts stay available for
-        # premium slots. Inactive unless gate_enabled is true in the base config.
-        "reserve_safe_for_premium": True,
+        # Standard-pool lanes of a GATED install prefer accounts whose per-model
+        # week is already spent, so Fable-fresh accounts stay available for
+        # premium lanes. Deliberately NOT set here: it is injected (default True)
+        # by _config_for_pool ONLY into the standard-pool VIEW, which exists only
+        # when the base gate is enabled — so a non-gated install (gate off,
+        # default) never activates it, matching "inactive unless gate_enabled".
+        # Opt a gated install's standard lanes out with
+        # per_model_weekly.reserve_safe_for_premium: false.
     },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
@@ -8083,10 +8087,15 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                              "(`cus login-mount <account>`) so this lane can borrow it."
                              if independent_logins_enabled(config) else "")
             elif (_per_model_weekly_gate(config)[0]
-                  and pick_swap_target(shim, _config_for_pool(config, "standard")) is not None):
+                  and (_std := pick_swap_target(shim, _config_for_pool(config, "standard"))) is not None
+                  and "[DEGRADED:" not in _std.reason):
                 # The premium gate rejected every target as per-model(Fable)-capped,
-                # yet the SAME pool has a standard-viable target → aggregate 7d
-                # headroom remains. A fresh login family does NOT lift a per-model
+                # yet the SAME pool has a CLEAN (non-degraded) standard target →
+                # aggregate 7d headroom genuinely remains. Guard on non-degraded so
+                # a lane starved by aggregate 7d saturation (where the standard
+                # retry ALSO only finds an over-cap/degraded target) is not
+                # mislabeled per-model — it falls through to the 7d/saturation
+                # branch below. A fresh login family does NOT lift a per-model
                 # cap, so no login-mount hint; the honest remedy is the per-model
                 # weekly window resetting (or added capacity).
                 cause = ("over its per-model (Fable) weekly cap, so the premium gate has no "
