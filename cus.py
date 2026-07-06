@@ -2026,17 +2026,22 @@ def mount_pids(mount: Path) -> list[int]:
     return pids
 
 
-def pane_mount_name(pane: str) -> str | None:
+def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
     """Which mount ('slot-N' / 'account-X') a tmux pane's claude process uses.
 
     None = bare/global (~/.claude/) or undeterminable. Walks the pane's
     process tree to the claude pid and reads its /proc environ — same ground
     truth as mount_pids, from the pane side (for `cus status` display).
+
+    `tmux_socket` disambiguates same-named panes (e.g. two `%3`s) across
+    multiple tmux servers: pane ids are only unique within one server, so a
+    None socket resolves against the default socket while a recorded socket
+    targets the exact server the session was launched under.
     """
     if not pane or pane == "no-tmux":
         return None
     try:
-        pid = _pane_pid(pane)
+        pid = _pane_pid(pane, tmux_socket)
         if not pid:
             return None
         cpid = _find_descendant_claude_pid(pid) or pid
@@ -5985,13 +5990,15 @@ def session_current_slot(session_id: str) -> str | None:
     429 attribution and lazy-warm filtering need (review findings 2026-07-02).
     """
     pane = None
+    tmux_socket = None
     for e in reversed(_parse_sessions_log()):
         if e.get("session_id") == session_id:
             pane = e.get("pane")
+            tmux_socket = e.get("tmux_socket")
             break
     if not pane:
         return None
-    mnt = pane_mount_name(pane)
+    mnt = pane_mount_name(pane, tmux_socket)
     return mnt if (mnt and mnt.startswith(SLOT_PREFIX)) else None
 
 
@@ -6004,7 +6011,7 @@ def live_sessions_on_slot(slot_name: str) -> list:
         sessions = find_live_sessions()
     except Exception:
         return []
-    return [s for s in sessions if pane_mount_name(s.pane) == slot_name]
+    return [s for s in sessions if pane_mount_name(s.pane, s.tmux_socket) == slot_name]
 
 
 def _locked_slots(config: dict) -> set[str]:
@@ -8386,20 +8393,56 @@ class LiveSession:
     started_at: str
     last_stop_at: str | None     # latest Stop hook entry; None if never stopped
     transcript_path: Path | None  # ~/.claude/projects/<cwd>/<id>.jsonl
+    tmux_socket: str | None = None  # tmux server socket (${TMUX%%,*}); None = default/no-tmux
 
 
 def _parse_sessions_log() -> list[dict]:
-    """Read sessions.log as a list of dicts. Order: oldest first."""
+    """Read sessions.log as a list of dicts. Order: oldest first.
+
+    Two on-disk shapes coexist (CSV, cwd LAST so it may contain commas):
+      6-col (current):  <ts>,<session_id>,<account>,<pane>,<tmux_socket>,<cwd>
+      5-col (legacy):   <ts>,<session_id>,<account>,<pane>,<cwd>
+    Detection is by column count: split into at most 6 fields — 6 parts means
+    a socket is present (parts[4]), 5 means a legacy line (tmux_socket=None,
+    cwd=parts[4]). Either way cwd is the greedy final field, so an embedded
+    comma in cwd is preserved. "no-tmux"/"" sockets normalize to None.
+    """
     if not SESSIONS_LOG.exists():
         return []
     entries: list[dict] = []
     with SESSIONS_LOG.open() as f:
         for line in f:
-            parts = line.strip().split(",", 4)
-            if len(parts) < 5:
+            raw = line.rstrip("\r\n")  # tolerate CRLF (\r) if the log was ever CRLF-written
+            parts = raw.split(",", 5)
+            if len(parts) >= 6:
+                ts, session_id, account, pane, tmux_socket, cwd = parts
+                if tmux_socket in ("", "no-tmux"):
+                    tmux_socket = None
+            else:
+                parts = raw.split(",", 4)
+                if len(parts) < 5:
+                    continue
+                ts, session_id, account, pane, cwd = parts
+                tmux_socket = None
+            if not session_id:
                 continue
-            entries.append({"ts": parts[0], "session_id": parts[1], "account": parts[2], "pane": parts[3], "cwd": parts[4]})
+            entries.append({
+                "ts": ts,
+                "session_id": session_id,
+                "account": account,
+                "pane": pane,
+                "tmux_socket": tmux_socket,
+                "cwd": cwd,
+            })
     return entries
+
+
+def _same_tmux_pane(entry: dict, pane: str, tmux_socket: str | None) -> bool:
+    """True if a sessions.log entry refers to the same (server, pane) target.
+
+    Pane ids repeat across tmux servers, so a pane match alone is ambiguous;
+    the socket must also agree (both normalized so ""/absent == None)."""
+    return entry.get("pane") == pane and (entry.get("tmux_socket") or None) == (tmux_socket or None)
 
 
 def _latest_stops_per_session() -> dict[str, str]:
@@ -8538,6 +8581,7 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
                 started_at=e["ts"],
                 last_stop_at=last_stop_at,
                 transcript_path=transcript,
+                tmux_socket=e.get("tmux_socket"),
             ))
     return live
 
@@ -8610,13 +8654,26 @@ def tmux_is_available() -> bool:
     return shutil.which("tmux") is not None
 
 
-def tmux_pane_exists(pane: str) -> bool:
+def _tmux_cmd(tmux_socket: str | None = None) -> list[str]:
+    """Base tmux argv, targeting a specific server socket when known.
+
+    Every tmux subprocess in the pane-resolution path routes through this so a
+    recorded `tmux_socket` (`${TMUX%%,*}` at SessionStart) hits the exact server
+    the pane lives on. None → bare `tmux` (default socket), preserving the
+    original single-server behavior. Fixes cross-server pane-id collisions
+    (two `%3`s on two servers → same PID → wrong mount/account attribution)."""
+    if tmux_socket:
+        return ["tmux", "-S", tmux_socket]
+    return ["tmux"]
+
+
+def tmux_pane_exists(pane: str, tmux_socket: str | None = None) -> bool:
     """Verify the given tmux pane id still exists."""
     if not pane or pane == "no-tmux" or not tmux_is_available():
         return False
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            [*_tmux_cmd(tmux_socket), "list-panes", "-a", "-F", "#{pane_id}"],
             capture_output=True, text=True, timeout=5,
         )
         return pane in result.stdout.split()
@@ -8624,7 +8681,8 @@ def tmux_pane_exists(pane: str) -> bool:
         return False
 
 
-def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds: float = 0.3) -> bool:
+def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds: float = 0.3,
+                   tmux_socket: str | None = None) -> bool:
     """Send `text` (optionally followed by Enter) to a tmux pane.
 
     Pattern documented in tmux-Claude integration guides: use -l (literal)
@@ -8634,27 +8692,27 @@ def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds:
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return False
     try:
-        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", text], check=True, timeout=5)
+        subprocess.run([*_tmux_cmd(tmux_socket), "send-keys", "-t", pane, "-l", text], check=True, timeout=5)
         if then_enter:
             time.sleep(delay_seconds)
-            subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
+            subprocess.run([*_tmux_cmd(tmux_socket), "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
 
-def tmux_send_keys(pane: str, *keys: str) -> bool:
+def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> bool:
     """Send raw key sequences (e.g. 'Escape', 'C-c') to a tmux pane."""
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return False
     try:
-        subprocess.run(["tmux", "send-keys", "-t", pane, *keys], check=True, timeout=5)
+        subprocess.run([*_tmux_cmd(tmux_socket), "send-keys", "-t", pane, *keys], check=True, timeout=5)
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
 
-def _pane_pid(pane: str) -> int | None:
+def _pane_pid(pane: str, tmux_socket: str | None = None) -> int | None:
     """Return the shell PID running inside the given tmux pane, or None.
 
     Uses `tmux display-message #{pane_pid}`. That's the PID of the shell tmux
@@ -8664,7 +8722,7 @@ def _pane_pid(pane: str) -> int | None:
         return None
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+            [*_tmux_cmd(tmux_socket), "display-message", "-p", "-t", pane, "#{pane_pid}"],
             capture_output=True, text=True, timeout=5,
         )
         pid_str = result.stdout.strip()
@@ -8744,7 +8802,7 @@ def _read_claude_session_id_from_cmdline(pid: int) -> str | None:
     return None
 
 
-def pane_live_session_id(pane: str) -> str | None:
+def pane_live_session_id(pane: str, tmux_socket: str | None = None) -> str | None:
     """Authoritative current session-id for a tmux pane, read from the live
     claude process's cmdline (--resume arg). Returns None if claude was
     launched without --resume (fresh session) or any lookup step failed;
@@ -8757,7 +8815,7 @@ def pane_live_session_id(pane: str) -> str | None:
     sessions, the session-id isn't recoverable from the live process and
     we fall back to sessions.log.
     """
-    pid = _pane_pid(pane)
+    pid = _pane_pid(pane, tmux_socket)
     if pid is None:
         return None
     claude_pid = _find_descendant_claude_pid(pid)
@@ -8766,13 +8824,13 @@ def pane_live_session_id(pane: str) -> str | None:
     return _read_claude_session_id_from_cmdline(claude_pid)
 
 
-def tmux_pane_name(pane: str) -> str:
+def tmux_pane_name(pane: str, tmux_socket: str | None = None) -> str:
     """Return the tmux pane's command/process name, for whitelist matching."""
     if not tmux_is_available() or not pane:
         return ""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"],
+            [*_tmux_cmd(tmux_socket), "display-message", "-p", "-t", pane, "#{pane_current_command}"],
             capture_output=True, text=True, timeout=5,
         )
         return result.stdout.strip()
@@ -8780,7 +8838,7 @@ def tmux_pane_name(pane: str) -> str:
         return ""
 
 
-def pane_is_claude(pane: str) -> bool:
+def pane_is_claude(pane: str, tmux_socket: str | None = None) -> bool:
     """True if a tmux pane is currently running a claude session (GH #37).
 
     Claude Code runs as `claude` or (more commonly) as a `node` process hosting
@@ -8796,7 +8854,7 @@ def pane_is_claude(pane: str) -> bool:
     """
     if not pane or pane == "no-tmux":
         return False
-    return tmux_pane_name(pane) in ("claude", "node")
+    return tmux_pane_name(pane, tmux_socket) in ("claude", "node")
 
 
 # --------------------------------------------------------------------------
@@ -8830,7 +8888,7 @@ def session_matches_whitelist(session: LiveSession, config: dict) -> tuple[bool,
     patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
     if not patterns or not session.pane or session.pane == "no-tmux":
         return False, ""
-    pane_cmd = tmux_pane_name(session.pane)
+    pane_cmd = tmux_pane_name(session.pane, session.tmux_socket)
     for pat in patterns:
         try:
             if re.search(pat, pane_cmd):
@@ -9055,7 +9113,7 @@ def _resolve_relaunch_session_id(
 
     # Step 2: walk back through sessions.log for this pane.
     entries = _parse_sessions_log()
-    pane_entries = [e for e in entries if e.get("pane") == session.pane]
+    pane_entries = [e for e in entries if _same_tmux_pane(e, session.pane, session.tmux_socket)]
     pane_entries.reverse()  # latest first
     now = datetime.now(timezone.utc)
     for e in pane_entries:
@@ -9114,13 +9172,18 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     latest_stops = _latest_stops_per_session()
     now = datetime.now(timezone.utc)
 
-    # Group by pane; latest entry overwrites (entries are oldest-first).
-    by_pane: dict[str, dict] = {}
+    # Group by tmux server + pane; latest entry overwrites (entries are
+    # oldest-first). Pane ids (%3, %12, …) are only unique WITHIN one tmux
+    # server, so keying on the bare pane would collapse same-named panes from
+    # two servers into one entry and attribute both to whichever /proc lookup
+    # the default socket happened to resolve. Keying on (tmux_socket, pane)
+    # keeps each server's pane distinct.
+    by_pane: dict[tuple[str | None, str], dict] = {}
     for e in entries:
         pane = e.get("pane", "")
         if not pane or pane == "no-tmux":
             continue
-        by_pane[pane] = e
+        by_pane[(e.get("tmux_socket"), pane)] = e
 
     # GH #22: count how many panes share each cwd. The newest-mtime
     # fallback (step 3 below) is CWD-wide and can't disambiguate between
@@ -9141,12 +9204,12 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     transcripts = _transcript_index()
 
     out: list[LiveSession] = []
-    for pane, e in by_pane.items():
+    for (tmux_socket, pane), e in by_pane.items():
         if account_filter and e["account"] != account_filter:
             continue
-        if not tmux_pane_exists(pane):
+        if not tmux_pane_exists(pane, tmux_socket):
             continue
-        if not pane_is_claude(pane):
+        if not pane_is_claude(pane, tmux_socket):
             # Pane is back to shell (or running something else). No live claude.
             continue
 
@@ -9171,7 +9234,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         # relaunched into the same chat. Fix: promote sessions.log above
         # newest-mtime so pane-specific data wins.
         cwd = e.get("cwd", "")
-        live_sid = pane_live_session_id(pane)
+        live_sid = pane_live_session_id(pane, tmux_socket)
 
         def _validate(cand_sid: str) -> Path | None:
             # cwd-first + O(1) index fallback (no full-tree glob) — GH #91.
@@ -9250,7 +9313,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         if best_mtime > 0 and (now_ts - best_mtime) > active_mtime_window:
             best_mtime = 0.0
         for pe in entries:
-            if pe.get("pane") != pane:
+            if not _same_tmux_pane(pe, pane, tmux_socket):
                 continue
             pe_ts_str = pe.get("ts")
             if not pe_ts_str:
@@ -9386,6 +9449,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             started_at=e["ts"],
             last_stop_at=last_stop_at,
             transcript_path=transcript,
+            tmux_socket=tmux_socket,
         ))
 
     # Cross-pane collision detector (GH #29). The fallback chain above is
@@ -9427,7 +9491,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     return out
 
 
-def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
+def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str | None = None) -> None:
     """Cleanly /exit claude in a tmux pane, handling input-box-has-focus cases.
 
     The 2026-05-19 incident showed that a bare `/exit` typed via tmux send-keys
@@ -9478,18 +9542,18 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
     # prompt. Escape dismisses any modal/picker/prompt without
     # submitting anything. Two Escapes to cover nested UI state
     # (autocomplete inside a prompt, etc.).
-    tmux_send_keys(pane, "Escape")
+    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
     time.sleep(0.15)
-    tmux_send_keys(pane, "Escape")
+    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
     time.sleep(0.15)
 
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
-        tmux_send_keys(pane, "C-u")
+        tmux_send_keys(pane, "C-u", tmux_socket=tmux_socket)
         time.sleep(0.15)
-        tmux_send_keys(pane, *(["BSpace"] * 400))
+        tmux_send_keys(pane, *(["BSpace"] * 400), tmux_socket=tmux_socket)
         time.sleep(0.3)
-        tmux_send_text(pane, "/exit")
+        tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
         return
 
     # Default: "submit" — preserve draft by sending it as a message first.
@@ -9497,14 +9561,15 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
     # the Enter below only sees the main chat input. If the input is empty,
     # Enter is a no-op in claude's TUI. If non-empty, the draft is sent
     # as a normal user turn (safely persisted in JSONL, visible on --resume).
-    tmux_send_keys(pane, "Enter")
+    tmux_send_keys(pane, "Enter", tmux_socket=tmux_socket)
     time.sleep(0.3)
     # Type /exit into the (now-empty) input box. tmux_send_text appends
     # Enter automatically.
-    tmux_send_text(pane, "/exit")
+    tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
 
 
-def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25) -> bool:
+def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25,
+                   tmux_socket: str | None = None) -> bool:
     """Poll until the tmux pane's current command is no longer claude/node.
 
     Replaces the original hard-coded `time.sleep(2)` between /exit and the
@@ -9517,7 +9582,7 @@ def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        cmd = tmux_pane_name(pane)
+        cmd = tmux_pane_name(pane, tmux_socket)
         if cmd not in ("claude", "node", ""):
             return True
         time.sleep(poll_interval)
@@ -9797,7 +9862,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     # swap downstream still proceeds (it benefits new sessions regardless).
     still_claude = []
     for s in swappable:
-        if pane_is_claude(s.pane):
+        if pane_is_claude(s.pane, s.tmux_socket):
             still_claude.append(s)
         else:
             click.echo(
@@ -9819,7 +9884,8 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping pause-message (no need)")
             else:
                 click.echo(f"    pane {s.pane}: mid-turn — injecting pause-message")
-                tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+                tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."),
+                               tmux_socket=s.tmux_socket)
                 ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
                 if not ok:
                     # GH #19: escalate to tier 3 on pause-response timeout
@@ -9827,9 +9893,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     # apparently didn't land (session stuck in tool call);
                     # force interrupt is the right next step.
                     click.echo(f"      pause_message timed out; escalating to tier 3 (force double-Escape)")
-                    tmux_send_keys(s.pane, "Escape")
+                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                     time.sleep(0.3)
-                    tmux_send_keys(s.pane, "Escape")
+                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                     time.sleep(0.5)
         elif tier == 3:
             if is_idle:
@@ -9839,9 +9905,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    pane {s.pane}: mid-turn — force interrupt (double Escape)")
                 # Single Escape may not interrupt — Claude's TUI sometimes
                 # needs two to dismiss running tool calls.
-                tmux_send_keys(s.pane, "Escape")
+                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                 time.sleep(0.3)
-                tmux_send_keys(s.pane, "Escape")
+                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                 time.sleep(0.5)
                 shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                 if shell_note:
@@ -9874,15 +9940,16 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 if not ok:
                     # Escalate to tier 2: send pause_message and wait again.
                     click.echo(f"      tier 1 timed out; escalating to tier 2 (sending pause_message)")
-                    tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+                    tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."),
+                               tmux_socket=s.tmux_socket)
                     pause_timeout = hot.get("pause_response_timeout_seconds", 120)
                     ok2 = wait_for_stop(s.session_id, pause_timeout)
                     if not ok2:
                         # Escalate to tier 3: double-Escape force interrupt.
                         click.echo(f"      tier 2 timed out; escalating to tier 3 (force double-Escape)")
-                        tmux_send_keys(s.pane, "Escape")
+                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                         time.sleep(0.3)
-                        tmux_send_keys(s.pane, "Escape")
+                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                         time.sleep(0.5)
                         shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                         if shell_note:
@@ -9909,11 +9976,11 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         # pane — re-check it's still claude. If the user already exited during
         # the wait, typing "/exit" here would land in their shell and could
         # close the pane. Skip; the pane is already off the old account.
-        if not pane_is_claude(s.pane):
+        if not pane_is_claude(s.pane, s.tmux_socket):
             click.echo(f"    pane {s.pane}: no longer running claude — skipping /exit (GH #37; would type into shell)")
             continue
         click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
-        tmux_exit_claude(s.pane, draft_handling=draft_handling)
+        tmux_exit_claude(s.pane, draft_handling=draft_handling, tmux_socket=s.tmux_socket)
 
     # Poll each pane until shell prompt is back. Replaces the original
     # sleep(2) which raced — claude wasn't always done exiting when the
@@ -9925,7 +9992,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         if getattr(s, "_stuck_skip", False):
             # Already skipped /exit; don't wait for shell either.
             continue
-        if wait_for_shell(s.pane, timeout_seconds=shell_timeout):
+        if wait_for_shell(s.pane, timeout_seconds=shell_timeout, tmux_socket=s.tmux_socket):
             panes_ready.append(s)
         else:
             click.echo(f"    WARN: pane {s.pane} didn't return to shell in {shell_timeout}s; skipping relaunch")
@@ -10018,7 +10085,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         if i > 0 and stagger > 0:
             time.sleep(stagger)
         click.echo(f"    pane {s.pane}: relaunch → {cmd}")
-        tmux_send_text(s.pane, cmd)
+        tmux_send_text(s.pane, cmd, tmux_socket=s.tmux_socket)
 
 
 def _read_rate_limit_log_since(since_ts: str | None) -> list[dict]:
@@ -10656,7 +10723,7 @@ def status() -> None:
             # mode: a pane keeps its loaded creds until relaunch, so the recorded
             # SessionStart account is the better estimate.
             if per_session:
-                mnt = pane_mount_name(s.pane)
+                mnt = pane_mount_name(s.pane, s.tmux_socket)
                 if mnt and mnt.startswith(SLOT_PREFIX):
                     eff = state.get("slots", {}).get(mnt, {}).get("account") or s.account
                     where = f"slot={mnt:<8}"
@@ -10940,7 +11007,11 @@ def sessions_cmd(as_json: bool) -> None:
     resolved_inputs: list[dict] = []
     panes_on_slot: set[str] = set()
     for s in live:
-        mount = pane_mount_name(s.pane)
+        # GH #137 + cross-server fix: resolve the mount on the pane's OWN tmux
+        # server (s.tmux_socket). Without the socket, two panes named %3 on two
+        # tmux servers would resolve against the default socket and mis-attribute
+        # to whichever server answered — the diagnostics view must be per-server.
+        mount = pane_mount_name(s.pane, s.tmux_socket)
         if mount and mount.startswith(SLOT_PREFIX):
             panes_on_slot.add(mount)
         acct, source = _resolve_mount_account(mount, state)
@@ -11045,7 +11116,7 @@ def check_orchestrate_cmd(target: str | None) -> None:
         click.echo("  (none — orchestrator would do simple cred swap with no relaunch)")
         return
     for s in live_panes:
-        pane_cmd = tmux_pane_name(s.pane)
+        pane_cmd = tmux_pane_name(s.pane, s.tmux_socket)
         idle = session_is_idle(s, hot.get("mid_turn_idle_seconds", 30))
         pinned, pin_reason = session_is_pinned(s, config)
         wl, wl_reason = session_matches_whitelist(s, config)
