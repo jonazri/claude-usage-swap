@@ -54,18 +54,19 @@ def _setup_env(tmp: Path, n_stale: int = 50):
         lines.append(f"2026-01-01T00:00:00Z,stale-{i:04d},default,%9,/home/x/gone")
     sessions_log.write_text("\n".join(lines) + "\n")
 
-    saved = (cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG)
+    saved = (cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG, cus.tmux_pane_exists)
     cus.CLAUDE_DIR = claude_dir
     cus.SESSIONS_LOG = sessions_log
     cus.STOPS_LOG = tmp / "stops.log"  # absent — liveness rides on transcripts
+    cus.tmux_pane_exists = lambda pane, tmux_socket=None: True
     cus._TRANSCRIPT_INDEX_CACHE.clear()  # don't inherit a prior test's scan
     return saved, live_sid
 
 
 def _restore(saved):
     """Undo _setup_env's monkeypatch. `saved` is the 3-tuple _setup_env
-    returned: (CLAUDE_DIR, SESSIONS_LOG, STOPS_LOG), restored positionally."""
-    cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG = saved
+    returned: (CLAUDE_DIR, SESSIONS_LOG, STOPS_LOG, tmux_pane_exists)."""
+    cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG, cus.tmux_pane_exists = saved
 
 
 def test_live_session_found_via_index():
@@ -84,6 +85,20 @@ def test_live_session_found_via_index():
             assert live[0].transcript_path and live[0].transcript_path.exists()
         finally:
             cus._find_transcript = orig_find
+            _restore(saved)
+
+
+def test_tmux_session_with_missing_recorded_pane_is_not_live():
+    """A fresh transcript is not enough once the recorded tmux pane is gone."""
+    with tempfile.TemporaryDirectory() as td:
+        saved, live_sid = _setup_env(Path(td))
+        cus.SESSIONS_LOG.write_text(
+            f"{_now_iso()},{live_sid},default,%0,/tmp/tmux-1000/committee-loop,/home/x/repo\n"
+        )
+        cus.tmux_pane_exists = lambda pane, tmux_socket=None: False
+        try:
+            assert cus.find_live_sessions() == []
+        finally:
             _restore(saved)
 
 
@@ -124,7 +139,7 @@ def test_transcript_index_shape():
 def test_transcript_index_missing_projects_root():
     """No ~/.claude/projects at all → empty index, no crash."""
     with tempfile.TemporaryDirectory() as td:
-        saved = (cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG)
+        saved = (cus.CLAUDE_DIR, cus.SESSIONS_LOG, cus.STOPS_LOG, cus.tmux_pane_exists)
         cus.CLAUDE_DIR = Path(td) / "nonexistent"
         cus._TRANSCRIPT_INDEX_CACHE.clear()
         try:

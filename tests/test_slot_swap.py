@@ -114,6 +114,27 @@ def test_swap_into_empty_slot_installs_without_touching_global():
         env.restore()
 
 
+def test_swap_into_empty_slot_refuses_tokenless_target_snapshot():
+    env = _Env()
+    try:
+        state = cus.load_state()
+        name, d = cus.create_slot(state)
+        cus.save_state(state)
+        (env.accounts_dir / "account-alpha" / ".credentials.json").write_text("{}")
+
+        try:
+            cus.execute_swap("alpha", trigger="launch", slot=name)
+            raise AssertionError("expected RuntimeError")
+        except RuntimeError as e:
+            assert "no claudeAiOauth.refreshToken" in str(e)
+
+        assert not (d / ".credentials.json").exists()
+        assert cus.load_state()["slots"][name]["account"] is None
+        assert env.global_mount_unchanged()
+    finally:
+        env.restore()
+
+
 def test_occupied_slot_swap_saves_back_and_bumps_ladder():
     env = _Env()
     try:

@@ -625,6 +625,39 @@ def test_sos_starvation_suppressed_when_pool_can_rescue():
         env.restore()
 
 
+def test_sos_starvation_message_omits_double_booking_when_cause_is_saturation():
+    """When a lane is starved purely because every other account is over its 7d
+    cap (none is HELD by another live mount), the SOS must NOT blame #104
+    double-booking or suggest `cus login-mount` — provisioning a family or
+    freeing a lane cannot help; only added capacity or a window reset does.
+    Regression for the misleading 2026-07-06 slot-5 alert, whose remedies did
+    not match the true cause."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.make_slot("alpha", live=True)   # hot lane; beta stays idle (NOT held)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"next_swap_at_pct": 50, "current_5h_pct": 100.0, "current_7d_pct": 20.0})
+        # beta is the only other account and is over the 80% 7d hard cap → the
+        # lane is starved by saturation, NOT by a double-book (drop is empty).
+        state["accounts"]["beta"].update({"next_swap_at_pct": 50, "current_5h_pct": 0.0, "current_7d_pct": 85.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "lowest_usage",
+            "independent_logins": {"use_independent_logins": True}})
+
+        starved = [c for c in cus.diagnose(state, cfg)
+                   if "with no swap target" in c.summary and "alpha" in c.summary]
+        assert starved, [c.summary for c in cus.diagnose(state, cfg)]
+        action = starved[0].action
+        assert "held by another live mount" not in action, action
+        assert "login-mount" not in action, action
+        # The remedy that DOES fit saturation is still offered.
+        assert "reset" in action, action
+    finally:
+        env.restore()
+
+
 # --------------------------------------------------------------------------
 # Provisioning command (P2): `cus login-mount <account>` account-keyed, repeatable
 # --------------------------------------------------------------------------

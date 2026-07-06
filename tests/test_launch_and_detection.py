@@ -172,6 +172,25 @@ def test_launch_prepare_full_flow():
         env.restore()
 
 
+def test_launch_prepare_reinstalls_same_account_slot_with_tokenless_creds():
+    env = _Env()
+    try:
+        slot_name, slot_dir = cus.create_slot(cus.load_state())
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text("{}")
+
+        reused, reused_dir, account = cus._launch_prepare("alpha", cus.load_state(), cus.load_config())
+
+        assert (reused, reused_dir, account) == (slot_name, slot_dir, "alpha")
+        creds = json.loads((slot_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha"
+    finally:
+        env.restore()
+
+
 def test_launch_prepare_rejects_unknown_account():
     env = _Env()
     try:

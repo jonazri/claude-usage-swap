@@ -4,7 +4,7 @@
 # Reads the SessionStart hook JSON event from stdin (per Claude Code hooks spec):
 #   {"session_id": "...", "transcript_path": "...", "cwd": "...", ...}
 # Writes one line per session to ~/claude-accounts/sessions.log:
-#   <ts>,<session_id>,<account>,<tmux_pane>,<cwd>
+#   <ts>,<session_id>,<account>,<tmux_pane>,<tmux_socket>,<cwd>
 #
 # Account is whichever is active in state.json at the moment this fires.
 # TMUX_PANE comes from the env (set by tmux if running under it).
@@ -52,9 +52,13 @@ fi
 
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 PANE="${TMUX_PANE:-no-tmux}"
+TMUX_SOCKET="no-tmux"
+if [[ -n "${TMUX:-}" ]]; then
+    TMUX_SOCKET="${TMUX%%,*}"
+fi
 
 mkdir -p "$ACCOUNTS_DIR"
-echo "$TS,$SESSION_ID,$ACCOUNT,$PANE,$CWD" >> "$LOG"
+echo "$TS,$SESSION_ID,$ACCOUNT,$PANE,$TMUX_SOCKET,$CWD" >> "$LOG"
 
 # Hooks should not block the session — exit 0 always.
 exit 0
