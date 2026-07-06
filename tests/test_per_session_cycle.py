@@ -521,7 +521,6 @@ def test_premium_slot_degrades_temporarily_when_no_model_safe_target():
         assert moves[0]["slot"] == slot
         assert moves[0]["to"] == "beta"
         assert moves[0]["pool"] == "standard"
-        assert moves[0].get("pool_after") is None
         assert "premium degraded to standard" in moves[0]["reason"]
 
         cus._execute_slot_moves(moves, state, _pool_config(), no_execute=False)

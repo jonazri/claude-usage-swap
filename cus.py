@@ -8069,16 +8069,25 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
             if not starved:
                 continue
-            # Name the ACTUAL blocker so the remedy fits (2026-07-06). `drop`
-            # holds only the accounts withheld because another live mount already
-            # holds them AND no free pooled family exists — a genuine #104
-            # double-book wall. Non-empty ⇒ provisioning a family (or freeing a
-            # lane) is the unlock, so keep the #104 clause + login-mount hint.
-            # EMPTY ⇒ nothing was withheld for double-booking; the blocker is
-            # either a per-model (Fable) premium-gate wall (aggregate 7d may
-            # still have headroom) or plain 7d/saturation exhaustion — neither of
-            # which a family or a freed lane can fix. Emitting the double-book
-            # clause + hint there sends the operator down a dead end.
+            # A premium lane that would DEGRADE to standard is NOT starved: the
+            # daemon (decide_slot_swaps) re-runs it under standard-pool rules and
+            # rotates it whenever a clean standard target exists. Mirror that here
+            # so Condition 2b never raises a false "cannot rotate" for a lane the
+            # daemon actually moves every cycle — it self-heals, no human action
+            # needed. (This also subsumes the earlier per-model-cap message: a
+            # premium lane blocked only by the Fable gate has a clean standard
+            # target, so it degrades rather than starves.)
+            if pool == "premium":
+                _std = pick_swap_target(shim, _config_for_pool(config, "standard"))
+                if _std is not None and "[DEGRADED:" not in _std.reason:
+                    continue
+            # Name the ACTUAL blocker so the remedy fits (2026-07-06). `drop` holds
+            # only accounts withheld because another live mount holds them AND no
+            # free pooled family exists — a genuine #104 double-book wall, which
+            # provisioning a family (or freeing a lane) unblocks. EMPTY ⇒ the
+            # blocker is 7d/aggregate saturation (every candidate over cap), which
+            # neither a family nor a freed lane can fix — so drop the double-book
+            # clause + login-mount hint there (dead-end advice).
             reset_hint = "wait for another account's 5h/7d window to reset"
             if drop:
                 cause = ("held by another live mount (GH #104 forbids double-booking — it "
@@ -8086,22 +8095,6 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 pool_hint = (" Or provision another independent login for a headroom account "
                              "(`cus login-mount <account>`) so this lane can borrow it."
                              if independent_logins_enabled(config) else "")
-            elif (_per_model_weekly_gate(config)[0]
-                  and (_std := pick_swap_target(shim, _config_for_pool(config, "standard"))) is not None
-                  and "[DEGRADED:" not in _std.reason):
-                # The premium gate rejected every target as per-model(Fable)-capped,
-                # yet the SAME pool has a CLEAN (non-degraded) standard target →
-                # aggregate 7d headroom genuinely remains. Guard on non-degraded so
-                # a lane starved by aggregate 7d saturation (where the standard
-                # retry ALSO only finds an over-cap/degraded target) is not
-                # mislabeled per-model — it falls through to the 7d/saturation
-                # branch below. A fresh login family does NOT lift a per-model
-                # cap, so no login-mount hint; the honest remedy is the per-model
-                # weekly window resetting (or added capacity).
-                cause = ("over its per-model (Fable) weekly cap, so the premium gate has no "
-                         "Fable-clean target (aggregate 7d headroom may remain)")
-                pool_hint = ""
-                reset_hint = "wait for a tracked model's weekly (per-model) window to reset"
             else:
                 cause = "over its weekly (7d) cap or otherwise saturated"
                 pool_hint = ""

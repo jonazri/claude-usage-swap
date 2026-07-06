@@ -837,21 +837,20 @@ def test_sos_starvation_message_omits_double_booking_when_cause_is_saturation():
         env.restore()
 
 
-def test_sos_starvation_message_names_per_model_cap_when_premium_gate_blocks():
-    """REQUIRED-FIX regression (reviewer 2026-07-06): a premium lane starved
-    ONLY because the per-model gate rejects every target as Fable-capped — while
-    aggregate 7d headroom remains (a standard-pool pick succeeds) — must NOT be
-    told its blocker is the "7d cap", and must NOT be sent to `cus login-mount`
-    (a fresh login family does not lift a per-model cap). Condition 2b names the
-    per-model (Fable) window instead."""
+def test_premium_lane_that_degrades_to_standard_is_not_flagged_starved():
+    """REQUIRED-FIX regression (final review 2026-07-06): a premium lane blocked
+    ONLY by the per-model (Fable) gate — but with a CLEAN standard-pool target
+    (aggregate 7d headroom remains) — is NOT starved. decide_slot_swaps degrades
+    it to standard and rotates it every cycle, so Condition 2b must mirror that
+    and NOT raise a false 'cannot rotate' SOS (which would read as urgent and
+    send the operator to add unneeded accounts)."""
     env = _Env(accounts=("alpha", "beta"))
     try:
         env.make_slot("alpha", live=True)   # premium lane; beta idle (NOT held)
         state = cus.load_state()
         state["accounts"]["alpha"].update({"next_swap_at_pct": 50, "current_5h_pct": 100.0, "current_7d_pct": 20.0})
         # beta: Fable-dead (premium gate rejects it) yet aggregate-healthy — the
-        # standard pool could still use it, so the true blocker is the per-model
-        # cap, not saturation and not a double-book.
+        # standard-pool retry succeeds, so the lane DEGRADES rather than starves.
         state["accounts"]["beta"].update({"next_swap_at_pct": 50, "current_5h_pct": 0.0, "current_7d_pct": 20.0,
                                            "per_model_weekly_pct": {"Fable": 100.0}})
         cus.save_state(state)
@@ -863,12 +862,7 @@ def test_sos_starvation_message_names_per_model_cap_when_premium_gate_blocks():
 
         starved = [c for c in cus.diagnose(state, cfg)
                    if "with no swap target" in c.summary and "alpha" in c.summary]
-        assert starved, [c.summary for c in cus.diagnose(state, cfg)]
-        action = starved[0].action
-        assert "Fable" in action and "per-model" in action, action
-        assert "7d cap" not in action, action
-        assert "login-mount" not in action, action
-        assert "held by another live mount" not in action, action
+        assert not starved, f"premium lane that degrades must not be flagged starved: {[c.summary for c in starved]}"
     finally:
         env.restore()
 
