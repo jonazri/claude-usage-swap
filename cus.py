@@ -620,6 +620,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # that level) while the aggregate-7d cap keeps its own value — lets
         # "swap when Fable hits 90%" coexist with a lower aggregate ceiling.
         "cap_pct": None,
+        # Standard-pool lanes of a GATED install prefer accounts whose per-model
+        # week is already spent, so Fable-fresh accounts stay available for
+        # premium lanes. Deliberately NOT set here: it is injected (default True)
+        # by _config_for_pool ONLY into the standard-pool VIEW, which exists only
+        # when the base gate is enabled — so a non-gated install (gate off,
+        # default) never activates it, matching "inactive unless gate_enabled".
+        # Opt a gated install's standard lanes out with
+        # per_model_weekly.reserve_safe_for_premium: false.
     },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
@@ -1216,6 +1224,21 @@ def _credential_refresh_token(creds: Any) -> str | None:
     oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
     rt = oauth.get("refreshToken") if isinstance(oauth, dict) else None
     return rt if isinstance(rt, str) and rt else None
+
+
+def mount_has_usable_credentials(mount: Path) -> bool:
+    """True iff the mount's live creds file parses and carries a refresh token.
+
+    "Usable" matches has_independent_login's bar: an access-token-only or
+    logout-shaped file is treated as absent — it can seed no session and must be
+    reinstalled from the account snapshot rather than reused as-is."""
+    path = mount_creds_path(mount)
+    if not path.exists():
+        return False
+    try:
+        return _credential_refresh_token(read_json(path)) is not None
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
 def _refresh_fingerprint(refresh_token: str) -> str:
@@ -3207,6 +3230,20 @@ def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
     return max(vals) if vals else 0.0
 
 
+def _tracked_model_weekly_from_acct(acct: dict, config: dict) -> float | None:
+    """Max tracked per-model weekly % on this account, or None if it carries no
+    reading. Unlike _max_model_weekly_from_acct this is INDEPENDENT of the
+    per-model gate (it never zeroes on a disabled gate): the standard-pool
+    reserve (reserve_safe_for_premium) needs to tell a genuinely Fable-fresh
+    account apart from one with no reading even when the gate is off."""
+    pm = acct.get("per_model_weekly_pct") or {}
+    if not pm:
+        return None
+    allow = {str(m).lower() for m in (config.get("per_model_weekly", {}).get("models") or [])}
+    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    return max(vals) if vals else None
+
+
 def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
     per_model_weekly_pct from state.json. Used to fold per-model weekly caps
@@ -3778,6 +3815,9 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # falling back to hard_7d) — identical to the pre-split primary filter:
     # arrivals stop earlier than swap-away drains. See _model_weekly_target_cap_for_config.
     gate_enabled, _ = _per_model_weekly_gate(config)
+    # Hoisted (used by the standard-lane reserve elif AND the safe_7d filter
+    # below): the aggregate 7d hard cap.
+    hard_7d = _hard_7d_cap_for_config(config)
     model_cap = _model_weekly_target_cap_for_config(config)
     model_safe = [(n, a) for n, a in candidates
                   if _max_model_weekly_from_acct(a, config) < model_cap]
@@ -3789,8 +3829,20 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # callers (decide_swap's "no valid swap target" branch, decide_slot_swaps'
         # fan-out HOLD) emit the operator-facing daemon.log line.
         return None
-    if model_safe:
+    if gate_enabled:
         candidates = model_safe
+    elif config.get("per_model_weekly", {}).get("reserve_safe_for_premium"):
+        model_spent = [(n, a) for n, a in candidates
+                       if (pm := _tracked_model_weekly_from_acct(a, config)) is None or pm >= model_cap]
+        # Reserve is a PREFERENCE, not a wall: narrow standard lanes onto the
+        # model-exhausted set ONLY if it holds a target that survives BOTH downstream
+        # filters — under the aggregate 7d hard cap AND not immediately re-tripping its
+        # own ladder. Otherwise narrowing would strand the lane on a degraded
+        # model-spent account while a healthy Fable-fresh target exists in the full pool.
+        if any(a.get("current_7d_pct", 0) < hard_7d
+               and not _target_would_immediately_re_trip(a, config)
+               for _, a in model_spent):
+            candidates = model_spent
 
     # Universal filter (GH #17, all strategies): exclude candidates above
     # the user-stated AGGREGATE weekly ceiling. Previously only headroom/smart
@@ -3798,7 +3850,6 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
     # (system is degraded; swap somewhere rather than stay on a hot active). Runs
     # on the per-model-safe survivors from the HARD gate above.
-    hard_7d = _hard_7d_cap_for_config(config)
     safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
@@ -6057,6 +6108,7 @@ def _config_for_pool(config: dict, pool: str) -> dict:
         view = dict(config)
         pmw = dict(config.get("per_model_weekly", {}))
         pmw["gate_enabled"] = False
+        pmw["reserve_safe_for_premium"] = pmw.get("reserve_safe_for_premium", True)
         view["per_model_weekly"] = pmw
         return view
     return config
@@ -6162,6 +6214,44 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
             shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
+        effective_pool = pool
+        reason_prefix = ""
+        # Premium→standard DEGRADE (deliberate divergence from #163's HOLD): a
+        # premium lane whose per-model gate rejects every target as Fable-capped
+        # (no valid target) does NOT have to sit idle when the SAME account pool
+        # still has aggregate 7d headroom that serves standard-model work. Re-run
+        # the decision under standard-pool rules (gate off) and, if that yields a
+        # GENUINE (non-degraded) target, take it for THIS cycle only — the slot's
+        # pool tag is untouched, so it reverts to premium the moment a Fable-clean
+        # target frees. HOLD (upstream #163) remains the fallback when the
+        # standard retry ALSO finds nothing / only a degraded target.
+        #
+        # Trigger set = every gate that means "premium WANTS to move but has no
+        # acceptable target" — the ladder/hard-cap no-target holds AND the newer
+        # #139/#163 anti-degrade/anti-pingpong holds (`hard_7d_cap_degraded`,
+        # `hard_cap_pingpong`, `cap_degraded_target`). The one that materially
+        # needs the retry is `hard_cap_pingpong` under a PER-MODEL forcing cap:
+        # premium's best target is Fable-capped, but standard ignores the Fable
+        # gate and a clean aggregate target exists. The aggregate-cap holds also
+        # land here, but their standard retry is likewise 7d-capped, so the
+        # non-degraded guard below rejects it and the lane correctly HOLDs.
+        # Excluded on purpose: `min_improvement_gate` (a real target exists, just
+        # marginal — degrading would defeat that anti-churn hold) and the
+        # hysteresis/defer holds (transient, not a no-target condition).
+        if (decision is None and pool == "premium"
+                and trace.get("gate") in {"no_target", "hard_7d_cap_no_target",
+                                          "hard_7d_cap_degraded", "hard_cap_pingpong",
+                                          "cap_degraded_target"}):
+            std_trace: dict = {}
+            std_cfg = _config_for_pool(config, "standard")
+            std_decision = decide_swap(shim, std_cfg, usage_by_account, std_trace)
+            if std_decision is not None and "[DEGRADED:" not in std_decision.reason:
+                decision = std_decision
+                cfg_view = std_cfg
+                effective_pool = "standard"
+                reason_prefix = f"premium degraded to standard: {trace.get('reason')}; "
+                if traces is not None:
+                    traces[f"{acct_name}:standard"] = std_trace
         if traces is not None:
             traces[f"{acct_name}:{pool}"] = trace
         if decision is None:
@@ -6251,13 +6341,15 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                                f"for a premium lane; won't double-book '{target}' onto a second "
                                f"live mount — GH #104 / #139)")
                     continue
+            if reason_prefix:
+                reason = reason_prefix + reason
             taken.add(target)
             round_claims[target] = round_claims.get(target, 0) + 1
             moves.append({
                 "slot": slot_name, "from": acct_name, "to": target,
                 "gate": decision.gate, "tier": decision.tier,
                 "deferrable": decision.deferrable, "reason": reason,
-                "pool": pool,
+                "pool": effective_pool,
             })
     return moves
 
@@ -7984,13 +8076,35 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
             if not starved:
                 continue
-            # Remedy hint. With the pool feature ON, the starvation means every
-            # headroom account is held AND has no free family — so provisioning
-            # another family (raising a pool's depth) is the login-free unlock,
-            # alongside add-account / free-a-lane / wait-for-reset.
-            pool_hint = (" Or provision another independent login for a headroom account "
-                         "(`cus login-mount <account>`) so this lane can borrow it."
-                         if independent_logins_enabled(config) else "")
+            # A premium lane that would DEGRADE to standard is NOT starved: the
+            # daemon (decide_slot_swaps) re-runs it under standard-pool rules and
+            # rotates it whenever a clean standard target exists. Mirror that here
+            # so Condition 2b never raises a false "cannot rotate" for a lane the
+            # daemon actually moves every cycle — it self-heals, no human action
+            # needed. (This also subsumes the earlier per-model-cap message: a
+            # premium lane blocked only by the Fable gate has a clean standard
+            # target, so it degrades rather than starves.)
+            if pool == "premium":
+                _std = pick_swap_target(shim, _config_for_pool(config, "standard"))
+                if _std is not None and "[DEGRADED:" not in _std.reason:
+                    continue
+            # Name the ACTUAL blocker so the remedy fits (2026-07-06). `drop` holds
+            # only accounts withheld because another live mount holds them AND no
+            # free pooled family exists — a genuine #104 double-book wall, which
+            # provisioning a family (or freeing a lane) unblocks. EMPTY ⇒ the
+            # blocker is 7d/aggregate saturation (every candidate over cap), which
+            # neither a family nor a freed lane can fix — so drop the double-book
+            # clause + login-mount hint there (dead-end advice).
+            reset_hint = "wait for another account's 5h/7d window to reset"
+            if drop:
+                cause = ("held by another live mount (GH #104 forbids double-booking — it "
+                         "clobbers the OAuth token) or is saturated")
+                pool_hint = (" Or provision another independent login for a headroom account "
+                             "(`cus login-mount <account>`) so this lane can borrow it."
+                             if independent_logins_enabled(config) else "")
+            else:
+                cause = "over its weekly (7d) cap or otherwise saturated"
+                pool_hint = ""
             # Tier severity: at/above saturation the lane is effectively frozen
             # and burning a live session → urgent; merely over the first ladder
             # step (still has headroom) → warning, an early nudge to add capacity.
@@ -7998,11 +8112,9 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 severity="urgent" if lane_pct >= sat_pct else "warning",
                 summary=f"lane {', '.join(sorted(slots))} on '{acct_name}' at {lane_pct:.0f}% "
                         f"(≥{lane_thr}%) with no swap target",
-                action=(f"'{acct_name}' is over its ladder step but every other account is either "
-                        f"held by another live mount (GH #104 forbids double-booking — it clobbers "
-                        f"the OAuth token) or is saturated, so this lane cannot rotate. Add another "
-                        f"account (`cus add <name>`), free a live lane, or wait for another account's "
-                        f"5h/7d window to reset." + pool_hint),
+                action=(f"'{acct_name}' is over its ladder step but every other account is {cause}, "
+                        f"so this lane cannot rotate. Add another account (`cus add <name>`), free a "
+                        f"live lane, or {reset_hint}." + pool_hint),
                 affected=acct_name,
             ))
 
@@ -14294,8 +14406,23 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
 
     # Install the account into the slot — the same in-place swap primitive the
     # daemon uses (no-op when the slot already holds it). Reloads and persists
-    # state itself, under the swap lock.
-    if state.get("slots", {}).get(slot_name, {}).get("account") != account:
+    # state itself, under the swap lock. If an idle slot claims the right
+    # account but carries logout-shaped creds, blank its account first so the
+    # swap below actually REINSTALLS from the good snapshot instead of reusing
+    # a dead mount (execute_swap is a no-op when the slot already holds it).
+    slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
+    if slot_account == account and not mount_in_use(slot_dir) and not mount_has_usable_credentials(slot_dir):
+        click.echo(f"launch: {slot_name} held '{account}' but credentials are unusable; reinstalling")
+        with _swap_lock():
+            fresh = load_state()
+            entry = fresh.setdefault("slots", {}).setdefault(slot_name, {"account": None, "created_ts": now_iso()})
+            if entry.get("account") == account and not mount_has_usable_credentials(slot_dir):
+                entry["account"] = None
+                entry.pop("login_family", None)
+                save_state(fresh)
+        state = load_state()
+        slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
+    if slot_account != account:
         execute_swap(account, trigger="launch", slot=slot_name)
 
     state = load_state()
