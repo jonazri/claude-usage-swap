@@ -8412,7 +8412,7 @@ def _parse_sessions_log() -> list[dict]:
     entries: list[dict] = []
     with SESSIONS_LOG.open() as f:
         for line in f:
-            raw = line.rstrip("\n")
+            raw = line.rstrip("\r\n")  # tolerate CRLF (\r) if the log was ever CRLF-written
             parts = raw.split(",", 5)
             if len(parts) >= 6:
                 ts, session_id, account, pane, tmux_socket, cwd = parts

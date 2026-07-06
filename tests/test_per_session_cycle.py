@@ -278,14 +278,20 @@ def test_pane_mount_name_disambiguates_same_pane_across_tmux_sockets():
         pid_by_socket = {sock_a: 101, sock_b: 202}
         mount_by_pid = {101: cus.ACCOUNTS_DIR / "slot-1", 202: cus.ACCOUNTS_DIR / "slot-2"}
         orig = (cus._pane_pid, cus._find_descendant_claude_pid, cus._pid_config_dir)
-        cus._pane_pid = lambda pane, tmux_socket=None: pid_by_socket.get(tmux_socket)
+        # A None socket means "the default tmux server" — pane_mount_name runs
+        # bare `tmux` (no -S), which connects to the default socket, modeled here
+        # as sock_a. So resolve None the same way _pane_pid would on the default
+        # server, rather than leaving a stub gap that masks the real behavior.
+        cus._pane_pid = lambda pane, tmux_socket=None: pid_by_socket.get(tmux_socket if tmux_socket is not None else sock_a)
         cus._find_descendant_claude_pid = lambda pid: pid
         cus._pid_config_dir = lambda pid: str(mount_by_pid[pid])
         try:
             assert cus.pane_mount_name("%3", sock_a) == "slot-1"
             assert cus.pane_mount_name("%3", sock_b) == "slot-2"
-            # No socket → default server (sock_a mapping) — never crosses to sock_b.
-            assert cus.pane_mount_name("%3", None) is None
+            # No socket → the DEFAULT tmux server (bare `tmux`), modeled as sock_a
+            # → slot-1; an EXPLICIT sock_b still resolves independently (%3 does
+            # not collapse across servers).
+            assert cus.pane_mount_name("%3", None) == "slot-1"
         finally:
             cus._pane_pid, cus._find_descendant_claude_pid, cus._pid_config_dir = orig
     finally:
