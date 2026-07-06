@@ -381,7 +381,126 @@ def test_config_for_pool_disables_model_gate_for_standard():
     std = cus._config_for_pool(cfg, "standard")
     assert prem is cfg  # premium: unchanged object
     assert std["per_model_weekly"]["gate_enabled"] is False
+    assert std["per_model_weekly"]["reserve_safe_for_premium"] is True
     assert cfg["per_model_weekly"]["gate_enabled"] is True  # original untouched
+
+
+def test_standard_pool_prefers_model_exhausted_target_to_preserve_safe_accounts():
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 10.0,
+                                          "per_model_weekly_pct": {"Fable": 20.0}})
+        # gamma: Fable-exhausted (model-spent) but HEALTHY — aggregate headroom
+        # AND below the first ladder step (won't immediately re-trip), so the
+        # reserve narrows the standard lane onto it. (7d=40, adapted from the
+        # pre-fix 60: the required not-re-trip guard now excludes a model-spent
+        # target that sits at/over steps[0]=50, so it must be genuinely healthy.)
+        state["accounts"]["gamma"].update({"current_5h_pct": 9.0, "current_7d_pct": 40.0,
+                                           "per_model_weekly_pct": {"Fable": 100.0}})
+
+        target = cus.pick_swap_target(state, cus._config_for_pool(_pool_config(), "standard"))
+
+        assert target is not None
+        assert target.name == "gamma"
+    finally:
+        env.restore()
+
+
+def test_standard_pool_falls_back_to_safe_account_when_model_exhausted_target_degraded():
+    # reserve_safe_for_premium is a PREFERENCE, not a wall. When every
+    # model-exhausted (Fable-spent) account is itself over the 7d cap (or would
+    # immediately re-trip), a standard lane must fall back to a Fable-fresh
+    # account that still has aggregate headroom rather than starve on the
+    # degraded model-spent one. Regression for the 2026-07-06 slot-5 SOS: all
+    # headroom accounts were Fable-fresh, so reserve narrowed the lane to a lone
+    # 81%-7d account and pick_swap_target returned DEGRADED → a false "no swap
+    # target" alarm while idle capacity sat reserved.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        # alpha: the standard lane's own account, leaving on 5h.
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        # beta: Fable-fresh AND aggregate headroom — the correct fallback target.
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 10.0,
+                                          "per_model_weekly_pct": {"Fable": 20.0}})
+        # gamma: Fable-exhausted (model-spent) but over the 80% 7d cap → degraded.
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 85.0,
+                                           "per_model_weekly_pct": {"Fable": 100.0}})
+
+        target = cus.pick_swap_target(state, cus._config_for_pool(_pool_config(), "standard"))
+
+        assert target is not None
+        assert target.name == "beta", f"expected fallback to Fable-fresh beta, got {target.name}"
+        assert "DEGRADED" not in target.reason, target.reason
+    finally:
+        env.restore()
+
+
+def test_reserve_skips_would_re_trip_model_spent_target():
+    # REQUIRED-FIX regression (reviewer 2026-07-06): the reserve guard is
+    # `7d-under-cap AND not-would-immediately-re-trip`, not 7d-only. A standard
+    # lane must NOT be narrowed onto a model-spent account that would re-trip its
+    # own ladder on arrival when a HEALTHY Fable-fresh target exists in the full
+    # pool. Here beta is model-spent (Fable=100) AND would re-trip (5h=60 ≥
+    # steps[0]=50) though its 7d (20) is under the 80 cap; gamma is Fable-fresh
+    # and healthy. A 7d-only guard would narrow onto beta and strand the lane on
+    # a re-tripping (DEGRADED) target; the fix picks gamma.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        state["accounts"]["beta"].update({"current_5h_pct": 60.0, "current_7d_pct": 20.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 10.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+
+        target = cus.pick_swap_target(state, cus._config_for_pool(_pool_config(), "standard"))
+
+        assert target is not None
+        assert target.name == "gamma", f"expected healthy Fable-fresh gamma, got {target.name}"
+        assert "DEGRADED" not in target.reason, target.reason
+    finally:
+        env.restore()
+
+
+def test_premium_slot_degrades_temporarily_when_no_model_safe_target():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 25.0,
+                                           "per_model_weekly_pct": {"Fable": 30.0}})
+        # beta: Fable-dead (premium gate rejects it) but aggregate-healthy — a
+        # CLEAN standard target (7d=30 < steps[0]=50, adapted from the pre-fix
+        # 63 so the standard retry yields a non-DEGRADED pick, per PIECE 4).
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 30.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage_pm(100.0, 25.0, fable=30.0),
+                 "beta": _usage_pm(0.0, 30.0, fable=100.0)}
+
+        moves = cus.decide_slot_swaps(state, _pool_config(), usage)
+        assert len(moves) == 1, moves
+        assert moves[0]["slot"] == slot
+        assert moves[0]["to"] == "beta"
+        assert moves[0]["pool"] == "standard"
+        assert moves[0].get("pool_after") is None
+        assert "premium degraded to standard" in moves[0]["reason"]
+
+        cus._execute_slot_moves(moves, state, _pool_config(), no_execute=False)
+        # The move is for THIS cycle only — the slot's pool tag stays premium.
+        assert cus._slot_pool(cus.load_state(), slot, _pool_config()) == "premium"
+    finally:
+        env.restore()
 
 
 def test_premium_slot_swaps_off_model_exhausted_standard_holds():
