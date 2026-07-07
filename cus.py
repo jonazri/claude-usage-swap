@@ -2374,6 +2374,103 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     return target
 
 
+def _launch_candidate_saturated(acct: dict, config: dict) -> tuple[bool, str]:
+    """Does a launch candidate's (freshly-polled) reading sit AT/OVER any HARD
+    saturation line pick_swap_target treats as a wall? Returns (saturated, why).
+
+    This is the verify half of the launch-pick fresh-reading guard (2026-07-07,
+    the rayi5-98%-twice incident — see _launch_prepare's verify loop for the full
+    WHY). It mirrors the picker's three NO-FALLBACK exclusions, but evaluated on
+    the FRESH reading now sitting in `acct` after a force-poll rather than the
+    cached one the picker scored:
+
+      • 5h / effective ladder step — `_target_would_immediately_re_trip` is True
+        once the extrapolated effective % (max of the enabled 5h/7d windows) is
+        at/above `thresholds.steps[0]` (currently 90). This is the exact wall
+        that a stale-low idle account slips under: its cached 5h read low, so the
+        picker chose it, but the live number is over the step.
+      • aggregate 7d hard cap — `current_7d_pct >= hard_7d_cap_pct` (default 80,
+        a LOWER line than the 90 step, so it's checked explicitly).
+      • per-model weekly gate — PREMIUM pool only. The standard pool is handed a
+        gate-disabled config via `_config_for_pool`, so `_per_model_weekly_gate`
+        returns (False, …) and this arm is a no-op there (a standard lane may
+        still land on a Fable-capped account by design — GH #99). For premium,
+        a fresh per-model weekly at/over the target cap is a hard reject.
+
+    A candidate that trips ANY of these was stale-low and is actually capped, so
+    the launch loop rejects it and re-picks. `config` MUST be the pool-adjusted
+    view (the same one pick_launch_account was called with) so the per-model arm
+    matches the launch's pool semantics.
+    """
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    # 5h / effective ladder step (the primary stale-low-idle failure mode).
+    if _target_would_immediately_re_trip(acct, config):
+        return True, f"5h/effective={_account_estimated_effective_pct(acct, config):.0f}% >= step {steps[0]}%"
+    # Aggregate weekly hard cap (a lower line than the ladder step).
+    hard_7d = _hard_7d_cap_for_config(config)
+    if acct.get("current_7d_pct", 0) >= hard_7d:
+        return True, f"7d={acct.get('current_7d_pct', 0):.0f}% >= 7d cap {hard_7d}%"
+    # Per-model (Fable) weekly gate — premium pool only (no-op config for standard).
+    gate_enabled, _ = _per_model_weekly_gate(config)
+    if gate_enabled:
+        model_cap = _model_weekly_target_cap_for_config(config)
+        m = _max_model_weekly_from_acct(acct, config)
+        if m >= model_cap:
+            return True, f"per-model weekly={m:.0f}% >= cap {model_cap:.0f}%"
+    return False, ""
+
+
+def _force_poll_launch_candidate(account: str, state: dict, config: dict) -> bool:
+    """Force-poll ONE launch candidate and merge its FRESH reading into `state`
+    (in-memory) and persist it. Returns True only when a TRUSTWORTHY success
+    reading landed; False on any poll error (stale / expired / 429 / network /
+    unknown account) so the caller can DEGRADE TO SAFE rather than block.
+
+    This is the refresh half of the launch-pick fresh-reading guard (2026-07-07,
+    the rayi5-98%-twice incident). It mirrors `cus force-poll`'s core
+    (poll_account_usage → update_state_with_usage) MINUS the operator-facing
+    un-stale / relogin affordances that command adds — a launch must stay fast
+    and side-effect-light. We poll ONLY the candidate (not the whole pool) to
+    keep launch latency low, per the "targeted refresh" preference.
+
+    Two writes on purpose:
+      1. the caller's WORKING `state` dict, so the very next pick_launch_account
+         verify/re-pick sees the fresh %; and
+      2. a persisted reload-merge-save, so the daemon inherits the fresh reading
+         and doesn't immediately re-poll + bounce the freshly-launched session
+         (the exact churn this whole fix exists to prevent). The reload before
+         the save mirrors `cus force-poll`: the HTTP call can take seconds and a
+         concurrent swap may have edited `active`/history in the interim.
+    `update_state_with_usage` only touches the one named account, so neither
+    write disturbs the other accounts' readings.
+    """
+    try:
+        u = poll_account_usage(account)
+    except Exception:
+        # Network / parse blowup — treat as "couldn't verify", degrade to safe.
+        # A launch must never hard-fail on a poll hiccup (backward-compatible:
+        # on any error we fall through to the pre-fix cached-pick behavior).
+        return False
+    # (1) Reflect into the caller's working state for the re-check + re-pick.
+    update_state_with_usage(state, {account: u})
+    # (2) Persist best-effort so the daemon sees the same fresh number.
+    try:
+        fresh = load_state()
+        if account in fresh.get("accounts", {}):
+            update_state_with_usage(fresh, {account: u})
+            save_state(fresh)
+    except Exception:
+        # Persistence is best-effort; the in-memory update above is what the
+        # verify loop actually reads, so a save failure must not block the launch.
+        pass
+    # A stale / expired / errored poll is NOT a fresh reading we can trust to
+    # verify against — signal the caller to keep the existing pick and move on
+    # (the swap install-point / daemon will surface a genuinely broken account).
+    if u.token_stale or u.token_expired or u.raw.get("error"):
+        return False
+    return True
+
+
 def mount_in_use(mount: Path) -> bool:
     return bool(mount_pids(mount))
 
@@ -16688,13 +16785,87 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     if pool not in VALID_POOLS:
         raise click.ClickException(f"unknown pool '{pool}'. Valid: {list(VALID_POOLS)}")
     if account in (None, "auto"):
-        target = pick_launch_account(state, _config_for_pool(config, pool))
+        pool_config = _config_for_pool(config, pool)
+        target = pick_launch_account(state, pool_config)
         if target is None:
             raise click.ClickException(
                 "no launchable account: every account is expired, erroring, or on a live mount with "
                 "per_session.lane_sharing off (GH #104 — won't double-book a live account; lane sharing "
                 "makes live accounts joinable). Exit a session, wait for a 5h/weekly reset, fix logins, "
                 "or add an account. See `cus status` / `cus sos`.")
+
+        # ---- Fresh-reading verify-and-repick (2026-07-07, this fix) ----
+        # WHY: pick_launch_account scores accounts off their CACHED state
+        # readings (current_5h_pct / current_7d_pct / per-model). An IDLE account
+        # (no live lane naming it) is polled RARELY, so its cached 5h% goes
+        # STALE-LOW — and the launch SPREAD preference actively FAVORS such an
+        # idle account (no slot occupies it) as a "fresh" spread target. Twice on
+        # 2026-07-07 that landed `cus launch auto` on rayi5 while rayi5 was really
+        # at 5h 98% — its lanes had died and it was sitting near-capped waiting to
+        # reset, but its cached reading was stale-low. The saturation filter never
+        # saw the real 98%; the daemon then force-polled the new session's account,
+        # saw 98%, and bounced the session straight off — a churny, bad launch.
+        #
+        # This is the "never act on a stale reading" rule — already enforced on
+        # the SWAP path, which triggers off FRESH per-cycle usage — leaking
+        # through the LAUNCH path, which reads the cached dict. The fix wraps the
+        # existing picker (spread / lane-share / GH #104 logic all intact) with a
+        # fresh-reading verification: force-poll the chosen candidate, re-check
+        # the LIVE number against the picker's own HARD saturation lines
+        # (_launch_candidate_saturated), and if it was stale-low-actually-capped,
+        # reject it and re-pick with it excluded. Bounded so it always converges;
+        # degrades to the pre-fix cached pick on any poll error (never hard-fails).
+        rejected: set[str] = set()
+        # Bound: at most one verify-poll per account, capped at a small constant
+        # so a pathological pool can never spin the launch. len(accounts) covers
+        # "every account rejected once"; 6 is the belt-and-suspenders ceiling.
+        max_iters = min(max(len(state.get("accounts", {})), 1), 6)
+        for _ in range(max_iters):
+            cand = target.name
+            cached_5h = state.get("accounts", {}).get(cand, {}).get("current_5h_pct")
+            # Targeted refresh: poll ONLY this candidate (keeps launch latency
+            # low), merging the fresh reading into `state` for the re-check.
+            if not _force_poll_launch_candidate(cand, state, config):
+                # Couldn't get a trustworthy fresh reading (network / stale / 429)
+                # → DEGRADE TO SAFE: trust the pick as-is rather than block. A
+                # genuinely-broken account is surfaced downstream (install-point /
+                # daemon SOS), not by refusing the launch here.
+                break
+            saturated, why = _launch_candidate_saturated(
+                state.get("accounts", {}).get(cand, {}), pool_config)
+            if not saturated:
+                break  # fresh reading confirms the candidate is genuinely clean
+            # Stale-low → actually capped: reject it and re-pick without it.
+            cached_note = (f" (was cached 5h={cached_5h:.0f}%)"
+                           if isinstance(cached_5h, (int, float)) else "")
+            click.echo(f"launch: rejected '{cand}' — fresh poll shows {why}"
+                       f"{cached_note}, re-picking")
+            rejected.add(cand)
+            shim = dict(state)
+            shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items()
+                                if n not in rejected}
+            repick = pick_launch_account(shim, pool_config)
+            if repick is None:
+                # Every remaining account is expired / erroring / live-only too —
+                # the pool is genuinely saturated. DON'T hard-fail: fall back to
+                # the picker's own least-bad choice over the FULL pool (now
+                # carrying the fresh readings we just polled in), landing on the
+                # healthiest of a bad lot rather than refusing the launch.
+                least_bad = pick_launch_account(state, pool_config) or target
+                click.echo(f"launch: no fresh-clean account after rejecting "
+                           f"{sorted(rejected)}; landing on '{least_bad.name}' "
+                           f"(least-bad under a saturated fleet)")
+                target = least_bad
+                break
+            target = repick
+        else:
+            # Loop hit its iteration cap with every pick so far rejected AND
+            # re-pick still yielding fresh candidates — extremely unlikely given
+            # the strictly-shrinking exclusion set, but if it happens, land on the
+            # last pick rather than spin. Bounded-convergence guarantee.
+            click.echo(f"launch: verify loop hit its {max_iters}-iteration cap; "
+                       f"landing on '{target.name}'")
+
         account = target.name
         click.echo(f"launch: picked '{account}' ({target.reason})")
     elif account not in state.get("accounts", {}):
