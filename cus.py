@@ -351,6 +351,47 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # warning — an actively-maintained mount that just rotated its token is
         # not at risk even if we catch it momentarily near a stale expiresAt.
         "recent_refresh_minutes": 10,
+        # ── Fix 1 (2026-07-07 blank-mount PREEMPT) ───────────────────────────
+        # The soft near-expiry-AND-idle WARNING above (condition 1) fires just
+        # BEFORE the classic blank-mount failure: Claude Code's OWN in-place
+        # OAuth refresh rewrites the mount's .credentials.json as the token
+        # nears expiry, and if that refresh fails mid-write it leaves the file
+        # BLANK (accessToken:"" / expiresAt:0) → the live session shows "Not
+        # logged in · Run /login" (the 2026-07-07 tabby-5/slot-7 incident). The
+        # reactive auto-heal restores the file but Claude Code just re-blanks on
+        # its next failed refresh, AND a file-heal can't un-stick a process that
+        # already cached the logged-out state. So instead of only WARNING when
+        # this condition holds, PROACTIVELY refresh the lane's mount token via
+        # cus's OWN refresh grant (_refresh_account_token) and rewrite fresh,
+        # valid creds into the mount BEFORE Claude Code's failure-prone in-place
+        # refresh can blank it — keeping the mount ahead of expiry so Claude
+        # Code never needs its (fragile) refresh. Degrades to the existing
+        # warn+heal on any failure; only ever touches a live lane's own mount.
+        "preempt": {
+            # Master gate. False ⇒ no proactive refresh; behavior is the
+            # warn+heal-only pre-2026-07-07 daemon (bit-for-bit).
+            "enabled": True,
+            # Poll-burnout backoff: at most one proactive-refresh ATTEMPT per
+            # lane per this many minutes, whether it succeeds or fails. Without
+            # it a persistently-failing grant would re-fire every poll (the
+            # 2026-06-19 burnout shape). A SUCCESSFUL refresh is naturally
+            # rate-limited far longer than this — a fresh token sits hours out,
+            # so the near-expiry-AND-idle trigger can't re-arm until it ages
+            # back down; the cooldown only bounds the FAILURE-retry cadence.
+            "cooldown_minutes": 15,
+        },
+        # ── Fix 2 (2026-07-07 STUCK-SESSION escalation) ──────────────────────
+        # A file-heal is SILENT success today even when the live session stays
+        # wedged in "not logged in" — the running process cached the logged-out
+        # state and only a RELAUNCH clears it (hot_swap disabled here, so nothing
+        # auto-relaunches). Detect the heal→blank→heal cycle: a lane healed
+        # >= heal_threshold times within window_minutes means the file-heal is
+        # NOT helping and the operator must relaunch. Emits a distinct URGENT
+        # SOS naming the exact relaunch command.
+        "stuck": {
+            "heal_threshold": 2,     # >= this many heals ...
+            "window_minutes": 30,    # ... within this rolling window → escalate
+        },
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -553,6 +594,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # changes its shape and this starts erroring on every stale account.
     "token_self_refresh": {
         "enabled": True,
+        # Fix 4 (2026-07-07 un-stale idle accounts). An idle account whose stored
+        # access token aged out sits `token_stale` FOREVER even though its refresh
+        # token is still valid — nothing exercises it, so the poll-time
+        # _refresh_account_token above may never clear it (it's gated by `enabled`
+        # and folded into a poll). That causes (a) chronically wrong cus readings
+        # and (b) "stale snapshot → blank on install" when a lane swaps onto it.
+        # This mints a fresh access token via a DIRECT OAuth refresh grant
+        # (`_oauth_refresh_grant`, #127 — no session, no billed tokens), writes it
+        # back to the account SNAPSHOT, and clears token_stale.
+        #   * `unstale_idle_on_poll: True` — each daemon cycle, sweep accounts
+        #     still flagged token_stale (not token_expired) and un-stale them.
+        #     False ⇒ only `cus force-poll` un-stales (the operator's manual lever).
+        #   * `unstale_cooldown_minutes: 10` — poll-burnout backoff: at most one
+        #     grant attempt per account per this many minutes (force-poll bypasses
+        #     it — an operator explicitly asked). A DEAD refresh token
+        #     (invalid_grant) is left flagged and NOT retried tightly: it genuinely
+        #     needs a browser relogin.
+        "unstale_idle_on_poll": True,
+        "unstale_cooldown_minutes": 10,
     },
     "subagent_skip": {
         "enabled": True,
@@ -3051,7 +3111,7 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
     return primary_pair if primary_pair[0] is not None else first_stale_pair
 
 
-def _refresh_account_token(account_name: str) -> bool:
+def _refresh_account_token(account_name: str, creds_path: Path | None = None) -> bool:
     """Best-effort OAuth refresh_token grant for an inactive account whose
     stored access token has aged out (the token_stale condition, GH #13).
 
@@ -3072,11 +3132,24 @@ def _refresh_account_token(account_name: str) -> bool:
     pre-existing token_stale behavior", never as an error to surface —
     Anthropic can change the client_id/URL/response shape without notice,
     so silent, total fallback on any surprise is the only safe posture.
+
+    2026-07-07 (blank-mount preempt, Fix 1): `creds_path` optionally targets a
+    SPECIFIC credentials file instead of the account snapshot. The default
+    (None → the account's snapshot at `account_creds_path`) is the pre-existing
+    behavior every prior caller relies on. The preempt path passes a live LANE
+    mount's own `.credentials.json` so the fresh access token lands directly in
+    the file the running session reads — exactly what Claude Code's own in-place
+    refresh does, but driven reliably by cus ahead of expiry. Using the mount's
+    OWN refresh token (read from that file) and writing back only to that file
+    keeps it family-safe (#104): no other mount/store is touched, and the daemon's
+    existing save-back propagates the fresh token to the canonical store on the
+    next cycle, just as it does after a Claude Code refresh.
     """
     if not load_config().get("token_self_refresh", {}).get("enabled", True):
         return False
 
-    creds_path = account_creds_path(account_name)
+    if creds_path is None:
+        creds_path = account_creds_path(account_name)
     if not creds_path.exists():
         return False
     try:
@@ -3141,6 +3214,133 @@ def _refresh_account_token(account_name: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def _unstale_account_snapshot(account: str, state: dict, config: dict | None = None,
+                              *, force: bool = False) -> bool:
+    """Un-stale an idle `token_stale` account by minting a fresh access token via a
+    DIRECT OAuth refresh grant and writing it back to the account SNAPSHOT (Fix 4,
+    2026-07-07). Clears the `token_stale` flag on `state.accounts[account]` (caller
+    persists). Returns True only on a confirmed refresh+writeback.
+
+    The bug it fixes (verified live: `cus force-poll merkos` left token_stale set):
+    an idle account whose stored access token expired — nothing exercises it — sits
+    `token_stale` forever even though its REFRESH token is still valid. That yields
+    (a) chronically wrong cus readings and (b) "stale snapshot → blank on install"
+    when a lane swaps onto it (the chats1a-on-merkos blank). The poll-time
+    `_refresh_account_token` is gated by `token_self_refresh.enabled` and folded
+    into a poll, so it may never clear a stale flag; this is the explicit,
+    ungated-by-that-flag un-stale.
+
+    Uses `_oauth_refresh_grant` (#127) — a pure token-mint call: no session, no
+    haiku, no billed tokens. Recoverable case only (a valid stored refresh token):
+      * grant `alive`   → persist the rotated tokens into the snapshot (the old
+                          refresh token is dead the instant the grant succeeds),
+                          clear token_stale, audit `decision=refreshed`, return True.
+      * grant `dead`    → invalid_grant: the refresh token genuinely needs a
+                          browser relogin. Leave token_stale flagged, audit
+                          `decision=failed`, return False — and DON'T retry tightly.
+      * grant `unknown` → network/endpoint drift: fail-open, leave flagged, retry
+                          later (bounded by the cooldown).
+
+    Poll-burnout backoff: at most one attempt per account per
+    `token_self_refresh.unstale_cooldown_minutes`, unless `force` (force-poll is
+    operator-invoked, so it bypasses the cooldown). Never raises into the caller."""
+    cfg = config if config is not None else load_config()
+    acct = state.get("accounts", {}).get(account) if isinstance(state, dict) else None
+    if not isinstance(acct, dict):
+        return False
+    # Only the recoverable idle case: stale but NOT hard-expired (a real 401 on a
+    # non-expired stored token is token_expired — that needs a browser relogin, not
+    # a refresh grant).
+    if not acct.get("token_stale") or acct.get("token_expired"):
+        return False
+    # Poll-burnout backoff (per account, success OR fail), bypassed by force.
+    now = time.time()
+    cooldown_min = cfg.get("token_self_refresh", {}).get("unstale_cooldown_minutes", 10)
+    if not force:
+        last = _UNSTALE_ATTEMPT_MS.get(account)
+        if last is not None and (now - last) < cooldown_min * 60:
+            return False
+    _UNSTALE_ATTEMPT_MS[account] = now
+
+    snap = account_creds_path(account)
+    if not snap.exists():
+        _cred_audit("unstale-refresh", "failed", "no account snapshot on disk",
+                    account=account, token_fp="none")
+        return False
+    try:
+        creds = read_json(snap)  # dict — narrowed so the writeback below is type-clean
+    except (json.JSONDecodeError, OSError):
+        return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # No usable refresh token in the snapshot → genuinely needs a relogin.
+        _cred_audit("unstale-refresh", "failed", "no usable refresh token in account snapshot",
+                    account=account, token_fp="none")
+        return False
+
+    verdict, tok = _oauth_refresh_grant(rt)
+    if verdict != "alive" or not isinstance(tok, dict):
+        _cred_audit("unstale-refresh", "failed",
+                    f"refresh grant {verdict} (dead ⇒ browser relogin; unknown ⇒ retry later)",
+                    account=account, token_fp=_audit_token_fp(creds))
+        return False
+
+    # Persist the rotation BEFORE clearing the flag — after a successful grant the
+    # snapshot's OLD refresh token is a dead branch (single-use rotation, #104), so
+    # the fresh pair must land on disk or we'd lose the family. Whole assembly is
+    # guarded so a malformed grant response can never crash the caller.
+    try:
+        access = tok.get("access_token")
+        if not isinstance(access, str) or not access:
+            _cred_audit("unstale-refresh", "failed", "grant returned no access_token",
+                        account=account, token_fp=_audit_token_fp(creds))
+            return False
+        oauth = dict(creds.get("claudeAiOauth") or {})
+        oauth["accessToken"] = access
+        oauth["refreshToken"] = tok.get("refresh_token") or rt
+        expires_in = tok.get("expires_in")
+        if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+            oauth["expiresAt"] = int((time.time() + float(expires_in)) * 1000)
+        new_creds = dict(creds)
+        new_creds["claudeAiOauth"] = oauth
+        backup_credentials_file(snap)
+        write_json(snap, new_creds, mode=0o600)
+    except (OSError, TypeError, ValueError):
+        return False
+
+    # Clear the stale flag in state (caller saves). token_expired stays cleared too
+    # — a working refresh grant proves the account is reachable.
+    acct.pop("token_stale", None)
+    acct["token_expired"] = False
+    _cred_audit("unstale-refresh", "refreshed",
+                "minted fresh access token via direct OAuth grant; cleared token_stale",
+                account=account, token_fp=_audit_token_fp(new_creds),
+                extra=f"new_expiry={_expiry_repr(new_creds)}")
+    return True
+
+
+def _sweep_unstale_idle_accounts(state: dict, config: dict) -> list[str]:
+    """Each daemon cycle, un-stale every account still flagged token_stale (Fix 4).
+
+    Cheap self-healing pass over the accounts the poll just left token_stale (and
+    not token_expired): a direct refresh grant per account, cooldown-bounded so it
+    can't burn out, snapshot-writeback + flag-clear on success. Gated by
+    `token_self_refresh.unstale_idle_on_poll` (default True). Returns the list of
+    un-staled account names. Even if the caller never persists the cleared flag,
+    the snapshot writeback is durable — next cycle's poll reads the fresh token and
+    clears token_stale via the normal success path — so this can only help."""
+    if not config.get("token_self_refresh", {}).get("unstale_idle_on_poll", True):
+        return []
+    out: list[str] = []
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict):
+            continue
+        if acct.get("token_stale") and not acct.get("token_expired"):
+            if _unstale_account_snapshot(name, state, config):
+                out.append(name)
+    return out
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -7940,6 +8140,107 @@ def _auto_heal_live_mount(state: dict, config: dict, no_execute: bool = False) -
 # a-blank discipline, but scoped to each LIVE lane's own mount.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Blank-mount PREEMPT + STUCK-SESSION + FORENSICS shared state (2026-07-07)
+# ---------------------------------------------------------------------------
+# In-process tracking for the three 2026-07-07 durable fixes. All three are
+# process-local (the daemon is a long-lived process) and intentionally NOT
+# persisted to disk:
+#   * A daemon restart clearing them is safe-by-design — the worst case is one
+#     extra proactive-refresh attempt (Fix 1) or a reset heal-count (Fix 2), both
+#     harmless; there is nothing durable to corrupt.
+#   * Keeping them off-disk avoids adding a new on-disk format (backward-compat).
+# Tests reset them explicitly (they persist for the module's lifetime).
+#
+# _PREEMPT_ATTEMPT_MS: (slot, account) -> monotonic-ish wall-clock seconds of the
+#   last proactive-refresh ATTEMPT, the poll-burnout backoff clock for Fix 1.
+# _LANE_HEAL_HISTORY: (slot, account) -> list of wall-clock heal timestamps, the
+#   heal→blank→heal detector for Fix 2 (pruned to the stuck window on read).
+_PREEMPT_ATTEMPT_MS: dict[tuple[str, str], float] = {}
+_LANE_HEAL_HISTORY: dict[tuple[str, str], list[float]] = {}
+# _UNSTALE_ATTEMPT_MS: account -> last un-stale refresh-grant attempt (Fix 4,
+#   2026-07-07), the poll-burnout backoff clock for the idle-account un-stale sweep.
+_UNSTALE_ATTEMPT_MS: dict[str, float] = {}
+
+
+def _reset_blank_tracking() -> None:
+    """Clear all in-process blank-mount / un-stale tracking (test hook; also
+    usable to force a fresh preempt/un-stale attempt or heal-count after a config
+    change). Never needed in normal daemon operation — the dicts self-prune."""
+    _PREEMPT_ATTEMPT_MS.clear()
+    _LANE_HEAL_HISTORY.clear()
+    _UNSTALE_ATTEMPT_MS.clear()
+
+
+def _lane_lastvalid_path(mount_creds: Path) -> Path:
+    """Path of a lane mount's last-known-valid SHADOW copy (Fix 3, 2026-07-07).
+
+    A sibling of the mount's `.credentials.json` named `.credentials.json.lastvalid`.
+    We APPEND the suffix (not `with_suffix`, which would replace `.json`) so the
+    shadow sits next to the live file and is trivially greppable. Refreshed
+    whenever the mount is observed valid, it serves two ends: (a) an INSTANT,
+    same-family heal source (see `_lane_heal_source`), and (b) a stable baseline
+    to diff a freshly-blanked mount against for forensics (prior-valid token
+    fingerprint / expiry vs the now-blank state)."""
+    return Path(str(mount_creds) + ".lastvalid")
+
+
+def _update_lane_lastvalid(mount_creds: Path, creds: Any) -> None:
+    """Refresh a lane's last-known-valid shadow copy IFF the mount is valid
+    (Fix 3). Best-effort observability: never raises into the caller — a failed
+    shadow write must not disturb a poll/preempt/heal. No-op on a blank/invalid
+    mount (we never overwrite a good shadow with a bad snapshot — the whole point
+    is to retain the last GOOD generation to heal/diff against)."""
+    if _live_mount_creds_invalid(creds):
+        return
+    try:
+        atomic_copy(mount_creds, _lane_lastvalid_path(mount_creds), mode=0o600)
+    except OSError:
+        pass
+
+
+def _lastvalid_age_seconds(mount_creds: Path) -> float | None:
+    """Seconds since the lane's last-valid shadow was last refreshed (its mtime),
+    i.e. roughly how long since the mount was last seen healthy — the "how long
+    since it was last valid" forensic field. None when no shadow exists yet."""
+    shadow = _lane_lastvalid_path(mount_creds)
+    try:
+        return (time.time() - shadow.stat().st_mtime) if shadow.exists() else None
+    except OSError:
+        return None
+
+
+def _mtime_iso(path: Path) -> str:
+    """UTC ISO mtime of a file for a CRED-AUDIT line, or `none` if absent/unreadable."""
+    try:
+        if not path.exists():
+            return "none"
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        return "none"
+
+
+def _expiry_repr(creds: Any) -> str:
+    """Compact expiresAt for a CRED-AUDIT line: the raw epoch-ms plus its ISO
+    rendering, or `none`. For a blanked mount this is typically `0` — the epoch
+    signature — which is itself the evidence, so we log it verbatim."""
+    exp = _creds_expires_at(creds)
+    if exp is None:
+        return "none"
+    try:
+        iso = datetime.fromtimestamp(exp / 1000, timezone.utc).isoformat(timespec="minutes")
+    except (OverflowError, OSError, ValueError):
+        iso = "?"
+    return f"{int(exp)}({iso})"
+
+
+def _record_lane_heal(slot: str, account: str) -> None:
+    """Log one successful lane heal for the Fix 2 heal→blank→heal detector.
+    Appends now() to the lane's rolling history; `_diagnose_stuck_lanes` prunes
+    to the stuck window and escalates once the count crosses the threshold."""
+    _LANE_HEAL_HISTORY.setdefault((slot, account), []).append(time.time())
+
+
 def _blanked_live_lanes(state: dict, config: dict) -> list[tuple[str, str]]:
     """(slot, account) for every LIVE lane whose OWN mount creds are blanked/invalid.
 
@@ -7991,8 +8292,10 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
         pooled lane whose family store is itself blanked/missing heals from
         NOTHING here (returns None) rather than cross-contaminating — it escalates
         to the relogin SOS, same as the shared-mount "no usable backup" case.
-      * A plain (non-pooled) lane is a shared-snapshot copy, so it heals from the
-        account's newest usable snapshot/backup — the exact same
+      * A plain (non-pooled) lane is a shared-snapshot copy, so it heals from its
+        own last-valid SHADOW first (Fix 3, 2026-07-07 — the freshest, guaranteed
+        same-family copy of exactly what this mount last held) and then, failing
+        that, the account's newest usable snapshot/backup — the same
         `_newest_usable_creds_source` the shared-mount heal uses.
 
     "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
@@ -8009,7 +8312,23 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
             except (json.JSONDecodeError, OSError):
                 pass
         # Leased family store blanked/missing → NO cross-family fallback (#104).
+        # The last-valid shadow is deliberately NOT consulted for a pooled lane:
+        # a stale shadow could predate a re-lease to a different family, and
+        # re-installing it would cross-contaminate; the family store is the only
+        # authoritative source for a pooled lane.
         return None
+    # Plain lane. The last-valid shadow is a copy of THIS lane's own mount taken
+    # while it was valid — same slot, same refresh-token lineage by construction
+    # — so it is the freshest #104-safe heal source and cannot cross-contaminate.
+    # Prefer it; fall through to the snapshot/backup when there's no usable shadow
+    # (e.g. right after a daemon restart, before any valid scan has taken one).
+    shadow = _lane_lastvalid_path(mount_creds_path(slot_path(slot)))
+    if shadow.exists():
+        try:
+            if not _live_mount_creds_invalid(read_json(shadow)):
+                return shadow
+        except (json.JSONDecodeError, OSError):
+            pass
     return _newest_usable_creds_source(account)
 
 
@@ -8153,13 +8472,44 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
     discipline (a pooled lane heals only from its own family — see
     `_lane_heal_source`). Returns the list of healed slot names. `no_execute` logs
     the intended heal without writing, for `cus daemon --once --no-execute`.
-    """
+
+    Forensics (Fix 3, 2026-07-07): every blank detection emits a `op=blank-detected`
+    CRED-AUDIT line and every successful restore a `op=blank-heal` line, capturing
+    the mount mtime, how long since the mount was last valid (shadow age), the
+    prior-valid token fingerprint (from the last-valid shadow) vs the now-blank
+    state, and the expiry that triggered — so the NEXT recurrence can be
+    characterized (which family, how stale, was Claude Code's refresh the writer).
+    No raw tokens ever (fingerprint only). Each heal is also recorded for the Fix 2
+    heal→blank→heal stuck-session detector (`_diagnose_stuck_lanes`)."""
     if config.get("mode", "global") not in ("per_session", "hybrid"):
         return []
     healed: list[str] = []
     for slot, account in _blanked_live_lanes(state, config):
         source = _lane_heal_source(slot, account, state, config)
         dest = mount_creds_path(slot_path(slot))
+        # ── Forensics: characterize the blank BEFORE we heal it (Fix 3). ──────
+        # Read the now-blank mount + the last-valid shadow so we can log what the
+        # mount held when it was healthy vs the blank it is now — the evidence
+        # that pins the cause (family, staleness, epoch signature) next time.
+        try:
+            _blank_creds = read_json(dest) if dest.exists() else None
+        except (json.JSONDecodeError, OSError):
+            _blank_creds = None
+        try:
+            _shadow_p = _lane_lastvalid_path(dest)
+            _shadow_creds = read_json(_shadow_p) if _shadow_p.exists() else None
+        except (json.JSONDecodeError, OSError):
+            _shadow_creds = None
+        _lv_age = _lastvalid_age_seconds(dest)
+        _cred_audit(
+            "blank-detected", "detected",
+            "live lane mount creds blanked/invalid (2026-07-07 blank-mount signature)",
+            slot=slot, account=account, token_fp=_audit_token_fp(_blank_creds),
+            extra=(f"mount_mtime={_mtime_iso(dest)} "
+                   f"last_valid_age={'unknown' if _lv_age is None else f'{_lv_age:.0f}s'} "
+                   f"blank_expiry={_expiry_repr(_blank_creds)} "
+                   f"prev_valid_fp={_audit_token_fp(_shadow_creds)} "
+                   f"prev_valid_expiry={_expiry_repr(_shadow_creds)}"))
         if source is None:
             # No usable snapshot/backup/family: cannot self-heal without a browser
             # relogin. Leave the blank so diagnose() surfaces the URGENT SOS.
@@ -8185,6 +8535,22 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
         # — the family store / snapshot is a heal SOURCE here, never a write target.
         backup_credentials_file(dest)
         atomic_copy(source, dest, mode=0o600)
+        # Forensics: record the heal, its source, and the restored token's fp so a
+        # heal→blank→heal cycle is visible in the audit stream (Fix 3).
+        try:
+            _healed_creds = read_json(dest)
+        except (json.JSONDecodeError, OSError):
+            _healed_creds = None
+        _cred_audit(
+            "blank-heal", "wrote",
+            f"auto-restored blanked live lane mount from {source.name}",
+            slot=slot, account=account, token_fp=_audit_token_fp(_healed_creds),
+            extra=f"source={source} restored_expiry={_expiry_repr(_healed_creds)}")
+        # Record the heal for the Fix 2 stuck-session (heal→blank→heal) detector.
+        _record_lane_heal(slot, account)
+        # The restored mount is a fresh last-known-good — refresh the shadow so a
+        # subsequent blank diffs against THIS generation, and heal has it instantly.
+        _update_lane_lastvalid(dest, _healed_creds)
         msg = (f"live lane {slot} ({account}) mount creds were blanked/invalid (GH #141 lane "
                f"follow-up) — auto-restored '{account}' credentials from {source} into {dest}; "
                f"the lane's session is usable again without a human (2026-07-05 slot-2 incident).")
@@ -8449,6 +8815,215 @@ def _diagnose_live_mounts_creds_health(state: dict, config: dict) -> list[SOSCon
         active = state.get("active")
         if active:
             _scan("shared", active, CREDS_JSON, None)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — PREEMPT the blank (proactive mount-token refresh, 2026-07-07)
+# ---------------------------------------------------------------------------
+# The single highest-value fix for the recurring blank-mount failure. The warn
+# scan above emits a heads-up when a live lane's OAuth access token is near
+# expiry AND its mount isn't observed refreshing — the EXACT condition that
+# precedes the classic blank: Claude Code, seeing its token near expiry, attempts
+# its OWN in-place refresh of the mount's .credentials.json, and a mid-write
+# failure leaves the file blank (accessToken:"" / expiresAt:0) → "Not logged in".
+# Rather than only WARN, this PROACTIVELY performs the refresh cus-side (a pure
+# token-mint grant via `_refresh_account_token`, no quota, no session) and writes
+# the fresh, valid token straight into the mount — so the mount stays ahead of
+# expiry and Claude Code never needs its fragile in-place refresh. This breaks
+# the heal→blank→heal cycle at its SOURCE. Incident it targets: 2026-07-07
+# tabby-5/slot-7 (rayi6) sat "not logged in" until a human noticed.
+
+
+def _preempt_live_lane_blanks(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Proactively refresh live lane mounts that are near-expiry-AND-idle, BEFORE
+    Claude Code's failure-prone in-place refresh can blank them (Fix 1).
+
+    For every LIVE lane (per_session/hybrid; /proc-gated via `occupied_slot_accounts`)
+    whose mount is still VALID but whose access token is within
+    `creds_warn.access_expiry_minutes` of expiry and hasn't been rewritten within
+    `creds_warn.recent_refresh_minutes` (i.e. it isn't self-maintaining — the exact
+    predicate condition 1 of `_diagnose_mount_creds_health` warns on), mint a fresh
+    token via `_refresh_account_token(account, creds_path=<mount>)` and let it
+    rewrite the mount in place. Because a successful refresh bumps the mount mtime,
+    the subsequent warn scan sees it "recently refreshed" and stays silent — a
+    preempted lane neither warns nor blanks.
+
+    Safety / degrade-to-safe posture (never crashes a poll, backward-compatible):
+      * Gated by `creds_warn.enabled` AND `creds_warn.preempt.enabled` (default on);
+        both off ⇒ the pre-2026-07-07 warn+heal-only behavior, bit-for-bit.
+      * Only touches a lane whose mount is VALID and carries a usable refresh token
+        (an ALREADY-blank mount belongs to the reactive heal, not the preempt).
+      * Poll-burnout backoff: at most one ATTEMPT per lane per
+        `preempt.cooldown_minutes`, success or fail, so a persistently-failing
+        grant can't re-fire every poll (the 2026-06-19 burnout shape).
+      * Family-safe (#104): refreshes using the mount's OWN refresh token and
+        writes back ONLY to that mount — no other mount/store is touched; the
+        existing save-back propagates the fresh token to the canonical store.
+      * On ANY failure (refresh disabled, grant error, non-200) it does NOTHING to
+        the mount and leaves the lane for the existing warn+heal path — degrade,
+        never worsen.
+
+    Returns the list of preempted slot names. `no_execute` logs intent only."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    cw = config.get("creds_warn", {}) if isinstance(config, dict) else {}
+    if not cw.get("enabled", True):
+        return []
+    pcfg = cw.get("preempt", {}) if isinstance(cw, dict) else {}
+    if not pcfg.get("enabled", True):
+        return []
+    window = cw.get("access_expiry_minutes", 45)
+    recent_min = cw.get("recent_refresh_minutes", 10)
+    cooldown_min = pcfg.get("cooldown_minutes", 15)
+    now = time.time()
+    now_ms = int(now * 1000)
+    preempted: list[str] = []
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            mount = mount_creds_path(slot_path(slot))
+            try:
+                creds = read_json(mount) if mount.exists() else None
+            except (json.JSONDecodeError, OSError):
+                creds = None
+            # An already-blank mount is the REACTIVE heal's job, not the preempt's
+            # — the whole point of preempt is to act while the mount is still valid.
+            if _live_mount_creds_invalid(creds):
+                continue
+            # Fix 3: the mount is valid → refresh its last-known-good shadow. Doing
+            # it here (every cycle, on every live valid lane) keeps the shadow
+            # current for instant heal + blank-vs-lastvalid forensic diffing.
+            _update_lane_lastvalid(mount, creds)
+            # Near-expiry gate. Skip the healthy (plenty of runway) and the already
+            # -stale (minutes_left<=0 — that's the warn/heal path, not a token we
+            # can safely pre-refresh: a stale mount may already be mid-fail).
+            exp = _creds_expires_at(creds)
+            if exp is None:
+                continue
+            minutes_left = (exp - now_ms) / 60_000.0
+            if minutes_left <= 0 or minutes_left > window:
+                continue
+            # Self-maintaining? A mount rewritten within recent_min is actively
+            # rotating its own token — leave it alone (matches the warn scan's
+            # `recently_refreshed` suppression).
+            try:
+                if mount.exists() and (now - mount.stat().st_mtime) < recent_min * 60:
+                    continue
+            except OSError:
+                continue
+            # Need a usable refresh token to mint a new access token; without one
+            # this lane needs a browser relogin (the refresh-TTL warning handles it).
+            if _credential_refresh_token(creds) is None:
+                continue
+            # Poll-burnout backoff (per lane, success OR fail).
+            key = (slot, account)
+            last_attempt = _PREEMPT_ATTEMPT_MS.get(key)
+            if last_attempt is not None and (now - last_attempt) < cooldown_min * 60:
+                continue
+            _PREEMPT_ATTEMPT_MS[key] = now
+            old_fp = _audit_token_fp(creds)
+            if no_execute:
+                click.echo(f"  preempt (--no-execute): WOULD proactively refresh live lane {slot} "
+                           f"({account}) mount token (~{minutes_left:.0f} min to expiry, idle) "
+                           f"before Claude Code's in-place refresh can blank it (Fix 1)")
+                continue
+            # Proactive refresh straight into the mount. On failure, do NOT touch
+            # the mount — degrade to the existing warn+heal path.
+            if _refresh_account_token(account, creds_path=mount):
+                try:
+                    fresh = read_json(mount)
+                except (json.JSONDecodeError, OSError):
+                    fresh = None
+                _cred_audit(
+                    "blank-preempt", "wrote",
+                    f"proactive mount-token refresh ahead of expiry (~{minutes_left:.0f}m left, idle)",
+                    slot=slot, account=account, token_fp=_audit_token_fp(fresh),
+                    extra=(f"prev_token_fp={old_fp} mount_mtime={_mtime_iso(mount)} "
+                           f"new_expiry={_expiry_repr(fresh)}"))
+                _update_lane_lastvalid(mount, fresh)
+                click.echo(f"  PREEMPT: refreshed live lane {slot} ({account}) mount token ahead of "
+                           f"expiry (~{minutes_left:.0f} min left, idle) — kept it ahead of Claude "
+                           f"Code's failure-prone in-place refresh, so it can't blank (Fix 1).")
+                preempted.append(slot)
+            else:
+                _cred_audit(
+                    "blank-preempt", "skipped-refresh-failed",
+                    "proactive refresh grant failed — degrading to the existing warn+heal path",
+                    slot=slot, account=account, token_fp=old_fp,
+                    extra=f"mount_mtime={_mtime_iso(mount)} expiry={_expiry_repr(creds)}")
+    return preempted
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — STUCK-SESSION escalation (heal→blank→heal detector, 2026-07-07)
+# ---------------------------------------------------------------------------
+# The reactive file-heal restores a blanked mount, but that is SILENT success
+# even when it doesn't actually un-stick the live session: once the running
+# Claude Code process has cached the logged-out state ("Not logged in · Run
+# /login"), restoring the file does NOT revive it — the process must be
+# RELAUNCHED (hot_swap is disabled in this config, so nothing does it
+# automatically). A lane blanking REPEATEDLY (heal→blank→heal) is the signature
+# of exactly this: the file keeps getting fixed and re-blanked while the process
+# stays wedged. This escalates that case to a distinct URGENT that tells the
+# operator a file-heal won't help and names the relaunch command.
+
+
+def _stuck_lane_sos(slot: str, account: str, heal_count: int, window_min: int) -> SOSCondition:
+    """URGENT for a lane stuck in a heal→blank→heal cycle (Fix 2). The summary is
+    STABLE (no live-changing counts) so `maybe_write_sos`'s severity:summary
+    de-dup notifies once, not every poll; the volatile count/window ride the
+    action."""
+    return SOSCondition(
+        severity="urgent",
+        summary=(f"lane {slot} ({account}) keeps blanking / session stuck 'not logged in' — "
+                 f"file healed but the live process needs a RELAUNCH"),
+        action=(
+            f"Lane {slot}'s mount for '{account}' has been auto-healed {heal_count} times within "
+            f"{window_min} min — a heal→blank→heal cycle. Each heal restores the FILE, but the "
+            f"running Claude Code process on this lane cached the logged-out state ('Not logged in "
+            f"· Run /login') and a file-heal cannot revive it (hot_swap is disabled, so nothing "
+            f"auto-relaunches). The 2026-07-07 tabby-5/slot-7 signature. The live process needs a "
+            f"RELAUNCH — restore the session in place:\n"
+            f"      cus launch {account} --lane {slot} -- --continue\n"
+            f"    (Fix 1's proactive refresh should keep the mount ahead of expiry so this stops "
+            f"recurring; if it persists, the account likely needs a browser re-login: "
+            f"cus relogin {account}.)"),
+        affected=account,
+    )
+
+
+def _diagnose_stuck_lanes(state: dict, config: dict) -> list[SOSCondition]:
+    """Escalate every LIVE lane healed >= `creds_warn.stuck.heal_threshold` times
+    within `creds_warn.stuck.window_minutes` to the stuck-session URGENT (Fix 2).
+
+    Reads the in-process `_LANE_HEAL_HISTORY` populated by `_auto_heal_live_lanes`,
+    pruning each lane's timestamps to the rolling window as it goes (so a lane that
+    stops blanking ages out of the count and clears). Only reports lanes that are
+    STILL live — a lane whose session exited is no longer stuck. Off entirely
+    outside lane-serving modes."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    cw = config.get("creds_warn", {}) if isinstance(config, dict) else {}
+    scfg = cw.get("stuck", {}) if isinstance(cw, dict) else {}
+    threshold = scfg.get("heal_threshold", 2)
+    window_min = scfg.get("window_minutes", 30)
+    now = time.time()
+    live = {(slot, account)
+            for account, slots in occupied_slot_accounts(state).items()
+            for slot in slots}
+    out: list[SOSCondition] = []
+    for key in list(_LANE_HEAL_HISTORY.keys()):
+        recent = [t for t in _LANE_HEAL_HISTORY[key] if (now - t) <= window_min * 60]
+        if recent:
+            _LANE_HEAL_HISTORY[key] = recent
+        else:
+            del _LANE_HEAL_HISTORY[key]  # fully aged out — forget the lane
+            continue
+        if key not in live:
+            continue  # session exited → not stuck anymore
+        if len(recent) >= threshold:
+            slot, account = key
+            out.append(_stuck_lane_sos(slot, account, len(recent), window_min))
     return out
 
 
@@ -12473,11 +13048,36 @@ def force_poll(account: str) -> None:
         sys.exit(4)
     acct = state["accounts"][account]
     if u.token_stale:
-        minutes = u.raw.get("expired_minutes_ago", "?")
-        click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable). State updated to clear any prior token_expired flag.")
+        # Reflect the stale flag in state first, so the Fix 4 un-stale helper
+        # (which gates on acct['token_stale']) can act on it.
         update_state_with_usage(state, {account: u})
-        save_state(state)
-        sys.exit(0)
+        # Fix 4 (2026-07-07): force-poll is the operator's explicit "revive it"
+        # lever. Before accepting the stale flag, try to un-stale via a DIRECT
+        # OAuth refresh grant (no session, no billed tokens) — writes a fresh
+        # access token into the account snapshot and clears token_stale — then
+        # re-poll for live numbers. force=True bypasses the burnout cooldown (an
+        # operator explicitly asked). A DEAD refresh token can't be revived → keep
+        # the stale message + exit (that one needs a browser relogin).
+        if _unstale_account_snapshot(account, state, config, force=True):
+            save_state(state)  # persist the cleared flag + fresh snapshot at once
+            click.echo(f"  UN-STALED {account} — minted a fresh access token via a direct OAuth "
+                       f"refresh grant and cleared token_stale; re-polling for live numbers.")
+            u = poll_account_usage(account)
+            state = load_state()
+            if account not in state.get("accounts", {}):
+                click.echo(f"  account '{account}' disappeared from state.json mid-repoll; not saving")
+                sys.exit(4)
+            acct = state["accounts"][account]
+        if u.token_stale:
+            # Un-stale failed (dead refresh token) OR the re-poll is somehow still
+            # stale — don't loop; record and exit with the recoverable-stale note.
+            minutes = u.raw.get("expired_minutes_ago", "?")
+            click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token "
+                       f"still valid; account remains usable). A direct refresh grant could not revive "
+                       f"it now; if it persists, re-login: cus relogin {account}.")
+            update_state_with_usage(state, {account: u})
+            save_state(state)
+            sys.exit(0)
     if u.token_expired:
         # GH #77 auto-heal hint (same as `cus poll`): a fresher snapshot means
         # the re-login already happened — only the snapshot→live sync is missing.
@@ -12811,6 +13411,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         click.echo(f"startup swap-journal check skipped: {e}")
 
     def _emit_sos_after(state: dict, config: dict) -> None:
+        # Fix 1 (2026-07-07 blank-mount PREEMPT): FIRST — before any heal or
+        # diagnose — proactively refresh live lane mounts that are near-expiry-AND
+        # -idle, the state that PRECEDES the classic blank (Claude Code's own
+        # in-place refresh failing mid-write). Keeping the mount ahead of expiry
+        # means Claude Code never needs its fragile refresh, so the mount never
+        # blanks — breaking the heal→blank→heal cycle at its source. A preempted
+        # mount is rewritten (fresh mtime), so the warn scan below then sees it
+        # self-maintaining and stays silent. No-op outside per_session/hybrid or
+        # when disabled; degrades to the warn+heal path on any refresh failure.
+        _preempt_live_lane_blanks(state, config, no_execute=no_execute)
         # GH #141 self-heal: BEFORE diagnosing, try to auto-restore a blanked
         # live shared mount (global/hybrid only; no-op elsewhere or when healthy).
         # Running it here — the one place every served-mount cycle path funnels
@@ -12835,6 +13445,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # before they fail. Merged into the same conditions list so they ride the
         # existing SOS.md write + notify de-dup (`maybe_write_sos`).
         conditions.extend(_diagnose_live_mounts_creds_health(state, config))
+        # Fix 2 (2026-07-07 STUCK-SESSION escalation): a lane auto-healed
+        # repeatedly (heal→blank→heal within the stuck window) means the file-heal
+        # is NOT un-sticking the live process — it cached the logged-out state and
+        # needs a RELAUNCH. Append the distinct URGENT so the operator knows a
+        # file-heal won't help. Reads the in-process heal history recorded by
+        # `_auto_heal_live_lanes` above.
+        conditions.extend(_diagnose_stuck_lanes(state, config))
         maybe_write_sos(conditions, state)
         if conditions:
             for c in conditions:
@@ -12919,6 +13536,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
+        # Fix 4 (2026-07-07): cheap self-healing pass — un-stale every account the
+        # poll just left token_stale (idle account, valid refresh token) via a
+        # direct OAuth refresh grant. Keeps cus's readings correct and prevents the
+        # "stale snapshot → blank on install" when a lane later swaps onto it.
+        # Cooldown-bounded (no burnout); no-op when disabled or nothing is stale.
+        for _unstaled in _sweep_unstale_idle_accounts(state, config):
+            click.echo(f"  un-staled idle account {_unstaled}: minted a fresh access token via a "
+                       f"direct OAuth refresh grant and cleared token_stale (Fix 4)")
         # GH #59: countdown fallback — for any account whose 5h reset elapsed
         # without a fresh poll this cycle, trust the countdown and infer the
         # window reset (5h→0) BEFORE the ladder-reset + decision below, so both
