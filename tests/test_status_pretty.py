@@ -264,6 +264,43 @@ def test_pretty_orphaned_slot_mount_keeps_slot_grounding():
         env.restore()
 
 
+# --- --pretty: width adaptation & section hiding -----------------------------
+
+
+def _max_line_len(out: str) -> int:
+    return max((len(l) for l in out.splitlines()), default=0)
+
+
+def test_pretty_wide_has_bars():
+    out = _pretty(columns="160")
+    assert "█" in out or "░" in out
+    assert _max_line_len(out) <= 160
+
+
+def test_pretty_medium_drops_bars_keeps_model_column():
+    out = _pretty(columns="100")
+    assert "█" not in out and "░" not in out
+    assert "7d by model" in out
+    assert _max_line_len(out) <= 100
+
+
+def test_pretty_narrow_folds_model_column():
+    out = _pretty(columns="60")
+    assert "7d by model" not in out
+    assert "Fable 74%" in out                   # folded under the account name
+    assert _max_line_len(out) <= 60
+
+
+def test_pretty_minimal_state_hides_sections():
+    minimal = {"active": "a", "accounts": {"a": {}}, "swap_history": []}
+    out = _pretty({"state": minimal, "config": "mode: per_session\n",
+                   "families": {}, "with_slot_dir": False, "sessions": []})
+    assert "Lanes" not in out
+    assert "Recent swaps" not in out
+    assert "Locks" not in out
+    assert "gate OFF" not in out
+
+
 def _run_all() -> int:
     import types
     tests = [v for k, v in globals().items()
