@@ -199,7 +199,7 @@ def test_pretty_disabled_and_next_swap():
 
 def test_pretty_pool_column_and_gate_caption():
     out = _pretty()
-    assert "2/2 free" in out
+    assert "2/2 free (<3)" in out
     assert "gate OFF" in out                     # pools exist, gate not enabled
 
 

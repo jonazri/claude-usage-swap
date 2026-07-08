@@ -10930,6 +10930,9 @@ def _render_status_pretty(state: dict, config: dict) -> None:
     def usage_cell(acct: dict, key: str, row: dict) -> Text:
         win = "5h" if key == "current_5h_pct" else "7d"
         if _pct_is_unknown(acct, key):
+            # Intentionally NO estimator note here (plain mode prints one):
+            # an extrapolation beside an unobservable base reads as current
+            # data — the 2026-07-05 stale-reading trap. '?' stays bare.
             return Text("?", style="dim")
         val = acct.get(key, 0.0)
         stale = _pct_is_stale_known(acct, key)
@@ -10974,8 +10977,9 @@ def _render_status_pretty(state: dict, config: dict) -> None:
         if not fams:
             return Text("")
         free = [f for f in fams if f not in leased_families(name, state)]
-        return Text(f"{len(free)}/{len(fams)} free",
-                    style="yellow" if len(fams) < pool_want else "")
+        short = len(fams) < pool_want
+        return Text(f"{len(free)}/{len(fams)} free" + (f" (<{pool_want})" if short else ""),
+                    style="yellow" if short else "")
 
     tbl = Table(box=box.SIMPLE_HEAD, pad_edge=False)
     tbl.add_column("Account", no_wrap=True)
