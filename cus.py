@@ -11011,6 +11011,150 @@ def _render_status_pretty(state: dict, config: dict) -> None:
                            "set use_independent_logins: true)", style="yellow"))
     console.print()
 
+    # --- Lanes & sessions (merged) ---------------------------------------
+    # Mirrors the plain Lanes + Live-sessions logic (see status()); the lane
+    # annotations are re-derived here from the same helpers rather than
+    # extracted, per the spec's refactor boundary (_account_row only).
+    per_session = mode == "per_session"
+    slots_state = state.get("slots", {}) or {}
+    slot_dirs = list_slot_dirs()
+    live = find_live_sessions()
+    machine_active = state.get("active", "?")
+    hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
+    cwd_max = max(20, width - 60)
+
+    def trunc_cwd(cwd: str) -> str:
+        # Left-truncate: tails distinguish (home prefixes are shared).
+        return cwd if len(cwd) <= cwd_max else "…" + cwd[-(cwd_max - 1):]
+
+    buckets: dict = {}
+    for s in live:
+        if per_session:
+            mnt = pane_mount_name(s.pane, s.tmux_socket)
+            if mnt and mnt.startswith(SLOT_PREFIX):
+                key, eff = mnt, (slots_state.get(mnt, {}).get("account") or s.account)
+            elif mnt:  # account-dir launch (relogin flow)
+                key, eff = f"mount:{mnt}", mnt.removeprefix("account-")
+            else:
+                key, eff = "(bare)", machine_active
+        else:
+            key = "(global)"
+            eff = s.account if hot_swap_on else machine_active
+        buckets.setdefault(key, []).append((s, eff))
+
+    def session_lines(entries, show_acct: bool = False) -> Text:
+        t = Text()
+        for i, (s, eff) in enumerate(entries):
+            if i:
+                t.append("\n")
+            t.append(f"{(s.session_id or '?')[:8]} {s.pane} ")
+            if show_acct:
+                t.append(f"{eff} ")
+            if not per_session and eff != s.account:
+                t.append(f"(start:{s.account}) ", style="dim")
+            t.append(trunc_cwd(s.cwd), style="dim")
+        return t
+
+    locked = _locked_slots(config)
+    il_cfg = config.get("independent_logins", {})
+    il_flag = il_cfg.get("use_independent_logins", False)
+    il_visible = (il_flag or bool(list_provisioned_logins())
+                  or any(list_login_families(a) for a in state["accounts"]))
+    default_pool = config.get("per_session", {}).get("default_pool", "premium")
+
+    lane_rows = []
+    seen = set()
+    for d in slot_dirs:
+        seen.add(d.name)
+        entry = slots_state.get(d.name, {})
+        acct = entry.get("account")
+        pids = mount_pids(d)
+        state_txt = Text(f"live {len(pids)} pids", style="green") if pids else Text("idle", style="dim")
+        notes = []
+        if d.name in locked:
+            notes.append(("🔒locked", "yellow"))
+        pool = _slot_pool(state, d.name, config)
+        if pool != default_pool:
+            notes.append((pool, "cyan"))
+        if il_visible and acct:
+            lease = slot_leased_family(state, d.name)
+            if lease and lease[0] == acct:
+                notes.append((f"pool {lease[1]}", "green"))
+            elif list_login_families(acct):
+                notes.append(("pool avail", "green"))
+            elif has_independent_login(acct, d.name):
+                notes.append(("indep-login ✓", "green"))
+            elif il_flag:
+                notes.append(("indep-login MISSING", "yellow"))
+            else:
+                notes.append(("copy", "cyan"))
+        if d.name not in slots_state:
+            notes.append(("orphan — not in state", "yellow"))
+        notes_txt = Text(" · ").join(Text(n, style=st) for n, st in notes) if notes else Text("")
+        lane_rows.append((Text(d.name), Text(acct or "(empty)"), state_txt,
+                          notes_txt, session_lines(buckets.pop(d.name, []))))
+    for name in sorted(set(slots_state) - seen):
+        lane_rows.append((Text(name), Text(slots_state[name].get("account") or "(empty)"),
+                          Text("state entry, dir missing", style="yellow"), Text(""), Text("")))
+    for key in sorted(buckets):
+        entries = buckets[key]
+        if key == "(bare)":
+            lane_rows.append((Text("(bare)", style="yellow"), Text(machine_active),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("observe-only", style="yellow"),
+                              session_lines(entries)))
+        elif key.startswith("mount:"):
+            lane_rows.append((Text(key.removeprefix("mount:")), Text(entries[0][1]),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("account-dir mount", style="cyan"),
+                              session_lines(entries)))
+        else:  # (global) — background/hybrid modes
+            acct_label = "(per-pane)" if hot_swap_on else machine_active
+            lane_rows.append((Text("(global)"), Text(acct_label),
+                              Text(f"{len(entries)} session(s)"), Text(""),
+                              session_lines(entries, show_acct=hot_swap_on)))
+
+    if lane_rows:
+        lt = Table(box=box.SIMPLE_HEAD, pad_edge=False,
+                   title="Lanes & sessions", title_justify="left", title_style="bold")
+        lt.add_column("Lane", no_wrap=True)
+        lt.add_column("Account")
+        lt.add_column("State")
+        lt.add_column("Notes")
+        lt.add_column("Sessions")
+        for r in lane_rows:
+            lt.add_row(*r)
+        console.print(lt)
+        console.print()
+
+    # --- Locks -------------------------------------------------------------
+    pins = config.get("session_locks", {}).get("pinned", {}) or {}
+    patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
+    locked_cfg = sorted(locked)
+    if pins or patterns or locked_cfg:
+        console.print(Text("Locks", style="bold"))
+        for k, v in pins.items():
+            console.print(f"  pinned: {k} → {v}")
+        for s_ in locked_cfg:
+            console.print(f"  locked slot: {s_}")
+        for p in patterns:
+            console.print(f"  never_restart: {p}")
+        console.print()
+
+    # --- Recent swaps --------------------------------------------------------
+    history = state.get("swap_history", [])
+    if history:
+        st = Table(box=box.SIMPLE_HEAD, pad_edge=False,
+                   title=f"Recent swaps ({min(5, len(history))} of {len(history)})",
+                   title_justify="left", title_style="bold")
+        st.add_column("When", no_wrap=True)
+        st.add_column("Swap")
+        st.add_column("Trigger")
+        for e in history[-5:]:
+            st.add_row(rel_ts(e["ts"]), f"{e['from']} → {e['to']}",
+                       Text(e.get("trigger", "unknown"), style="dim"))
+        console.print(st)
+
 
 # --------------------------------------------------------------------------
 # `cus sessions` — one-shot per-pane → slot → account → binding-limit view

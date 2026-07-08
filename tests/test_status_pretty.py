@@ -213,6 +213,37 @@ def test_pretty_plain_mode_untouched_by_flag_addition():
         env.restore()
 
 
+# --- --pretty: lanes & sessions, locks, swaps --------------------------------
+
+
+def test_pretty_lane_row_merges_sessions():
+    out = _pretty()
+    assert "slot-1" in out
+    assert "live 2 pids" in out
+    assert "26f23a57" in out                    # session id on the lane row
+    assert "GabAI" in out                       # cwd tail survives truncation
+    assert "pool avail" in out                  # login annotation carried over
+
+
+def test_pretty_bare_pseudo_lane():
+    out = _pretty()
+    assert "(bare)" in out
+    assert "5c0e416a" in out                    # the %3 session groups under it
+
+
+def test_pretty_locks_panel():
+    out = _pretty()
+    assert "Locks" in out
+    assert "pinned: sess-x → alpha" in out
+
+
+def test_pretty_recent_swaps():
+    out = _pretty()
+    assert "Recent swaps (1 of 1)" in out
+    assert "alpha → bravo" in out
+    assert "auto-ladder" in out
+
+
 def _run_all() -> int:
     import types
     tests = [v for k, v in globals().items()
