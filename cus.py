@@ -10648,6 +10648,54 @@ def whoami_cmd() -> None:
         click.echo(f"  flags:        {', '.join(flags)}")
 
 
+def _account_row(name: str, acct: dict, config: dict, first_step: float) -> dict:
+    """Shared per-account display derivation for `status` (plain + --pretty).
+
+    Pure data — no printing, no click.style — so both renderers consume the
+    SAME flags/estimator/next-swap/per-model semantics and cannot drift.
+
+    - flags: operator DISABLED (config, not polled state — surfaced so nobody
+      wonders why the picker skips the account) + the polled health flags, in
+      fixed order.
+    - est: estimator (C) — extrapolated CURRENT usage per window, included
+      only when it diverges >= 1.0pct from the last poll, so a fast-climbing
+      account is visible between polls. Insertion order 5h then 7d matches
+      the plain-output note order.
+    - next_swap_pct: None while on the shared first ladder step (the status
+      header already prints the ladder once as a legend); a value only for a
+      mid-ladder / non-default account, the only case worth a per-row callout.
+    - per_model: 7d-by-model, sorted highest-first so a model nearing its own
+      weekly cap is the first thing the eye lands on.
+    """
+    flags = []
+    if name in _disabled_accounts(config):
+        flags.append("DISABLED")
+    if acct.get("token_expired"):
+        flags.append("TOKEN_EXPIRED")
+    if acct.get("rate_limited"):
+        flags.append("RATE_LIMITED")
+    if acct.get("poll_error"):
+        flags.append("POLL_ERROR")
+    if acct.get("token_stale"):
+        flags.append("TOKEN_STALE")
+    est: dict = {}
+    for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
+        polled = acct.get(key, 0.0)
+        est_val = estimate_window_pct(acct, win, config)
+        if est_val - polled >= 1.0:
+            est[win] = (est_val, acct.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0)
+    nxt = acct.get("next_swap_at_pct", first_step)
+    return {
+        "flags": flags,
+        "status_col": ",".join(flags) if flags else "ok",
+        "est": est,
+        "next_swap_pct": nxt if nxt != first_step else None,
+        "per_model": sorted((acct.get("per_model_weekly_pct") or {}).items(),
+                            key=lambda kv: -kv[1]),
+        "last": acct.get("last_swap_ts") or "never",
+    }
+
+
 @cli.command()
 def status() -> None:
     """Show active account, per-account usage state, locks, and recent activity."""
@@ -10679,53 +10727,19 @@ def status() -> None:
     click.echo()
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 91)
-    disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
+        row = _account_row(name, a, config, first_step)
         marker = " *" if name == state["active"] else ""
-        last = a.get("last_swap_ts") or "never"
-        flags = []
-        # Operator out-of-rotation flag (config, not polled state) — surfaced
-        # here so nobody wonders why the picker never chooses this account.
-        if name in disabled:
-            flags.append("DISABLED")
-        if a.get("token_expired"):
-            flags.append("TOKEN_EXPIRED")
-        if a.get("rate_limited"):
-            flags.append("RATE_LIMITED")
-        if a.get("poll_error"):
-            flags.append("POLL_ERROR")
-        if a.get("token_stale"):
-            flags.append("TOKEN_STALE")
-        status_col = ",".join(flags) if flags else "ok"
-        # Estimator (C): annotate the extrapolated CURRENT usage when it diverges
-        # from the last poll, so a fast-climbing account is visible between polls
-        # (this is what the picker now uses to judge target fullness).
-        est_note = ""
-        for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
-            polled = a.get(key, 0.0)
-            est = estimate_window_pct(a, win, config)
-            if est - polled >= 1.0:
-                rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
-                est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        # Show next_swap_at_pct ONLY when it's advanced off the shared first
-        # ladder step (the legend above already prints that) — i.e. this account
-        # is mid-ladder / carries a non-default value, which is the only case
-        # worth a per-row callout.
-        nxt_val = a.get("next_swap_at_pct", first_step)
-        nxt_note = f"  [next-swap: {nxt_val:.0f}%]" if nxt_val != first_step else ""
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {status_col:<24} {last:<28}{nxt_note}{est_note}")
-        # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
-        # sub-line only for accounts that have any, sorted highest-first so a
-        # model nearing its own weekly cap is the first thing the eye lands on.
-        # 5h is intentionally absent — the API has no per-model 5h window.
-        pm = a.get("per_model_weekly_pct") or {}
-        if pm:
-            # Mark per-model numbers stale (dim + trailing '~') for any account
-            # we couldn't freshly observe — a token_stale account's cached
-            # `Fable=100%` printed bare read as an authoritative current value
-            # and drove a wrong swap (2026-07-05 incident). See _fmt_model_pct.
+        est_note = "".join(f"  [{win} est {e:.0f}% @ +{rate:.1f}%/min]"
+                           for win, (e, rate) in row["est"].items())
+        nxt_note = (f"  [next-swap: {row['next_swap_pct']:.0f}%]"
+                    if row["next_swap_pct"] is not None else "")
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}")
+        # Stale/unknown per-model treatment lives in _fmt_model_pct; which
+        # models to show and their order comes from _account_row.
+        if row["per_model"]:
             parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
-                              for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+                              for m, p in row["per_model"])
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
