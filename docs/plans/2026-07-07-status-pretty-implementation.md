@@ -1,6 +1,6 @@
 # `cus status --pretty` Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task-by-task: run each task's full TDD cycle, have each task independently reviewed before moving to the next, and track steps via the checkbox (`- [ ]`) syntax.
 
 **Goal:** Add a `--pretty` flag to `cus status` that renders a rich, color, width-adaptive one-shot view of the same data, per the approved spec `docs/plans/2026-07-07-status-pretty.md`.
 
