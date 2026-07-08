@@ -244,6 +244,26 @@ def test_pretty_recent_swaps():
     assert "auto-ladder" in out
 
 
+def test_pretty_orphaned_slot_mount_keeps_slot_grounding():
+    """A session mounted on a slot whose dir vanished must stay grounded to
+    its slot name (yellow 'slot dir missing'), not fall into '(global)'."""
+    env = _PrettyEnv(sessions=[
+        cus.LiveSession(session_id="deadbeef0123", account="alpha",
+                        pane="%9", cwd="/home/yaz",
+                        started_at="2026-01-01T00:00:00Z",
+                        last_stop_at=None, transcript_path=None),
+    ])
+    try:
+        cus.pane_mount_name = lambda pane, tmux_socket=None: "slot-9"
+        out = CliRunner().invoke(cus.status, ["--pretty"], env={"COLUMNS": "160"},
+                                 catch_exceptions=False).output
+        assert "slot-9" in out
+        assert "slot dir missing" in out
+        assert "(global)" not in out
+    finally:
+        env.restore()
+
+
 def _run_all() -> int:
     import types
     tests = [v for k, v in globals().items()

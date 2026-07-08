@@ -11103,6 +11103,15 @@ def _render_status_pretty(state: dict, config: dict) -> None:
                               Text(f"{len(entries)} session(s)"),
                               Text("observe-only", style="yellow"),
                               session_lines(entries)))
+        elif key.startswith(SLOT_PREFIX):
+            # Mount ground truth says slot-N, but the dir is gone from
+            # list_slot_dirs() (removed/renamed under a live pane). Keep the
+            # session grounded to its real slot — plain mode prints slot=<mnt>
+            # from the same mount — rather than mislabeling it "(global)".
+            lane_rows.append((Text(key), Text(entries[0][1]),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("slot dir missing", style="yellow"),
+                              session_lines(entries)))
         elif key.startswith("mount:"):
             lane_rows.append((Text(key.removeprefix("mount:")), Text(entries[0][1]),
                               Text(f"{len(entries)} session(s)"),
