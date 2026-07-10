@@ -134,7 +134,7 @@ Lanes distribute ~2+2 on the 20x accounts with 5x accounts absorbing singles; ev
 
 ## Risks and accepted edges
 
-- **Overshoot between polls:** a 20x now rotates at 92.5% of its own cap — by construction the same 1.5-pro-unit absolute buffer a 5x has at 70%, but p90 burn tails (~90–110%/h of a 5x-sized window) consume absolute units at the same rate regardless of host account; the extrapolating estimator mitigates, fix #2 closes the tail.
+- **Overshoot between polls:** a 20x now rotates at 92.5% of its own cap — but p90 burn tails (~90–110%/h of a 5x-sized window) consume absolute units at the same rate regardless of host account; the extrapolating estimator mitigates, fix #2 closes the tail.
 - **Max-account stacking:** allowed when per-lane density genuinely favors it; bounded by the health line's per-lane form and the physical `pool_size: 4` family cap.
 - **Reference retune is manual:** pinning `reference_x` trades silent runtime shifts (round-2 criticals) for an explicit operator decision when fleet composition changes; the stateless drift warning makes it visible every cycle until addressed.
 - **Tier string drift:** unparseable `rateLimitTier` → ratio 1 (neutral percent behavior) — safe but *silent per-account*; the relaxed regex narrows this, and `cus status` showing per-account `capacity_x` makes it auditable.
