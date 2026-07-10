@@ -1,7 +1,7 @@
 # Capacity-aware anti-herding routing
 
 - **Date:** 2026-07-10
-- **Status:** spec approved in design review; implementation not started
+- **Status:** revision 2 — committee round-1 findings applied (accept/leave consistency, single units-space ranking key, invariant restated, baseline definition hardened); implementation not started
 - **Scope:** fix #3 of the 2026-07-10 overnight-halt incident (strategy/config). Fixes #1 (halted-session revival) and #2 (event-driven reactive 429) are separate, follow-on specs.
 
 ## Incident context (why now)
@@ -29,7 +29,7 @@ At the halt hour, the fleet had **24.6 pro-units of capacity remaining** (pro-un
 
 1. Lanes distribute across accounts in proportion to *absolute remaining capacity*, not raw percent.
 2. Fan-out stays functional deep into heavy nights (health line that doesn't collapse the candidate pool).
-3. No behavior change for homogeneous fleets (upstream compatibility), gated and default-off in code.
+3. No behavior change with the gate off (upstream compatibility); with the gate on, homogeneous fleets diverge from today only where lane contention exists (see Invariant).
 4. Fewer, later, cache-friendlier swaps (aligned with the lazy_swap cost model, GH #56).
 
 ## Non-goals
@@ -46,11 +46,13 @@ thresholds:
   steps: [70, 85, 94]           # was [50, 75, 90] — raises leave-ladder AND target-health line
 spread_lanes:
   enabled: true                 # explicit (was implicit default)
-  cluster_penalty: 60           # was default 40 — idle account wins within healthy pool
+  cluster_penalty: 60           # gate-on: 0.60 units/lane isolation preference (see formula 1)
 poll_interval_seconds: 300      # was 600 — halves worst-case reaction latency until fix #2
 capacity_aware:
   enabled: true                 # Part B, below
 ```
+
+**Deployment ordering (committee round-1):** Part B code lands first with the gate off (default), tests green, dry-run clean. Part A is then applied as one atomic config edit (including `capacity_aware.enabled: true`) followed by a daemon restart. The config block is never applied against a daemon that lacks Part B code.
 
 `steps[0]` intentionally does triple duty and all three move coherently to 70: (a) per-account leave-ladder start (`next_swap_at_pct`), (b) target health line, (c) launch-allocator acceptance line. Chosen over [80,90,96] (collides with `hard_7d_cap_pct: 80`; one poll-cycle burn spike can cap an account from 80) and [60,80,92] (only 27% rescuable).
 
@@ -58,46 +60,53 @@ capacity_aware:
 
 ### Normalization model
 
-- `capacity_x(account)`: parsed from `claudeAiOauth.rateLimitTier` in the account's stored credentials (regex `_(\d+)x$` → int) at poll time, cached in `state.json` per account. `accounts[].capacity_x` in config overrides. Unparseable/unknown → baseline (conservative: never overestimate).
-- `baseline_x = min(capacity_x over enabled accounts)`.
+- `capacity_x(account)`: parsed from `claudeAiOauth.rateLimitTier` in the account's stored credentials (regex `_(\d+)x$` → int, e.g. `default_claude_max_20x` → 20). Read at poll time by a new sibling of `_read_access_token_with_expiry` (which returns only token/expiry today) and cached per account in `state.json`. `accounts[].capacity_x` in config overrides the parsed value.
+- `baseline_x`: **two-pass, guarded** (committee round-1 — the one-pass definition was circular):
+  1. `baseline_x = min(capacity_x over enabled accounts with a parseable/overridden tier)`, floored at 1.
+  2. Accounts with no parseable tier and no override are then assigned `capacity_x = baseline_x` (ratio 1 — they behave exactly as under today's percent logic; this is *neutral*, not "conservative": if such an account's true tier is below the fleet minimum, the operator must set `accounts[].capacity_x`).
+  3. If **no** account has a parseable tier, `baseline_x = 1` and every ratio is 1 — the gated math reduces to pure percent behavior fleet-wide.
 - Absolute headroom, in **baseline units**:
-  `remaining_units(window) = (100 − pct) / 100 × capacity_x / baseline_x`
+  `remaining_units(acct) = (100 − pct) / 100 × capacity_x / baseline_x`
+  (`pct` = the effective percent already used by the ladder: max of enabled windows, extrapolated via `_account_estimated_effective_pct`. `baseline_x ≥ 1` by construction — no zero division.)
 
-**Invariant (the compatibility anchor):** on a homogeneous fleet — all accounts the same size, whatever that size — every formula below reduces algebraically to today's percent behavior, bit-for-bit. Capacity-awareness only changes decisions where sizes differ. This is why `baseline_x` is fleet-relative (min), not hardcoded: an all-1x fleet gets today's behavior too, instead of an unreachable health line.
+**Invariant (restated after committee round-1):** with the gate **off** (default), behavior is bit-for-bit today's — everything below is gated. With the gate **on**, on a homogeneous fleet (all ratios 1): the unit conversions and threshold comparisons reduce exactly to today's percent forms **at zero lane-load**; where lane loads exist, the contention divisor `÷(lanes+1)` intentionally replaces today's linear cluster penalty — that is a designed behavioral change, not a regression, and the invariant tests are scoped accordingly (see Rollout).
 
 ### What converts vs. what stays percent
 
 | Concern | Space | Rationale |
 |---|---|---|
-| Target scoring (who to land on) | units | What matters is tokens a lane can burn before cap |
-| Health line / would-re-trip / launch-accept | units | "Room for one more lane" is an absolute question |
-| Leave-ladder (`steps`, `next_swap_at_pct`) | percent | Proximity to the account's *own* cap; % burn already runs 4× slower on a 20x |
+| Target scoring (who to land on) | units, per-lane | What matters is tokens a lane can burn before cap |
+| Health line / would-re-trip / launch-accept | units, per-lane | "Room for one more lane" — divided by the lanes already there |
+| Leave-ladder trip (`steps` / `next_swap_at_pct`) | **percent thresholds, compared in units** (account-level, no lane divisor) | Committee round-1: comparing raw percent while accepting in units re-opens the swap-back loop (a 20x lands legally at 80%, then trips its 70-step next cycle). Converting the comparison keeps accept/leave consistent: a 20x trips its 70-step at 92.5%, leaving the same absolute buffer (1.5 pro-units) a 5x has at 70. |
 | Burn-rate estimator, hysteresis, growth gates | percent | Per-account dynamics are self-consistent; convert at comparison time only |
 | `hard_7d_cap_pct`, per-model weekly gate | percent | Policy lines protecting each account's week |
 
-### The three formula changes
+### The formula changes (all gated; all comparisons in baseline units)
 
-1. **Score density (smart and lowest_usage), per-lane:**
-   `score' = strategy_score × (capacity_x / baseline_x) ÷ (lanes_on_it + 1)`
-   where `lanes_on_it` = live lanes + this-cycle claims (the existing `_lane_load` input). The `÷(lanes+1)` models contention — the incoming lane shares remaining capacity with lanes already there (this is the exact quantity behind the 62% counterfactual). Scaling the whole smart score also scales the burn-soon bonus with size — intended: the capacity wasted by an unburned soon-resetting 20x is 4× a 5x's.
-   For `lowest_usage` (ascending fullness sort) the equivalent form is: sort descending by `remaining_units ÷ (lanes+1)`, cluster penalty folded in as below.
-2. **Cluster penalty, capacity-scaled:**
-   `penalty' = cluster_penalty × lanes ÷ (capacity_x / baseline_x)`
-   Density division does the capacity math; the penalty's remaining job is blast-radius isolation (co-located lanes share fate on a 429/token failure) — 60 pts/lane on a 5x, effectively 15 on a 20x.
-3. **Health line (absolute `steps[0]`), reused by fan-out retry and launch allocator:**
-   `healthy ⇔ remaining_units ≥ (100 − steps[0]) / 100`
-   ("at least what a baseline account sitting exactly at steps[0] would have left" — 0.3 units at steps[0]=70.) A 20x at 88% (0.48u) remains a legal target; a 5x at 88% (0.12u) does not. Extrapolated percent (`_account_estimated_effective_pct`) still feeds the percent side before conversion.
+Let `ratio = capacity_x / baseline_x`, `lanes = live lanes on the candidate + this-cycle claims` (the existing `_lane_load` input).
+
+1. **Ranking key — one combined expression, all scoring strategies** (`lowest_usage`, `headroom`, `smart`):
+   `key = (strategy_score_pts / 100) × ratio ÷ (lanes + 1) − (cluster_penalty / 100) × lanes`
+   where `strategy_score_pts` is the strategy's existing point-scale score (for `lowest_usage`, use `100 − effective_pct`, preserving its ordering semantics; 5h tiebreak unchanged). Candidates rank by `key` descending. Both terms are in baseline units: the first is per-lane capacity density (the exact quantity behind the 62% counterfactual — scaling smart's burn-soon bonus with size is intended, since the capacity wasted by an unburned soon-resetting 20x is 4× a 5x's); the second is the isolation preference (co-located lanes share fate on a 429/token failure), worth 0.60u per lane at `cluster_penalty: 60`. The old point-scale subtraction (`_lane_load_penalty`) is **not** applied in gate-on mode — mixing point-scale penalties with unit-scale scores produced provably wrong orderings (committee round-1: a one-lane 20x at 99% outranked a one-lane idle 5x).
+   *Worked example (isolation-vs-capacity dial):* idle 5x@60% keys 0.55; 20x@65% with 1 lane keys (0.35×4)/2 − 0.6 = 0.10 — isolation wins. Same 20x idle keys 1.40 — capacity wins. `cluster_penalty` (in hundredths of a unit per lane) is the knob that moves this crossover.
+2. **Health line (absolute, per-lane, strict), reused by fan-out retry and launch allocator:**
+   `healthy ⇔ remaining_units ÷ (lanes + 1) > (100 − steps[0]) / 100`
+   Strict `>` preserves today's boundary semantics (currently healthy ⇔ pct **<** steps[0]; committee round-1 caught the `≥` flip). The `÷(lanes+1)` term closes the round-1 gap where a 20x@88% carrying 3 lanes passed a gate whose rationale is "room for one more lane" — its per-lane share (0.12u) is exactly the rejected 5x@88% case. Homogeneous zero-lane reduction: healthy ⇔ pct < steps[0], as today.
+3. **Leave-ladder trip (absolute, account-level):**
+   `trip ⇔ remaining_units ≤ (100 − next_swap_at_pct) / 100`
+   The ladder's percent *thresholds* (`steps`, per-account `next_swap_at_pct` ratchet, `maybe_reset_thresholds` unwind) are untouched; only `decide_swap`'s Trigger-2 comparison converts. `≤` preserves today's trip-at-equality boundary (pct ≥ threshold). No lane divisor here — leaving is about the account's own proximity to cap. Accept (2) is deliberately *stricter* than leave (3); that ordering is loop-safe, the reverse is what ping-pongs.
 
 ### Code touch points
 
 | Site | Change |
 |---|---|
-| poll path (`AccountUsage` build) | parse + cache `capacity_x` |
-| new helpers | `_capacity_x(name, state, config)`, `_baseline_x(state, config)`, `_remaining_units(acct, ...)` |
-| `_lane_load_penalty` (~4465) | scale by `÷ (capacity_x/baseline_x)` when gated on |
-| `pick_swap_target` (~4490): lowest_usage sort, headroom score, smart score | density form when gated on |
-| `_target_would_immediately_re_trip` (~4417) | absolute form when gated on |
-| launch allocator acceptance (~2418) | same absolute health predicate |
+| poll path (`poll_account_usage`) | new `_read_rate_limit_tier(account_name)` beside `_read_access_token_with_expiry` (cus.py ~3192, currently token/expiry only); parse + cache `capacity_x` in state |
+| new helpers | `_capacity_ctx(state, config)` → `{baseline_x, capacity_x_by_name}`; `_remaining_units(acct, name, ctx, config)` |
+| **plumbing** (committee round-1) | `_target_would_immediately_re_trip(acct, config)` and `_launch_candidate_saturated(acct, config)` receive no fleet state today (call sites cus.py 2436, 4679, 4700, 7750, 9808 pass acct/config only). Thread the context via the established shim pattern (`state["_lane_load"]` precedent): decision-layer callers stash `state["_capacity_ctx"]`; the two helpers gain an optional `ctx=None` param — `None` ⇒ today's percent path, so non-lane callers (SOS probes, `cus switch`, global mode) are untouched |
+| `pick_swap_target` (~4490): lowest_usage sort, headroom score, smart score | gate-on: rank by formula 1's combined key; `_lane_load_penalty` bypassed (returns 0) in gate-on mode |
+| `decide_swap` Trigger 2 (~7191) | gate-on: formula 3 comparison |
+| launch allocator acceptance (~2418) | gate-on: formula 2 predicate |
+| SOS | warn when `baseline_x` changes between cycles (mitigates the baseline-shift edge below) |
 | `cus status` | show `capacity_x` and units remaining (display only) |
 
 All changes additive and behind `capacity_aware.enabled` (default **false**) so upstream merges stay bit-for-bit; our config enables it.
@@ -108,18 +117,20 @@ Lanes distribute ~2+2 on the 20x accounts with 5x accounts absorbing singles; ev
 
 ## Rollout & verification
 
-1. **Unit tests** (beside existing strategy tests in `tests/`):
-   - Homogeneous-reduction invariant: with `capacity_aware.enabled`, an all-same-x fleet produces identical picks to gate-off across recorded scenarios.
-   - Heterogeneous fixtures: 20x@65% beats idle 5x@60%; loses once 3 lanes sit on it; health line admits 20x@88%, rejects 5x@88%.
-   - Multiplier sourcing: tier parse, config override, unknown→baseline.
+1. **Unit tests** (beside existing strategy tests in `tests/`; fixtures are synthetic state dicts — hand-built from decisions.jsonl snapshots where noted — committed under `tests/fixtures/capacity_aware/`):
+   - Gate-off: identical picks to current code across all fixtures (bit-for-bit).
+   - Gate-on homogeneous, zero lane-load: identical picks to gate-off (the reduced invariant), including boundary fixtures at `pct == steps[0]` (healthy=false) and the Trigger-2 equality boundary (trip=true).
+   - Gate-on homogeneous, loaded: explicit divergence fixtures asserting contention-division ordering (documents the designed change).
+   - Heterogeneous, per strategy (`smart` and `lowest_usage` separately, 5h and 7d driven variants): 20x@65% idle beats 5x@60% idle; loses to it once the 20x carries 1 lane (worked example above); health line admits idle 20x@88%, rejects 20x@88%+3 lanes and 5x@88%; ladder fixture: 20x@80% with `next_swap_at_pct=70` is accepted AND does not trip Trigger 2 (trips at 92.5%).
+   - Baseline sourcing: tier parse, config override, unknown→ratio-1, all-unknown→all-ratio-1, floor at 1, single-enabled-account fleet.
 2. **Dry-run against live state:** `cus daemon --once --no-execute` before and after the config change; diff the decisions.
-3. **Apply:** update config, `systemctl --user restart cus.service`.
-4. **Observe 24–48h:** re-run `experiments/herding-analysis/herding_analysis.py`; success = double-book swaps with a strictly-better idle alternative (the 62% metric) drops to ~0, and max-stack≥3 cycles fall from 74% to near per-capacity-expected levels.
+3. **Apply** (ordering per Part A): Part B merged with gate off → tests + dry-run → single atomic config edit → `systemctl --user restart cus.service`.
+4. **Observe 24–48h:** re-run `experiments/herding-analysis/herding_analysis.py`; success criteria (numeric): the capacity-aware counterfactual metric (§6 of the script — double-book swaps with a strictly-better idle alternative in per-lane units) drops from **62% to <5%**, and no 429-halt of a live session while ≥1 baseline-unit of per-lane headroom exists on any healthy account.
 
 ## Risks and accepted edges
 
-- **Overshoot between polls:** steps[0]=70 + p90 burns ~90–110%/h ⇒ up to ~8pp overshoot per 300s cycle; mitigated by the extrapolating estimator, fully addressed by fix #2.
-- **Max-account over-stacking:** density division and physical `pool_size: 4` cap stack depth; accepted by design (that's what capacity proportionality means).
-- **Baseline shift:** adding a smaller account later lowers `baseline_x` and loosens the absolute health line fleet-wide by the same ratio. Inherent to fleet-relative anchoring; documented, accepted.
-- **Tier string drift:** if Anthropic renames `rateLimitTier` values, parse fails → account treated as baseline (safe); config override available.
-- **Two changes at once** (smart + capacity-aware): accepted by operator choice in design review; the invariant tests isolate capacity-aware regressions, and `decisions.jsonl` records strategy per decision for attribution.
+- **Overshoot between polls:** a 20x now rotates at 92.5% of its own cap — by construction the same 1.5-pro-unit absolute buffer a 5x has at 70%, but p90 burn tails (~90–110%/h of a 5x-sized window) consume absolute units at the same rate regardless of host account; the extrapolating estimator mitigates, fix #2 closes the tail.
+- **Max-account stacking:** allowed when per-lane density genuinely favors it; bounded by the health line's per-lane form and the physical `pool_size: 4` family cap.
+- **Baseline shift:** adding a smaller account later lowers `baseline_x` and loosens the absolute health line fleet-wide by the same ratio (a 1x joining a 5x-baseline fleet moves a 5x's effective line from 70% to 94% of its own cap). Inherent to fleet-relative anchoring; mitigated by the SOS baseline-change warning (touch points) so it is never silent; operator response is re-tuning `steps` or overriding `capacity_x`.
+- **Tier string drift:** if Anthropic renames `rateLimitTier` values, parse fails → ratio 1 (neutral, percent behavior); config override available.
+- **Two changes at once** (smart + capacity-aware): accepted by operator choice in design review; the gate-off/gate-on test matrix isolates capacity-aware regressions, and `decisions.jsonl` records strategy per decision for attribution.
