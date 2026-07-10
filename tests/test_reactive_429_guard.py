@@ -119,6 +119,7 @@ def test_A1_429_still_reacts_when_active_near_cap():
     d = _reactive("default", accts)
     assert d is not None and d.gate == "reactive_429" and d.target == "merkos", \
         f"429 at 70% should react and swap to merkos, got {d}"
+    assert d.reactive_entries and d.reactive_entries[0]["session_id"].startswith("deadbeef")
 
 
 def test_A1_and_B_compose_no_swap_onto_full_even_when_active_hot():

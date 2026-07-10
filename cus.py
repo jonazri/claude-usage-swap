@@ -6597,6 +6597,10 @@ class SwapDecision:
     # session riding into a rate-limit. Keyed explicitly (NOT off `tier`) because
     # a hard-cap swap can land at tier 2 yet must never be deferred.
     deferrable: bool = True
+    # Reactive hook records consumed to produce this decision. They travel with
+    # the decision until execution succeeds so dry-runs/failures can requeue the
+    # exact event instead of losing it behind last_429_check_ts.
+    reactive_entries: list[dict] | None = None
 
 
 def _build_decision_record(
@@ -8015,18 +8019,21 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
         return []
     message = str(reactive.get("resume_message") or DEFAULT_CONFIG["reactive"]["resume_message"])
     panes: list[str] = []
-    seen: set[str] = set()
+    seen: set[tuple[str | None, str]] = set()
     for session in live_sessions_on_slot(slot_name):
         pane = session.pane
-        if not pane or pane == "no-tmux" or pane in seen:
+        tmux_socket = getattr(session, "tmux_socket", None)
+        pane_key = (tmux_socket, pane)
+        if not pane or pane == "no-tmux" or pane_key in seen:
             continue
-        seen.add(pane)
-        if not tmux_send_keys(pane, "Escape", "Escape"):
+        seen.add(pane_key)
+        if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
             click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
             continue
-        if tmux_send_text(pane, message):
+        if tmux_send_text(pane, message, tmux_socket=tmux_socket):
             panes.append(pane)
-            click.echo(f"    reactive resume: pane {pane} continued after credential swap")
+            socket_note = f" via {tmux_socket}" if tmux_socket else ""
+            click.echo(f"    reactive resume: pane {pane}{socket_note} continued after credential swap")
         else:
             click.echo(f"    reactive resume: pane {pane} continuation send failed")
     return panes
@@ -8170,6 +8177,8 @@ def _execute_global_mount_swap(decision: "SwapDecision", state: dict, config: di
             target=decision.target, tier=decision.tier,
             where={"warm_pane_count": len(warm_panes), "panes": warm_panes},
         ))
+        if decision.reactive_entries:
+            _requeue_rate_limit_entries(decision.reactive_entries)
         return
     if no_execute:
         click.echo("    (--no-execute) skipping shared-mount swap")
@@ -8178,15 +8187,22 @@ def _execute_global_mount_swap(decision: "SwapDecision", state: dict, config: di
             reason=decision.reason, target=decision.target, tier=decision.tier,
             where=_migrating_panes(),
         ))
+        if decision.reactive_entries:
+            _requeue_rate_limit_entries(decision.reactive_entries)
         return
-    if config.get("hot_swap", {}).get("enabled", False):
-        try:
-            hot_swap_orchestrate(decision, state, config)
-        except NameError:
+    try:
+        if config.get("hot_swap", {}).get("enabled", False):
+            try:
+                hot_swap_orchestrate(decision, state, config)
+            except NameError:
+                execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
+        else:
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
-    else:
-        execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
-        click.echo(f"    swapped shared mount (bare sessions follow; lanes unaffected)")
+            click.echo(f"    swapped shared mount (bare sessions follow; lanes unaffected)")
+    except Exception:
+        if decision.reactive_entries:
+            _requeue_rate_limit_entries(decision.reactive_entries)
+        raise
     _log_decision(_build_decision_record(
         state, config, action="swap", gate=decision.gate,
         reason=decision.reason, target=decision.target, tier=decision.tier,
@@ -12778,6 +12794,7 @@ def check_rate_limit_reactive(state: dict, config: dict, entries: list | None = 
         tier=3,
         gate="reactive_429",
         deferrable=False,  # GH #56: a real user-facing 429 is an emergency — never lazy-defer
+        reactive_entries=[matched_session],
     )
     _finish()
     return decision
@@ -14465,13 +14482,21 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             ))
             if no_execute:
                 click.echo("    (--no-execute) skipping reactive swap")
-            elif config.get("hot_swap", {}).get("enabled", False):
-                try:
-                    hot_swap_orchestrate(reactive_decision, state, config)
-                except NameError:
-                    execute_swap(reactive_decision.target, trigger="reactive-429")
+                if reactive_decision.reactive_entries:
+                    _requeue_rate_limit_entries(reactive_decision.reactive_entries)
             else:
-                execute_swap(reactive_decision.target, trigger="reactive-429")
+                try:
+                    if config.get("hot_swap", {}).get("enabled", False):
+                        try:
+                            hot_swap_orchestrate(reactive_decision, state, config)
+                        except NameError:
+                            execute_swap(reactive_decision.target, trigger="reactive-429")
+                    else:
+                        execute_swap(reactive_decision.target, trigger="reactive-429")
+                except Exception:
+                    if reactive_decision.reactive_entries:
+                        _requeue_rate_limit_entries(reactive_decision.reactive_entries)
+                    raise
             return
 
         # 1. Poll — differential cadence (2026-07-02): the ACTIVE account is
