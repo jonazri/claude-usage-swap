@@ -3199,6 +3199,60 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     return False, f"{role}: {elapsed:.0f}s < {interval:.0f}s"
 
 
+def _account_creds_candidates(account_name: str, state: dict) -> list[Path]:
+    """Ordered candidate credentials-file paths for `account_name`, freshest
+    source first — factored out of `_read_access_token_with_expiry` (2026-07-03
+    token-stale blindness incident, GH #130) so other readers of an account's
+    stored credentials can resolve through the exact SAME freshest-wins chain
+    without duplicating it (capacity-aware spec 2026-07-10 adds the first
+    other reader, `_read_rate_limit_tier`).
+
+    Preference order (see `_read_access_token_with_expiry`'s docstring for the
+    full rationale):
+      1. the live shared mount (CREDS_JSON), only when this account is the
+         shared-active one;
+      2. any SLOT backing this account whose dir exists, live slots (a
+         session actually running, `mount_in_use`) before idle ones;
+      3. the account's primary store (`account_creds_path`) — always last,
+         always included as the final fallback.
+
+    Pure/read-only: only stats/existence-checks paths, never opens or parses
+    the files themselves — that stays with each caller, since what they read
+    out of a candidate (accessToken+expiresAt vs. rateLimitTier) differs.
+    """
+    candidates: list[Path] = []
+    # (1) live shared mount, only when this account is the shared-active one.
+    if state.get("active") == account_name and CREDS_JSON.exists():
+        candidates.append(CREDS_JSON)
+    # (2) slots backing this account; live slots first, idle slots after. A
+    # live slot's creds are refreshed by the session running on it, so they
+    # beat both an idle slot and (usually) the primary store for freshness.
+    live_slot_creds: list[Path] = []
+    idle_slot_creds: list[Path] = []
+    for slot_name, entry in state.get("slots", {}).items():
+        if (entry or {}).get("account") != account_name:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists():
+            continue
+        cred = d / ".credentials.json"
+        if not cred.exists():
+            continue
+        try:
+            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
+            # per cycle, but a direct call here is cheap enough (one slot) and
+            # a few seconds of staleness only picks idle-vs-live ordering, not
+            # correctness — both get tried.
+            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
+        except Exception:
+            idle_slot_creds.append(cred)
+    candidates.extend(live_slot_creds)
+    candidates.extend(idle_slot_creds)
+    # (3) primary account store — historical fallback, always last.
+    candidates.append(account_creds_path(account_name))
+    return candidates
+
+
 def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int | None]:
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
@@ -3272,38 +3326,10 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         except (TypeError, ValueError):
             return True
 
-    # Assemble candidate creds paths in preference order (see docstring).
-    candidates: list[Path] = []
-    # (1) live shared mount, only when this account is the shared-active one.
-    if state.get("active") == account_name and CREDS_JSON.exists():
-        candidates.append(CREDS_JSON)
-    # (2) slots backing this account; live slots first, idle slots after. A
-    # live slot's creds are refreshed by the session running on it, so they
-    # beat both an idle slot and (usually) the primary store for freshness.
-    live_slot_creds: list[Path] = []
-    idle_slot_creds: list[Path] = []
-    for slot_name, entry in state.get("slots", {}).items():
-        if (entry or {}).get("account") != account_name:
-            continue
-        d = slot_path(slot_name)
-        if not d.exists():
-            continue
-        cred = d / ".credentials.json"
-        if not cred.exists():
-            continue
-        try:
-            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
-            # per cycle, but a direct call here is cheap enough (one slot) and
-            # a few seconds of staleness only picks idle-vs-live ordering, not
-            # correctness — both get tried.
-            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
-        except Exception:
-            idle_slot_creds.append(cred)
-    candidates.extend(live_slot_creds)
-    candidates.extend(idle_slot_creds)
-    # (3) primary account store — historical fallback, always last.
+    # Assemble candidate creds paths in preference order (see docstring),
+    # shared with `_read_rate_limit_tier` via `_account_creds_candidates`.
+    candidates = _account_creds_candidates(account_name, state)
     primary = account_creds_path(account_name)
-    candidates.append(primary)
 
     # First non-stale candidate wins. Track the primary's pair (task contract:
     # all-stale returns the primary) and the first present-but-stale pair (so a
@@ -3321,6 +3347,67 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         if first_stale_pair[0] is None:
             first_stale_pair = (token, expires_at)
     return primary_pair if primary_pair[0] is not None else first_stale_pair
+
+
+# Nx tier suffix/prefix, mid-string tolerant: "_20x_v2", "20x", "tier-20x" all
+# parse to 20; requires an `_`/`-`/string-start immediately before the digits
+# and an `_`/`-`/string-end immediately after the "x" so e.g. "box20xyz" does
+# NOT spuriously match (capacity-aware spec 2026-07-10, "Normalization model").
+_RATE_LIMIT_TIER_RE = re.compile(r"(?:[_-]|^)(\d+)x(?=[_-]|$)")
+
+
+def _read_rate_limit_tier(account_name: str) -> tuple[int | None, str | None]:
+    """Parsed Claude subscription rate-limit tier for `account_name`, e.g. 20
+    from a stored `claudeAiOauth.rateLimitTier` of "tier-20x".
+
+    WHY (capacity-aware spec 2026-07-10, "Normalization model"): routing used
+    to assume every account has equal capacity; a hardcoded tier map is
+    replaced by reading each account's OWN tier straight out of its stored
+    credentials. Resolved through the exact SAME freshest-wins multi-source
+    chain `_read_access_token_with_expiry` uses (`_account_creds_candidates`)
+    for the same GH #130 reason: a stale primary snapshot must never shadow a
+    live slot's fresher value.
+
+    Returns (parsed_x, raw_tier_string):
+      - (None, None) when NO candidate has a `claudeAiOauth.rateLimitTier`
+        value at all (missing — e.g. no creds file, or an older snapshot
+        predating this field);
+      - (None, raw) when a value IS present but doesn't match the `Nx` shape
+        (unparseable);
+      - (N, raw) on a successful parse — N is always the first digit group,
+        so "_20x_v2" / "20x" / "tier-20x" all yield 20.
+    Validation that N must be >= 1 (a `_0x` parse is pathological — a
+    zero-capacity account is unroutable, not "reference-scale") is the
+    CALLER's job (`_account_capacity_x`), not this function's — this is a
+    pure parse, not a policy decision.
+
+    READ-ONLY, same contract as `_read_access_token_with_expiry`: never
+    writes, refreshes, or rotates anything. Local file reads only — never
+    HTTP.
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except Exception:
+        state = {}
+
+    for path in _account_creds_candidates(account_name, state):
+        try:
+            if not path.exists():
+                continue
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue
+        oauth = creds.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or "rateLimitTier" not in oauth:
+            continue
+        raw = oauth.get("rateLimitTier")
+        if raw is None:
+            continue
+        match = _RATE_LIMIT_TIER_RE.search(str(raw))
+        if match:
+            return int(match.group(1)), raw
+        return None, raw
+    return None, None
 
 
 def _refresh_account_token(account_name: str, creds_path: Path | None = None) -> bool:
@@ -4463,6 +4550,334 @@ def _disabled_accounts(config: dict) -> set:
     stops NEW placements. Re-enable by deleting the key or setting false."""
     return {a.get("name") for a in config.get("accounts", [])
             if isinstance(a, dict) and a.get("disabled")}
+
+
+# ---------------------------------------------------------------------------
+# Capacity-aware anti-herding — Normalization model (capacity-aware spec
+# 2026-07-10, docs/plans/2026-07-10-capacity-aware-anti-herding.md). Phase 1:
+# tier sourcing, reference_x, and ctx helpers. ALL INERT until Phase 2 wires
+# gate-on callers — the only site anything here is invoked from today is the
+# `one_cycle` poll-cycle wiring point (caches `capacity_x` at poll time).
+#
+# Units model: ratio = capacity_x / reference_x; remaining_units =
+# (100 - pct) / 100 * ratio. A hardcoded "every account has equal capacity"
+# assumption is what caused the 2026-07-10 halt incident (fix #3) this spec
+# addresses — a 5x account and a 20x account at the same raw percent do NOT
+# have the same remaining headroom, and treating them as if they did is what
+# herds swaps onto (and floods 429s on) the smaller-tier accounts.
+# ---------------------------------------------------------------------------
+
+def _account_raw_capacity_x(name: str, state: dict, config: dict) -> tuple[int | None, list[str]]:
+    """The account's raw N-in-`Nx` tier, BEFORE the neutral/reference_x
+    fallback layer `_account_capacity_x` adds on top.
+
+    WHY split out (capacity-aware spec 2026-07-10): `_observed_fleet_min_x`
+    must compute the fleet-relative `reference_x` from ONLY genuinely-known
+    tiers (a valid config override or a parseable, >= 1 credentials-parsed
+    tier) — folding in `_account_capacity_x`'s own neutral fallback here would
+    be circular, since that fallback IS `reference_x`, and computing
+    `reference_x` from a value that already assumes `reference_x` is
+    meaningless. This function never looks at `reference_x` at all.
+
+    Precedence: `accounts[].capacity_x` in config wins outright when it is
+    numeric (bool excluded — `True`/`False` are not intended tier values even
+    though `bool` is an `int` subclass) and >= 1. An invalid override (wrong
+    type, or numeric but < 1) is reported via a warning and does NOT
+    short-circuit — resolution falls through to the account's credentials-
+    parsed `claudeAiOauth.rateLimitTier` (`_read_rate_limit_tier`). A parsed
+    tier < 1 (the pathological `_0x` case — a zero-capacity account is
+    unroutable, not "reference-scale") is likewise reported and treated as
+    unknown.
+
+    Returns (value, warnings): value is None when neither source yields a
+    usable (>= 1) number for `name` — exactly the "this account would become
+    neutral" case `_account_capacity_x` handles next.
+    """
+    warnings: list[str] = []
+    override = None
+    for a in config.get("accounts", []):
+        if isinstance(a, dict) and a.get("name") == name:
+            override = a.get("capacity_x")
+            break
+    if override is not None:
+        is_number = isinstance(override, (int, float)) and not isinstance(override, bool)
+        if is_number and override >= 1:
+            return int(override), warnings
+        warnings.append(
+            f"account {name!r}: config capacity_x override {override!r} is invalid "
+            "(must be numeric and >= 1) — falling back to the credentials-parsed tier"
+        )
+    parsed_x, raw_tier = _read_rate_limit_tier(name)
+    if parsed_x is not None:
+        if parsed_x >= 1:
+            return parsed_x, warnings
+        warnings.append(
+            f"account {name!r}: parsed rate-limit tier {raw_tier!r} -> {parsed_x}x is "
+            "invalid (must be >= 1) — treating as an unknown/neutral tier"
+        )
+    return None, warnings
+
+
+def _account_capacity_x(name: str, state: dict, config: dict) -> tuple[int, list[str]]:
+    """Resolved per-account `capacity_x` (capacity-aware spec 2026-07-10,
+    "Normalization model"): the hardcoded-equal-capacity assumption is
+    replaced by reading each account's OWN rate-limit tier — a config
+    override when the operator has pinned one, else the credentials-parsed
+    tier, else NEUTRAL (the resolved `reference_x` itself, giving the account
+    a ratio of exactly 1 so an unknown tier neither inflates nor starves its
+    scoring in either direction).
+
+    Note on the neutral value's type: `reference_x` is a float in general
+    (a pinned `capacity_aware.reference_x` may be any value >= 1). The `int`
+    return type mirrors the common case (real tiers and the typical fleet-min
+    reference are integers); a neutral account's `capacity_x` is returned
+    EXACTLY equal to `reference_x` regardless, because the ratio being
+    exactly 1 is the load-bearing invariant, not the numeric type.
+
+    Caching: whenever a genuinely-known value (override or parsed — never the
+    neutral fallback, which is derived, not observed) is resolved and differs
+    from the cached `state["accounts"][name]["capacity_x"]`, the cache is
+    refreshed in place. The wiring call inside `one_cycle`'s poll state-update
+    section invokes this once per JUST-polled account every cycle for exactly
+    that reason; `_capacity_ctx`'s eager fill is the other caller, for
+    accounts a poll cycle hasn't reached yet.
+    """
+    raw_x, warnings = _account_raw_capacity_x(name, state, config)
+    if raw_x is not None:
+        acct_state = state.setdefault("accounts", {}).setdefault(name, {})
+        if acct_state.get("capacity_x") != raw_x:
+            acct_state["capacity_x"] = raw_x
+        return raw_x, warnings
+    reference_x, ref_warnings = _resolve_reference_x(state, config)
+    return reference_x, warnings + ref_warnings
+
+
+def _observed_fleet_min_x(state: dict, config: dict) -> float | None:
+    """Fleet-relative candidate for `reference_x` (capacity-aware spec
+    2026-07-10, "Normalization model"): the smallest raw `capacity_x` among
+    ENABLED accounts that have a genuinely-known tier (config override or a
+    parseable, >= 1 credentials tier) — NEVER neutral/unknown accounts, since
+    those are defined AS the reference and including them would be circular.
+
+    Returns None when the enabled fleet has NO account with a known tier at
+    all (the "all-unknown" case) — the caller decides the fallback (1) and
+    whether a None here should suppress a drift comparison, rather than this
+    function silently coercing to 1 and losing that distinction.
+
+    "The same domain rule, resolved once and reused" (brief item 4): callers
+    that need the observed fleet minimum call THIS directly rather than each
+    re-deriving their own filtered-subset notion of it — `_resolve_reference_x`
+    (the bootstrap/snapshot path) and `_capacity_warnings` (the drift check)
+    both do.
+    """
+    disabled = _disabled_accounts(config)
+    known: list[int] = []
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is not None:
+            known.append(raw_x)
+    return float(min(known)) if known else None
+
+
+def _resolve_reference_x(state: dict, config: dict) -> tuple[float, list[str]]:
+    """Resolved `reference_x` (capacity-aware spec 2026-07-10, "Normalization
+    model"): the capacity scale every account's `capacity_x` is divided by to
+    get its unit ratio. Precedence:
+
+      1. `capacity_aware.reference_x` PINNED in config, when numeric and >= 1.
+         A present-but-invalid pin (wrong type, or numeric but < 1) is treated
+         EXACTLY as absent (falls through to 2/3) plus a warning about the
+         invalid value.
+      2. Absent (or invalid) → the PERSISTED snapshot at
+         `state["capacity_reference_snapshot"]`, if one has already been
+         computed — used SILENTLY, no warning. Once snapshotted, `reference_x`
+         deliberately stays STABLE across cycles even if the fleet's observed
+         minimum later drifts: removing/disabling the smallest account must
+         NOT silently rescale every other account's ratio fleet-wide (the
+         round-2 instability this pin/snapshot design exists to avoid).
+      3. No pin, no snapshot yet (first-ever resolution) → compute the
+         observed fleet minimum (`_observed_fleet_min_x`; falls back to 1 if
+         the enabled fleet has no known tier at all), PERSIST it as the
+         snapshot, and emit an SOS-instruction warning telling the operator to
+         pin `capacity_aware.reference_x` explicitly — a computed snapshot is
+         a reasonable bootstrap, never a substitute for a stated operator
+         intent.
+    """
+    warnings: list[str] = []
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    if pinned is not None:
+        is_number = isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+        if is_number and pinned >= 1:
+            return float(pinned), warnings
+        warnings.append(
+            f"capacity_aware.reference_x override {pinned!r} is invalid "
+            "(must be numeric and >= 1) — treating as unpinned"
+        )
+    snapshot = state.get("capacity_reference_snapshot")
+    if snapshot is not None:
+        return float(snapshot), warnings
+    observed = _observed_fleet_min_x(state, config)
+    value = observed if observed is not None else 1.0
+    state["capacity_reference_snapshot"] = value
+    warnings.append(
+        "capacity_aware.reference_x is not pinned — bootstrapped a snapshot of "
+        f"{value:g}x from the observed fleet minimum tier and persisted it to "
+        "state.json's capacity_reference_snapshot; pin capacity_aware.reference_x "
+        "explicitly in config.yaml to make this an intentional, stable choice "
+        "rather than an incidental one."
+    )
+    return value, warnings
+
+
+def _capacity_gate_on(config: dict) -> bool:
+    """Master gate for the capacity-aware Normalization model (capacity-aware
+    spec 2026-07-10). Default OFF — every gate-off golden
+    (tests/test_capacity_gate_off_goldens.py) must reproduce today's
+    hardcoded-equal-capacity behavior bit-for-bit until Phase 2 wires gate-on
+    callers (Rollout §1)."""
+    return bool(config.get("capacity_aware", {}).get("enabled", False))
+
+
+def _capacity_ctx(state: dict, config: dict) -> dict:
+    """Build the fleet-level capacity-aware context (capacity-aware spec
+    2026-07-10, "Normalization model"):
+    `{"reference_x": float, "capacity_x_by_name": {name: int},
+    "lane_load_by_name": {name: int}}`.
+
+    Self-sufficient by design: standalone entry points (`diagnose()`, `cus
+    status`, ...) must never see a "partially-known fleet" — for any ENABLED
+    account missing a cached `capacity_x` in state, this EAGERLY reads+caches
+    its tier right here (a local credentials-file read, same mechanism
+    `_read_rate_limit_tier` always uses — never an HTTP poll), rather than
+    waiting for that account's next due poll cycle to populate the cache via
+    the `one_cycle` wiring point. An operator-disabled account missing the
+    cache is left out of `capacity_x_by_name` rather than spending a read on
+    an account nothing routes to this cycle — the poll-time wiring point
+    fills it once the account is re-enabled and actually polled.
+
+    `lane_load_by_name` mirrors `_lane_load`'s slot/mount occupancy counting
+    (`occupied_slot_accounts(state)`, live-session-per-/proc semantics, same
+    as the anti-clustering `base_lane_load` in `decide_slot_swaps`) — callers
+    that need claim-aware counts (this-cycle's in-flight moves, not just
+    what's live right now) may overwrite entries after building this ctx.
+    """
+    reference_x, _warnings = _resolve_reference_x(state, config)
+    disabled = _disabled_accounts(config)
+    capacity_x_by_name: dict[str, int] = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name:
+            continue
+        cached = state.get("accounts", {}).get(name, {}).get("capacity_x")
+        if cached is not None:
+            capacity_x_by_name[name] = cached
+            continue
+        if name in disabled:
+            continue
+        value, _acct_warnings = _account_capacity_x(name, state, config)
+        capacity_x_by_name[name] = value
+    lane_load_by_name = {acct: len(slots) for acct, slots in occupied_slot_accounts(state).items()}
+    return {
+        "reference_x": reference_x,
+        "capacity_x_by_name": capacity_x_by_name,
+        "lane_load_by_name": lane_load_by_name,
+    }
+
+
+def _remaining_units(pct: float, name: str, ctx: dict, config: dict) -> float:
+    """Remaining capacity in reference-scale UNITS for account `name` at usage
+    `pct` (capacity-aware spec 2026-07-10, "Normalization model"):
+    `ratio = capacity_x / reference_x`; `remaining_units = (100 - pct) / 100 *
+    ratio`. A 20x account at 0% carries 20x the reference account's remaining
+    headroom at 0%; the same 20x account at 80% carries only 0.2 * 20 = 4x —
+    letting a big-tier account's LOW percent still correctly outrank a
+    small-tier account's headroom on a shared scale, instead of comparing raw
+    percents as if every account had the same underlying capacity (the
+    hardcoded-equal-capacity assumption behind the 2026-07-10 halt incident).
+
+    `name` missing from `ctx["capacity_x_by_name"]` (e.g. a spare account
+    `_capacity_ctx` never populated) falls back to `reference_x` itself —
+    ratio 1, the same neutral `_account_capacity_x` would resolve.
+
+    `config` is accepted, unused by this base formula today, for call-shape
+    symmetry with the gate-on callers Phase 2 threads this into.
+    """
+    reference_x = ctx.get("reference_x") or 1.0
+    capacity_x = ctx.get("capacity_x_by_name", {}).get(name, reference_x)
+    ratio = capacity_x / reference_x
+    return (100.0 - pct) / 100.0 * ratio
+
+
+def _capacity_warnings(state: dict, config: dict) -> list[str]:
+    """Diagnostic warnings for the capacity-aware Normalization model
+    (capacity-aware spec 2026-07-10). Pure computation — SOS wiring (folding
+    these into `diagnose()`'s SOSCondition list) is a later task; this only
+    returns the strings.
+
+    Two independent checks:
+
+      1. Drift: the observed fleet minimum has fallen BELOW the pinned
+         `capacity_aware.reference_x`. Silent when the observed minimum is AT
+         or ABOVE the pin (removing/disabling small accounts so the fleet
+         floor RISES is a deliberate, healthy pin state — nothing to warn
+         about) and silent when the enabled fleet has no known tier at all
+         (`_observed_fleet_min_x` returns None — nothing observed to drift).
+         Only meaningful when a valid pin actually exists in config; an
+         unpinned/snapshotted `reference_x` has nothing to "drift" from by
+         definition (it tracks the observed minimum by construction, once).
+      2. Sub-reference: any account (enabled OR operator-disabled) whose
+         ratio `capacity_x / reference_x` is at or below the first ladder
+         step's headroom fraction, `(100 - steps[0]) / 100` — a warn-and-run
+         heads-up, not a block, since such an account will legitimately trip
+         the ladder sooner than the rest of the fleet in reference-scale
+         units. Downgraded to a soft `"INFO: "`-prefixed string for accounts
+         the operator has already disabled (cus.py:10680-10693 is the
+         existing per-account SOS-severity-split precedent this mirrors) —
+         it isn't being routed to right now, so the same condition is
+         informational rather than actionable.
+    """
+    warnings: list[str] = []
+    reference_x, _ref_warnings = _resolve_reference_x(state, config)
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    has_valid_pin = (isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+                     and pinned >= 1)
+    observed_min = _observed_fleet_min_x(state, config)
+    if has_valid_pin and observed_min is not None and observed_min < reference_x:
+        warnings.append(
+            f"capacity-aware: observed fleet minimum tier ({observed_min:g}x) has drifted "
+            f"BELOW the pinned reference_x ({reference_x:g}x) — every account's unit ratio "
+            "is now computed against a reference bigger than any live account; re-pin "
+            "capacity_aware.reference_x to the new floor if this is intentional."
+        )
+    disabled = _disabled_accounts(config)
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    sub_reference_threshold = (100.0 - steps[0]) / 100.0
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or reference_x <= 0:
+            continue
+        capacity_x, _acct_warnings = _account_capacity_x(name, state, config)
+        ratio = capacity_x / reference_x
+        if ratio <= sub_reference_threshold:
+            message = (
+                f"account {name!r}: capacity_x/reference_x ratio ({ratio:.2f}) is at or "
+                f"below the first ladder step's headroom fraction ({sub_reference_threshold:.2f}) "
+                "— expect it to trip the swap ladder sooner than the rest of the fleet in "
+                "reference-scale units (warn-and-run, not blocked)"
+            )
+            if name in disabled:
+                message = f"INFO: {message} (operator-disabled — informational only)"
+            warnings.append(message)
+    return warnings
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
@@ -15039,6 +15454,17 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
+        # capacity-aware spec 2026-07-10 (Normalization model, Phase 1): cache
+        # each JUST-polled account's parsed rate-limit tier alongside its usage
+        # update, so state.json's capacity_x tracks the SAME poll cadence as
+        # current_5h_pct/current_7d_pct instead of going stale. Local
+        # credentials-file read only (never HTTP) — the same freshest-wins
+        # chain _read_access_token_with_expiry already uses. Inert today:
+        # nothing yet reads the cached value (Phase 2 wires the gate-on
+        # consumers); warnings are discarded here on purpose (a later task
+        # folds them into SOS).
+        for _capx_name in usage_by_account:
+            _account_capacity_x(_capx_name, state, config)
         # Fix 4 (2026-07-07): cheap self-healing pass — un-stale every account the
         # poll just left token_stale (idle account, valid refresh token) via a
         # direct OAuth refresh grant. Keeps cus's readings correct and prevents the
