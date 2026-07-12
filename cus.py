@@ -852,6 +852,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # set to 0 to disable the bound (every early wake fires immediately,
         # pre-2026-07-12 behavior).
         "wake_min_interval_seconds": 30,
+        # Fix #1a (2026-07-10 halt incident): a session can sit parked at Claude
+        # Code's rate-limit modal with NO fresh 429 event pending — the daemon
+        # was down when the halt fired, the event expired from the pending
+        # queue, or the halt came from a path the hooks never saw (so wake_on_429
+        # and the reactive path never learned of it). Each per_session cycle the
+        # halted-lane sweep reads every live slotted session's pane tail once for
+        # the modal's halt signatures; on a match it SYNTHESIZES a reactive entry
+        # (token `halted_lane_sweep`) into the SAME pending queue the hooks feed —
+        # so the existing reactive machinery does the credential move + modal
+        # dismiss + continue — when the account is still at/over its leave line,
+        # or just nudges the pane directly when its account has since reset (the
+        # halt is stale). The sweep NEVER moves credentials itself and is cheap:
+        # it skips entirely when tmux is unavailable and captures each pane at
+        # most once per cycle. Walk-back: set false to disable the sweep (only
+        # fresh hook-delivered 429s drive reactive moves, pre-2026-07-10
+        # behavior).
+        "halted_lane_sweep": True,
+        # Extra case-sensitive substrings that also mark a pane as halted at the
+        # rate-limit modal, appended to the built-in HALT_PANE_SIGNATURES — for
+        # Claude Code locales/versions whose modal wording differs.
+        "halt_signatures_extra": [],
     },
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
@@ -7583,6 +7604,26 @@ def _maybe_burn_before_reset(
     )
 
 
+def _below_ladder_leave_line(cur_pct: float, name: str, cap_ctx: dict | None,
+                             config: dict, threshold: float, cap_on: bool) -> bool:
+    """G4 ladder leave-line test, shared by decide_swap's Trigger 2 and the
+    halted-lane sweep (fix #1a, 2026-07-10) so both judge "has this account
+    crossed its swap-away step?" with byte-identical logic.
+
+    True  = still BELOW the step → HOLD (nothing to do).
+    False = AT/OVER the step → the lane should leave its account.
+
+    Gate-on the test is in reference UNITS — reuse `_remaining_units` (do NOT
+    duplicate the units formula): HOLD iff remaining_units > (100 − threshold)/100.
+    Gate-off it is the raw `cur_pct < threshold`, and the units form reduces to
+    exactly that at capacity ratio 1, so gate-off callers stay bit-for-bit.
+    Judges the CURRENT account (the G4 trip form), NOT a target's health —
+    threshold is the account's own clamped `next_swap_at_pct`, no lane divisor."""
+    if cap_on:
+        return _remaining_units(cur_pct, name, cap_ctx, config) > (100.0 - threshold) / 100.0
+    return cur_pct < threshold
+
+
 def decide_swap(
     state: dict,
     config: dict,
@@ -7903,10 +7944,7 @@ def decide_swap(
     # (>=100 → steps[-1]). A 20x@80% with next_swap_at=70 has 0.8u > 0.3u so it
     # HOLDS gate-on (trips gate-off), and only trips at >= 92.5%. Reduces to
     # `cur_pct < threshold` at ratio 1.
-    if _cap_on:
-        _below_threshold = _remaining_units(cur_pct, current, _cap_ctx, config) > (100.0 - threshold) / 100.0
-    else:
-        _below_threshold = cur_pct < threshold
+    _below_threshold = _below_ladder_leave_line(cur_pct, current, _cap_ctx, config, threshold, _cap_on)
     if _below_threshold:
         _note("below_threshold", "hold",
               f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
@@ -8882,6 +8920,125 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
     return panes
 
 
+# Case-sensitive substrings that mark a pane parked at Claude Code's rate-limit
+# / session-limit modal (fix #1a, 2026-07-10 halt incident). Extend per-install
+# via reactive.halt_signatures_extra. Matched against the pane tail as plain
+# substrings, so keep them specific enough not to false-positive on ordinary
+# output that quotes the phrase.
+HALT_PANE_SIGNATURES = (
+    "Stop and wait for limit to reset",
+    "You've hit your",
+    "/rate-limit-options",
+    "hit your session limit",
+)
+
+
+def _sweep_halted_lanes(state: dict, config: dict,
+                        reactive_moves: list[dict] | None = None) -> list[dict]:
+    """Fix #1a (2026-07-10 halt incident): revive lanes parked at Claude Code's
+    rate-limit modal with NO fresh 429 event pending — the daemon was down when
+    the halt fired, the event expired from the pending queue, or the halt came
+    from a path the hooks never saw.
+
+    For each live slotted session we read its pane tail ONCE and match the halt
+    signatures. On a match:
+      • account AT/OVER its leave line (same G4 comparison decide_swap uses) and
+        the slot is not already covered by a queued reactive move or a still-
+        pending reactive entry → SYNTHESIZE a reactive entry (token
+        `halted_lane_sweep`) into the SAME pending queue the hooks feed, so the
+        EXISTING reactive machinery does the credential move + modal dismiss +
+        continue on the next cycle. The sweep NEVER moves credentials itself.
+      • account BELOW its leave line (e.g. it already reset) → the halt is stale;
+        a nudge suffices, so dismiss+continue the pane directly via
+        `_resume_reactive_slot_sessions`.
+
+    Cheap by construction: returns immediately when disabled or tmux is absent,
+    and captures each pane at most once per cycle. Returns the synthesized
+    entries (for logging/testing)."""
+    reactive = config.get("reactive", {})
+    if not reactive.get("halted_lane_sweep", True):
+        return []
+    # tmux gone ⇒ no panes to read and no way to nudge; skip the whole sweep
+    # before spending a single subprocess (item 4 cheapness constraint).
+    if not tmux_is_available():
+        return []
+    signatures = [*HALT_PANE_SIGNATURES, *(reactive.get("halt_signatures_extra") or [])]
+
+    # Slots already covered — never double-synthesize: a reactive move queued
+    # this cycle for the slot, or a still-pending reactive entry (a held/deferred
+    # 429 the reactive path retained) whose slot matches.
+    covered: set[str] = {m.get("slot") for m in (reactive_moves or [])}
+    for e in (state.get("pending_429_entries") or []):
+        if e.get("slot"):
+            covered.add(e["slot"])
+
+    cap_on = _capacity_gate_on(config)
+    cap_ctx = _capacity_ctx(state, config) if cap_on else None
+    locked = _locked_slots(config)
+    synthesized: list[dict] = []
+    seen_panes: set[tuple[str | None, str]] = set()
+    for slot_name in sorted(state.get("slots", {})):
+        acct = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
+        if not acct or acct not in state.get("accounts", {}):
+            continue
+        if slot_name in locked:
+            continue  # user froze this slot; never auto-move or nudge it
+        for session in live_sessions_on_slot(slot_name):
+            pane = getattr(session, "pane", None)
+            tmux_socket = getattr(session, "tmux_socket", None)
+            pane_key = (tmux_socket, pane)
+            if not pane or pane == "no-tmux" or pane_key in seen_panes:
+                continue
+            seen_panes.add(pane_key)  # at most one capture per pane per cycle
+            tail = tmux_capture_pane(pane, tmux_socket=tmux_socket)
+            if not tail or not any(sig in tail for sig in signatures):
+                continue
+            acct_dict = state["accounts"][acct]
+            # G4 leave-line for the CURRENT account (reuse decide_swap's exact
+            # trip comparison + the same clamped ladder step; not the target
+            # health form). cur_pct is the dict-native extrapolate-to-now
+            # effective %, matching how the reactive path reads a slot account.
+            cur_pct = _account_estimated_effective_pct(acct_dict, config)
+            threshold = _next_ladder_step(acct_dict, config)
+            over_line = not _below_ladder_leave_line(
+                cur_pct, acct, cap_ctx, config, threshold, cap_on)
+            if not over_line:
+                click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted but '{acct}' "
+                           f"is below its leave line ({cur_pct:.1f}% < step {threshold:.0f}%) — "
+                           "stale halt; nudging the pane, not moving credentials")
+                _resume_reactive_slot_sessions(slot_name, config)
+                continue
+            if slot_name in covered:
+                click.echo(f"  halted-lane sweep: {slot_name} halted on capped '{acct}' but a "
+                           "reactive entry already covers it — leaving it to the reactive path")
+                continue
+            if not session.session_id:
+                # The reactive path indexes e["session_id"]; without one we
+                # cannot round-trip a resumable entry. Skip synthesis (extremely
+                # rare for a live slotted session) rather than store a broken record.
+                click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted on capped "
+                           f"'{acct}' but has no resolvable session id — skipping synthesis")
+                continue
+            covered.add(slot_name)
+            synthesized.append({
+                "ts": now_iso(),
+                "session_id": session.session_id,
+                "match": "halted-lane sweep",
+                "source": "halted_lane_sweep",
+                "slot": slot_name,
+                "account": acct,
+            })
+            click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted on capped '{acct}' "
+                       f"({cur_pct:.1f}% >= step {threshold:.0f}%) with no pending 429 — synthesizing "
+                       "a reactive entry so the next cycle moves + resumes the lane")
+    if synthesized:
+        # Append semantics (like _requeue_rate_limit_entries): merge onto any
+        # existing pending so an unrelated held 429 is not clobbered.
+        existing = state.get("pending_429_entries", []) or []
+        _store_pending_rate_limit_entries(state, [*existing, *synthesized])
+    return synthesized
+
+
 def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute: bool) -> None:
     """Execute (or dry-run/lazy-defer) a list of slot move dicts. Shared by the
     per_session and hybrid cycles (extracted 2026-07-02, GH #99).
@@ -8971,6 +9128,15 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     # global cycle's step 0).
     moves = check_rate_limit_reactive_per_session(state, config, exclude_accounts=exclude_for_slots)
     reactive_pending = bool(state.pop("_reactive_retry_pending", False))
+
+    # Halted-lane sweep (fix #1a, 2026-07-10 halt incident): after the fresh-event
+    # reactive pass, catch lanes parked at the rate-limit modal with no pending
+    # 429 (daemon-down / expired / non-hook halt). It synthesizes reactive entries
+    # into the pending queue (moved + resumed by the reactive machinery next cycle)
+    # or nudges stale-halt panes directly — never moves credentials itself. Slots
+    # already handled by a move THIS cycle are passed so they are not re-synthesized.
+    _sweep_halted_lanes(state, config, reactive_moves=moves)
+
     traces: dict = {}
     if not moves and not reactive_pending:
         moves = decide_slot_swaps(state, config, usage_by_account, traces,
@@ -12174,6 +12340,27 @@ def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> boo
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
+
+
+def tmux_capture_pane(pane: str, tmux_socket: str | None = None, lines: int = 30) -> str | None:
+    """Best-effort capture of a tmux pane's visible tail (last `lines` lines).
+
+    Returns the captured text, or None on any failure or when tmux/the pane is
+    unavailable. Read-only (`capture-pane -p`), never sends keys — used by the
+    halted-lane sweep to look for Claude Code's rate-limit modal without ever
+    touching credentials."""
+    if not tmux_is_available() or not pane or pane == "no-tmux":
+        return None
+    try:
+        result = subprocess.run(
+            [*_tmux_cmd(tmux_socket), "capture-pane", "-p", "-t", pane, "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
 
 
 def _pane_pid(pane: str, tmux_socket: str | None = None) -> int | None:
