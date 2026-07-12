@@ -105,6 +105,28 @@ def test_sos_target_side_20x_at_80_not_reported_saturated():
     assert "ladder step" in reason_off
 
 
+def test_sos_target_side_label_prints_units_not_false_percent_comparison():
+    """2026-07-12 live SOS finding: gate-on, a lane-bearing 5x under its raw
+    ladder step (47% < 70%) is correctly disqualified by the PER-LANE units
+    line (0.265u/lane <= 0.3u), but the label printed the percent template
+    ("at ladder step (47% >= 70%)") — an arithmetically false statement. The
+    gate-on label must state the units comparison it actually used."""
+    acct = _acct(47.0, 23.0, next_swap_at_pct=70)
+    ctx = cap_ctx(5, {"small5x": 5}, {"small5x": 1})
+    config = cap_config(steps=[70, 85, 94])
+
+    reason = cus._premium_target_loss_reason("small5x", acct, config, ctx=ctx)
+    assert "per-lane headroom" in reason
+    assert "u" in reason  # units, e.g. "0.27u/lane"
+    assert "ladder step" not in reason
+    assert "47% ≥ 70%" not in reason
+
+    # Percent path unchanged: gate-off the same account is simply healthy
+    # (47 < 70), so the labeller never reaches the ladder-step branch.
+    off = cus._premium_target_loss_reason("small5x", acct, cap_config(enabled=False, steps=[70, 85, 94]))
+    assert off == "unavailable"
+
+
 # ---------------------------------------------------------------------------
 # SOS source-side (G8): Condition 2b rotation probe uses formula 3 + the clamp.
 # ---------------------------------------------------------------------------

@@ -11156,6 +11156,19 @@ def _premium_target_loss_reason(name: str, acct: dict, config: dict, ctx: dict |
     if _max_model_weekly_from_acct(acct, config) >= _model_weekly_target_cap_for_config(config):
         return "over per-model weekly cap"
     if _target_would_immediately_re_trip(acct, config, name=name, ctx=(ctx if _cap else None)):
+        if _cap:
+            # The gate-on verdict above is the PER-LANE units line, which can
+            # fire while raw percent is still under the step — the percent
+            # template below would then print an arithmetically false
+            # comparison, e.g. "at ladder step (47% ≥ 70%)" (live SOS,
+            # 2026-07-12). State the comparison actually used.
+            cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+            lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+            per_lane = _remaining_units(
+                _account_estimated_effective_pct(acct, config), name, ctx, config
+            ) / (lanes + 1)
+            return (f"below per-lane headroom line ({per_lane:.2f}u/lane "
+                    f"≤ {(100.0 - cfg_steps[0]) / 100.0:.2f}u across {lanes + 1} lane(s))")
         eff = _account_effective_pct(acct, config)
         return f"at ladder step ({eff:.0f}% ≥ {acct.get('next_swap_at_pct', 50):.0f}%)"
     return "unavailable"
