@@ -269,24 +269,31 @@ def test_g5_hysteresis_5x71_to_idle_20x75_proceeds_gate_on():
 # ==========================================================================
 
 def test_g7_drain_orders_by_fewest_remaining_7d_units():
-    """5x@7d=60 (0.4u) DEPLETES BEFORE 20x@7d=75 (1.0u) gate-on (fewest
-    remaining-7d-units first), reversing gate-off's closest-to-raw-cap order.
-    (Both kept under the 80% aggregate cap so the A/B set is identical — the
-    spec's illustrative 85% would be excluded gate-off by that cap.)"""
+    """5x@7d=45 (0.55u) DEPLETES BEFORE 20x@7d=48 (2.08u) gate-on (fewest
+    remaining-7d-units first), reversing gate-off's closest-to-raw-cap order
+    (which picks the 20x at raw 48% > 45%).
+
+    Both candidates sit well under every ladder step (5h idle, 7d < steps[0]),
+    so BOTH survive the universal would-re-trip filter in gate-on AND gate-off —
+    which is exactly what makes this a clean test of the drain ORDERING rather
+    than of the health filter. (Task-5 note: once that filter judges targets in
+    reference units, the spec's illustrative 5x@60% [0.4u < the 0.5u health line]
+    is itself pruned as would-re-trip, so it can no longer be a drain candidate;
+    the ordering divergence is shown here with two genuinely-healthy targets.)"""
     accounts = {
         "hot": _acct(96.0, 20.0, next_swap_at_pct=95),
-        "small5x": _acct(10.0, 60.0, next_swap_at_pct=95),
-        "big20x": _acct(10.0, 75.0, next_swap_at_pct=95),
+        "small5x": _acct(5.0, 45.0, next_swap_at_pct=95),
+        "big20x": _acct(5.0, 48.0, next_swap_at_pct=95),
     }
     ctx = cap_ctx(5, {"hot": 5, "small5x": 5, "big20x": 20}, {})
     state_on = {"active": "hot", "_capacity_ctx": ctx,
                 "accounts": {k: dict(v) for k, v in accounts.items()}}
     on = cus.pick_swap_target(state_on, cap_config(strategy="drain"))
-    assert on.name == "small5x"   # 0.4u drains before 0.6u
+    assert on.name == "small5x"   # 0.55u drains before 2.08u (fewest units first)
 
     state_off = {"active": "hot", "accounts": {k: dict(v) for k, v in accounts.items()}}
     off = cus.pick_swap_target(state_off, cap_config(strategy="drain", enabled=False))
-    assert off.name == "big20x"   # raw 85% > 60% ⇒ closest-to-cap first
+    assert off.name == "big20x"   # raw 48% > 45% ⇒ closest-to-cap first
 
 
 def test_g7_drain_accept_admits_20x_over_its_raw_rung():

@@ -155,30 +155,38 @@ def discover_call_sites(source: str) -> dict[Fingerprint, int]:
 # hand against `grep -n` on cus.py); all "pending" today since none of these
 # sites have been converted yet.
 EXPECTED: dict[Fingerprint, str] = {
-    ("_candidate_is_valid_premium_target", "pick_swap_target", 1): "pending",  # L9963
-    ("_hybrid_cycle", "decide_swap", 1): "pending",  # L8378
-    ("_launch_candidate_saturated", "_target_would_immediately_re_trip", 1): "pending",  # L2446
-    ("_launch_prepare", "_launch_candidate_saturated", 1): "pending",  # L17602
-    ("_maybe_burn_before_reset", "pick_swap_target", 1): "pending",  # L6904
-    ("_premium_target_loss_reason", "_target_would_immediately_re_trip", 1): "pending",  # L9936
-    ("_try", "pick_swap_target", 1): "pending",  # L2382 (nested in pick_launch_account)
-    ("auto_swap_cmd", "pick_swap_target", 1): "pending",  # L14307
-    ("check_rate_limit_reactive", "_target_would_immediately_re_trip", 1): "pending",  # L12968
-    ("check_rate_limit_reactive", "pick_swap_target", 1): "pending",  # L12961
-    ("check_rate_limit_reactive_per_session", "_target_would_immediately_re_trip", 1): "pending",  # L7994
-    ("check_rate_limit_reactive_per_session", "pick_swap_target", 1): "pending",  # L7986
-    ("decide_slot_swaps", "_target_would_immediately_re_trip", 1): "ctx",  # L7764 task-4: fan-out re-pick health check threads name+ctx (G2)
-    ("decide_slot_swaps", "decide_swap", 1): "pending",  # L7672
-    ("decide_slot_swaps", "decide_swap", 2): "pending",  # L7703
-    ("decide_slot_swaps", "pick_swap_target", 1): "pending",  # L7763
-    ("decide_swap", "pick_swap_target", 1): "pending",  # L7076
-    ("decide_swap", "pick_swap_target", 2): "pending",  # L7332
-    ("diagnose", "pick_swap_target", 1): "pending",  # L10419 (nested in is_valid, closed)
-    ("diagnose", "pick_swap_target", 2): "pending",  # L10433
-    ("one_cycle", "decide_swap", 1): "pending",  # L15094 (nested closure)
-    ("one_cycle", "pick_swap_target", 1): "pending",  # L15126
-    ("pick_swap_target", "_target_would_immediately_re_trip", 1): "pending",  # L4689 (self-call)
-    ("pick_swap_target", "_target_would_immediately_re_trip", 2): "pending",  # L4710
+    # Task 5 (capacity-aware spec 2026-07-10, Phase 2b) converted every swap-
+    # decision call site to thread or stash a capacity ctx; there are no
+    # percent-path carve-outs among these four callees (the documented carve-outs
+    # — `cus switch` single-account validation, per-model weekly gates,
+    # never_swap_to_pct, and bbr min_candidate_headroom_pct — are gates that are
+    # NOT call sites of pick_swap_target / decide_swap /
+    # _target_would_immediately_re_trip / _launch_candidate_saturated, so they
+    # never appear in this inventory).
+    ("_candidate_is_valid_premium_target", "pick_swap_target", 1): "ctx",  # L10692 task-5: SOS probe stashes fleet ctx onto its 2-acct shim (G8/formula 2)
+    ("_hybrid_cycle", "decide_swap", 1): "ctx",  # L9099 task-5: shared-mount decide shim carries stashed ctx
+    ("_launch_candidate_saturated", "_target_would_immediately_re_trip", 1): "ctx",  # L2483 task-5: launch-accept wall threads name+ctx (G3/formula 2)
+    ("_launch_prepare", "_launch_candidate_saturated", 1): "ctx",  # L18419 task-5: verify-and-repick builds fresh ctx, passes name+ctx
+    ("_maybe_burn_before_reset", "pick_swap_target", 1): "ctx",  # L7518 task-5: bbr target pick is ctx-aware via stash-or-fresh-build fallback
+    ("_premium_target_loss_reason", "_target_would_immediately_re_trip", 1): "ctx",  # L10665 task-5: loss labeller gains ctx param, threads name+ctx (G8/G2)
+    ("_try", "pick_swap_target", 1): "ctx",  # L2389 task-5: pick_launch_account shim builder stashes ctx (nested in pick_launch_account)
+    ("auto_swap_cmd", "pick_swap_target", 1): "ctx",  # L15085 task-5: auto-swap CLI stashes ctx on a local shim (G8)
+    ("check_rate_limit_reactive", "_target_would_immediately_re_trip", 1): "ctx",  # L13687 task-5: global reactive veto threads name+ctx
+    ("check_rate_limit_reactive", "pick_swap_target", 1): "ctx",  # L13674 task-5: global reactive escape stashes ctx on a local shim
+    ("check_rate_limit_reactive_per_session", "_target_would_immediately_re_trip", 1): "ctx",  # L8698 task-5: post-merge unsafe-target veto threads name+ctx
+    ("check_rate_limit_reactive_per_session", "pick_swap_target", 1): "ctx",  # L8688 task-5: per_session reactive shim carries claim-aware stashed ctx
+    ("decide_slot_swaps", "_target_would_immediately_re_trip", 1): "ctx",  # L8463 task-4/5: fan-out re-pick health check threads name+shim2 ctx (G2)
+    ("decide_slot_swaps", "decide_swap", 1): "ctx",  # L8369 task-5: per-group shim carries claim-aware stashed ctx
+    ("decide_slot_swaps", "decide_swap", 2): "ctx",  # L8383 task-5: std-pool degrade retry reuses same ctx-stashed shim
+    ("decide_slot_swaps", "pick_swap_target", 1): "ctx",  # L8461 task-5: fan-out re-pick shim2 carries fresh claim-aware stashed ctx
+    ("decide_swap", "pick_swap_target", 1): "ctx",  # L7708 task-5: threads ctx via caller's stashed state + picker self-build fallback
+    ("decide_swap", "pick_swap_target", 2): "ctx",  # L7986 task-5: threads ctx via caller's stashed state + picker self-build fallback
+    ("diagnose", "pick_swap_target", 1): "ctx",  # L11159 task-5: SOS Condition 2b shim carries stashed ctx (G8/formula 2)
+    ("diagnose", "pick_swap_target", 2): "ctx",  # L11173 task-5: premium-degrade probe reuses same ctx-stashed shim
+    ("one_cycle", "decide_swap", 1): "ctx",  # L15844 task-5: decide_state shim carries stashed ctx
+    ("one_cycle", "pick_swap_target", 1): "ctx",  # L15887 task-5: no-target diagnostic re-picks on the ctx-stashed decide_state
+    ("pick_swap_target", "_target_would_immediately_re_trip", 1): "ctx",  # L5194 task-5: reserve-preference self-call threads name+ctx (self-build ctx)
+    ("pick_swap_target", "_target_would_immediately_re_trip", 2): "ctx",  # L5253 task-5: with_headroom filter self-call threads name+ctx (self-build ctx)
 }
 
 
