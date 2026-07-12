@@ -321,3 +321,92 @@ def test_locked_slot_is_never_swept(monkeypatch):
     assert out == []
     assert capture_calls == []
     assert resume_calls == []
+
+
+# --------------------------------------------------------------------------
+# 5. Nudge cooldown + per-slot dedup (review finding 2026-07-12)
+#
+# The under-line direct-nudge path used to re-fire every cycle for as long as
+# a halt signature persisted in the pane (concrete false-positive: this repo's
+# own source files contain the halt signatures verbatim). Fix: a per-slot
+# cooldown (reactive.nudge_min_interval_seconds, default 900) recorded in
+# state["slots"][slot]["last_sweep_nudge_ts"], plus per-SLOT (not per-pane)
+# dedup of the _resume_reactive_slot_sessions call.
+# --------------------------------------------------------------------------
+
+def test_nudge_recorded_and_skipped_within_window(monkeypatch, capsys):
+    """First sweep nudges and stamps last_sweep_nudge_ts; an immediate second
+    sweep is within the default 900s cooldown and must NOT nudge again — and
+    the skip is logged (debug-level line), not silent."""
+    state = _state(pct_5h=40.0, next_swap_at=90)  # under line
+    cfg = _cfg()
+    sess = _FakeSession("sess-1", "%1", None, "acctA")
+    _, resume_calls = _install_tmux(monkeypatch, {"slot-1": [(sess, HALT_TEXT)]})
+
+    cus._sweep_halted_lanes(state, cfg)
+    assert resume_calls == ["slot-1"]
+    assert "last_sweep_nudge_ts" in state["slots"]["slot-1"]
+    from datetime import datetime
+    datetime.fromisoformat(state["slots"]["slot-1"]["last_sweep_nudge_ts"].replace("Z", "+00:00"))
+
+    capsys.readouterr()  # discard first-sweep output
+    out = cus._sweep_halted_lanes(state, cfg)
+    assert out == []
+    assert resume_calls == ["slot-1"]  # unchanged: no second nudge
+    captured = capsys.readouterr()
+    assert "nudge" in captured.out.lower()  # skip is logged, not silent
+
+
+def test_nudge_fires_again_after_window_elapses(monkeypatch):
+    """A last_sweep_nudge_ts older than the configured floor no longer holds
+    the nudge back."""
+    from datetime import datetime, timedelta, timezone
+    state = _state(pct_5h=40.0, next_swap_at=90)
+    state["slots"]["slot-1"]["last_sweep_nudge_ts"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1000)).isoformat()
+    cfg = _cfg(nudge_min_interval_seconds=900)
+    sess = _FakeSession("sess-1", "%1", None, "acctA")
+    _, resume_calls = _install_tmux(monkeypatch, {"slot-1": [(sess, HALT_TEXT)]})
+    cus._sweep_halted_lanes(state, cfg)
+    assert resume_calls == ["slot-1"]
+
+
+def test_two_matching_panes_one_slot_nudged_once(monkeypatch):
+    """Two live panes on the same slot both matching a halt signature (the
+    cosmetic half of the finding) must produce exactly ONE
+    _resume_reactive_slot_sessions call for the slot, not two — it already
+    walks every pane on the slot internally."""
+    state = _state(pct_5h=40.0, next_swap_at=90)
+    cfg = _cfg()
+    s1 = _FakeSession("sess-1", "%1", None, "acctA")
+    s2 = _FakeSession("sess-2", "%2", None, "acctA")  # different pane, same slot
+    _, resume_calls = _install_tmux(
+        monkeypatch, {"slot-1": [(s1, HALT_TEXT), (s2, HALT_TEXT)]})
+    cus._sweep_halted_lanes(state, cfg)
+    assert resume_calls == ["slot-1"]
+
+
+def test_cooldown_does_not_affect_over_line_synthesis(monkeypatch):
+    """The cooldown is scoped to the direct-nudge (under-line) path only —
+    a recent last_sweep_nudge_ts must not suppress over-line synthesis."""
+    state = _state(pct_5h=95.0, next_swap_at=90)  # over line -> synth path
+    state["slots"]["slot-1"]["last_sweep_nudge_ts"] = cus.now_iso()  # "just nudged"
+    cfg = _cfg()
+    sess = _FakeSession("sess-1", "%1", None, "acctA")
+    _, resume_calls = _install_tmux(monkeypatch, {"slot-1": [(sess, HALT_TEXT)]})
+    out = cus._sweep_halted_lanes(state, cfg)
+    assert len(out) == 1
+    assert resume_calls == []
+
+
+def test_nudge_min_interval_zero_disables_cooldown(monkeypatch):
+    """nudge_min_interval_seconds: 0 restores the pre-2026-07-12 behavior:
+    every under-line match nudges, regardless of how recently the slot was
+    last nudged."""
+    state = _state(pct_5h=40.0, next_swap_at=90)
+    state["slots"]["slot-1"]["last_sweep_nudge_ts"] = cus.now_iso()  # just nudged
+    cfg = _cfg(nudge_min_interval_seconds=0)
+    sess = _FakeSession("sess-1", "%1", None, "acctA")
+    _, resume_calls = _install_tmux(monkeypatch, {"slot-1": [(sess, HALT_TEXT)]})
+    cus._sweep_halted_lanes(state, cfg)
+    assert resume_calls == ["slot-1"]

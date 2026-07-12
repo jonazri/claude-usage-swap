@@ -873,6 +873,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # rate-limit modal, appended to the built-in HALT_PANE_SIGNATURES — for
         # Claude Code locales/versions whose modal wording differs.
         "halt_signatures_extra": [],
+        # Review finding (2026-07-12, follow-up to fix #1a): the sweep's
+        # under-line direct-nudge path (halt signature matched, account already
+        # below its leave line) had no floor or dedup — it re-fired every
+        # per_session cycle (45-300s) for as long as the signature persisted in
+        # the pane, e.g. a developer viewing this repo's own source (which
+        # contains the halt signatures verbatim) got double-Escape + resume-text
+        # injected every cycle, and a stale halt the nudge can't clear looped
+        # forever. nudge_min_interval_seconds bounds this per SLOT: a nudge is
+        # skipped (logged, not silent) if state["slots"][slot]["last_sweep_nudge_ts"]
+        # is younger than this many wall-clock seconds. The over-line synthesis
+        # path needs no such floor — the pending-entry dedup (`covered`) already
+        # bounds it to one synthesis per slot until the reactive path consumes
+        # it. Walk-back: set to 0 to disable the cooldown (every under-line
+        # match nudges, pre-2026-07-12 behavior).
+        "nudge_min_interval_seconds": 900,
     },
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
@@ -8950,7 +8965,16 @@ def _sweep_halted_lanes(state: dict, config: dict,
         continue on the next cycle. The sweep NEVER moves credentials itself.
       • account BELOW its leave line (e.g. it already reset) → the halt is stale;
         a nudge suffices, so dismiss+continue the pane directly via
-        `_resume_reactive_slot_sessions`.
+        `_resume_reactive_slot_sessions`. This direct-nudge path is called AT
+        MOST ONCE PER SLOT per cycle (it already iterates the slot's own panes
+        internally — a second matching pane on the same slot is a no-op here),
+        and is further floored by `reactive.nudge_min_interval_seconds` (review
+        finding 2026-07-12): a slot nudged within that many seconds
+        (state["slots"][slot]["last_sweep_nudge_ts"]) is skipped — logged, not
+        silent — rather than re-fired every cycle for as long as the signature
+        persists in the pane (a stale halt the nudge can't clear, or a
+        false-positive like this very source file's halt-signature strings
+        showing in a developer's pane, would otherwise loop forever).
 
     Cheap by construction: returns immediately when disabled or tmux is absent,
     and captures each pane at most once per cycle. Returns the synthesized
@@ -8975,8 +8999,15 @@ def _sweep_halted_lanes(state: dict, config: dict,
     cap_on = _capacity_gate_on(config)
     cap_ctx = _capacity_ctx(state, config) if cap_on else None
     locked = _locked_slots(config)
+    nudge_min_interval = reactive.get("nudge_min_interval_seconds", 900)
     synthesized: list[dict] = []
     seen_panes: set[tuple[str | None, str]] = set()
+    # Slots already handled by the under-line direct-nudge path THIS cycle —
+    # a second matching pane on the same slot must not re-nudge or re-log
+    # (review finding 2026-07-12: `_resume_reactive_slot_sessions` already
+    # walks every pane on the slot internally, so per-pane calls double-fired
+    # it for a slot with two matching panes).
+    nudged_this_cycle: set[str] = set()
     for slot_name in sorted(state.get("slots", {})):
         acct = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
         if not acct or acct not in state.get("accounts", {}):
@@ -9003,10 +9034,39 @@ def _sweep_halted_lanes(state: dict, config: dict,
             over_line = not _below_ladder_leave_line(
                 cur_pct, acct, cap_ctx, config, threshold, cap_on)
             if not over_line:
+                if slot_name in nudged_this_cycle:
+                    continue  # another pane on this slot already handled the nudge this cycle
+                nudged_this_cycle.add(slot_name)
+                # Cooldown (review finding 2026-07-12): without this floor the
+                # nudge re-fired every cycle for as long as the signature sat
+                # in the pane tail — including a stale halt the nudge itself
+                # can't clear, or a false positive (e.g. this repo's own source
+                # containing the halt signatures verbatim in a developer's
+                # pane). last_sweep_nudge_ts is wall-clock (persisted in
+                # state), so it survives across daemon restarts, unlike the
+                # module-level monotonic floor used for wake_min_interval_seconds.
+                last_nudge = (state.get("slots", {}).get(slot_name, {}) or {}).get(
+                    "last_sweep_nudge_ts")
+                on_cooldown = False
+                elapsed = None
+                if nudge_min_interval > 0 and last_nudge:
+                    try:
+                        last_nudge_dt = datetime.fromisoformat(last_nudge.replace("Z", "+00:00"))
+                        elapsed = (datetime.now(timezone.utc) - last_nudge_dt).total_seconds()
+                        on_cooldown = elapsed < nudge_min_interval
+                    except ValueError:
+                        pass  # unparseable timestamp: fail open, treat as not on cooldown
+                if on_cooldown:
+                    click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted but '{acct}' "
+                               f"is below its leave line — nudged {int(elapsed)}s ago "
+                               f"(< nudge_min_interval_seconds={nudge_min_interval}s); "
+                               "skipping repeat nudge")
+                    continue
                 click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted but '{acct}' "
                            f"is below its leave line ({cur_pct:.1f}% < step {threshold:.0f}%) — "
                            "stale halt; nudging the pane, not moving credentials")
                 _resume_reactive_slot_sessions(slot_name, config)
+                state["slots"][slot_name]["last_sweep_nudge_ts"] = now_iso()
                 continue
             if slot_name in covered:
                 click.echo(f"  halted-lane sweep: {slot_name} halted on capped '{acct}' but a "
