@@ -4,6 +4,17 @@
 - **Status:** revision 5 — committee-loop CONVERGED (9 iterations, 33 verified findings applied; see `docs/plans/2026-07-10-capacity-aware-anti-herding-ledgers.md` for the deferred/polish record); 14 spec-level deferred items folded in post-convergence; implementation not started
 - **Scope:** fix #3 of the 2026-07-10 overnight-halt incident (strategy/config). Fixes #1 (halted-session revival) and #2 (event-driven reactive 429) are separate, follow-on specs.
 
+## Execution preamble (for a fresh implementation session)
+
+**Driver:** `superpowers:subagent-driven-development` (tasks below are independent within a phase; phases are strictly ordered). **Context to load first:** this spec; the ledgers sidecar (`2026-07-10-capacity-aware-anti-herding-ledgers.md` — the "code"/"cite" implementation notes and the hot-area guidance); repo `CLAUDE.md` (deploy = `systemctl --user restart cus.service`, never a foreground daemon; completion requires active service + post-restart cycle in `~/claude-accounts/daemon.log` + clean `cus sos`); `experiments/herding-analysis/herding_analysis.py` (the observation oracle). All code lands in `cus.py`; tests in `tests/` (pytest, per CI).
+
+- **Phase 0 — oracles before behavior** (~30 min): commit the caller-inventory oracle test (Rollout §2 bullet 1) and capture the gate-off golden fixtures (Rollout §1). Both must pass against UNMODIFIED cus.py. ✋ *Checkpoint (verification-before-completion): run `pytest tests/ -x -q` and paste the pass line before proceeding.*
+- **Phase 1 — sourcing + ctx** (~1–2 h): `_read_rate_limit_tier`, `capacity_x` validation/caching, `reference_x` bootstrap/persistence/drift rules (Normalization model), `_capacity_ctx` + `_remaining_units`. Table-driven sourcing/validation tests (Rollout §2 last bullet). ✋ *Checkpoint: full suite green; goldens untouched (gate off).*
+- **Phase 2 — gate conversions G1–G10 + plumbing** (~2–4 h): work the conversion-rule table top to bottom; the plumbing touch-point row is the map of every ctx stash/thread site; the caller-inventory oracle must stay green after EACH gate. ✋ *Checkpoint: full suite incl. all Rollout §2 fixtures; gate-off goldens still bit-for-bit.*
+- **Phase 3 — dry-run against live state** (~15 min): `cus daemon --once --no-execute` with gate off (expect: decisions identical to live daemon's latest cycle) and again with a scratch gate-on config copy (expect: capacity-aware picks, no errors). ✋ *Checkpoint: paste both decision diffs.*
+- **Phase 4 — apply Part A** (human-gated): **re-verify the live-config baseline first** (it drifted mid-review once already — the 2026-07-10 14:53 stopgap; diff live `~/claude-accounts/config.yaml` against this spec's incident-time/live annotations at lines ~20/24/46 and reconcile before editing). Then the single atomic Part A edit → `systemctl --user restart cus.service`. ✋ *Checkpoint (per repo CLAUDE.md): `systemctl --user is-active cus.service` + new PID/start-time, one completed post-restart cycle in `daemon.log`, `cus sos` clean — paste all three before declaring deployed; rollback per Rollout §4 (whole block, never gate-off alone).*
+- **Phase 5 — observe 24–48 h**: re-run the analysis script per Rollout §5; success criteria there. ✋ *Final verification: paste the §6 metric line (target <5%, from 62%) and the stacking distribution before closing the task.*
+
 ## Incident context (why now)
 
 On the night of 2026-07-09→10, two live tmux sessions halted on 429 and stayed dead ~7 hours despite the cus daemon running and swapping. Root causes:
