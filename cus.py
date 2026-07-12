@@ -4511,7 +4511,8 @@ def projected_seven_day_reset(acct: dict, config: dict, now=None) -> str | None:
         return projected_ts or api_ts
 
 
-def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
+def _target_would_immediately_re_trip(acct: dict, config: dict,
+                                      name: str | None = None, ctx: dict | None = None) -> bool:
     """Return True if this candidate is "full" — its effective utilization is
     at/above the FIRST ladder step — and so should not be swapped onto. Used to
     prune "doomed" candidates that would cause a swap-back loop. GH #17.
@@ -4529,12 +4530,28 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     regardless of where its ladder happens to sit. Degraded/all-full pools are
     still handled downstream by headroom_fallback + the min-improvement gate, so
     progressive-return semantics survive.
+
+    Capacity-aware conversion (G2, capacity-aware spec 2026-07-10, "The formula
+    changes" formula 2): when the gate is on AND the caller threads the
+    candidate's `name` + fleet `ctx`, "full" is judged in reference-scale UNITS
+    per lane instead of raw percent — the candidate is HEALTHY (not full) iff
+    `remaining_units(extrapolated pct) / (lanes + 1) > (100 − steps[0]) / 100`.
+    A big-tier account at a high percent can still clear the line (it has more
+    absolute headroom to give a lane); a small-tier account can't. `ctx=None`
+    (or the gate off) keeps today's raw-percent path bit-for-bit — that is the
+    default for every caller not yet converted (Task 5 threads the rest).
     """
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
     # Estimator (C): use the extrapolated %, so a target polled just under the
     # step but climbing fast (will be over it by the time the swap lands) is
     # still treated as full. Falls back to polled when no rate is known.
-    return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
+    est_pct = _account_estimated_effective_pct(acct, config)
+    if _capacity_gate_on(config) and name is not None and ctx is not None:
+        lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+        remaining = _remaining_units(est_pct, name, ctx, config)
+        healthy = remaining / (lanes + 1) > (100.0 - cfg_steps[0]) / 100.0
+        return not healthy
+    return est_pct >= cfg_steps[0]
 
 
 def _disabled_accounts(config: dict) -> set:
@@ -4903,13 +4920,47 @@ def _lane_load_penalty(name: str, state: dict, config: dict) -> float:
     caller — SOS probes, `cus switch`, global mode — passes no `_lane_load`, so
     their scoring is untouched), or when the candidate backs no lanes. Scales
     linearly with lane count, so a magnet that has already accreted 2-3 lanes is
-    penalized 2-3× and the fleet disperses within a cycle or two."""
+    penalized 2-3× and the fleet disperses within a cycle or two.
+
+    Capacity-aware (G1, capacity-aware spec 2026-07-10, "The formula changes"):
+    0.0 whenever the gate is on — the reference-unit ranking key
+    (`_capacity_rank_key`) folds lane isolation into its own `÷(lanes+1)`
+    contention divisor plus a units-scale linear term, so this point-scale
+    penalty is deliberately NOT applied on top of it."""
     if not _spread_lanes_enabled(config):
+        return 0.0
+    if _capacity_gate_on(config):
         return 0.0
     load = (state.get("_lane_load") or {}).get(name, 0)
     if not load:
         return 0.0
     return float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0)) * load
+
+
+def _capacity_rank_key(score_pts: float, name: str, ctx: dict, config: dict) -> float:
+    """Gate-on swap-target ranking key (G1, capacity-aware spec 2026-07-10,
+    "The formula changes" formula 1):
+
+        key = (score_pts / 100) × ratio ÷ (lanes + 1) − (cluster_penalty / 100) × lanes
+
+    where `ratio = capacity_x / reference_x` and `lanes` is the candidate's
+    live-lane count (both from `ctx`). `score_pts` is the strategy's existing
+    point-scale score (e.g. `100 − effective_pct` for lowest_usage, the
+    weighted headroom/burn-soon score for headroom/smart) fed in verbatim — NOT
+    clamped or re-weighted. Candidates rank by this key DESCENDING.
+
+    Both terms are in reference units: the first is per-lane capacity density
+    for the score's headroom component (a big-tier account's low percent
+    correctly outranks a small-tier account's); the second is the isolation
+    preference (co-located lanes share fate on a 429/token failure), 0.60u per
+    lane at `cluster_penalty: 60`, scale-stable because `reference_x` is pinned.
+    This replaces the point-scale `_lane_load_penalty` (which returns 0 gate-on).
+    """
+    reference_x = ctx.get("reference_x") or 1.0
+    ratio = ctx.get("capacity_x_by_name", {}).get(name, reference_x) / reference_x
+    lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+    cluster_penalty = float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0))
+    return (score_pts / 100.0) * ratio / (lanes + 1) - (cluster_penalty / 100.0) * lanes
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
@@ -5105,13 +5156,34 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
                for _, a in model_spent):
             candidates = model_spent
 
+    # Capacity-aware gate (capacity-aware spec 2026-07-10). When on, ranking and
+    # the aggregate-7d filter below run in reference UNITS, not raw percent. ctx
+    # comes from the stash Task 5 lays down (claim-aware lane counts); absent
+    # that, build a fresh one here — the deliberate fallback resolution is that
+    # a missing stash must NEVER silently mean "percent path" while the gate is
+    # on. Built only gate-on (the fresh build reads credentials/occupancy and is
+    # a no-op cost gate-off, keeping gate-off bit-for-bit).
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = (state.get("_capacity_ctx") or _capacity_ctx(state, config)) if _cap_on else None
+
     # Universal filter (GH #17, all strategies): exclude candidates above
     # the user-stated AGGREGATE weekly ceiling. Previously only headroom/smart
     # applied this — lowest_usage/drain/round_robin would happily pick an
     # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
     # (system is degraded; swap somewhere rather than stay on a hot active). Runs
     # on the per-model-safe survivors from the HARD gate above.
-    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+    #
+    # G9 (capacity-aware spec 2026-07-10): gate-on, the ceiling is a reference-
+    # unit line — a candidate is safe iff `remaining_7d_units > (100 −
+    # hard_7d_cap_pct)/100` (no lane divisor; the 7d cap is aggregate, not a
+    # per-lane ladder). A big-tier account at a high 7d percent can still clear
+    # it. Reduces exactly to `current_7d_pct < hard_7d` at ratio 1.
+    if _cap_on:
+        _hard_7d_units_line = (100.0 - hard_7d) / 100.0
+        safe_7d = [(n, a) for n, a in candidates
+                   if _remaining_units(a.get("current_7d_pct", 0), n, _cap_ctx, config) > _hard_7d_units_line]
+    else:
+        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -5145,29 +5217,63 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # by 5h for stability. Anti-cluster (2026-07-06): a lane-load penalty is
         # ADDED to the effective-util sort key (higher util = sorted later), so a
         # candidate already backing live lanes is deprioritized vs an empty one.
-        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
-                                        + _lane_load_penalty(kv[0], state, config),
-                                        kv[1].get("current_5h_pct", 0.0)))
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, rank by the reference-
+        # unit key DESCENDING — score_pts here is `100 − effective_pct` (this
+        # strategy's existing point score) — keeping the 5h tiebreak. At ratio 1
+        # / zero lane-load this reduces to today's effective-pct ordering.
+        if _cap_on:
+            candidates.sort(key=lambda kv: (
+                -_capacity_rank_key(100.0 - _account_effective_pct(kv[1], config), kv[0], _cap_ctx, config),
+                kv[1].get("current_5h_pct", 0.0)))
+        else:
+            candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
+                                            + _lane_load_penalty(kv[0], state, config),
+                                            kv[1].get("current_5h_pct", 0.0)))
         chosen, _ = candidates[0]
-        return SwapTarget(name=chosen, reason=_annotate("lowest_usage: lowest effective util"))
+        return SwapTarget(name=chosen, reason=_annotate(
+            "lowest_usage[capacity]: highest remaining-units-per-lane" if _cap_on
+            else "lowest_usage: lowest effective util"))
 
     if strategy == "drain":
         # cux drain: pass 1 = candidates with effective_pct under their own
         # next_swap_at (i.e. headroom for an arrival). Pass 2 = any candidate
         # below 100% 5h. Pass 2 still applies the universal cap_fallback /
         # headroom_fallback filters above.
-        ordered = [
-            (n, a) for n, a in candidates
-            if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
-        ]
+        #
+        # G7 (capacity-aware spec 2026-07-10): drain is non-scoring (no G1 key).
+        # Gate-on converts BOTH halves to reference units — (a) the pass-1 ACCEPT
+        # `effective_pct < next_swap_at` becomes `remaining_units(effective_pct)
+        # > (100 − next_swap_at)/100` (a big-tier account with real unit headroom
+        # is admitted even above its raw rung); (b) the deplete-first ORDERING
+        # `-current_7d_pct` (closest-to-cap first) becomes fewest-remaining-7d-
+        # units-first — same deplete-first intent, but a 5x@60% (0.4u) drains
+        # before a 20x@85% (0.6u) even though 85 > 60 in raw percent.
+        if _cap_on:
+            ordered = [
+                (n, a) for n, a in candidates
+                if _remaining_units(_account_effective_pct(a, config), n, _cap_ctx, config)
+                > (100.0 - a.get("next_swap_at_pct", 50)) / 100.0
+            ]
+        else:
+            ordered = [
+                (n, a) for n, a in candidates
+                if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
+            ]
         if ordered:
-            ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
+            if _cap_on:
+                ordered.sort(key=lambda kv: _remaining_units(kv[1].get("current_7d_pct", 0.0), kv[0], _cap_ctx, config))
+            else:
+                ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
             chosen, _ = ordered[0]
             return SwapTarget(name=chosen, reason=_annotate("drain: under own threshold"))
         # Pass 2: any candidate with some 5h room
         ordered = [(n, a) for n, a in candidates if a.get("current_5h_pct", 0.0) < 100]
         if ordered:
-            ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
+            if _cap_on:
+                ordered.sort(key=lambda kv: _remaining_units(kv[1].get("current_7d_pct", 0.0), kv[0], _cap_ctx, config))
+            else:
+                ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
             chosen, _ = ordered[0]
             return SwapTarget(name=chosen, reason=_annotate("drain: 5h has room"))
         return None
@@ -5179,7 +5285,16 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         cfg_accounts = {a["name"]: a for a in config.get("accounts", [])}
         candidates.sort(key=lambda kv: cfg_accounts.get(kv[0], {}).get("priority", 99))
         for name, acct in candidates:
-            if _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50):
+            # G7 (capacity-aware spec 2026-07-10): non-scoring — priority ORDER
+            # is untouched; only the per-account headroom ACCEPT converts to the
+            # reference-unit line (reduces to `effective_pct < next_swap_at` at
+            # ratio 1).
+            if _cap_on:
+                accepted = (_remaining_units(_account_effective_pct(acct, config), name, _cap_ctx, config)
+                            > (100.0 - acct.get("next_swap_at_pct", 50)) / 100.0)
+            else:
+                accepted = _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50)
+            if accepted:
                 return SwapTarget(name=name, reason=_annotate("strict_priority: highest priority with headroom"))
         return None
 
@@ -5219,6 +5334,17 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
         # Anti-cluster (2026-07-06): subtract the lane-load penalty so an account
         # already backing live lanes scores below a distinct empty one.
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, feed the weighted
+        # headroom `score` in as score_pts and rank by the reference-unit key
+        # DESCENDING (which supplies its own lane isolation, so the point-scale
+        # penalty is not applied). Reduces to today's score ordering at ratio 1 /
+        # zero lane-load.
+        if _cap_on:
+            candidates.sort(key=lambda kv: -_capacity_rank_key(score(kv[1]), kv[0], _cap_ctx, config))
+            chosen, chosen_acct = candidates[0]
+            k = _capacity_rank_key(score(chosen_acct), chosen, _cap_ctx, config)
+            return SwapTarget(name=chosen, reason=_annotate(f"headroom[capacity]: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% key={k:.2f}"))
         candidates.sort(key=lambda kv: -(score(kv[1]) - _lane_load_penalty(kv[0], state, config)))
         chosen, chosen_acct = candidates[0]
         s = score(chosen_acct) - _lane_load_penalty(chosen, state, config)
@@ -5305,19 +5431,33 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # so a magnet that has already accreted lanes falls behind a distinct
         # empty account and the fleet disperses. Inert when spread_lanes is off or
         # no _lane_load map was supplied (non-lane callers).
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, the unclamped smart
+        # score (headroom + burn-soon + reset-proximity, NOT 0-100 bounded) is
+        # fed in as score_pts to the reference-unit key, which supplies its own
+        # ÷(lanes+1) isolation in place of the point-scale cluster penalty. The
+        # burn-soon bonus scales with a candidate's ratio (a soon-resetting 20x
+        # wastes 4× a 5x's capacity), so it stays a deliberate magnet until it
+        # accretes enough lanes for the divisor + linear term to overtake it.
         scored = []
         for n, a in candidates:
             sc, rz = smart_score(a)
-            pen = _lane_load_penalty(n, state, config)
-            if pen:
-                sc -= pen
-                rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
-            scored.append((n, a, sc, rz))
+            if _cap_on:
+                rank = _capacity_rank_key(sc, n, _cap_ctx, config)
+                rz = (rz + f" capacity-key({rank:.2f})").strip()
+            else:
+                pen = _lane_load_penalty(n, state, config)
+                if pen:
+                    sc -= pen
+                    rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
+                rank = sc
+            scored.append((n, a, rank, rz))
         scored.sort(key=lambda x: -x[2])
-        chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
+        chosen, chosen_acct, chosen_rank, chosen_reasons = scored[0]
+        _metric = "key" if _cap_on else "score"
         return SwapTarget(
             name=chosen,
-            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={chosen_score:.1f} {chosen_reasons}"),
+            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% {_metric}={chosen_rank:.1f} {chosen_reasons}"),
         )
 
     return None
@@ -7398,6 +7538,15 @@ def decide_swap(
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
+    # Capacity-aware gate (capacity-aware spec 2026-07-10). When on, the trigger
+    # comparisons below run in reference UNITS for the ACTIVE account `current`,
+    # not raw percent. ctx comes from the Task-5 stash (claim-aware lane counts);
+    # absent that, build fresh — a missing stash must never silently mean the
+    # percent path while the gate is on (deliberate fallback resolution). Built
+    # only gate-on, so gate-off stays bit-for-bit.
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = (state.get("_capacity_ctx") or _capacity_ctx(state, config)) if _cap_on else None
+
     # Fix A — extrapolation-aware trigger (2026-07-06 rayi3 incident). The ladder
     # (Trigger 2) and hard-cap (Trigger 1) trips below compare against the
     # BURN-EXTRAPOLATED usage, projected forward to the moment the daemon could
@@ -7449,7 +7598,16 @@ def decide_swap(
         if cur_model > 0:
             cur_model = min(100.0, cur_model + _burn_extrapolation_delta(
                 active_acct, "7d", config, _trig_now, _trig_look_ahead))
-    agg_tripped = cur_7d >= hard_7d_cap
+    # G9 Trigger-1 arm (capacity-aware spec 2026-07-10): the AGGREGATE 7d cap
+    # trips in reference units — `remaining_7d_units <= (100 − hard_7d_cap)/100`
+    # (no lane divisor; aggregate cap, same shape as the picker's safe_7d line
+    # G9). Keeps the site's own `cur_7d` source (burn-extrapolated under
+    # poll-accel, raw otherwise). The per-model arm is deliberately untouched.
+    # Reduces to `cur_7d >= hard_7d_cap` at ratio 1.
+    if _cap_on:
+        agg_tripped = _remaining_units(cur_7d, current, _cap_ctx, config) <= (100.0 - hard_7d_cap) / 100.0
+    else:
+        agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
         # Preserve the FORCING caps before the display reassignment below stomps
@@ -7609,7 +7767,18 @@ def decide_swap(
     ladder_threshold_bbr = active_acct.get("next_swap_at_pct", cfg_steps_bbr[0])
     if ladder_threshold_bbr >= 100:
         ladder_threshold_bbr = cfg_steps_bbr[-1]
-    if current_max_pct(cur_usage, config) < ladder_threshold_bbr:
+    # G6 (capacity-aware spec 2026-07-10): the "ladder won't fire, so run bbr"
+    # precheck runs in reference units — bbr is eligible iff `remaining_units >
+    # (100 − clamped next_swap_at)/100`. Keeps its RAW current_max_pct source (no
+    # look-ahead): the asymmetry with G4's look-ahead-maxed cur_pct is today's
+    # behavior, deliberately preserved. Reduces to `< ladder_threshold_bbr` at
+    # ratio 1.
+    _bbr_max_pct = current_max_pct(cur_usage, config)
+    if _cap_on:
+        _bbr_below_step = _remaining_units(_bbr_max_pct, current, _cap_ctx, config) > (100.0 - ladder_threshold_bbr) / 100.0
+    else:
+        _bbr_below_step = _bbr_max_pct < ladder_threshold_bbr
+    if _bbr_below_step:
         bbr_decision = _maybe_burn_before_reset(
             state, config, current, active_acct, cur_usage, usage_by_account
         )
@@ -7643,7 +7812,18 @@ def decide_swap(
     if _poll_accel_enabled(config):
         cur_pct = max(cur_pct, _account_estimated_effective_pct(
             active_acct, config, _trig_now, look_ahead_seconds=_trig_look_ahead))
-    if cur_pct < threshold:
+    # G4 (capacity-aware spec 2026-07-10): the ladder trips in reference units —
+    # HOLD (below step) iff `remaining_units > (100 − clamped threshold)/100`,
+    # trip iff `<=`. Keeps this site's own cur_pct source (raw max-ed with the
+    # look-ahead only under poll-accel) and its already-clamped local threshold
+    # (>=100 → steps[-1]). A 20x@80% with next_swap_at=70 has 0.8u > 0.3u so it
+    # HOLDS gate-on (trips gate-off), and only trips at >= 92.5%. Reduces to
+    # `cur_pct < threshold` at ratio 1.
+    if _cap_on:
+        _below_threshold = _remaining_units(cur_pct, current, _cap_ctx, config) > (100.0 - threshold) / 100.0
+    else:
+        _below_threshold = cur_pct < threshold
+    if _below_threshold:
         _note("below_threshold", "hold",
               f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
         return None
@@ -7809,15 +7989,37 @@ def decide_swap(
     # leak 1-2pp drift through small `min_improvement_pct` margins.
     if hyst_cfg.get("enabled", True):
         min_improvement = hyst_cfg.get("min_improvement_pct", 3)
-        active_eff = _account_effective_pct(active_acct, config)
-        target_eff = _account_effective_pct(state["accounts"][target.name], config)
-        if target_eff > active_eff - min_improvement:
-            msg = (
-                f"ladder swap suppressed: target {target.name} at "
-                f"{target_eff:.1f}% would not improve on active {current} at "
-                f"{active_eff:.1f}% by min_improvement_pct={min_improvement}pp "
-                f"(picker reason: {target.reason})"
-            )
+        # G5 (capacity-aware spec 2026-07-10): gate-on, "must improve" is judged
+        # in reference units — HOLD iff `target_units − active_units <
+        # min_improvement/100` (min_improvement_pct is percent points, so /100
+        # puts it on the units scale: default 3 → 0.03u). A move to a bigger-tier
+        # account with more absolute headroom is a genuine improvement even at a
+        # higher raw percent (active 5x@71% has 0.29u; idle 20x@75% has 1.0u, so
+        # gate-on proceeds where gate-off holds). The diagnostic logs the units
+        # comparison gate-on — the percent numbers would not be what held it.
+        if _cap_on:
+            active_metric = _remaining_units(_account_effective_pct(active_acct, config), current, _cap_ctx, config)
+            target_metric = _remaining_units(_account_effective_pct(state["accounts"][target.name], config), target.name, _cap_ctx, config)
+            insufficient = target_metric - active_metric < min_improvement / 100.0
+        else:
+            active_metric = _account_effective_pct(active_acct, config)
+            target_metric = _account_effective_pct(state["accounts"][target.name], config)
+            insufficient = target_metric > active_metric - min_improvement
+        if insufficient:
+            if _cap_on:
+                msg = (
+                    f"ladder swap suppressed: target {target.name} at "
+                    f"{target_metric:.2f}u would not improve on active {current} at "
+                    f"{active_metric:.2f}u by min_improvement={min_improvement / 100.0:.2f}u "
+                    f"(picker reason: {target.reason})"
+                )
+            else:
+                msg = (
+                    f"ladder swap suppressed: target {target.name} at "
+                    f"{target_metric:.1f}% would not improve on active {current} at "
+                    f"{active_metric:.1f}% by min_improvement_pct={min_improvement}pp "
+                    f"(picker reason: {target.reason})"
+                )
             click.echo(f"  {msg}")
             _note("min_improvement_gate", "hold", msg)
             return None
@@ -8041,6 +8243,17 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     # piling every lane onto the single burn-soon magnet (the rayi5→rayi4 pile-up).
     base_lane_load: dict[str, int] = {a: len(s) for a, s in occupied.items()}
 
+    # Capacity-aware (G2 fan-out threading, capacity-aware spec 2026-07-10):
+    # gate-on, the fan-out re-pick's "would it immediately re-trip" health check
+    # is judged in reference units per lane, so thread the candidate name + a
+    # fleet ctx directly into `_target_would_immediately_re_trip` at that call
+    # site. This is the only ctx threading this task does outside the
+    # picker/decide_swap fresh-build fallback; the full stash cadence (incl.
+    # claim-aware lane counts) is Task 5. Built only gate-on so gate-off is
+    # bit-for-bit (no credential/occupancy reads on the default path).
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = _capacity_ctx(state, config) if _cap_on else None
+
     def _cur_lane_load() -> dict[str, int]:
         """account → lanes it will back = pre-existing live lanes + moves already
         queued onto it THIS cycle. Recomputed per pick so each successive fan-out
@@ -8177,7 +8390,9 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 shim2["_lane_load"] = _cur_lane_load()
                 retry = pick_swap_target(shim2, cfg_view)
                 retry_healthy = retry is not None and not _target_would_immediately_re_trip(
-                    state.get("accounts", {}).get(retry.name, {}), cfg_view)
+                    state.get("accounts", {}).get(retry.name, {}), cfg_view,
+                    name=(retry.name if _cap_on else None),
+                    ctx=(_cap_ctx if _cap_on else None))
                 # Anti-clustering HOLD (2026-07-06 rayi5→rayi4 pile-up). The #109
                 # pool double-book below is what lets several lanes STACK onto one
                 # burn-soon account in a single cycle (4 mounts on 3 families → the

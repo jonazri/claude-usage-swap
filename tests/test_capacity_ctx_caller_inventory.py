@@ -167,7 +167,7 @@ EXPECTED: dict[Fingerprint, str] = {
     ("check_rate_limit_reactive", "pick_swap_target", 1): "pending",  # L12961
     ("check_rate_limit_reactive_per_session", "_target_would_immediately_re_trip", 1): "pending",  # L7994
     ("check_rate_limit_reactive_per_session", "pick_swap_target", 1): "pending",  # L7986
-    ("decide_slot_swaps", "_target_would_immediately_re_trip", 1): "pending",  # L7764
+    ("decide_slot_swaps", "_target_would_immediately_re_trip", 1): "ctx",  # L7764 task-4: fan-out re-pick health check threads name+ctx (G2)
     ("decide_slot_swaps", "decide_swap", 1): "pending",  # L7672
     ("decide_slot_swaps", "decide_swap", 2): "pending",  # L7703
     ("decide_slot_swaps", "pick_swap_target", 1): "pending",  # L7763

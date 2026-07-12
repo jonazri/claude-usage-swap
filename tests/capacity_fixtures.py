@@ -322,6 +322,42 @@ def build_scenarios() -> list[tuple[str, dict, dict]]:
     return scenarios
 
 
+# ---------------------------------------------------------------------------
+# Capacity-aware GATE-ON conversion fixtures (Task 4, capacity-aware spec
+# 2026-07-10). These are NEW builders — the gate-off golden machinery above
+# (build_scenarios/_acct/_cfg/usage_from_state) is deliberately untouched so
+# the goldens contract stays intact. Used only by
+# tests/test_capacity_gate_conversions.py.
+# ---------------------------------------------------------------------------
+
+def cap_config(strategy: str = "smart", *, reference_x: float = 5,
+               cluster_penalty: float = 60, enabled: bool = True, **overrides) -> dict:
+    """Config with the capacity-aware gate ON, `reference_x` pinned, and the
+    formula-1 `spread_lanes.cluster_penalty` set (default 60 = the spec's
+    worked-example value). `enabled=False` yields the byte-identical gate-off
+    twin for A/B assertions."""
+    return cus.deep_merge(cus.DEFAULT_CONFIG, {
+        "strategy": strategy,
+        "capacity_aware": {"enabled": enabled, "reference_x": reference_x},
+        "spread_lanes": {"enabled": True, "cluster_penalty": cluster_penalty},
+        **overrides,
+    })
+
+
+def cap_ctx(reference_x: float = 5, capacity_x_by_name: dict | None = None,
+            lane_load_by_name: dict | None = None) -> dict:
+    """Hand-built `_capacity_ctx`-shaped dict for stashing into
+    `state['_capacity_ctx']` (the picker/decide_swap fallback reads it before
+    building fresh) or passing straight to `_remaining_units` /
+    `_target_would_immediately_re_trip`. Full control of ratios + lane counts
+    without touching /proc or credentials files."""
+    return {
+        "reference_x": float(reference_x),
+        "capacity_x_by_name": dict(capacity_x_by_name or {}),
+        "lane_load_by_name": dict(lane_load_by_name or {}),
+    }
+
+
 if __name__ == "__main__":
     for name, state, config in build_scenarios():
         print(name)
