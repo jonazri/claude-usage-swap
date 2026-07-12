@@ -41,8 +41,22 @@ STOP_FAILURE = HOOKS / "cus_stop_failure.sh"
 PTUF = HOOKS / "cus_post_tool_use_failure.sh"
 
 
-def _cfg(wake_on_429: bool = True) -> dict:
-    return {"reactive": {"wake_on_429": wake_on_429}}
+def _cfg(wake_on_429: bool = True, wake_min_interval_seconds: float | None = None) -> dict:
+    reactive: dict = {"wake_on_429": wake_on_429}
+    if wake_min_interval_seconds is not None:
+        reactive["wake_min_interval_seconds"] = wake_min_interval_seconds
+    return {"reactive": reactive}
+
+
+@pytest.fixture(autouse=True)
+def _reset_wake_cycle_state():
+    """`cus._last_wake_cycle_monotonic` is module-level (persists for the
+    daemon process's lifetime by design — see its definition next to
+    _WAKE_SLICE_SECONDS). Reset it around every test so tests stay isolated
+    from each other regardless of order."""
+    cus._last_wake_cycle_monotonic = None
+    yield
+    cus._last_wake_cycle_monotonic = None
 
 
 # --------------------------------------------------------------------------
@@ -167,6 +181,149 @@ def test_stale_wake_file_mid_slice_with_old_mtime_is_ignored(tmp_path, monkeypat
     assert result is None
     assert calls == [5.0, 5.0, 2.0]
     assert wake.exists()  # never consumed — stale relative to wait_start_wall
+
+
+# --------------------------------------------------------------------------
+# Daemon side: reactive.wake_min_interval_seconds (review finding 2026-07-12)
+#
+# A hook storm (a session 429-ing every few seconds) recreates wake-429
+# faster than a cycle can consume it. Without a floor, each recreation was
+# consumed unconditionally, driving back-to-back full cycle bodies for the
+# whole min_seconds_between_reactive_swaps window. These tests pin: a floor
+# between consecutive EARLY WAKES (module-level _last_wake_cycle_monotonic),
+# the file is left in place (not consumed) while blocked, and the wake still
+# fires as soon as the floor elapses — never dropped.
+# --------------------------------------------------------------------------
+
+def _fake_clock(monkeypatch, start: float = 0.0):
+    """Install a monotonic-driven fake clock: time.sleep(s) both records the
+    call and advances the same clock time.monotonic() reads, so floor math
+    (which is monotonic-based) can be driven deterministically."""
+    clock = {"t": start}
+    calls = []
+
+    def fake_sleep(s):
+        calls.append(s)
+        clock["t"] += s
+
+    monkeypatch.setattr(cus.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cus.time, "monotonic", lambda: clock["t"])
+    return clock, calls
+
+
+def test_second_early_wake_within_floor_defers_until_floor_elapses(tmp_path, monkeypatch):
+    """Back-to-back wake attempts within the floor: the second wait must not
+    consume the file immediately — it has to sleep out at least the
+    remaining floor first."""
+    monkeypatch.setattr(cus, "ACCOUNTS_DIR", tmp_path)
+    wake = tmp_path / "wake-429"
+    clock, calls = _fake_clock(monkeypatch)
+    cfg = _cfg(wake_min_interval_seconds=30)
+
+    # First early wake: nothing has woken before, so it's honored immediately
+    # and arms _last_wake_cycle_monotonic at t=0.
+    wake.touch()
+    result1 = cus._interruptible_sleep(300, cfg)
+    assert result1 == "wake-429"
+    assert not wake.exists()
+
+    # Hook storm: another 429 lands almost right away (3s later), well
+    # inside the 30s floor.
+    clock["t"] += 3
+    wake.touch()
+    calls.clear()
+
+    result2 = cus._interruptible_sleep(300, cfg)
+
+    assert result2 == "wake-429"
+    # Remaining floor at the second wait's start = 30 - 3 = 27s.
+    assert sum(calls) >= 27
+    assert not wake.exists()
+
+
+def test_early_wake_after_floor_elapsed_fires_immediately(tmp_path, monkeypatch):
+    """Once wake_min_interval_seconds has fully elapsed since the previous
+    early wake, a new wake-429 is honored at wait-start with zero sleep,
+    same as the no-floor-yet-armed case."""
+    monkeypatch.setattr(cus, "ACCOUNTS_DIR", tmp_path)
+    wake = tmp_path / "wake-429"
+    clock, calls = _fake_clock(monkeypatch)
+    cfg = _cfg(wake_min_interval_seconds=30)
+
+    wake.touch()
+    assert cus._interruptible_sleep(300, cfg) == "wake-429"
+
+    clock["t"] += 31  # floor fully elapsed
+    wake.touch()
+    calls.clear()
+
+    result = cus._interruptible_sleep(300, cfg)
+
+    assert result == "wake-429"
+    assert calls == []  # consumed at wait-start, no sleeping needed
+    assert not wake.exists()
+
+
+def test_blocked_wake_file_is_not_consumed_while_floor_pending(tmp_path, monkeypatch):
+    """While blocked by the floor, the file must be left in place — not
+    deleted — so the event survives if this wait's total_seconds runs out
+    before the floor does (picked up by a later wait instead)."""
+    monkeypatch.setattr(cus, "ACCOUNTS_DIR", tmp_path)
+    wake = tmp_path / "wake-429"
+    clock, calls = _fake_clock(monkeypatch)
+    cfg = _cfg(wake_min_interval_seconds=30)
+
+    wake.touch()
+    assert cus._interruptible_sleep(300, cfg) == "wake-429"
+
+    wake.touch()
+    calls.clear()
+    # This wait's total_seconds (10s) is far shorter than the 30s floor, so
+    # the wait must end (returning None) with the file still present.
+    result = cus._interruptible_sleep(10, cfg)
+
+    assert result is None
+    assert wake.exists()  # never consumed — floor not reached
+    assert sum(calls) == 10
+
+
+def test_wake_min_interval_zero_disables_the_floor(tmp_path, monkeypatch):
+    """wake_min_interval_seconds: 0 restores pre-2026-07-12 behavior: every
+    eligible wake-429 is honored immediately, no matter how recently the
+    previous one fired."""
+    monkeypatch.setattr(cus, "ACCOUNTS_DIR", tmp_path)
+    wake = tmp_path / "wake-429"
+    clock, calls = _fake_clock(monkeypatch)
+    cfg = _cfg(wake_min_interval_seconds=0)
+
+    wake.touch()
+    assert cus._interruptible_sleep(300, cfg) == "wake-429"
+
+    wake.touch()
+    calls.clear()
+
+    result = cus._interruptible_sleep(300, cfg)
+
+    assert result == "wake-429"
+    assert calls == []  # no defer at all
+    assert not wake.exists()
+
+
+def test_gate_off_ignores_wake_min_interval(tmp_path, monkeypatch):
+    """reactive.wake_on_429: false must still be a single uninterrupted
+    sleep — the floor is part of the early-wake machinery it bypasses
+    entirely, regardless of what wake_min_interval_seconds says."""
+    monkeypatch.setattr(cus, "ACCOUNTS_DIR", tmp_path)
+    (tmp_path / "wake-429").touch()
+    calls = []
+    monkeypatch.setattr(cus.time, "sleep", lambda s: calls.append(s))
+
+    cfg = _cfg(wake_on_429=False, wake_min_interval_seconds=30)
+    result = cus._interruptible_sleep(15, cfg)
+
+    assert result is None
+    assert calls == [15]
+    assert (tmp_path / "wake-429").exists()  # never consumed
 
 
 # --------------------------------------------------------------------------

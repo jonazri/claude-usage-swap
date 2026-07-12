@@ -837,6 +837,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # daemon reverts to a single uninterrupted time.sleep() and the wake
         # file, though still touched by the hooks, is never consumed.
         "wake_on_429": True,
+        # Review finding (2026-07-12, follow-up to fix #2): with wake_on_429
+        # on, hooks can recreate wake-429 faster than a cycle can consume it —
+        # a session 429-ing every few seconds drove back-to-back full cycle
+        # bodies (state I/O, log parsing, log spam) for the whole
+        # min_seconds_between_reactive_swaps window. Per-account HTTP polls
+        # stayed capped by that hysteresis window, but the cycle BODY itself
+        # had no floor. wake_min_interval_seconds bounds how often an early
+        # wake may fire: an early wake is only honored if this many seconds of
+        # MONOTONIC time have passed since the previous one; otherwise the
+        # wake-429 file is left in place (not consumed) and the sleep
+        # continues in slices until the floor elapses, so the event still
+        # fires — just no sooner than the floor — nothing is dropped. Walk-back:
+        # set to 0 to disable the bound (every early wake fires immediately,
+        # pre-2026-07-12 behavior).
+        "wake_min_interval_seconds": 30,
     },
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
@@ -16175,7 +16190,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
     "token_self_refresh": "OAuth self-refresh for `token_stale` accounts (2026-07-02, GH #13 follow-up). `enabled: true` (default): before flagging an inactive account token_stale, POST a refresh_token grant to the same undocumented endpoint the `claude` CLI itself uses (extracted from the installed binary — not a published API). Costs no usage quota and creates no session, unlike spawning a real `claude` probe session would. Any failure (network, non-200, malformed response) falls straight through to the pre-existing token_stale flag. Set `enabled: false` to revert to never talking to this endpoint, e.g. if Anthropic changes its shape and it starts erroring.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
-    "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll). `wake_on_429: true` (default, fix #2 2026-07-10) makes the daemon's inter-cycle sleep interruptible so that swap actually starts within seconds of the hook firing instead of waiting out the rest of poll_interval_seconds — set false to restore pure poll-interval cadence.",
+    "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll). `wake_on_429: true` (default, fix #2 2026-07-10) makes the daemon's inter-cycle sleep interruptible so that swap actually starts within seconds of the hook firing instead of waiting out the rest of poll_interval_seconds — set false to restore pure poll-interval cadence. `wake_min_interval_seconds: 30` (review finding 2026-07-12) bounds how often an early wake may fire: under a hook storm (a session 429-ing every few seconds), wake_on_429 alone let hooks recreate wake-429 faster than a cycle could consume it, driving back-to-back full cycle bodies. An early wake now only fires if this many monotonic seconds have passed since the previous one; otherwise wake-429 is left in place (not consumed) and picked up as soon as the floor elapses — no event is lost, just rate-limited. Set 0 to disable the bound.",
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
@@ -16616,6 +16631,12 @@ def _adaptive_sleep_seconds(state: dict, config: dict, base_interval: float) -> 
 _WAKE_SLICE_SECONDS = 5.0
 _WAKE_MTIME_EPSILON_SECONDS = 2.0
 
+# Module-level, mirrors _DAEMON_SINGLETON_FD: monotonic timestamp of the last
+# honored early wake, across ALL _interruptible_sleep calls for the life of
+# the daemon process. Used to enforce reactive.wake_min_interval_seconds
+# (review finding 2026-07-12) — see that function's docstring.
+_last_wake_cycle_monotonic: float | None = None
+
 
 def _interruptible_sleep(total_seconds: float, config: dict) -> str | None:
     """Sleep `total_seconds`, but wake early if a 429 hook fires (fix #2,
@@ -16637,47 +16658,84 @@ def _interruptible_sleep(total_seconds: float, config: dict) -> str | None:
     Gate on ⇒ sleep in `_WAKE_SLICE_SECONDS`-second slices. Between slices,
     check for the wake file. An event that arrived *during the previous
     cycle's body* (before this wait even started) should shorten THIS wait
-    rather than be silently dropped, so the file is consumed unconditionally
+    rather than be silently dropped, so the file is *eligible* unconditionally
     if it already exists at wait-start. Otherwise, only a touch whose mtime is
-    at/after this wait's start counts (guards against a leftover file somehow
-    surviving a previous consumption). Either way, consuming means: delete the
-    file and return immediately — "start the next cycle immediately" — which
-    is also what bounds this to (at most) one early wake per call: once we've
-    returned, nothing in THIS wait checks the file again. A second hook touch
-    landing after that just becomes the "already exists at wait-start" case
-    for the *next* wait, not a double-fire of this one. Per-account rate
+    at/after this wait's start makes it eligible (guards against a leftover
+    file somehow surviving a previous consumption).
+
+    Review finding (2026-07-12): under a hook storm (a session 429-ing every
+    few seconds), hooks can recreate wake-429 faster than a cycle consumes
+    it — an eligible file used to be consumed unconditionally, driving
+    back-to-back full cycle bodies (state I/O, log parsing, log spam) for the
+    whole min_seconds_between_reactive_swaps window even though per-account
+    HTTP polling stayed capped. `reactive.wake_min_interval_seconds` (default
+    30, 0 disables) bounds this: an eligible file is only actually consumed
+    once >= that many MONOTONIC seconds have passed since the previous
+    early wake (tracked in the module-level `_last_wake_cycle_monotonic`,
+    since a single logical hook storm can span many `_interruptible_sleep`
+    calls as the daemon loops). Below the floor, the file is left in place —
+    NOT consumed, NOT re-validated by mtime — and the slice loop just keeps
+    going; the pending wake fires the moment the floor elapses (which may be
+    in a later slice of this same call, or, if `total_seconds` runs out
+    first, on a subsequent call — the event is delayed, never dropped).
+
+    Consuming means: delete the file and return immediately — "start the
+    next cycle immediately" — which is also what bounds this to (at most)
+    one early wake per call: once we've returned, nothing in THIS wait checks
+    the file again. A second hook touch landing after that just becomes the
+    "already exists at wait-start" case for the *next* wait. Per-account rate
     limiting on the reactive swap itself is handled separately, by
     `swap_hysteresis.min_seconds_between_reactive_swaps`.
 
     Returns "wake-429" if woken early, else None (mirrors the plain-sleep
     return of "nothing happened").
     """
-    if not config.get("reactive", {}).get("wake_on_429", True):
+    reactive_cfg = config.get("reactive", {})
+    if not reactive_cfg.get("wake_on_429", True):
         time.sleep(total_seconds)
         return None
 
+    wake_min_interval = reactive_cfg.get("wake_min_interval_seconds", 30)
     wake_file = Path(ACCOUNTS_DIR) / "wake-429"
     wait_start_wall = time.time()
+    wait_start_mono = time.monotonic()
+
+    def _floor_elapsed(now_mono: float) -> bool:
+        if wake_min_interval <= 0:
+            return True
+        if _last_wake_cycle_monotonic is None:
+            return True
+        return (now_mono - _last_wake_cycle_monotonic) >= wake_min_interval
 
     def _consume(elapsed: float) -> str:
+        global _last_wake_cycle_monotonic
         try:
             wake_file.unlink()
         except OSError:
             pass
+        _last_wake_cycle_monotonic = time.monotonic()
         click.echo(f"[{now_iso()}] wake: 429 hook event — starting cycle early "
                    f"({elapsed:.0f}s into a {total_seconds:.0f}s sleep)")
         return "wake-429"
 
-    if wake_file.exists():
+    # `pending` tracks "this file has already passed its one-time relevance
+    # check (unconditional at wait-start, or fresh-mtime mid-sleep) and is
+    # just waiting on the wake_min_interval floor" — once True, later loop
+    # iterations skip the mtime re-check (it would wrongly see a since-stale
+    # mtime on a file we already validated) and only re-poll the floor.
+    pending = wake_file.exists()
+    if pending and _floor_elapsed(wait_start_mono):
         return _consume(0.0)
 
-    wait_start_mono = time.monotonic()
     remaining = total_seconds
     while remaining > 0:
         this_slice = min(_WAKE_SLICE_SECONDS, remaining)
         time.sleep(this_slice)
         remaining -= this_slice
-        if wake_file.exists():
+        if not wake_file.exists():
+            pending = False
+            continue
+        if not pending:
             try:
                 mtime = wake_file.stat().st_mtime
             except OSError:
@@ -16691,8 +16749,15 @@ def _interruptible_sleep(total_seconds: float, config: dict) -> str | None:
             # genuinely stale files — a leftover file from hours/cycles ago
             # (the case the mtime guard exists for) is still far outside it.
             if mtime is not None and mtime >= wait_start_wall - _WAKE_MTIME_EPSILON_SECONDS:
-                elapsed = time.monotonic() - wait_start_mono
+                pending = True
+        if pending:
+            now_mono = time.monotonic()
+            if _floor_elapsed(now_mono):
+                elapsed = now_mono - wait_start_mono
                 return _consume(elapsed)
+            # Floor not yet reached: leave the file in place and keep
+            # sleeping in slices — it'll be re-checked (against the floor
+            # only, no mtime re-validation) next slice.
     return None
 
 
