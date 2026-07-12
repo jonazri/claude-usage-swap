@@ -888,6 +888,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # it. Walk-back: set to 0 to disable the cooldown (every under-line
         # match nudges, pre-2026-07-12 behavior).
         "nudge_min_interval_seconds": 900,
+        # Fix #1b (2026-07-10 halt incident, 2nd occurrence): the gentle resume
+        # above dismisses Claude's modal, but the RUNNING process keeps the OLD
+        # OAuth access token cached in memory — after an in-place credential move
+        # the fresh creds sit on disk unread, so the session can keep burning /
+        # re-429ing the just-capped account until the in-memory token expires. The
+        # deterministic recovery the operator validated by hand: `/exit` the
+        # session, then re-run the pane's ORIGINAL launch command (a wrapper like
+        # `headroom wrap claude … -- --resume <id>`) in the SAME pane — the fresh
+        # process reads the slot's CURRENT credentials. escalate_relaunch automates
+        # exactly that, but ONLY as an ESCALATION when the gentle resume
+        # demonstrably didn't stick: a SECOND reactive-429 on the same slot within
+        # escalate_window_seconds of the last resume. It recovers the launch command
+        # FIRST (pane_pid via tmux → the shell's first child's /proc cmdline) and
+        # only /exits the pane when that command matches the safety pattern (contains
+        # 'claude'); any failure at any step falls back to the normal resume-message
+        # path plus an SOS note — a pane is never left dead. The same slot is never
+        # escalated twice within the window (fall back to resume + SOS instead).
+        # Walk-back: set false to disable (a repeat 429 gets the gentle resume only,
+        # pre-2026-07-10 behavior — leaving the stale-token halt for a human).
+        "escalate_relaunch": True,
+        # How recent the last gentle resume must be for a fresh reactive-429 on the
+        # same slot to count as "the resume didn't stick" and trigger the /exit +
+        # relaunch escalation; also the window in which a slot is escalated at most
+        # once. Matches the reactive hysteresis / nudge cadence.
+        "escalate_window_seconds": 900,
     },
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
@@ -8811,13 +8836,28 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
             continue
         round_claims[target.name] = round_claims.get(target.name, 0) + 1
         taken.add(target.name)
-        moves.append({
+        move = {
             "slot": slot_name, "from": acct, "to": target.name,
             "gate": "reactive_429", "tier": 3, "deferrable": False,
             "reason": f"user-facing 429 on the '{acct}' session in {slot_name}; {target.reason}",
             "pool": pool,
             "_reactive_entries": slot_to_entries[slot_name],
-        })
+        }
+        # Escalation-relaunch decision (Fix #1b): a gentle resume that fired within
+        # escalate_window_seconds but a fresh 429 landed anyway means the running
+        # process is still on the stale in-memory token — flag the move so
+        # _execute_slot_moves /exits + relaunches instead of resuming. Never
+        # escalate the same slot twice in the window (skip_repeat → resume + SOS).
+        _esc = _escalation_decision(state, config, slot_name)
+        if _esc == "escalate":
+            move["_escalate"] = True
+            click.echo(f"  reactive-429 on {slot_name}: 2nd 429 within the escalate window — will "
+                       f"/exit + relaunch the pane (the gentle resume didn't shed the stale token)")
+        elif _esc == "skip_repeat":
+            move["_escalate_skip_repeat"] = True
+            click.echo(f"  reactive-429 on {slot_name}: already escalated within the window — "
+                       f"resume-message only this time (SOS note added; a human may be needed)")
+        moves.append(move)
     if owns_entries:
         _store_pending_rate_limit_entries(state, retry_entries)
     else:
@@ -8901,7 +8941,22 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
                 click.echo(f"  lane-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
 
 
-def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
+def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
+    """Dismiss Claude's quota modal on one pane (double-Escape) and submit a
+    context-preserving continuation. Best-effort; returns True on a sent
+    continuation. Shared by the reactive resume path and the escalation fallback."""
+    if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
+        click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
+        return False
+    if tmux_send_text(pane, message, tmux_socket=tmux_socket):
+        socket_note = f" via {tmux_socket}" if tmux_socket else ""
+        click.echo(f"    reactive resume: pane {pane}{socket_note} continued after credential swap")
+        return True
+    click.echo(f"    reactive resume: pane {pane} continuation send failed")
+    return False
+
+
+def _resume_reactive_slot_sessions(slot_name: str, config: dict, state: dict | None = None) -> list[str]:
     """Dismiss Claude's quota modal and continue sessions after a lane escape.
 
     Rewriting a live lane's credentials is necessary but not sufficient: a
@@ -8909,6 +8964,12 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
     the pane(s) actually backed by `slot_name`, send the established double-Escape
     safety prefix, then submit a context-preserving continuation. Best-effort and
     config-gated; a swap remains successful even when tmux is unavailable.
+
+    When `state` is threaded (the reactive move call site), each successfully
+    continued pane stamps `state["slots"][slot]["last_resume_ts"]` — the signal the
+    escalation-relaunch decision reads to tell a gentle resume that DID stick from
+    one that didn't (a second 429 on the same slot within escalate_window_seconds).
+    Kept optional (default None) so external callers keep the 2-arg signature.
     """
     reactive = config.get("reactive", {})
     if not reactive.get("resume_after_slot_swap", True):
@@ -8923,16 +8984,148 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
         if not pane or pane == "no-tmux" or pane_key in seen:
             continue
         seen.add(pane_key)
-        if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
-            click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
-            continue
-        if tmux_send_text(pane, message, tmux_socket=tmux_socket):
+        if _resume_pane(pane, tmux_socket, message):
             panes.append(pane)
-            socket_note = f" via {tmux_socket}" if tmux_socket else ""
-            click.echo(f"    reactive resume: pane {pane}{socket_note} continued after credential swap")
-        else:
-            click.echo(f"    reactive resume: pane {pane} continuation send failed")
+            if state is not None:
+                state.setdefault("slots", {}).setdefault(slot_name, {})["last_resume_ts"] = now_iso()
     return panes
+
+
+# --------------------------------------------------------------------------
+# Escalation relaunch (Fix #1b, 2026-07-10 halt incident, 2nd occurrence)
+# --------------------------------------------------------------------------
+# A running Claude keeps its OAuth access token cached in memory; after an
+# in-place credential move + gentle resume it can keep burning / re-429ing the
+# just-capped account until that token expires. The operator-validated recovery
+# is deterministic: `/exit` the session and re-run the pane's ORIGINAL launch
+# command so a FRESH process reads the slot's current credentials. We automate it
+# ONLY as an escalation — a second reactive-429 on the same slot within
+# escalate_window_seconds — and only ever after recovering a 'claude' launch
+# command, so a pane is never exited without a relaunch command in hand.
+
+# Slot-state fields the resume/escalation bookkeeping writes; persisted via a
+# reload-merge so they survive the cycle without clobbering execute_swap's writes.
+_REACTIVE_SLOT_BOOKKEEPING = (
+    "last_resume_ts", "last_escalation_ts", "escalation_skip_note", "escalation_skip_ts",
+)
+
+
+def _within_escalate_window(ts_iso: str | None, window_s: float) -> bool:
+    """True when `ts_iso` (an ISO/Z timestamp) is within `window_s` of now.
+    Unparseable / missing → False (fail safe: no escalation)."""
+    if not ts_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    return (datetime.now(timezone.utc) - dt).total_seconds() <= window_s
+
+
+def _escalation_decision(state: dict, config: dict, slot_name: str) -> str:
+    """Decide the reactive path for a 429 on `slot_name`:
+
+      "escalate"    — a gentle resume fired within the window but a fresh 429
+                      landed anyway; /exit + relaunch to shed the stale token.
+      "skip_repeat" — already escalated this slot within the window; fall back to
+                      the gentle resume + SOS note (never escalate twice in a row).
+      "none"        — first 429 / stale prior resume / feature off: normal resume.
+    """
+    reactive = config.get("reactive", {})
+    if not reactive.get("escalate_relaunch", True):
+        return "none"
+    window = reactive.get("escalate_window_seconds", 900)
+    slot = state.get("slots", {}).get(slot_name, {})
+    if not _within_escalate_window(slot.get("last_resume_ts"), window):
+        return "none"
+    if _within_escalate_window(slot.get("last_escalation_ts"), window):
+        return "skip_repeat"
+    return "escalate"
+
+
+def _record_escalation_skip(state: dict, slot_name: str, note: str) -> None:
+    """Stamp a one-line escalation-skip note on the slot (surfaced by `cus sos`
+    via _diagnose_escalation_skips) and log it in the established style."""
+    slot = state.setdefault("slots", {}).setdefault(slot_name, {})
+    slot["escalation_skip_note"] = note
+    slot["escalation_skip_ts"] = now_iso()
+    click.echo(f"    reactive escalate: {note}")
+
+
+def _persist_slot_reactive_state(state: dict, slot_name: str) -> None:
+    """Persist this slot's resume/escalation bookkeeping to disk WITHOUT clobbering
+    execute_swap's own account writes: reload the freshly-swapped state, merge only
+    the bookkeeping fields, save. Needed because the reactive resume/escalation run
+    AFTER _per_session_cycle's save_state, and the SOS pass reloads from disk."""
+    src = state.get("slots", {}).get(slot_name, {})
+    fields = {k: src[k] for k in _REACTIVE_SLOT_BOOKKEEPING if k in src}
+    if not fields:
+        return
+    try:
+        fresh = load_state()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return  # best-effort: bookkeeping is non-critical vs. the completed move
+    fresh.setdefault("slots", {}).setdefault(slot_name, {}).update(fields)
+    try:
+        save_state(fresh)
+    except (OSError, ValueError):
+        pass
+
+
+def _reactive_escalate_or_resume(move: dict, state: dict, config: dict) -> list[str]:
+    """Escalation-relaunch handler for a reactive-429 move flagged `_escalate`.
+
+    Runs AFTER the lane move has executed (the fresh creds are already on disk).
+    Per pane on the slot: recover the launch command FIRST; only if it matches the
+    safety pattern (contains 'claude') do we /exit + wait + relaunch — otherwise we
+    fall back to the gentle resume-message and drop an SOS note, never leaving a
+    pane dead. Records last_escalation_ts when at least one pane relaunched, so the
+    same slot is not escalated again within the window."""
+    slot_name = move["slot"]
+    reactive = config.get("reactive", {})
+    window = reactive.get("escalate_window_seconds", 900)
+    message = str(reactive.get("resume_message") or DEFAULT_CONFIG["reactive"]["resume_message"])
+    last_resume = state.get("slots", {}).get(slot_name, {}).get("last_resume_ts")
+    relaunched: list[str] = []
+    seen: set[tuple[str | None, str]] = set()
+    for session in live_sessions_on_slot(slot_name):
+        pane = getattr(session, "pane", None)
+        tmux_socket = getattr(session, "tmux_socket", None)
+        pane_key = (tmux_socket, pane)
+        if not pane or pane == "no-tmux" or pane_key in seen:
+            continue
+        seen.add(pane_key)
+        relaunch, claude_pid = _recover_pane_relaunch_cmd(pane, tmux_socket)
+        # Safety posture: never /exit a pane without a claude relaunch command.
+        if not relaunch or "claude" not in relaunch:
+            click.echo(f"    reactive escalate: {slot_name} pane {pane} — could not recover a claude "
+                       f"launch command; falling back to resume-message (pane left intact)")
+            _resume_pane(pane, tmux_socket, message)
+            _record_escalation_skip(
+                state, slot_name, f"escalation skipped: could not recover launch command for {slot_name}")
+            continue
+        click.echo(f"    reactive escalate: {slot_name} pane {pane} relaunching (resume at "
+                   f"{last_resume} was < {int(window)}s; shedding stale in-memory token)")
+        did_relaunch, exited = _escalate_relaunch_pane(pane, tmux_socket, relaunch, claude_pid, config)
+        if did_relaunch:
+            relaunched.append(pane)
+        elif not exited:
+            # /exit never landed — the pane is untouched, so the gentle resume is
+            # still a valid, non-destructive fallback.
+            click.echo(f"    reactive escalate: {slot_name} pane {pane} /exit failed; "
+                       f"falling back to resume-message")
+            _resume_pane(pane, tmux_socket, message)
+            _record_escalation_skip(
+                state, slot_name, f"escalation skipped: /exit send failed for {slot_name}")
+        else:
+            # /exit landed but the relaunch didn't — the pane is at a bare shell.
+            # Do NOT type a resume-message into a shell; flag it for a human.
+            _record_escalation_skip(
+                state, slot_name,
+                f"escalation relaunch FAILED after /exit for {slot_name} — pane at a shell, needs manual relaunch")
+    if relaunched:
+        state.setdefault("slots", {}).setdefault(slot_name, {})["last_escalation_ts"] = now_iso()
+    return relaunched
 
 
 # Case-sensitive substrings that mark a pane parked at Claude Code's rate-limit
@@ -9138,7 +9331,24 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
             ladder_bumped.add(move["from"])
             click.echo(f"    moved in place — session on {move['slot']} continues uninterrupted")
             if move.get("gate") == "reactive_429":
-                _resume_reactive_slot_sessions(move["slot"], config)
+                # The credential move is done; the running process still holds the
+                # OLD OAuth token in memory. Normally a gentle resume (modal-dismiss
+                # + continue) suffices. But when this is the 2nd 429 on the slot
+                # inside the window, the gentle resume demonstrably didn't shed the
+                # stale token — escalate to /exit + relaunch so a fresh process
+                # reads the slot's current creds (Fix #1b). Recovery/relaunch is
+                # best-effort and self-falls-back to the gentle resume + SOS note.
+                if move.get("_escalate"):
+                    _reactive_escalate_or_resume(move, state, config)
+                else:
+                    _resume_reactive_slot_sessions(move["slot"], config, state=state)
+                    if move.get("_escalate_skip_repeat"):
+                        _record_escalation_skip(
+                            state, move["slot"],
+                            f"escalation skipped: {move['slot']} already escalated within the window")
+                # Persist last_resume_ts / last_escalation_ts / skip note without
+                # clobbering execute_swap's on-disk account write (reload-merge).
+                _persist_slot_reactive_state(state, move["slot"])
             _log_decision(_build_decision_record(
                 state, config, action="swap", gate=move["gate"], reason=move["reason"],
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
@@ -10872,6 +11082,36 @@ def _diagnose_stuck_lanes(state: dict, config: dict) -> list[SOSCondition]:
     return out
 
 
+def _diagnose_escalation_skips(state: dict, config: dict) -> list[SOSCondition]:
+    """Surface lanes where the reactive escalation-relaunch (Fix #1b) had to be
+    SKIPPED — recovery of the launch command failed, or the slot was already
+    escalated within the window — so the gentle resume was used instead. If the
+    session keeps 429-ing on a capped account the operator likely needs to relaunch
+    it by hand. Warning-severity (the fallback resume was still applied); notes age
+    out after escalate_window_seconds so a cleared lane stops surfacing."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    window = config.get("reactive", {}).get("escalate_window_seconds", 900)
+    out: list[SOSCondition] = []
+    for slot_name, slot in sorted(state.get("slots", {}).items()):
+        note = slot.get("escalation_skip_note")
+        ts = slot.get("escalation_skip_ts")
+        if not note or not _within_escalate_window(ts, window):
+            continue
+        out.append(SOSCondition(
+            severity="warning",
+            summary=f"lane {slot_name}: reactive escalation skipped — {note}",
+            action=(
+                f"A repeat 429 on lane {slot_name} could not be recovered by the /exit + relaunch "
+                f"escalation (Fix #1b); the gentle resume-message was used instead. The running "
+                f"process may still hold a stale in-memory OAuth token on the capped account. If it "
+                f"keeps 429-ing, relaunch the session in place so it re-reads the slot's credentials:\n"
+                f"      cus launch <account> --lane {slot_name} -- --continue"),
+            affected=slot_name,
+        ))
+    return out
+
+
 def _premium_target_loss_reason(name: str, acct: dict, config: dict, ctx: dict | None = None) -> str:
     """Human label for WHY a reachable account is NOT a valid premium swap target.
 
@@ -12442,6 +12682,11 @@ def _pane_pid(pane: str, tmux_socket: str | None = None) -> int | None:
         return None
 
 
+# Filesystem root for /proc walks. A module constant so tests can monkeypatch it
+# onto a fake tree (cus._PROC_ROOT = tmp/proc) — no real /proc is touched in tests.
+_PROC_ROOT = Path("/proc")
+
+
 def _find_descendant_claude_pid(root_pid: int) -> int | None:
     """Walk /proc to find a descendant claude/node process under root_pid.
 
@@ -12511,6 +12756,144 @@ def _read_claude_session_id_from_cmdline(pid: int) -> str | None:
         if arg.startswith("--resume="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _proc_cmdline_args(pid: int) -> list[str]:
+    """argv of `pid` from _PROC_ROOT/<pid>/cmdline (NUL-separated). [] on any
+    failure. Distinct from _read_claude_session_id_from_cmdline (which hardcodes
+    /proc) so the escalation path can be pointed at a fake tree in tests."""
+    try:
+        raw = (_PROC_ROOT / str(pid) / "cmdline").read_bytes()
+    except (OSError, ValueError):
+        return []
+    return [c.decode("utf-8", errors="replace") for c in raw.split(b"\x00") if c]
+
+
+def _proc_child_pids(pid: int) -> list[int]:
+    """Direct child PIDs of `pid`, via _PROC_ROOT/<pid>/task/<tid>/children.
+
+    The main thread (tid == pid) is read first so the FIRST element is the pane
+    shell's first child — the original wrapper invocation we relaunch. Best-effort:
+    any unreadable task/children file is skipped; [] when the process is gone."""
+    task_dir = _PROC_ROOT / str(pid) / "task"
+    kids: list[int] = []
+    try:
+        tids = sorted(task_dir.iterdir(), key=lambda p: (p.name != str(pid), p.name))
+    except OSError:
+        return kids
+    for tid in tids:
+        try:
+            raw = (tid / "children").read_text()
+        except OSError:
+            continue
+        for tok in raw.split():
+            try:
+                kids.append(int(tok))
+            except ValueError:
+                continue
+    return kids
+
+
+def _deepest_claude_descendant(root_pid: int) -> int | None:
+    """Deepest descendant of `root_pid` whose /proc cmdline contains 'claude' — the
+    live process to wait on after /exit (claude runs as `node … claude …`, so the
+    leaf is what actually dies). None when no descendant matches or /proc is
+    unavailable. Cmdline-based (per the brief) and cycle-guarded."""
+    best_pid: int | None = None
+    best_depth = -1
+    seen: set[int] = set()
+    stack: list[tuple[int, int]] = [(c, 1) for c in _proc_child_pids(root_pid)]
+    while stack:
+        pid, depth = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if any("claude" in a for a in _proc_cmdline_args(pid)) and depth > best_depth:
+            best_pid, best_depth = pid, depth
+        for c in _proc_child_pids(pid):
+            if c not in seen:
+                stack.append((c, depth + 1))
+    return best_pid
+
+
+def _recover_pane_relaunch_cmd(pane: str, tmux_socket: str | None = None) -> tuple[str | None, int | None]:
+    """Recover (relaunch_command, claude_pid_to_wait_on) from a pane's process
+    tree, or (None, None). The relaunch command is the pane shell's FIRST child's
+    full cmdline (the original `headroom wrap claude … -- --resume <id>` wrapper);
+    the wait pid is the deepest 'claude' descendant. Best-effort, Linux /proc only —
+    the caller treats (None, …) or a non-'claude' command as recovery failure and
+    falls back to the gentle resume."""
+    pane_pid = _pane_pid(pane, tmux_socket)
+    if pane_pid is None:
+        return None, None
+    kids = _proc_child_pids(pane_pid)
+    if not kids:
+        return None, None
+    argv = _proc_cmdline_args(kids[0])
+    if not argv:
+        return None, None
+    relaunch = shlex.join(argv)
+    claude_pid = _deepest_claude_descendant(pane_pid)
+    if claude_pid is None and "claude" in relaunch:
+        claude_pid = kids[0]  # fall back to waiting on the wrapper itself
+    return relaunch, claude_pid
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while _PROC_ROOT/<pid> exists (the process, or a fake-tree stand-in)."""
+    try:
+        return (_PROC_ROOT / str(pid)).exists()
+    except OSError:
+        return False
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 10.0, interval: float = 0.5) -> bool:
+    """Poll /proc until `pid` exits or `timeout` seconds elapse. True if it exited
+    (so the pane's shell prompt is back before we type the relaunch command)."""
+    deadline = time.monotonic() + timeout
+    while _pid_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+    return True
+
+
+def _escalate_relaunch_pane(pane: str, tmux_socket: str | None, relaunch_cmd: str,
+                            claude_pid: int | None, config: dict) -> tuple[bool, bool]:
+    """`/exit` the pane, wait ≤10s for the claude child to die, then re-run the
+    recovered launch command in the SAME pane so a fresh process reads the slot's
+    current credentials. The caller has already verified a claude launch command is
+    in hand (safety posture: never /exit without one).
+
+    Returns (relaunched, exited):
+      (True,  True)  — relaunch sent; success.
+      (False, False) — /exit could not be sent; the pane was NOT touched, so the
+                       caller may safely fall back to the gentle resume-message.
+      (False, True)  — /exit was sent (claude is gone) but the relaunch could not
+                       be sent even after retries; the pane is at a bare shell — the
+                       caller must NOT type a resume-message into it, only SOS.
+    All steps best-effort."""
+    if not tmux_send_text(pane, "/exit", tmux_socket=tmux_socket):
+        click.echo(f"    reactive escalate: pane {pane} /exit send failed; pane untouched")
+        return (False, False)
+    # From here the pane's claude is on its way out — we own the relaunch.
+    if claude_pid is not None:
+        if not _wait_for_pid_exit(claude_pid, timeout=10.0):
+            click.echo(f"    reactive escalate: pane {pane} claude pid {claude_pid} still alive after "
+                       f"10s — relaunching anyway (best-effort)")
+    else:
+        time.sleep(2.0)  # no wait target — give the shell a moment to return
+    for attempt in range(3):
+        if tmux_send_text(pane, relaunch_cmd, tmux_socket=tmux_socket):
+            socket_note = f" via {tmux_socket}" if tmux_socket else ""
+            click.echo(f"    reactive escalate: pane {pane}{socket_note} relaunched — fresh process "
+                       f"reads the slot's current credentials")
+            return (True, True)
+        if attempt < 2:
+            time.sleep(0.5)
+    click.echo(f"    reactive escalate: pane {pane} relaunch command send failed after /exit — "
+               f"pane is at a bare shell and needs a manual relaunch")
+    return (False, True)
 
 
 def pane_live_session_id(pane: str, tmux_socket: str | None = None) -> str | None:
@@ -16022,6 +16405,11 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # file-heal won't help. Reads the in-process heal history recorded by
         # `_auto_heal_live_lanes` above.
         conditions.extend(_diagnose_stuck_lanes(state, config))
+        # Fix #1b (2026-07-10): a reactive escalation-relaunch that had to be
+        # skipped (launch command unrecoverable, or already escalated this window)
+        # leaves a note on the slot; surface it so a persistently-stuck lane gets a
+        # human. Ages out after escalate_window_seconds.
+        conditions.extend(_diagnose_escalation_skips(state, config))
         maybe_write_sos(conditions, state)
         if conditions:
             for c in conditions:
