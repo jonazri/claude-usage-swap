@@ -118,6 +118,14 @@ INBOX_MD = ACCOUNTS_DIR / "inbox.md"
 SOS_MD = ACCOUNTS_DIR / "SOS.md"
 LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
 
+# Capacity-aware anti-herding rollout (capacity-aware spec 2026-07-10, Phase 2b
+# / Task 5). Flipped True once every swap-decision call site of pick_swap_target
+# / decide_swap / _target_would_immediately_re_trip / _launch_candidate_saturated
+# threads or stashes a capacity ctx (or is a documented percent-path carve-out).
+# The caller-inventory oracle (tests/test_capacity_ctx_caller_inventory.py, Test
+# B) reads this to assert no site is left on the un-converted "pending" path.
+CAPACITY_AWARE_PLUMBING_COMPLETE = True
+
 # GH #79: how many timestamped `.credentials.json.bak.<ts>` files to keep per
 # directory. Each account's OAuth payload (incl. the ~30-day refresh token)
 # lives in exactly ONE authoritative place at a time, so every overwrite of a
@@ -2372,12 +2380,21 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     if state.get("active") and mount_in_use(CLAUDE_DIR):
         live_occupied.add(state["active"])
 
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): stash a fleet ctx
+    # onto every picker shim so the launch pick ranks in reference UNITS (G1) and
+    # the G10 raw fallbacks below pick by per-lane remaining units. Lane occupancy
+    # from occupied_slot_accounts(state) (via _capacity_ctx). Built only gate-on,
+    # so gate-off stays bit-for-bit (no stash, no credential/occupancy reads).
+    _cap_ctx_launch = _capacity_ctx(state, config) if _capacity_gate_on(config) else None
+
     def _try(excluded: set) -> SwapTarget | None:
         shim = dict(state)
         shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in excluded}
         shim["active"] = "\x00launch-sentinel"  # never a real account name
         if not shim["accounts"]:
             return None
+        if _cap_ctx_launch is not None:
+            shim["_capacity_ctx"] = _cap_ctx_launch
         try:
             return pick_swap_target(shim, config)
         except Exception:
@@ -2396,7 +2413,15 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
                  if not a.get("token_expired") and not a.get("poll_error")
                  and n not in live_occupied and n not in disabled]
         if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            if _cap_ctx_launch is not None:
+                # G10 (capacity-aware spec 2026-07-10): rank raw fallbacks by
+                # per-lane remaining reference units, not lowest raw percent — a
+                # loaded big-tier lane can out-headroom an idle small-tier one.
+                n, _ = max(cands, key=lambda p: _remaining_units(
+                    _account_estimated_effective_pct(p[1], config), p[0], _cap_ctx_launch, config)
+                    / (_cap_ctx_launch.get("lane_load_by_name", {}).get(p[0], 0) + 1))
+            else:
+                n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
     # Lane-share final fallback (GH #109 lanes, 2026-07-03): every healthy
     # account is on a live mount. Joining a live mount is safe (shared dir,
@@ -2408,12 +2433,19 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
                  if not a.get("token_expired") and not a.get("poll_error")
                  and n in live_occupied and n not in disabled]
         if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            if _cap_ctx_launch is not None:
+                # G10 (capacity-aware spec 2026-07-10): lane-share fallback picks
+                # the lane with the most per-lane remaining reference units.
+                n, _ = max(cands, key=lambda p: _remaining_units(
+                    _account_estimated_effective_pct(p[1], config), p[0], _cap_ctx_launch, config)
+                    / (_cap_ctx_launch.get("lane_load_by_name", {}).get(p[0], 0) + 1))
+            else:
+                n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
     return target
 
 
-def _launch_candidate_saturated(acct: dict, config: dict) -> tuple[bool, str]:
+def _launch_candidate_saturated(acct: dict, config: dict, name: str | None = None, ctx: dict | None = None) -> tuple[bool, str]:
     """Does a launch candidate's (freshly-polled) reading sit AT/OVER any HARD
     saturation line pick_swap_target treats as a wall? Returns (saturated, why).
 
@@ -2442,13 +2474,20 @@ def _launch_candidate_saturated(acct: dict, config: dict) -> tuple[bool, str]:
     matches the launch's pool semantics.
     """
     steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): when the caller
+    # threads name+ctx and the gate is on, the launch-accept wall judges in
+    # reference UNITS — the ladder step via G3/formula 2 (through
+    # _target_would_immediately_re_trip) and the aggregate 7d cap via G9/formula
+    # 3 — so a healthy big-tier account (e.g. 20x@80%) is not walled by percent.
+    _cap = _capacity_gate_on(config) and ctx is not None and name is not None
     # 5h / effective ladder step (the primary stale-low-idle failure mode).
-    if _target_would_immediately_re_trip(acct, config):
+    if _target_would_immediately_re_trip(acct, config, name=name, ctx=(ctx if _cap else None)):
         return True, f"5h/effective={_account_estimated_effective_pct(acct, config):.0f}% >= step {steps[0]}%"
     # Aggregate weekly hard cap (a lower line than the ladder step).
     hard_7d = _hard_7d_cap_for_config(config)
-    if acct.get("current_7d_pct", 0) >= hard_7d:
-        return True, f"7d={acct.get('current_7d_pct', 0):.0f}% >= 7d cap {hard_7d}%"
+    _cur_7d = acct.get("current_7d_pct", 0)
+    if (_remaining_units(_cur_7d, name, ctx, config) <= (100.0 - hard_7d) / 100.0) if _cap else (_cur_7d >= hard_7d):
+        return True, f"7d={_cur_7d:.0f}% >= 7d cap {hard_7d}%"
     # Per-model (Fable) weekly gate — premium pool only (no-op config for standard).
     gate_enabled, _ = _per_model_weekly_gate(config)
     if gate_enabled:
@@ -3199,6 +3238,60 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     return False, f"{role}: {elapsed:.0f}s < {interval:.0f}s"
 
 
+def _account_creds_candidates(account_name: str, state: dict) -> list[Path]:
+    """Ordered candidate credentials-file paths for `account_name`, freshest
+    source first — factored out of `_read_access_token_with_expiry` (2026-07-03
+    token-stale blindness incident, GH #130) so other readers of an account's
+    stored credentials can resolve through the exact SAME freshest-wins chain
+    without duplicating it (capacity-aware spec 2026-07-10 adds the first
+    other reader, `_read_rate_limit_tier`).
+
+    Preference order (see `_read_access_token_with_expiry`'s docstring for the
+    full rationale):
+      1. the live shared mount (CREDS_JSON), only when this account is the
+         shared-active one;
+      2. any SLOT backing this account whose dir exists, live slots (a
+         session actually running, `mount_in_use`) before idle ones;
+      3. the account's primary store (`account_creds_path`) — always last,
+         always included as the final fallback.
+
+    Pure/read-only: only stats/existence-checks paths, never opens or parses
+    the files themselves — that stays with each caller, since what they read
+    out of a candidate (accessToken+expiresAt vs. rateLimitTier) differs.
+    """
+    candidates: list[Path] = []
+    # (1) live shared mount, only when this account is the shared-active one.
+    if state.get("active") == account_name and CREDS_JSON.exists():
+        candidates.append(CREDS_JSON)
+    # (2) slots backing this account; live slots first, idle slots after. A
+    # live slot's creds are refreshed by the session running on it, so they
+    # beat both an idle slot and (usually) the primary store for freshness.
+    live_slot_creds: list[Path] = []
+    idle_slot_creds: list[Path] = []
+    for slot_name, entry in state.get("slots", {}).items():
+        if (entry or {}).get("account") != account_name:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists():
+            continue
+        cred = d / ".credentials.json"
+        if not cred.exists():
+            continue
+        try:
+            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
+            # per cycle, but a direct call here is cheap enough (one slot) and
+            # a few seconds of staleness only picks idle-vs-live ordering, not
+            # correctness — both get tried.
+            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
+        except Exception:
+            idle_slot_creds.append(cred)
+    candidates.extend(live_slot_creds)
+    candidates.extend(idle_slot_creds)
+    # (3) primary account store — historical fallback, always last.
+    candidates.append(account_creds_path(account_name))
+    return candidates
+
+
 def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int | None]:
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
@@ -3272,38 +3365,10 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         except (TypeError, ValueError):
             return True
 
-    # Assemble candidate creds paths in preference order (see docstring).
-    candidates: list[Path] = []
-    # (1) live shared mount, only when this account is the shared-active one.
-    if state.get("active") == account_name and CREDS_JSON.exists():
-        candidates.append(CREDS_JSON)
-    # (2) slots backing this account; live slots first, idle slots after. A
-    # live slot's creds are refreshed by the session running on it, so they
-    # beat both an idle slot and (usually) the primary store for freshness.
-    live_slot_creds: list[Path] = []
-    idle_slot_creds: list[Path] = []
-    for slot_name, entry in state.get("slots", {}).items():
-        if (entry or {}).get("account") != account_name:
-            continue
-        d = slot_path(slot_name)
-        if not d.exists():
-            continue
-        cred = d / ".credentials.json"
-        if not cred.exists():
-            continue
-        try:
-            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
-            # per cycle, but a direct call here is cheap enough (one slot) and
-            # a few seconds of staleness only picks idle-vs-live ordering, not
-            # correctness — both get tried.
-            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
-        except Exception:
-            idle_slot_creds.append(cred)
-    candidates.extend(live_slot_creds)
-    candidates.extend(idle_slot_creds)
-    # (3) primary account store — historical fallback, always last.
+    # Assemble candidate creds paths in preference order (see docstring),
+    # shared with `_read_rate_limit_tier` via `_account_creds_candidates`.
+    candidates = _account_creds_candidates(account_name, state)
     primary = account_creds_path(account_name)
-    candidates.append(primary)
 
     # First non-stale candidate wins. Track the primary's pair (task contract:
     # all-stale returns the primary) and the first present-but-stale pair (so a
@@ -3321,6 +3386,67 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         if first_stale_pair[0] is None:
             first_stale_pair = (token, expires_at)
     return primary_pair if primary_pair[0] is not None else first_stale_pair
+
+
+# Nx tier suffix/prefix, mid-string tolerant: "_20x_v2", "20x", "tier-20x" all
+# parse to 20; requires an `_`/`-`/string-start immediately before the digits
+# and an `_`/`-`/string-end immediately after the "x" so e.g. "box20xyz" does
+# NOT spuriously match (capacity-aware spec 2026-07-10, "Normalization model").
+_RATE_LIMIT_TIER_RE = re.compile(r"(?:[_-]|^)(\d+)x(?=[_-]|$)")
+
+
+def _read_rate_limit_tier(account_name: str) -> tuple[int | None, str | None]:
+    """Parsed Claude subscription rate-limit tier for `account_name`, e.g. 20
+    from a stored `claudeAiOauth.rateLimitTier` of "tier-20x".
+
+    WHY (capacity-aware spec 2026-07-10, "Normalization model"): routing used
+    to assume every account has equal capacity; a hardcoded tier map is
+    replaced by reading each account's OWN tier straight out of its stored
+    credentials. Resolved through the exact SAME freshest-wins multi-source
+    chain `_read_access_token_with_expiry` uses (`_account_creds_candidates`)
+    for the same GH #130 reason: a stale primary snapshot must never shadow a
+    live slot's fresher value.
+
+    Returns (parsed_x, raw_tier_string):
+      - (None, None) when NO candidate has a `claudeAiOauth.rateLimitTier`
+        value at all (missing — e.g. no creds file, or an older snapshot
+        predating this field);
+      - (None, raw) when a value IS present but doesn't match the `Nx` shape
+        (unparseable);
+      - (N, raw) on a successful parse — N is always the first digit group,
+        so "_20x_v2" / "20x" / "tier-20x" all yield 20.
+    Validation that N must be >= 1 (a `_0x` parse is pathological — a
+    zero-capacity account is unroutable, not "reference-scale") is the
+    CALLER's job (`_account_capacity_x`), not this function's — this is a
+    pure parse, not a policy decision.
+
+    READ-ONLY, same contract as `_read_access_token_with_expiry`: never
+    writes, refreshes, or rotates anything. Local file reads only — never
+    HTTP.
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except Exception:
+        state = {}
+
+    for path in _account_creds_candidates(account_name, state):
+        try:
+            if not path.exists():
+                continue
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue
+        oauth = creds.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or "rateLimitTier" not in oauth:
+            continue
+        raw = oauth.get("rateLimitTier")
+        if raw is None:
+            continue
+        match = _RATE_LIMIT_TIER_RE.search(str(raw))
+        if match:
+            return int(match.group(1)), raw
+        return None, raw
+    return None, None
 
 
 def _refresh_account_token(account_name: str, creds_path: Path | None = None) -> bool:
@@ -4424,7 +4550,8 @@ def projected_seven_day_reset(acct: dict, config: dict, now=None) -> str | None:
         return projected_ts or api_ts
 
 
-def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
+def _target_would_immediately_re_trip(acct: dict, config: dict,
+                                      name: str | None = None, ctx: dict | None = None) -> bool:
     """Return True if this candidate is "full" — its effective utilization is
     at/above the FIRST ladder step — and so should not be swapped onto. Used to
     prune "doomed" candidates that would cause a swap-back loop. GH #17.
@@ -4442,12 +4569,28 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     regardless of where its ladder happens to sit. Degraded/all-full pools are
     still handled downstream by headroom_fallback + the min-improvement gate, so
     progressive-return semantics survive.
+
+    Capacity-aware conversion (G2, capacity-aware spec 2026-07-10, "The formula
+    changes" formula 2): when the gate is on AND the caller threads the
+    candidate's `name` + fleet `ctx`, "full" is judged in reference-scale UNITS
+    per lane instead of raw percent — the candidate is HEALTHY (not full) iff
+    `remaining_units(extrapolated pct) / (lanes + 1) > (100 − steps[0]) / 100`.
+    A big-tier account at a high percent can still clear the line (it has more
+    absolute headroom to give a lane); a small-tier account can't. `ctx=None`
+    (or the gate off) keeps today's raw-percent path bit-for-bit — that is the
+    default for every caller not yet converted (Task 5 threads the rest).
     """
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
     # Estimator (C): use the extrapolated %, so a target polled just under the
     # step but climbing fast (will be over it by the time the swap lands) is
     # still treated as full. Falls back to polled when no rate is known.
-    return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
+    est_pct = _account_estimated_effective_pct(acct, config)
+    if _capacity_gate_on(config) and name is not None and ctx is not None:
+        lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+        remaining = _remaining_units(est_pct, name, ctx, config)
+        healthy = remaining / (lanes + 1) > (100.0 - cfg_steps[0]) / 100.0
+        return not healthy
+    return est_pct >= cfg_steps[0]
 
 
 def _disabled_accounts(config: dict) -> set:
@@ -4463,6 +4606,334 @@ def _disabled_accounts(config: dict) -> set:
     stops NEW placements. Re-enable by deleting the key or setting false."""
     return {a.get("name") for a in config.get("accounts", [])
             if isinstance(a, dict) and a.get("disabled")}
+
+
+# ---------------------------------------------------------------------------
+# Capacity-aware anti-herding — Normalization model (capacity-aware spec
+# 2026-07-10, docs/plans/2026-07-10-capacity-aware-anti-herding.md). Phase 1:
+# tier sourcing, reference_x, and ctx helpers. ALL INERT until Phase 2 wires
+# gate-on callers — the only site anything here is invoked from today is the
+# `one_cycle` poll-cycle wiring point (caches `capacity_x` at poll time).
+#
+# Units model: ratio = capacity_x / reference_x; remaining_units =
+# (100 - pct) / 100 * ratio. A hardcoded "every account has equal capacity"
+# assumption is what caused the 2026-07-10 halt incident (fix #3) this spec
+# addresses — a 5x account and a 20x account at the same raw percent do NOT
+# have the same remaining headroom, and treating them as if they did is what
+# herds swaps onto (and floods 429s on) the smaller-tier accounts.
+# ---------------------------------------------------------------------------
+
+def _account_raw_capacity_x(name: str, state: dict, config: dict) -> tuple[int | None, list[str]]:
+    """The account's raw N-in-`Nx` tier, BEFORE the neutral/reference_x
+    fallback layer `_account_capacity_x` adds on top.
+
+    WHY split out (capacity-aware spec 2026-07-10): `_observed_fleet_min_x`
+    must compute the fleet-relative `reference_x` from ONLY genuinely-known
+    tiers (a valid config override or a parseable, >= 1 credentials-parsed
+    tier) — folding in `_account_capacity_x`'s own neutral fallback here would
+    be circular, since that fallback IS `reference_x`, and computing
+    `reference_x` from a value that already assumes `reference_x` is
+    meaningless. This function never looks at `reference_x` at all.
+
+    Precedence: `accounts[].capacity_x` in config wins outright when it is
+    numeric (bool excluded — `True`/`False` are not intended tier values even
+    though `bool` is an `int` subclass) and >= 1. An invalid override (wrong
+    type, or numeric but < 1) is reported via a warning and does NOT
+    short-circuit — resolution falls through to the account's credentials-
+    parsed `claudeAiOauth.rateLimitTier` (`_read_rate_limit_tier`). A parsed
+    tier < 1 (the pathological `_0x` case — a zero-capacity account is
+    unroutable, not "reference-scale") is likewise reported and treated as
+    unknown.
+
+    Returns (value, warnings): value is None when neither source yields a
+    usable (>= 1) number for `name` — exactly the "this account would become
+    neutral" case `_account_capacity_x` handles next.
+    """
+    warnings: list[str] = []
+    override = None
+    for a in config.get("accounts", []):
+        if isinstance(a, dict) and a.get("name") == name:
+            override = a.get("capacity_x")
+            break
+    if override is not None:
+        is_number = isinstance(override, (int, float)) and not isinstance(override, bool)
+        if is_number and override >= 1:
+            return int(override), warnings
+        warnings.append(
+            f"account {name!r}: config capacity_x override {override!r} is invalid "
+            "(must be numeric and >= 1) — falling back to the credentials-parsed tier"
+        )
+    parsed_x, raw_tier = _read_rate_limit_tier(name)
+    if parsed_x is not None:
+        if parsed_x >= 1:
+            return parsed_x, warnings
+        warnings.append(
+            f"account {name!r}: parsed rate-limit tier {raw_tier!r} -> {parsed_x}x is "
+            "invalid (must be >= 1) — treating as an unknown/neutral tier"
+        )
+    return None, warnings
+
+
+def _account_capacity_x(name: str, state: dict, config: dict) -> tuple[int, list[str]]:
+    """Resolved per-account `capacity_x` (capacity-aware spec 2026-07-10,
+    "Normalization model"): the hardcoded-equal-capacity assumption is
+    replaced by reading each account's OWN rate-limit tier — a config
+    override when the operator has pinned one, else the credentials-parsed
+    tier, else NEUTRAL (the resolved `reference_x` itself, giving the account
+    a ratio of exactly 1 so an unknown tier neither inflates nor starves its
+    scoring in either direction).
+
+    Note on the neutral value's type: `reference_x` is a float in general
+    (a pinned `capacity_aware.reference_x` may be any value >= 1). The `int`
+    return type mirrors the common case (real tiers and the typical fleet-min
+    reference are integers); a neutral account's `capacity_x` is returned
+    EXACTLY equal to `reference_x` regardless, because the ratio being
+    exactly 1 is the load-bearing invariant, not the numeric type.
+
+    Caching: whenever a genuinely-known value (override or parsed — never the
+    neutral fallback, which is derived, not observed) is resolved and differs
+    from the cached `state["accounts"][name]["capacity_x"]`, the cache is
+    refreshed in place. The wiring call inside `one_cycle`'s poll state-update
+    section invokes this once per JUST-polled account every cycle for exactly
+    that reason; `_capacity_ctx`'s eager fill is the other caller, for
+    accounts a poll cycle hasn't reached yet.
+    """
+    raw_x, warnings = _account_raw_capacity_x(name, state, config)
+    if raw_x is not None:
+        acct_state = state.setdefault("accounts", {}).setdefault(name, {})
+        if acct_state.get("capacity_x") != raw_x:
+            acct_state["capacity_x"] = raw_x
+        return raw_x, warnings
+    reference_x, ref_warnings = _resolve_reference_x(state, config)
+    return reference_x, warnings + ref_warnings
+
+
+def _observed_fleet_min_x(state: dict, config: dict) -> float | None:
+    """Fleet-relative candidate for `reference_x` (capacity-aware spec
+    2026-07-10, "Normalization model"): the smallest raw `capacity_x` among
+    ENABLED accounts that have a genuinely-known tier (config override or a
+    parseable, >= 1 credentials tier) — NEVER neutral/unknown accounts, since
+    those are defined AS the reference and including them would be circular.
+
+    Returns None when the enabled fleet has NO account with a known tier at
+    all (the "all-unknown" case) — the caller decides the fallback (1) and
+    whether a None here should suppress a drift comparison, rather than this
+    function silently coercing to 1 and losing that distinction.
+
+    "The same domain rule, resolved once and reused" (brief item 4): callers
+    that need the observed fleet minimum call THIS directly rather than each
+    re-deriving their own filtered-subset notion of it — `_resolve_reference_x`
+    (the bootstrap/snapshot path) and `_capacity_warnings` (the drift check)
+    both do.
+    """
+    disabled = _disabled_accounts(config)
+    known: list[int] = []
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is not None:
+            known.append(raw_x)
+    return float(min(known)) if known else None
+
+
+def _resolve_reference_x(state: dict, config: dict) -> tuple[float, list[str]]:
+    """Resolved `reference_x` (capacity-aware spec 2026-07-10, "Normalization
+    model"): the capacity scale every account's `capacity_x` is divided by to
+    get its unit ratio. Precedence:
+
+      1. `capacity_aware.reference_x` PINNED in config, when numeric and >= 1.
+         A present-but-invalid pin (wrong type, or numeric but < 1) is treated
+         EXACTLY as absent (falls through to 2/3) plus a warning about the
+         invalid value.
+      2. Absent (or invalid) → the PERSISTED snapshot at
+         `state["capacity_reference_snapshot"]`, if one has already been
+         computed — used SILENTLY, no warning. Once snapshotted, `reference_x`
+         deliberately stays STABLE across cycles even if the fleet's observed
+         minimum later drifts: removing/disabling the smallest account must
+         NOT silently rescale every other account's ratio fleet-wide (the
+         round-2 instability this pin/snapshot design exists to avoid).
+      3. No pin, no snapshot yet (first-ever resolution) → compute the
+         observed fleet minimum (`_observed_fleet_min_x`; falls back to 1 if
+         the enabled fleet has no known tier at all), PERSIST it as the
+         snapshot, and emit an SOS-instruction warning telling the operator to
+         pin `capacity_aware.reference_x` explicitly — a computed snapshot is
+         a reasonable bootstrap, never a substitute for a stated operator
+         intent.
+    """
+    warnings: list[str] = []
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    if pinned is not None:
+        is_number = isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+        if is_number and pinned >= 1:
+            return float(pinned), warnings
+        warnings.append(
+            f"capacity_aware.reference_x override {pinned!r} is invalid "
+            "(must be numeric and >= 1) — treating as unpinned"
+        )
+    snapshot = state.get("capacity_reference_snapshot")
+    if snapshot is not None:
+        return float(snapshot), warnings
+    observed = _observed_fleet_min_x(state, config)
+    value = observed if observed is not None else 1.0
+    state["capacity_reference_snapshot"] = value
+    warnings.append(
+        "capacity_aware.reference_x is not pinned — bootstrapped a snapshot of "
+        f"{value:g}x from the observed fleet minimum tier and persisted it to "
+        "state.json's capacity_reference_snapshot; pin capacity_aware.reference_x "
+        "explicitly in config.yaml to make this an intentional, stable choice "
+        "rather than an incidental one."
+    )
+    return value, warnings
+
+
+def _capacity_gate_on(config: dict) -> bool:
+    """Master gate for the capacity-aware Normalization model (capacity-aware
+    spec 2026-07-10). Default OFF — every gate-off golden
+    (tests/test_capacity_gate_off_goldens.py) must reproduce today's
+    hardcoded-equal-capacity behavior bit-for-bit until Phase 2 wires gate-on
+    callers (Rollout §1)."""
+    return bool(config.get("capacity_aware", {}).get("enabled", False))
+
+
+def _capacity_ctx(state: dict, config: dict) -> dict:
+    """Build the fleet-level capacity-aware context (capacity-aware spec
+    2026-07-10, "Normalization model"):
+    `{"reference_x": float, "capacity_x_by_name": {name: int},
+    "lane_load_by_name": {name: int}}`.
+
+    Self-sufficient by design: standalone entry points (`diagnose()`, `cus
+    status`, ...) must never see a "partially-known fleet" — for any ENABLED
+    account missing a cached `capacity_x` in state, this EAGERLY reads+caches
+    its tier right here (a local credentials-file read, same mechanism
+    `_read_rate_limit_tier` always uses — never an HTTP poll), rather than
+    waiting for that account's next due poll cycle to populate the cache via
+    the `one_cycle` wiring point. An operator-disabled account missing the
+    cache is left out of `capacity_x_by_name` rather than spending a read on
+    an account nothing routes to this cycle — the poll-time wiring point
+    fills it once the account is re-enabled and actually polled.
+
+    `lane_load_by_name` mirrors `_lane_load`'s slot/mount occupancy counting
+    (`occupied_slot_accounts(state)`, live-session-per-/proc semantics, same
+    as the anti-clustering `base_lane_load` in `decide_slot_swaps`) — callers
+    that need claim-aware counts (this-cycle's in-flight moves, not just
+    what's live right now) may overwrite entries after building this ctx.
+    """
+    reference_x, _warnings = _resolve_reference_x(state, config)
+    disabled = _disabled_accounts(config)
+    capacity_x_by_name: dict[str, int] = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name:
+            continue
+        cached = state.get("accounts", {}).get(name, {}).get("capacity_x")
+        if cached is not None:
+            capacity_x_by_name[name] = cached
+            continue
+        if name in disabled:
+            continue
+        value, _acct_warnings = _account_capacity_x(name, state, config)
+        capacity_x_by_name[name] = value
+    lane_load_by_name = {acct: len(slots) for acct, slots in occupied_slot_accounts(state).items()}
+    return {
+        "reference_x": reference_x,
+        "capacity_x_by_name": capacity_x_by_name,
+        "lane_load_by_name": lane_load_by_name,
+    }
+
+
+def _remaining_units(pct: float, name: str, ctx: dict, config: dict) -> float:
+    """Remaining capacity in reference-scale UNITS for account `name` at usage
+    `pct` (capacity-aware spec 2026-07-10, "Normalization model"):
+    `ratio = capacity_x / reference_x`; `remaining_units = (100 - pct) / 100 *
+    ratio`. A 20x account at 0% carries 20x the reference account's remaining
+    headroom at 0%; the same 20x account at 80% carries only 0.2 * 20 = 4x —
+    letting a big-tier account's LOW percent still correctly outrank a
+    small-tier account's headroom on a shared scale, instead of comparing raw
+    percents as if every account had the same underlying capacity (the
+    hardcoded-equal-capacity assumption behind the 2026-07-10 halt incident).
+
+    `name` missing from `ctx["capacity_x_by_name"]` (e.g. a spare account
+    `_capacity_ctx` never populated) falls back to `reference_x` itself —
+    ratio 1, the same neutral `_account_capacity_x` would resolve.
+
+    `config` is accepted, unused by this base formula today, for call-shape
+    symmetry with the gate-on callers Phase 2 threads this into.
+    """
+    reference_x = ctx.get("reference_x") or 1.0
+    capacity_x = ctx.get("capacity_x_by_name", {}).get(name, reference_x)
+    ratio = capacity_x / reference_x
+    return (100.0 - pct) / 100.0 * ratio
+
+
+def _capacity_warnings(state: dict, config: dict) -> list[str]:
+    """Diagnostic warnings for the capacity-aware Normalization model
+    (capacity-aware spec 2026-07-10). Pure computation — SOS wiring (folding
+    these into `diagnose()`'s SOSCondition list) is a later task; this only
+    returns the strings.
+
+    Two independent checks:
+
+      1. Drift: the observed fleet minimum has fallen BELOW the pinned
+         `capacity_aware.reference_x`. Silent when the observed minimum is AT
+         or ABOVE the pin (removing/disabling small accounts so the fleet
+         floor RISES is a deliberate, healthy pin state — nothing to warn
+         about) and silent when the enabled fleet has no known tier at all
+         (`_observed_fleet_min_x` returns None — nothing observed to drift).
+         Only meaningful when a valid pin actually exists in config; an
+         unpinned/snapshotted `reference_x` has nothing to "drift" from by
+         definition (it tracks the observed minimum by construction, once).
+      2. Sub-reference: any account (enabled OR operator-disabled) whose
+         ratio `capacity_x / reference_x` is at or below the first ladder
+         step's headroom fraction, `(100 - steps[0]) / 100` — a warn-and-run
+         heads-up, not a block, since such an account will legitimately trip
+         the ladder sooner than the rest of the fleet in reference-scale
+         units. Downgraded to a soft `"INFO: "`-prefixed string for accounts
+         the operator has already disabled (cus.py:10680-10693 is the
+         existing per-account SOS-severity-split precedent this mirrors) —
+         it isn't being routed to right now, so the same condition is
+         informational rather than actionable.
+    """
+    warnings: list[str] = []
+    reference_x, _ref_warnings = _resolve_reference_x(state, config)
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    has_valid_pin = (isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+                     and pinned >= 1)
+    observed_min = _observed_fleet_min_x(state, config)
+    if has_valid_pin and observed_min is not None and observed_min < reference_x:
+        warnings.append(
+            f"capacity-aware: observed fleet minimum tier ({observed_min:g}x) has drifted "
+            f"BELOW the pinned reference_x ({reference_x:g}x) — every account's unit ratio "
+            "is now computed against a reference bigger than any live account; re-pin "
+            "capacity_aware.reference_x to the new floor if this is intentional."
+        )
+    disabled = _disabled_accounts(config)
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    sub_reference_threshold = (100.0 - steps[0]) / 100.0
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or reference_x <= 0:
+            continue
+        capacity_x, _acct_warnings = _account_capacity_x(name, state, config)
+        ratio = capacity_x / reference_x
+        if ratio <= sub_reference_threshold:
+            message = (
+                f"account {name!r}: capacity_x/reference_x ratio ({ratio:.2f}) is at or "
+                f"below the first ladder step's headroom fraction ({sub_reference_threshold:.2f}) "
+                "— expect it to trip the swap ladder sooner than the rest of the fleet in "
+                "reference-scale units (warn-and-run, not blocked)"
+            )
+            if name in disabled:
+                message = f"INFO: {message} (operator-disabled — informational only)"
+            warnings.append(message)
+    return warnings
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
@@ -4488,13 +4959,47 @@ def _lane_load_penalty(name: str, state: dict, config: dict) -> float:
     caller — SOS probes, `cus switch`, global mode — passes no `_lane_load`, so
     their scoring is untouched), or when the candidate backs no lanes. Scales
     linearly with lane count, so a magnet that has already accreted 2-3 lanes is
-    penalized 2-3× and the fleet disperses within a cycle or two."""
+    penalized 2-3× and the fleet disperses within a cycle or two.
+
+    Capacity-aware (G1, capacity-aware spec 2026-07-10, "The formula changes"):
+    0.0 whenever the gate is on — the reference-unit ranking key
+    (`_capacity_rank_key`) folds lane isolation into its own `÷(lanes+1)`
+    contention divisor plus a units-scale linear term, so this point-scale
+    penalty is deliberately NOT applied on top of it."""
     if not _spread_lanes_enabled(config):
+        return 0.0
+    if _capacity_gate_on(config):
         return 0.0
     load = (state.get("_lane_load") or {}).get(name, 0)
     if not load:
         return 0.0
     return float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0)) * load
+
+
+def _capacity_rank_key(score_pts: float, name: str, ctx: dict, config: dict) -> float:
+    """Gate-on swap-target ranking key (G1, capacity-aware spec 2026-07-10,
+    "The formula changes" formula 1):
+
+        key = (score_pts / 100) × ratio ÷ (lanes + 1) − (cluster_penalty / 100) × lanes
+
+    where `ratio = capacity_x / reference_x` and `lanes` is the candidate's
+    live-lane count (both from `ctx`). `score_pts` is the strategy's existing
+    point-scale score (e.g. `100 − effective_pct` for lowest_usage, the
+    weighted headroom/burn-soon score for headroom/smart) fed in verbatim — NOT
+    clamped or re-weighted. Candidates rank by this key DESCENDING.
+
+    Both terms are in reference units: the first is per-lane capacity density
+    for the score's headroom component (a big-tier account's low percent
+    correctly outranks a small-tier account's); the second is the isolation
+    preference (co-located lanes share fate on a 429/token failure), 0.60u per
+    lane at `cluster_penalty: 60`, scale-stable because `reference_x` is pinned.
+    This replaces the point-scale `_lane_load_penalty` (which returns 0 gate-on).
+    """
+    reference_x = ctx.get("reference_x") or 1.0
+    ratio = ctx.get("capacity_x_by_name", {}).get(name, reference_x) / reference_x
+    lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+    cluster_penalty = float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0))
+    return (score_pts / 100.0) * ratio / (lanes + 1) - (cluster_penalty / 100.0) * lanes
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
@@ -4665,6 +5170,19 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # below): the aggregate 7d hard cap.
     hard_7d = _hard_7d_cap_for_config(config)
     model_cap = _model_weekly_target_cap_for_config(config)
+
+    # Capacity-aware gate (capacity-aware spec 2026-07-10). When on, ranking, the
+    # aggregate-7d filter, and the per-model reserve preference below all run in
+    # reference UNITS, not raw percent. ctx comes from the stash Task 5 lays down
+    # (claim-aware lane counts); absent that, build a fresh one here — the
+    # deliberate fallback resolution is that a missing stash must NEVER silently
+    # mean "percent path" while the gate is on. Built only gate-on (the fresh
+    # build reads credentials/occupancy and is a no-op cost gate-off, keeping
+    # gate-off bit-for-bit). Hoisted above the reserve elif so its self-call
+    # converts too (capacity-aware spec 2026-07-10, Task 5).
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = (state.get("_capacity_ctx") or _capacity_ctx(state, config)) if _cap_on else None
+
     model_safe = [(n, a) for n, a in candidates
                   if _max_model_weekly_from_acct(a, config) < model_cap]
     if gate_enabled and not model_safe:
@@ -4685,9 +5203,16 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # filters — under the aggregate 7d hard cap AND not immediately re-tripping its
         # own ladder. Otherwise narrowing would strand the lane on a degraded
         # model-spent account while a healthy Fable-fresh target exists in the full pool.
-        if any(a.get("current_7d_pct", 0) < hard_7d
-               and not _target_would_immediately_re_trip(a, config)
-               for _, a in model_spent):
+        # G2/G9 (capacity-aware spec 2026-07-10): gate-on, "survives both
+        # downstream filters" is judged in reference units — 7d headroom
+        # (formula 3) AND per-lane re-trip health (formula 2, name+ctx threaded).
+        # Gate-off (_cap_on False → name/ctx None) reduces to the original raw
+        # percent form exactly, so gate-off stays bit-for-bit.
+        _reserve_ctx = _cap_ctx if _cap_on else None
+        if any((_remaining_units(a.get("current_7d_pct", 0), n, _cap_ctx, config) > (100.0 - hard_7d) / 100.0
+                    if _cap_on else a.get("current_7d_pct", 0) < hard_7d)
+               and not _target_would_immediately_re_trip(a, config, name=(n if _cap_on else None), ctx=_reserve_ctx)
+               for n, a in model_spent):
             candidates = model_spent
 
     # Universal filter (GH #17, all strategies): exclude candidates above
@@ -4696,7 +5221,18 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
     # (system is degraded; swap somewhere rather than stay on a hot active). Runs
     # on the per-model-safe survivors from the HARD gate above.
-    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+    #
+    # G9 (capacity-aware spec 2026-07-10): gate-on, the ceiling is a reference-
+    # unit line — a candidate is safe iff `remaining_7d_units > (100 −
+    # hard_7d_cap_pct)/100` (no lane divisor; the 7d cap is aggregate, not a
+    # per-lane ladder). A big-tier account at a high 7d percent can still clear
+    # it. Reduces exactly to `current_7d_pct < hard_7d` at ratio 1.
+    if _cap_on:
+        _hard_7d_units_line = (100.0 - hard_7d) / 100.0
+        safe_7d = [(n, a) for n, a in candidates
+                   if _remaining_units(a.get("current_7d_pct", 0), n, _cap_ctx, config) > _hard_7d_units_line]
+    else:
+        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -4707,7 +5243,13 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # Falls back to "any candidate" if NONE have headroom; the hysteresis
     # gate (GH #16) and usage-growth gate (GH #15) protect against the
     # resulting potential loop.
-    with_headroom = [(n, a) for n, a in candidates if not _target_would_immediately_re_trip(a, config)]
+    # G2 (capacity-aware spec 2026-07-10): gate-on, "would re-trip" is the
+    # per-lane reference-units health line (formula 2), so a healthy big-tier
+    # candidate (e.g. idle 20x@80%) is not pruned by raw percent. Gate-off
+    # (name/ctx None) is the original raw-percent filter, bit-for-bit.
+    _wh_ctx = _cap_ctx if _cap_on else None
+    with_headroom = [(n, a) for n, a in candidates
+                     if not _target_would_immediately_re_trip(a, config, name=(n if _cap_on else None), ctx=_wh_ctx)]
     headroom_fallback = not with_headroom
     if with_headroom:
         candidates = with_headroom
@@ -4730,29 +5272,63 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # by 5h for stability. Anti-cluster (2026-07-06): a lane-load penalty is
         # ADDED to the effective-util sort key (higher util = sorted later), so a
         # candidate already backing live lanes is deprioritized vs an empty one.
-        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
-                                        + _lane_load_penalty(kv[0], state, config),
-                                        kv[1].get("current_5h_pct", 0.0)))
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, rank by the reference-
+        # unit key DESCENDING — score_pts here is `100 − effective_pct` (this
+        # strategy's existing point score) — keeping the 5h tiebreak. At ratio 1
+        # / zero lane-load this reduces to today's effective-pct ordering.
+        if _cap_on:
+            candidates.sort(key=lambda kv: (
+                -_capacity_rank_key(100.0 - _account_effective_pct(kv[1], config), kv[0], _cap_ctx, config),
+                kv[1].get("current_5h_pct", 0.0)))
+        else:
+            candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
+                                            + _lane_load_penalty(kv[0], state, config),
+                                            kv[1].get("current_5h_pct", 0.0)))
         chosen, _ = candidates[0]
-        return SwapTarget(name=chosen, reason=_annotate("lowest_usage: lowest effective util"))
+        return SwapTarget(name=chosen, reason=_annotate(
+            "lowest_usage[capacity]: highest remaining-units-per-lane" if _cap_on
+            else "lowest_usage: lowest effective util"))
 
     if strategy == "drain":
         # cux drain: pass 1 = candidates with effective_pct under their own
         # next_swap_at (i.e. headroom for an arrival). Pass 2 = any candidate
         # below 100% 5h. Pass 2 still applies the universal cap_fallback /
         # headroom_fallback filters above.
-        ordered = [
-            (n, a) for n, a in candidates
-            if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
-        ]
+        #
+        # G7 (capacity-aware spec 2026-07-10): drain is non-scoring (no G1 key).
+        # Gate-on converts BOTH halves to reference units — (a) the pass-1 ACCEPT
+        # `effective_pct < next_swap_at` becomes `remaining_units(effective_pct)
+        # > (100 − next_swap_at)/100` (a big-tier account with real unit headroom
+        # is admitted even above its raw rung); (b) the deplete-first ORDERING
+        # `-current_7d_pct` (closest-to-cap first) becomes fewest-remaining-7d-
+        # units-first — same deplete-first intent, but a 5x@60% (0.4u) drains
+        # before a 20x@85% (0.6u) even though 85 > 60 in raw percent.
+        if _cap_on:
+            ordered = [
+                (n, a) for n, a in candidates
+                if _remaining_units(_account_effective_pct(a, config), n, _cap_ctx, config)
+                > (100.0 - a.get("next_swap_at_pct", 50)) / 100.0
+            ]
+        else:
+            ordered = [
+                (n, a) for n, a in candidates
+                if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
+            ]
         if ordered:
-            ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
+            if _cap_on:
+                ordered.sort(key=lambda kv: _remaining_units(kv[1].get("current_7d_pct", 0.0), kv[0], _cap_ctx, config))
+            else:
+                ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
             chosen, _ = ordered[0]
             return SwapTarget(name=chosen, reason=_annotate("drain: under own threshold"))
         # Pass 2: any candidate with some 5h room
         ordered = [(n, a) for n, a in candidates if a.get("current_5h_pct", 0.0) < 100]
         if ordered:
-            ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
+            if _cap_on:
+                ordered.sort(key=lambda kv: _remaining_units(kv[1].get("current_7d_pct", 0.0), kv[0], _cap_ctx, config))
+            else:
+                ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
             chosen, _ = ordered[0]
             return SwapTarget(name=chosen, reason=_annotate("drain: 5h has room"))
         return None
@@ -4764,7 +5340,16 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         cfg_accounts = {a["name"]: a for a in config.get("accounts", [])}
         candidates.sort(key=lambda kv: cfg_accounts.get(kv[0], {}).get("priority", 99))
         for name, acct in candidates:
-            if _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50):
+            # G7 (capacity-aware spec 2026-07-10): non-scoring — priority ORDER
+            # is untouched; only the per-account headroom ACCEPT converts to the
+            # reference-unit line (reduces to `effective_pct < next_swap_at` at
+            # ratio 1).
+            if _cap_on:
+                accepted = (_remaining_units(_account_effective_pct(acct, config), name, _cap_ctx, config)
+                            > (100.0 - acct.get("next_swap_at_pct", 50)) / 100.0)
+            else:
+                accepted = _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50)
+            if accepted:
                 return SwapTarget(name=name, reason=_annotate("strict_priority: highest priority with headroom"))
         return None
 
@@ -4804,6 +5389,17 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
         # Anti-cluster (2026-07-06): subtract the lane-load penalty so an account
         # already backing live lanes scores below a distinct empty one.
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, feed the weighted
+        # headroom `score` in as score_pts and rank by the reference-unit key
+        # DESCENDING (which supplies its own lane isolation, so the point-scale
+        # penalty is not applied). Reduces to today's score ordering at ratio 1 /
+        # zero lane-load.
+        if _cap_on:
+            candidates.sort(key=lambda kv: -_capacity_rank_key(score(kv[1]), kv[0], _cap_ctx, config))
+            chosen, chosen_acct = candidates[0]
+            k = _capacity_rank_key(score(chosen_acct), chosen, _cap_ctx, config)
+            return SwapTarget(name=chosen, reason=_annotate(f"headroom[capacity]: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% key={k:.2f}"))
         candidates.sort(key=lambda kv: -(score(kv[1]) - _lane_load_penalty(kv[0], state, config)))
         chosen, chosen_acct = candidates[0]
         s = score(chosen_acct) - _lane_load_penalty(chosen, state, config)
@@ -4890,19 +5486,33 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # so a magnet that has already accreted lanes falls behind a distinct
         # empty account and the fleet disperses. Inert when spread_lanes is off or
         # no _lane_load map was supplied (non-lane callers).
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, the unclamped smart
+        # score (headroom + burn-soon + reset-proximity, NOT 0-100 bounded) is
+        # fed in as score_pts to the reference-unit key, which supplies its own
+        # ÷(lanes+1) isolation in place of the point-scale cluster penalty. The
+        # burn-soon bonus scales with a candidate's ratio (a soon-resetting 20x
+        # wastes 4× a 5x's capacity), so it stays a deliberate magnet until it
+        # accretes enough lanes for the divisor + linear term to overtake it.
         scored = []
         for n, a in candidates:
             sc, rz = smart_score(a)
-            pen = _lane_load_penalty(n, state, config)
-            if pen:
-                sc -= pen
-                rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
-            scored.append((n, a, sc, rz))
+            if _cap_on:
+                rank = _capacity_rank_key(sc, n, _cap_ctx, config)
+                rz = (rz + f" capacity-key({rank:.2f})").strip()
+            else:
+                pen = _lane_load_penalty(n, state, config)
+                if pen:
+                    sc -= pen
+                    rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
+                rank = sc
+            scored.append((n, a, rank, rz))
         scored.sort(key=lambda x: -x[2])
-        chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
+        chosen, chosen_acct, chosen_rank, chosen_reasons = scored[0]
+        _metric = "key" if _cap_on else "score"
         return SwapTarget(
             name=chosen,
-            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={chosen_score:.1f} {chosen_reasons}"),
+            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% {_metric}={chosen_rank:.1f} {chosen_reasons}"),
         )
 
     return None
@@ -6983,6 +7593,15 @@ def decide_swap(
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
+    # Capacity-aware gate (capacity-aware spec 2026-07-10). When on, the trigger
+    # comparisons below run in reference UNITS for the ACTIVE account `current`,
+    # not raw percent. ctx comes from the Task-5 stash (claim-aware lane counts);
+    # absent that, build fresh — a missing stash must never silently mean the
+    # percent path while the gate is on (deliberate fallback resolution). Built
+    # only gate-on, so gate-off stays bit-for-bit.
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = (state.get("_capacity_ctx") or _capacity_ctx(state, config)) if _cap_on else None
+
     # Fix A — extrapolation-aware trigger (2026-07-06 rayi3 incident). The ladder
     # (Trigger 2) and hard-cap (Trigger 1) trips below compare against the
     # BURN-EXTRAPOLATED usage, projected forward to the moment the daemon could
@@ -7034,7 +7653,16 @@ def decide_swap(
         if cur_model > 0:
             cur_model = min(100.0, cur_model + _burn_extrapolation_delta(
                 active_acct, "7d", config, _trig_now, _trig_look_ahead))
-    agg_tripped = cur_7d >= hard_7d_cap
+    # G9 Trigger-1 arm (capacity-aware spec 2026-07-10): the AGGREGATE 7d cap
+    # trips in reference units — `remaining_7d_units <= (100 − hard_7d_cap)/100`
+    # (no lane divisor; aggregate cap, same shape as the picker's safe_7d line
+    # G9). Keeps the site's own `cur_7d` source (burn-extrapolated under
+    # poll-accel, raw otherwise). The per-model arm is deliberately untouched.
+    # Reduces to `cur_7d >= hard_7d_cap` at ratio 1.
+    if _cap_on:
+        agg_tripped = _remaining_units(cur_7d, current, _cap_ctx, config) <= (100.0 - hard_7d_cap) / 100.0
+    else:
+        agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
         # Preserve the FORCING caps before the display reassignment below stomps
@@ -7194,7 +7822,18 @@ def decide_swap(
     ladder_threshold_bbr = active_acct.get("next_swap_at_pct", cfg_steps_bbr[0])
     if ladder_threshold_bbr >= 100:
         ladder_threshold_bbr = cfg_steps_bbr[-1]
-    if current_max_pct(cur_usage, config) < ladder_threshold_bbr:
+    # G6 (capacity-aware spec 2026-07-10): the "ladder won't fire, so run bbr"
+    # precheck runs in reference units — bbr is eligible iff `remaining_units >
+    # (100 − clamped next_swap_at)/100`. Keeps its RAW current_max_pct source (no
+    # look-ahead): the asymmetry with G4's look-ahead-maxed cur_pct is today's
+    # behavior, deliberately preserved. Reduces to `< ladder_threshold_bbr` at
+    # ratio 1.
+    _bbr_max_pct = current_max_pct(cur_usage, config)
+    if _cap_on:
+        _bbr_below_step = _remaining_units(_bbr_max_pct, current, _cap_ctx, config) > (100.0 - ladder_threshold_bbr) / 100.0
+    else:
+        _bbr_below_step = _bbr_max_pct < ladder_threshold_bbr
+    if _bbr_below_step:
         bbr_decision = _maybe_burn_before_reset(
             state, config, current, active_acct, cur_usage, usage_by_account
         )
@@ -7228,7 +7867,18 @@ def decide_swap(
     if _poll_accel_enabled(config):
         cur_pct = max(cur_pct, _account_estimated_effective_pct(
             active_acct, config, _trig_now, look_ahead_seconds=_trig_look_ahead))
-    if cur_pct < threshold:
+    # G4 (capacity-aware spec 2026-07-10): the ladder trips in reference units —
+    # HOLD (below step) iff `remaining_units > (100 − clamped threshold)/100`,
+    # trip iff `<=`. Keeps this site's own cur_pct source (raw max-ed with the
+    # look-ahead only under poll-accel) and its already-clamped local threshold
+    # (>=100 → steps[-1]). A 20x@80% with next_swap_at=70 has 0.8u > 0.3u so it
+    # HOLDS gate-on (trips gate-off), and only trips at >= 92.5%. Reduces to
+    # `cur_pct < threshold` at ratio 1.
+    if _cap_on:
+        _below_threshold = _remaining_units(cur_pct, current, _cap_ctx, config) > (100.0 - threshold) / 100.0
+    else:
+        _below_threshold = cur_pct < threshold
+    if _below_threshold:
         _note("below_threshold", "hold",
               f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
         return None
@@ -7394,15 +8044,37 @@ def decide_swap(
     # leak 1-2pp drift through small `min_improvement_pct` margins.
     if hyst_cfg.get("enabled", True):
         min_improvement = hyst_cfg.get("min_improvement_pct", 3)
-        active_eff = _account_effective_pct(active_acct, config)
-        target_eff = _account_effective_pct(state["accounts"][target.name], config)
-        if target_eff > active_eff - min_improvement:
-            msg = (
-                f"ladder swap suppressed: target {target.name} at "
-                f"{target_eff:.1f}% would not improve on active {current} at "
-                f"{active_eff:.1f}% by min_improvement_pct={min_improvement}pp "
-                f"(picker reason: {target.reason})"
-            )
+        # G5 (capacity-aware spec 2026-07-10): gate-on, "must improve" is judged
+        # in reference units — HOLD iff `target_units − active_units <
+        # min_improvement/100` (min_improvement_pct is percent points, so /100
+        # puts it on the units scale: default 3 → 0.03u). A move to a bigger-tier
+        # account with more absolute headroom is a genuine improvement even at a
+        # higher raw percent (active 5x@71% has 0.29u; idle 20x@75% has 1.0u, so
+        # gate-on proceeds where gate-off holds). The diagnostic logs the units
+        # comparison gate-on — the percent numbers would not be what held it.
+        if _cap_on:
+            active_metric = _remaining_units(_account_effective_pct(active_acct, config), current, _cap_ctx, config)
+            target_metric = _remaining_units(_account_effective_pct(state["accounts"][target.name], config), target.name, _cap_ctx, config)
+            insufficient = target_metric - active_metric < min_improvement / 100.0
+        else:
+            active_metric = _account_effective_pct(active_acct, config)
+            target_metric = _account_effective_pct(state["accounts"][target.name], config)
+            insufficient = target_metric > active_metric - min_improvement
+        if insufficient:
+            if _cap_on:
+                msg = (
+                    f"ladder swap suppressed: target {target.name} at "
+                    f"{target_metric:.2f}u would not improve on active {current} at "
+                    f"{active_metric:.2f}u by min_improvement={min_improvement / 100.0:.2f}u "
+                    f"(picker reason: {target.reason})"
+                )
+            else:
+                msg = (
+                    f"ladder swap suppressed: target {target.name} at "
+                    f"{target_metric:.1f}% would not improve on active {current} at "
+                    f"{active_metric:.1f}% by min_improvement_pct={min_improvement}pp "
+                    f"(picker reason: {target.reason})"
+                )
             click.echo(f"  {msg}")
             _note("min_improvement_gate", "hold", msg)
             return None
@@ -7626,12 +8298,32 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     # piling every lane onto the single burn-soon magnet (the rayi5→rayi4 pile-up).
     base_lane_load: dict[str, int] = {a: len(s) for a, s in occupied.items()}
 
+    # Capacity-aware (G2 fan-out threading, capacity-aware spec 2026-07-10):
+    # gate-on, the fan-out re-pick's "would it immediately re-trip" health check
+    # is judged in reference units per lane, so thread the candidate name + a
+    # fleet ctx directly into `_target_would_immediately_re_trip` at that call
+    # site. This is the only ctx threading this task does outside the
+    # picker/decide_swap fresh-build fallback; the full stash cadence (incl.
+    # claim-aware lane counts) is Task 5. Built only gate-on so gate-off is
+    # bit-for-bit (no credential/occupancy reads on the default path).
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = _capacity_ctx(state, config) if _cap_on else None
+
     def _cur_lane_load() -> dict[str, int]:
         """account → lanes it will back = pre-existing live lanes + moves already
         queued onto it THIS cycle. Recomputed per pick so each successive fan-out
         re-pick sees the accreting load and steers to a fresh account."""
         names = set(base_lane_load) | set(round_claims)
         return {a: base_lane_load.get(a, 0) + round_claims.get(a, 0) for a in names}
+
+    def _stash_cap_ctx(shim: dict) -> None:
+        """Stash the fleet capacity ctx onto `shim` with THIS pick's CLAIM-AWARE
+        lane counts (base occupancy + this-round claims from _cur_lane_load), so
+        the picker/decide_swap read fresh lane loads and never stale claim counts
+        (capacity-aware spec 2026-07-10, Task 5 stash cadence — pop/rebuild every
+        time _lane_load is refreshed). Gate-off (_cap_ctx is None): no-op."""
+        if _cap_ctx is not None:
+            shim["_capacity_ctx"] = {**_cap_ctx, "lane_load_by_name": shim.get("_lane_load", {})}
 
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
     # — dropped here so a group whose slots are all locked never burns a
@@ -7668,6 +8360,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # decide_swap → pick_swap_target) penalizes an account already backing
         # lanes and prefers a distinct empty one.
         shim["_lane_load"] = _cur_lane_load()
+        _stash_cap_ctx(shim)
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
         effective_pool = pool
@@ -7760,9 +8453,12 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 # Anti-cluster: the re-pick sees the accreting lane-load too, so it
                 # steers to a fresh account rather than the loaded magnet.
                 shim2["_lane_load"] = _cur_lane_load()
+                _stash_cap_ctx(shim2)
                 retry = pick_swap_target(shim2, cfg_view)
                 retry_healthy = retry is not None and not _target_would_immediately_re_trip(
-                    state.get("accounts", {}).get(retry.name, {}), cfg_view)
+                    state.get("accounts", {}).get(retry.name, {}), cfg_view,
+                    name=(retry.name if _cap_on else None),
+                    ctx=(shim2.get("_capacity_ctx") if _cap_on else None))
                 # Anti-clustering HOLD (2026-07-06 rayi5→rayi4 pile-up). The #109
                 # pool double-book below is what lets several lanes STACK onto one
                 # burn-soon account in a single cycle (4 mounts on 3 families → the
@@ -7938,6 +8634,12 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
     # committed onto it — the exact GH #104 clobber the pool exists to prevent
     # (execution refuses the 2nd, but noisily, and the lane is stranded anyway).
     round_claims: dict[str, int] = {}
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): build one fleet ctx
+    # for the reactive escape picks; each per-slot shim gets it re-stashed with
+    # THIS slot's claim-aware lane counts below. Built only gate-on so gate-off
+    # stays bit-for-bit.
+    _cap_on_ps = _capacity_gate_on(config)
+    _cap_ctx_ps = _capacity_ctx(state, config) if _cap_on_ps else None
     for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
@@ -7978,6 +8680,11 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         occ_now = occupied_slot_accounts(state)
         shim["_lane_load"] = {a: len(occ_now.get(a, [])) + round_claims.get(a, 0)
                               for a in set(occ_now) | set(round_claims)}
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): re-stash the ctx
+        # with this slot's claim-aware lane counts so the escape pick ranks in
+        # reference units and the unsafe-target veto below judges health in units.
+        if _cap_ctx_ps is not None:
+            shim["_capacity_ctx"] = {**_cap_ctx_ps, "lane_load_by_name": shim["_lane_load"]}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
         # a premium slot's may not.
@@ -7990,8 +8697,15 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
                        "event retained for the next cycle and SOS will surface capacity")
             continue
         target_acct = state.get("accounts", {}).get(target.name, {})
+        # Post-merge (reactive self-heal PR): the picked target is vetted for
+        # immediate re-trip. Thread name+ctx so gate-on this veto is the per-lane
+        # UNITS health line — else reactive refuses a healthy idle 20x@75% by raw
+        # percent and HOLDs the lane on a capped account (capacity-aware 2026-07-10).
         if (target_acct.get("token_expired") or target_acct.get("poll_error")
-                or _target_would_immediately_re_trip(target_acct, pool_config)
+                or _target_would_immediately_re_trip(
+                    target_acct, pool_config,
+                    name=(target.name if _cap_on_ps else None),
+                    ctx=(shim.get("_capacity_ctx") if _cap_on_ps else None))
                 or "[DEGRADED:" in target.reason):
             retry_entries.extend(slot_to_entries[slot_name])
             click.echo(f"  reactive-429 on {slot_name}: HOLDING on '{acct}' — refusing unsafe "
@@ -8375,8 +9089,14 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         global_decision = None
     else:
         shared_excl = slot_accts | {m["to"] for m in slot_moves}
-        global_decision = decide_swap(
-            _state_excluding_accounts(state, shared_active, shared_excl), config, usage_by_account, {})
+        _bare_decide_state = _state_excluding_accounts(state, shared_active, shared_excl)
+        if _capacity_gate_on(config):
+            # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): stash a
+            # fresh ctx onto the (shallow-copied) shim, never the raw state, so
+            # the shared-mount decision runs in reference units. {**...} always
+            # copies, so this can't mutate the daemon's persistent state.
+            _bare_decide_state = {**_bare_decide_state, "_capacity_ctx": _capacity_ctx(state, config)}
+        global_decision = decide_swap(_bare_decide_state, config, usage_by_account, {})
 
     # Persist usage + 429 watermark BEFORE acting (crash-safe ordering).
     save_state(state)
@@ -9897,7 +10617,7 @@ def _diagnose_stuck_lanes(state: dict, config: dict) -> list[SOSCondition]:
     return out
 
 
-def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
+def _premium_target_loss_reason(name: str, acct: dict, config: dict, ctx: dict | None = None) -> str:
     """Human label for WHY a reachable account is NOT a valid premium swap target.
 
     Used only to name the LOST capacity in the pre-emptive headroom SOS
@@ -9928,12 +10648,19 @@ def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
     est = _account_estimated_effective_pct(acct, config)
     if est >= config.get("never_swap_to_pct", 100):
         return f"SATURATED ({est:.0f}%)"
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): with a fleet ctx
+    # from the diagnose caller, the 7d cap (G9 SOS labeller) and the ladder step
+    # (G2, via _target_would_immediately_re_trip) are judged in reference units,
+    # so the label never disagrees with the gate-on eligibility verdict. ctx=None
+    # keeps the percent path (single-account tooling).
+    _cap = _capacity_gate_on(config) and ctx is not None
     hard_7d = _hard_7d_cap_for_config(config)
-    if acct.get("current_7d_pct", 0) >= hard_7d:
-        return f"over 7d cap ({acct.get('current_7d_pct', 0):.0f}% ≥ {hard_7d:.0f}%)"
+    cur_7d = acct.get("current_7d_pct", 0)
+    if (_remaining_units(cur_7d, name, ctx, config) <= (100.0 - hard_7d) / 100.0) if _cap else (cur_7d >= hard_7d):
+        return f"over 7d cap ({cur_7d:.0f}% ≥ {hard_7d:.0f}%)"
     if _max_model_weekly_from_acct(acct, config) >= _model_weekly_target_cap_for_config(config):
         return "over per-model weekly cap"
-    if _target_would_immediately_re_trip(acct, config):
+    if _target_would_immediately_re_trip(acct, config, name=name, ctx=(ctx if _cap else None)):
         eff = _account_effective_pct(acct, config)
         return f"at ladder step ({eff:.0f}% ≥ {acct.get('next_swap_at_pct', 50):.0f}%)"
     return "unavailable"
@@ -9960,6 +10687,12 @@ def _candidate_is_valid_premium_target(
     shim = dict(state)
     shim["accounts"] = {leaver: accounts[leaver], candidate: accounts[candidate]}
     shim["active"] = leaver
+    if _capacity_gate_on(premium_config):
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): the picker must
+        # judge this candidate in reference units (G2, formula 2). Build the ctx
+        # from the FULL fleet state so reference_x / lane counts are fleet-wide,
+        # not the two-account shim.
+        shim["_capacity_ctx"] = _capacity_ctx(state, premium_config)
     tgt = pick_swap_target(shim, premium_config)
     if tgt is None:
         return False
@@ -10068,6 +10801,9 @@ def _diagnose_premium_headroom(
     #    becomes a usable target and it alone (with over-cap/blocked candidates) can
     #    still produce the URGENT line.
     premium_config = _config_for_pool(config, "premium")
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): a fresh fleet ctx
+    # so the lost-capacity labeller names caps in reference units. Gate-off: None.
+    _cap_ctx_ph = _capacity_ctx(state, premium_config) if _capacity_gate_on(config) else None
     disabled = _disabled_accounts(config)   # operator-parked: never a target, not lost capacity
     valid_targets: list[str] = []       # fresh, below every cap → clean swap
     stale_refreshable: list[str] = []   # idle token_stale, below caps → refresh-on-swap
@@ -10102,12 +10838,12 @@ def _diagnose_premium_headroom(
             if is_valid:
                 stale_refreshable.append(name)
             else:
-                lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+                lost.append(f"{name} {_premium_target_loss_reason(name, acct, config, ctx=_cap_ctx_ph)}")
             continue
         if is_valid:
             valid_targets.append(name)
         else:
-            lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+            lost.append(f"{name} {_premium_target_loss_reason(name, acct, config, ctx=_cap_ctx_ph)}")
 
     n_lanes = len(premium_lanes)
     m = len(valid_targets)           # FRESH, below-cap targets (drive the existing tiers)
@@ -10387,6 +11123,11 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             {shared_active} if (config.get("mode") == "hybrid" and shared_active) else set())
         sat_pct = config.get("usage_growth_gate", {}).get("saturation_pct", 95)
         thr_cfg = config.get("thresholds", {})
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): a fleet ctx for
+        # the source-side lane precondition (formula 3) and the target-side picker
+        # shims (formula 2). Gate-off: None → percent path, bit-for-bit.
+        _cap_ctx_2b = _capacity_ctx(state, config) if _capacity_gate_on(config) else None
+        _steps_2b = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS
         for acct_name, slots in sorted(occupied.items()):
             acct = accounts.get(acct_name, {})
             if not is_valid(acct):
@@ -10398,7 +11139,15 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             if thr_cfg.get("seven_day", True):
                 cand.append(acct.get("current_7d_pct", 0))
             lane_pct = max(cand) if cand else 0
-            if lane_pct < lane_thr:
+            # G8 source-side (capacity-aware spec 2026-07-10, Task 5): "is this
+            # lane over its ladder step?" is formula 3 gate-on (G4's form), using
+            # the SAME sentinel-clamped next_swap_at G4 uses (≥100 → steps[-1]),
+            # so a healthy big-tier lane isn't falsely reported unable to rotate.
+            if _cap_ctx_2b is not None:
+                _clamped_lane_thr = _steps_2b[-1] if lane_thr >= 100 else lane_thr
+                if _remaining_units(lane_pct, acct_name, _cap_ctx_2b, config) > (100.0 - _clamped_lane_thr) / 100.0:
+                    continue  # lane still has unit headroom — nothing to rotate
+            elif lane_pct < lane_thr:
                 continue  # lane below its ladder step — nothing to rotate
             # Build the same shim decide_slot_swaps builds for this group:
             # active = the lane's own account, candidate pool minus every OTHER
@@ -10415,6 +11164,9 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             if drop:
                 shim["accounts"] = {n: a for n, a in accounts.items() if n not in drop}
             shim["active"] = acct_name
+            if _cap_ctx_2b is not None:
+                # Target-side (formula 2): the picker ranks in reference units.
+                shim["_capacity_ctx"] = _cap_ctx_2b
             pool = _slot_pool(state, sorted(slots)[0], config)
             tgt = pick_swap_target(shim, _config_for_pool(config, pool))
             starved = tgt is None or (
@@ -10839,6 +11591,21 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                     affected=name,
                 ))
             out = kept
+
+    # Capacity-aware fleet warnings (capacity-aware spec 2026-07-10; Task 3
+    # computes them, Task 5 wires them into the SOS cycle report). Gate-on only:
+    # reference-drift + sub-reference-account heads-up (warn-and-run). An
+    # INFO:-prefixed string (operator-disabled account) becomes a soft info line.
+    # affected="system", so the disabled-account suppression above never drops it.
+    if _capacity_gate_on(config):
+        for w in _capacity_warnings(state, config):
+            _info = w.startswith("INFO:")
+            out.append(SOSCondition(
+                severity="info" if _info else "warning",
+                summary=(w if len(w) <= 90 else w[:87] + "..."),
+                action=w,
+                affected="system",
+            ))
 
     return out
 
@@ -12958,14 +13725,28 @@ def check_rate_limit_reactive(state: dict, config: dict, entries: list | None = 
             except ValueError:
                 pass
 
-    target = pick_swap_target(state, config)
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): the global reactive
+    # escape ranks in reference units and vets its target's health in units. Build
+    # ctx on a LOCAL shim — the raw `state` handed in here must never carry ctx.
+    # Gate-off: _r_shim IS state, so behavior stays bit-for-bit.
+    _cap_on_r = _capacity_gate_on(config)
+    _cap_ctx_r = None
+    _r_shim = state
+    if _cap_on_r:
+        _cap_ctx_r = _capacity_ctx(state, config)
+        _r_shim = dict(state)
+        _r_shim["_capacity_ctx"] = _cap_ctx_r
+    target = pick_swap_target(_r_shim, config)
     if target is None:
         click.echo(f"  429 detected on {active} session {matched_session['session_id'][:8]} but no valid swap target")
         _finish([matched_session])
         return None
     target_acct = state.get("accounts", {}).get(target.name, {})
     if (target_acct.get("token_expired") or target_acct.get("poll_error")
-            or _target_would_immediately_re_trip(target_acct, config)
+            or _target_would_immediately_re_trip(
+                target_acct, config,
+                name=(target.name if _cap_on_r else None),
+                ctx=_cap_ctx_r)
             or "[DEGRADED:" in target.reason):
         click.echo(f"  429 detected on {active} but refusing unsafe target "
                    f"'{target.name}' ({target.reason}); event retained for retry")
@@ -13391,6 +14172,11 @@ def status(pretty: bool) -> None:
     first_step = cfg_steps[0] if cfg_steps else 50
     click.echo("Ladder steps: " + " → ".join(f"{s}%" for s in cfg_steps))
     click.echo()
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): display-only
+    # per-account tier + remaining reference units, so the operator can read the
+    # normalized fleet the router now decides on. Gate-off: no extra column.
+    _cap_on_st = _capacity_gate_on(config)
+    _cap_ctx_st = _capacity_ctx(state, config) if _cap_on_st else None
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 91)
     for name, a in sorted(state["accounts"].items()):
@@ -13400,7 +14186,13 @@ def status(pretty: bool) -> None:
                            for win, (e, rate) in row["est"].items())
         nxt_note = (f"  [next-swap: {row['next_swap_pct']:.0f}%]"
                     if row["next_swap_pct"] is not None else "")
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}")
+        cap_note = ""
+        if _cap_ctx_st is not None:
+            _cx = _cap_ctx_st.get("capacity_x_by_name", {}).get(name, _cap_ctx_st.get("reference_x", 1.0))
+            _ru = _remaining_units(max(a.get("current_5h_pct", 0), a.get("current_7d_pct", 0)),
+                                   name, _cap_ctx_st, config)
+            cap_note = f"  [{_cx:g}x, {_ru:.2f}u free]"
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}{cap_note}")
         # Stale/unknown per-model treatment lives in _fmt_model_pct; which
         # models to show and their order comes from _account_row.
         if row["per_model"]:
@@ -14304,7 +15096,14 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
         chosen_name = target
         reason = f"explicit (auto-swap {target})"
     else:
-        picked = pick_swap_target(state, config)
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): the auto-swap
+        # CLI pick ranks in reference units. Build ctx on a local shim so the raw
+        # state is never mutated; gate-off passes state directly (bit-for-bit).
+        _asc_state = state
+        if _capacity_gate_on(config):
+            _asc_state = dict(state)
+            _asc_state["_capacity_ctx"] = _capacity_ctx(state, config)
+        picked = pick_swap_target(_asc_state, config)
         if picked is None:
             click.echo("No valid swap target available. All non-current accounts are blocked.")
             click.echo("Run `cus sos` for diagnosis.")
@@ -15039,6 +15838,17 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
+        # capacity-aware spec 2026-07-10 (Normalization model, Phase 1): cache
+        # each JUST-polled account's parsed rate-limit tier alongside its usage
+        # update, so state.json's capacity_x tracks the SAME poll cadence as
+        # current_5h_pct/current_7d_pct instead of going stale. Local
+        # credentials-file read only (never HTTP) — the same freshest-wins
+        # chain _read_access_token_with_expiry already uses. Inert today:
+        # nothing yet reads the cached value (Phase 2 wires the gate-on
+        # consumers); warnings are discarded here on purpose (a later task
+        # folds them into SOS).
+        for _capx_name in usage_by_account:
+            _account_capacity_x(_capx_name, state, config)
         # Fix 4 (2026-07-07): cheap self-healing pass — un-stale every account the
         # poll just left token_stale (idle account, valid refresh token) via a
         # direct OAuth refresh grant. Keeps cus's readings correct and prevents the
@@ -15091,6 +15901,12 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # accounts from the candidate pool (no-op when there are no slots).
         trace: dict = {}
         decide_state = _state_excluding_accounts(state, state.get("active"), _live_slot_accounts(state))
+        if _capacity_gate_on(config):
+            # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): stash the
+            # ctx onto the shallow-copied decide shim (never the raw state), so
+            # the shared-mount decision AND the no-target diagnostic below both
+            # judge in reference units off the SAME ctx decide_swap used.
+            decide_state = {**decide_state, "_capacity_ctx": _capacity_ctx(state, config)}
         decision = decide_swap(decide_state, config, usage_by_account, trace)
 
         # Persist usage updates BEFORE acting on swap (so a crash during
@@ -15111,19 +15927,38 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             active_acct = state["accounts"][active]
             threshold = active_acct.get("next_swap_at_pct", THRESHOLD_STEPS[0])
             active_usage = usage_by_account.get(active)
-            wanted = (
-                active_usage is not None
-                and not active_usage.token_expired
-                and current_max_pct(active_usage, config) >= threshold
-            )
+            # G8 source-side (capacity-aware spec 2026-07-10, Task 5): the
+            # global-mode "threshold tripped" diagnostic asks "does the active
+            # account WANT to rotate?" Gate-on that is formula 3 (G4's form) —
+            # remaining units at/under the (sentinel-clamped) next_swap_at line —
+            # so a healthy big-tier active (20x@80%) is not falsely reported.
+            if _capacity_gate_on(config) and active_usage is not None:
+                _cap_ctx_oc = decide_state.get("_capacity_ctx") or _capacity_ctx(state, config)
+                _steps_oc = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS
+                _clamped_thr_oc = _steps_oc[-1] if threshold >= 100 else threshold
+                wanted = (
+                    not active_usage.token_expired
+                    and _remaining_units(current_max_pct(active_usage, config), active, _cap_ctx_oc, config)
+                    <= (100.0 - _clamped_thr_oc) / 100.0
+                )
+            else:
+                wanted = (
+                    active_usage is not None
+                    and not active_usage.token_expired
+                    and current_max_pct(active_usage, config) >= threshold
+                )
             if wanted:
                 # Distinguish "no target available" from "gate suppressed."
                 # The gate-suppression paths (growth gate, hysteresis) already
                 # logged their own reason inside decide_swap. We only print
                 # "no valid swap target" if pick_swap_target would also fail
                 # — otherwise we'd be misleading the operator about WHY the
-                # swap didn't fire. Bug fixed 2026-05-25 (GH #19).
-                if pick_swap_target(state, config) is None:
+                # swap didn't fire. Bug fixed 2026-05-25 (GH #19). Gate-on the
+                # re-pick runs on the SAME ctx-stashed decide_state decide_swap
+                # used, not raw state (capacity-aware spec 2026-07-10, Task 5);
+                # gate-off it stays raw `state`, bit-for-bit.
+                _diag_state = decide_state if _capacity_gate_on(config) else state
+                if pick_swap_target(_diag_state, config) is None:
                     click.echo(f"  threshold tripped on {active} ({current_max_pct(active_usage, config):.1f}% >= {threshold}%) but no valid swap target")
             for name, acct in state["accounts"].items():
                 marker = " *" if name == state["active"] else "  "
@@ -17599,8 +18434,14 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                 # genuinely-broken account is surfaced downstream (install-point /
                 # daemon SOS), not by refusing the launch here.
                 break
+            # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): build a
+            # fresh ctx AFTER the force-poll (so lane/tier reads reflect the fresh
+            # state) and thread name+ctx, so the re-check agrees with the picker —
+            # a fresh-polled idle 20x@80% is accepted, not walled by percent.
+            _cap_ctx_vp = _capacity_ctx(state, pool_config) if _capacity_gate_on(pool_config) else None
             saturated, why = _launch_candidate_saturated(
-                state.get("accounts", {}).get(cand, {}), pool_config)
+                state.get("accounts", {}).get(cand, {}), pool_config,
+                name=cand, ctx=_cap_ctx_vp)
             if not saturated:
                 break  # fresh reading confirms the candidate is genuinely clean
             # Stale-low → actually capped: reject it and re-pick without it.
