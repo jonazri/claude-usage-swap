@@ -15396,40 +15396,72 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     return ("ok", txt)
 
 
+def _account_family_conflict(name_a: str, name_b: str) -> bool:
+    """True only when two account names belong to DIFFERENT identity families.
+
+    Compares the two accounts' canonical oauthAccount identities. Returns True
+    iff they share comparable evidence (accountUuid/emailAddress) that DISAGREES.
+    Returns False when they match, when they are the same account, or when there
+    is no shared evidence to compare (can't say → don't override). This is the
+    cross-check that lets a NAME-based resolution (state.slots occupant or an
+    account-<name> dir) be overridden only by a genuinely foreign on-disk
+    identity, never by a mere pro/max sibling (which shares one identity)."""
+    if name_a == name_b:
+        return False
+    return _identities_match(_dir_identity(name_a), _dir_identity(name_b)) is False
+
+
 def _resolve_mount_account(mount: str | None, state: dict) -> tuple[str | None, str]:
     """Resolve a live mount's TRUE account + the evidence source used.
 
-    Ground-truth ladder for GH #137, strongest evidence first:
-      1. on-disk oauthAccount — the slot/account dir's .claude.json is what
-         Claude Code actually authenticates as, independent of BOTH sessions.log
-         (launch-time label) and state.slots (the daemon's record, which itself
-         lags an in-place move by up to a cycle). Reverse-mapped to an account
-         name via each account's canonical snapshot identity.
-      2. state.slots[mount].account — the daemon's recorded occupant, used when
-         the on-disk identity matches no known account (e.g. a pooled backup
-         login the snapshots don't cover).
-      3. account-<name> mount — a relogin-style launch where the dir IS the
-         account name.
+    Ground-truth ladder (GH #137; corrected 2026-07-12 sessions-view incident):
+      1. NAME evidence — for a slot mount, state.slots[mount].account (the
+         daemon's recorded occupant, which is the operational truth the daemon
+         acts on); for an account-<name> mount, the dir name itself. This is the
+         PRIMARY source because it is the ONLY evidence that disambiguates a
+         pro/max sibling pair (e.g. yaz-myjli-com vs yaz-myjli-com-max) and the
+         shared `default` account — all of which carry ONE identical
+         oauthAccount identity, so identity matching CANNOT tell them apart.
+      2. on-disk oauthAccount — a CROSS-CHECK only. It overrides the name
+         evidence solely when it names a DIFFERENT identity family (an in-place
+         /login of a foreign account into the slot, or a mislabeled account
+         dir); a same-family on-disk identity never displaces the recorded
+         sibling. Also the sole source when there is no name evidence at all.
+
+    The 2026-07-12 bug: this ladder previously tried on-disk identity FIRST for
+    every mount, and _account_for_mount_identity returns the FIRST account in
+    state["accounts"] whose identity matches. With sibling/`default` identity
+    collapse, that returned the wrong sibling for one slot and `default` (or
+    whatever sorts first) for every other slot sharing an identity — so distinct
+    slots all rendered as one account with one account's usage numbers.
 
     Returns (account_or_None, source) where source is one of
-    {"disk-identity", "state-slot", "account-dir", "unresolved"}.
+    {"state-slot", "account-dir", "disk-identity", "unresolved"}.
     """
     if not mount:
         return (None, "unresolved")
-    if mount.startswith("account-"):
-        # A relogin/login-mount launch: the dir name is the account. Still
-        # prefer the on-disk identity if it resolves (catches a mislabeled dir).
-        disk = _account_for_mount_identity(slot_path(mount), state)
-        if disk:
-            return (disk, "disk-identity")
-        return (mount.removeprefix("account-"), "account-dir")
-    # Slot mount: on-disk identity wins, else the daemon's recorded occupant.
     disk = _account_for_mount_identity(slot_path(mount), state)
-    if disk:
-        return (disk, "disk-identity")
+    if mount.startswith("account-"):
+        # A relogin/login-mount launch: the dir name IS the account. Trust it
+        # unless the on-disk identity resolves to a genuinely different family
+        # (a mislabeled dir); a same-family disk hit must not flip a sibling.
+        name = mount.removeprefix("account-")
+        if disk and _account_family_conflict(disk, name):
+            return (disk, "disk-identity")
+        return (name, "account-dir")
+    # Slot mount: the daemon's recorded occupant is the operational truth and the
+    # only evidence that disambiguates siblings/`default`. Keep it unless the live
+    # identity CONTRADICTS its family (a foreign account was mounted in place),
+    # in which case the record is stale and the on-disk identity wins.
     recorded = (state.get("slots", {}).get(mount, {}) or {}).get("account")
     if recorded:
+        if disk and _account_family_conflict(disk, recorded):
+            return (disk, "disk-identity")
         return (recorded, "state-slot")
+    # No recorded occupant (a slot the daemon hasn't claimed): fall back to the
+    # on-disk identity if it resolves.
+    if disk:
+        return (disk, "disk-identity")
     return (None, "unresolved")
 
 
@@ -15488,7 +15520,18 @@ def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[
         # resolved a real mount — a bare/global pane has no mount to compare and
         # "follows global creds" by design, which is not the #137 defect.
         logged = r.get("logged_account")
+        source = r.get("source", "unresolved")
         drift = bool(mount) and bool(resolved_account) and logged != resolved_account
+        # Two very different situations both trip `drift`, and they deserve
+        # different framing (2026-07-12): when the account came from the daemon's
+        # own record (state-slot / account-dir), a launch-label mismatch just
+        # means the lane was swapped AFTER this pane launched — expected, benign.
+        # When the on-disk identity had to OVERRIDE the record (disk-identity on
+        # a real mount), a foreign account was mounted in place — the genuine
+        # alarm case. `bare/unresolved` never drifts.
+        drift_kind = None
+        if drift:
+            drift_kind = "identity-clobber" if source == "disk-identity" else "lane-moved"
 
         rows.append({
             "session_id": r.get("session_id"),
@@ -15500,8 +15543,9 @@ def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[
             "pool": pool,
             "logged_account": logged,
             "account": resolved_account,
-            "resolution_source": r.get("source", "unresolved"),
+            "resolution_source": source,
             "drift": drift,
+            "drift_kind": drift_kind,
             "five_h_pct": acct.get("current_5h_pct"),
             "seven_d_pct": acct.get("current_7d_pct"),
             "per_model_weekly": dict(acct.get("per_model_weekly_pct") or {}),
@@ -15610,8 +15654,17 @@ def sessions_cmd(as_json: bool) -> None:
                 acct = f"{acct} {click.style('[disabled]', fg='yellow')}"
             # Line 1: identity + where mounted.
             drift_tag = ""
-            if r["drift"]:
-                drift_tag = click.style(f"  DRIFT: sessions.log said '{r['logged_account']}'", fg="red", bold=True)
+            if r["drift"] and r.get("drift_kind") == "identity-clobber":
+                # The on-disk identity had to override the daemon's record — a
+                # foreign account is mounted in place. This is the real alarm.
+                drift_tag = click.style(
+                    f"  DRIFT: on-disk identity is '{r['account']}', not launch label '{r['logged_account']}'",
+                    fg="red", bold=True)
+            elif r["drift"]:
+                # Benign: the lane was swapped after this pane launched, so its
+                # sessions.log label is simply out of date. Informational only.
+                drift_tag = click.style(
+                    f"  (launched as '{r['logged_account']}' — lane moved since)", fg="yellow")
             click.echo(f"  {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
             # Line 2: usage numbers.
             five = "?" if r["five_h_pct"] is None else f"{r['five_h_pct']:.0f}%"
