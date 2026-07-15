@@ -22049,6 +22049,286 @@ def _pressure_shadow_decayed_step(state: dict, config: dict, now) -> dict:
     return out
 
 
+_PRESSURE_ELASTIC_CLASSES = ("workflow", "committee-loop", "subagent-heavy")
+"""The classes §5.2 allows as targeting candidates -- "Never interactive
+human-paced sessions" (and never `idle`, which has nothing to shed)."""
+
+_PRESSURE_DEFAULT_ELASTICITY_WEIGHTS = {
+    "subagent-heavy": 1.0,
+    "workflow": 0.9,
+    "committee-loop": 0.8,
+}
+"""Default per-class elasticity weights (Task 24) -- not pinned by the
+design doc; a documented, defensible, config-overridable default
+(`config.pressure.elasticity_weights`) ranking `subagent-heavy` work (most
+throttleable -- a coordinator can simply run fewer/cheaper subagents)
+above generic `workflow` above `committee-loop` (most disruptive to
+interrupt mid-round). Same "documented, defensible choice" precedent as
+Task 12's `_CLASSIFY_HIGH_RATE_PCT_PER_MIN`."""
+
+
+def _pressure_elasticity_weight(cls: str, config: dict) -> float:
+    """Per-class elasticity weight used to rank candidates (§5.2: "Rank by
+    contribution x elasticity_weight descending")."""
+    weights = (config or {}).get("pressure", {}).get(
+        "elasticity_weights", _PRESSURE_DEFAULT_ELASTICITY_WEIGHTS
+    )
+    return float(weights.get(cls, _PRESSURE_DEFAULT_ELASTICITY_WEIGHTS.get(cls, 0.0)))
+
+
+def _pressure_session_contribution(
+    session: dict, binding: dict, accounts_block: dict, reference_x: float
+) -> float:
+    """A session's §5.3 "contribution" to the bound breach, in the bound
+    view's own natural unit -- the SAME quantity used for both the §5.2
+    floor/rank test and the §5.3 sizing walk (Task 24 design decision: one
+    unified quantity, not a separate share-for-filtering vs
+    contribution-for-sizing pair).
+
+    - ``view == "account"``: the session's own %/min rate scaled by its
+      share of burn ON that one bound account
+      (``rate * account_shares[bound_acct]``) -- directly comparable to the
+      account's own ``required_reduction_pct_per_min`` (same %/min unit).
+    - ``view == "pool"``: the ROTATABLE share only, summed over EVERY
+      account the session rotated across (FACT #5) --
+      ``Σ_acct (rate * account_shares[acct] / 100) * capacity_x_acct /
+      reference_x``, i.e. each account's %/min contribution converted to
+      reference units/min via the exact same `_pressure_burn_units`
+      ratio-normalization Task 2 already established, then summed.
+    """
+    rate = float(session.get("rate") or 0.0)
+    shares = session.get("account_shares") or {}
+    view = binding.get("view")
+    if view == "account":
+        bound_acct = binding.get("name")
+        return rate * float(shares.get(bound_acct, 0.0))
+    if view == "pool":
+        total = 0.0
+        for acct_name, share in shares.items():
+            acct = accounts_block.get(acct_name) or {}
+            capacity_x = acct.get("capacity_x")
+            if capacity_x is None:
+                continue
+            ratio = float(capacity_x) / float(reference_x) if reference_x else 0.0
+            share_pct_per_min = rate * float(share)
+            total += _pressure_burn_units(share_pct_per_min, ratio)
+        return total
+    return 0.0
+
+
+def _pressure_dry_run_candidates(
+    sessions: list[dict], binding: dict, accounts_block: dict, reference_x: float, config: dict
+) -> list[dict]:
+    """§5.2 candidate filter + contribution/rank annotation, sorted
+    descending by ``contribution * elasticity_weight`` with the
+    deterministic near-tie break: higher raw pool-unit/`%`-per-min
+    ``contribution`` first, then ``session_id`` lexical (NO LLM, no
+    randomness, no dict/set-iteration dependence -- both tie-break keys are
+    plain value comparisons over a list already sorted by `session_id` on
+    input, so ties resolve identically across repeated calls).
+
+    Filter (§5.2): class in {workflow, committee-loop, subagent-heavy} AND
+    (contribution >= share_floor_pct OR trend == "rising"). NEVER
+    `interactive`, never `idle`.
+    """
+    share_floor_pct = float(
+        (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
+    )
+    out = []
+    for session in sorted(sessions, key=lambda s: s.get("session_id", "")):
+        cls = session.get("class")
+        if cls not in _PRESSURE_ELASTIC_CLASSES:
+            continue
+        contribution = _pressure_session_contribution(
+            session, binding, accounts_block, reference_x
+        )
+        trend = session.get("trend")
+        if contribution < share_floor_pct and trend != "rising":
+            continue
+        elasticity_weight = _pressure_elasticity_weight(cls, config)
+        out.append(
+            {
+                "session_id": session.get("session_id"),
+                "class": cls,
+                "trend": trend,
+                "contribution": contribution,
+                "elasticity_weight": elasticity_weight,
+            }
+        )
+    return _pressure_rank_candidates(out)
+
+
+def _pressure_rank_candidates(candidates: list[dict]) -> list[dict]:
+    """Deterministic §5.2 rank order, applied defensively regardless of
+    input order: ``contribution * elasticity_weight`` descending, near-tie
+    break by higher raw ``contribution`` then ``session_id`` lexical (NO
+    LLM, no randomness) -- shared by `_size_reduction_walk` here and by
+    Task 25's per-floor-step re-filter/re-rank passes."""
+    return sorted(
+        candidates,
+        key=lambda c: (
+            -(c["contribution"] * c["elasticity_weight"]),
+            -c["contribution"],
+            c["session_id"],
+        ),
+    )
+
+
+def _size_reduction_walk_pass(
+    candidates: list[dict], required: float, safety_factor: float, floor: float
+) -> dict:
+    """The base single-floor §5.3 sizing walk (Task 24) -- rank
+    ``candidates`` deterministically (`_pressure_rank_candidates`, applied
+    regardless of input order) and walk them in that order, accumulating
+    ``contribution``, STOPPING the instant ``planned_shed >= required *
+    safety_factor`` (§5.3's own stopping rule). ``floor`` is recorded on
+    the plan so Task 25's critical descent can report which floor step a
+    pass ran at, but this base pass does not itself re-filter candidates by
+    floor -- that filtering already happened in `_pressure_dry_run_candidates`
+    (or, for a per-floor-step re-filter, whatever Task 25 hands in).
+
+    Returns the raw walk result (`targets`/`planned_shed`/`met`), never the
+    escalate/reason framing -- that is `_size_reduction_walk`'s job, so
+    Task 25 can re-run this same pass at successive floor steps without
+    duplicating the escalate decision.
+    """
+    threshold = required * safety_factor
+    targets: list[dict] = []
+    planned_shed = 0.0
+    for candidate in _pressure_rank_candidates(candidates):
+        if planned_shed >= threshold:
+            break
+        targets.append(candidate)
+        planned_shed += candidate["contribution"]
+    return {
+        "targets": targets,
+        "planned_shed": planned_shed,
+        "met": planned_shed >= threshold,
+        "floor": floor,
+    }
+
+
+def _size_reduction_walk(
+    candidates: list[dict], required: float, safety_factor: float, config: dict
+) -> dict:
+    """Task 24's base single-floor sizing walk (Task 25 extends this same
+    helper with the critical `[15,10,5,2.5]` descent per finding 12 --
+    `_size_reduction_walk_pass` above is already factored out so that
+    extension re-runs the pass at successive floors without a rewrite).
+
+    ``candidates`` must already be filtered/ranked (§5.2) -- this function
+    only performs the §5.3 accumulate-and-stop walk plus the §5.4
+    met/escalate framing. Meetable: ``met=True, escalate=False``.
+    Unmeetable (candidates exhausted before reaching the threshold, or an
+    empty candidate set on a real ``required > 0``): ``met=False,
+    escalate=True`` with a non-empty ``reason`` -- never a vacuous empty
+    plan that silently "clears" a real breach (§5.4).
+    """
+    share_floor_pct = float(
+        (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
+    )
+    result = _size_reduction_walk_pass(candidates, required, safety_factor, share_floor_pct)
+    threshold = required * safety_factor
+    if result["met"]:
+        return {
+            "targets": result["targets"],
+            "planned_shed": result["planned_shed"],
+            "met": True,
+            "escalate": False,
+            "reason": None,
+        }
+    reason = (
+        f"unmeetable: {len(candidates)} elastic candidate(s) shed "
+        f"{result['planned_shed']:.4g} of required {threshold:.4g} "
+        f"(required={required:.4g} x safety_factor={safety_factor:.4g})"
+    )
+    return {
+        "targets": result["targets"],
+        "planned_shed": result["planned_shed"],
+        "met": False,
+        "escalate": True,
+        "reason": reason,
+    }
+
+
+def dry_run_target(pressure_state: dict, config: dict) -> dict:
+    """Task 24: the zero-token, fully deterministic "would-have-asked"
+    targeting plan (design doc §5.2 candidate walk + §5.3 sizing bridge),
+    consuming an already-published Task-20 `_pressure_snapshot`-shaped
+    dict. Read-only/pure (G0): never calls `save_state`, never mutates
+    `pressure_state` in place.
+
+    No breach (``binding is None``) is trivially met -- there is nothing to
+    target, which is NOT the §5.4 vacuous-clear case (that case is a REAL
+    breach with an empty/insufficient candidate set, handled below via
+    `_size_reduction_walk`'s own escalate path).
+
+    A level-bound Fable-weekly critical (design doc §3 Outputs) IS a real
+    breach, but §5.4 says it "skips §5.2/§5.3 sizing" for a qualitative
+    Fable->Sonnet downshift ask a later task builds -- NOT built here, so
+    this always escalates rather than defaulting `required` to 0 and
+    vacuously clearing a real breach.
+    """
+    safety_factor = float(pressure_state.get("safety_factor", 1.0))
+    binding = pressure_state.get("binding")
+    if binding is None:
+        return {
+            "targets": [],
+            "planned_shed": 0.0,
+            "required": 0.0,
+            "safety_factor": safety_factor,
+            "met": True,
+            "escalate": False,
+            "reason": None,
+        }
+
+    if binding.get("constraint") == "fable_weekly":
+        return {
+            "targets": [],
+            "planned_shed": 0.0,
+            "required": 0.0,
+            "safety_factor": safety_factor,
+            "met": False,
+            "escalate": True,
+            "reason": (
+                "fable_weekly level-bound critical: §5.4 skips §5.2/§5.3 "
+                "sizing for a qualitative Fable->Sonnet downshift ask "
+                "(not built) -- escalating rather than vacuously clearing"
+            ),
+        }
+
+    accounts_block = pressure_state.get("accounts", {})
+    reference_x = float(pressure_state.get("reference_x", 1.0))
+    view = binding.get("view")
+    window = binding.get("window")
+    if view == "account":
+        acct = accounts_block.get(binding.get("name"), {})
+        required = float(
+            acct.get(window, {}).get("required_reduction_pct_per_min", 0.0)
+        )
+    elif view == "pool":
+        pool_block = pressure_state.get("pool", {})
+        required = float(
+            pool_block.get(window, {}).get("required_reduction_units_per_min", 0.0)
+        )
+    else:
+        required = 0.0
+
+    candidates = _pressure_dry_run_candidates(
+        pressure_state.get("sessions", []), binding, accounts_block, reference_x, config
+    )
+    walk = _size_reduction_walk(candidates, required, safety_factor, config)
+    return {
+        "targets": walk["targets"],
+        "planned_shed": walk["planned_shed"],
+        "required": required,
+        "safety_factor": safety_factor,
+        "met": walk["met"],
+        "escalate": walk["escalate"],
+        "reason": walk["reason"],
+    }
+
+
 def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now) -> dict:
     """The shadow-log record for one cycle (Task 23) -- the STAGE-1 data
     source the eventual calibration reads.
