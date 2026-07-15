@@ -6506,6 +6506,159 @@ def _partition_burn(attribution_table: AttributionTable, state: dict,
     return PartitionedTable(pinned_by_account, rotatable_by_account, per_session)
 
 
+# --------------------------------------------------------------------------
+# Task 12 (spec-2 token-pressure forecaster, STAGE 1, Phase D): per-session
+# trailing burn RATE + trend/acceleration + deterministic session class
+# (§3 "Per-session trailing rate" / "Classification", §5.2 targeting walk).
+# --------------------------------------------------------------------------
+
+_CLASSIFY_IDLE_RATE_EPS = 0.01  # pct_per_min; at/below this reads as idle
+_CLASSIFY_HIGH_RATE_PCT_PER_MIN = 5.0  # sustained rate a human typing could not plausibly produce
+
+
+def _session_rate(weighted_samples: list[float], session_age_s: float,
+                   rate_window_min: float) -> float:
+    """Task 12 (§3 "Per-session trailing rate"): one session's trailing burn
+    rate in pct_per_min, over a window that ADAPTS to the session's own age
+    so a brand-new session isn't divided by a window it hasn't lived through
+    yet, and a long-lived session isn't averaged over its entire history
+    (which would hide a recent throttle's effect for hours -- the design
+    doc's rationale: the compliance check, ~2 daemon cycles / 20 min later,
+    must actually *see* a throttle take effect).
+
+    ``window_s = max(60, min(session_age_s, rate_window_min*60))``:
+      - floored at 60s so a seconds-old session never extrapolates a tiny
+        sample to an absurd %/min;
+      - capped at ``rate_window_min*60`` (default 10 min = 600s) so a
+        long-lived session's rate stays a TRAILING window, not a
+        since-launch average;
+      - between the two, a mid-age session (e.g. 5 min old) is divided by
+        its own actual age -- a 5-min-old workflow at 80% of true burn
+        isn't divided by 30 min and hidden (design doc §3).
+
+    ``weighted_samples`` are this window's already-burn-weighted values
+    (same scale ``_message_burn_units``/``_attribute_burn`` produce, Task
+    11) -- this function only sums and normalizes to a per-minute rate; it
+    does not itself weight or attribute anything.
+
+    ATTRIBUTION-SHARE ONLY (design doc §3 parenthetical): this rate feeds
+    per-session attribution shares and targeting candidacy (§5.2) ONLY --
+    the forecast itself stays on cus's own coarse per-account
+    ``current_%``/``burn_rate_*_pct_per_min`` from ``state.json``, never
+    this.
+    """
+    window_s = max(60.0, min(float(session_age_s), float(rate_window_min) * 60.0))
+    return sum(weighted_samples) / (window_s / 60.0)
+
+
+def _trend_class(rate_history: list[float], accel_thresh: float) -> str:
+    """Task 12 (§3 "trend/acceleration signal"): classify a session's
+    trailing-rate history (oldest-first, ~1h of ``_session_rate`` points at
+    the caller's own recompute cadence -- this function is spacing-agnostic,
+    it only looks at successive samples) as ``"rising"``, ``"falling"``, or
+    ``"steady"``.
+
+    Design doc §3: a *fast-ramping* session is the MOST worth an early
+    "cap fan-out" ask, not the least -- so this looks at ACCELERATION (the
+    second derivative), not just the sign of the rate's slope: a session
+    steadily burning at a high but constant rate is "steady", not "rising".
+
+    Acceleration is the discrete second difference
+    ``rate[i+1] - 2*rate[i] + rate[i-1]``, averaged over every consecutive
+    triplet in ``rate_history``. Mean acceleration ``> +accel_thresh`` ->
+    ``"rising"``; ``< -accel_thresh`` -> ``"falling"``; otherwise
+    ``"steady"``. Fewer than 3 points can't exhibit a second derivative at
+    all -> ``"steady"`` (conservative default, not enough data to flag
+    either way).
+    """
+    if len(rate_history) < 3:
+        return "steady"
+    accels = [
+        rate_history[i + 1] - 2 * rate_history[i] + rate_history[i - 1]
+        for i in range(1, len(rate_history) - 1)
+    ]
+    mean_accel = sum(accels) / len(accels)
+    if mean_accel > accel_thresh:
+        return "rising"
+    if mean_accel < -accel_thresh:
+        return "falling"
+    return "steady"
+
+
+def _in_worktree_cwd(cwd: str | None) -> bool:
+    """Task 12: whether ``cwd`` sits under a ``.worktrees/<child>`` (or bare
+    ``worktrees/<child>``) directory -- the parallel-worktree-per-agent
+    convention the design doc's Coordinator rollup section (§3, committee
+    #9) observed: a child agent's cwd is nested under the parent's own
+    worktree fan-out dir. ``None``/empty -> False (never guess)."""
+    if not cwd:
+        return False
+    parts = Path(cwd).parts
+    return "worktrees" in parts or ".worktrees" in parts
+
+
+def _classify_session(record: dict) -> str:
+    """Task 12 (§3 "Classification", deterministic heuristics; §5.2's
+    targeting candidate walk consumes this): ``"committee-loop"``,
+    ``"workflow"``, ``"subagent-heavy"`` (the ELASTIC/throttleable classes),
+    ``"interactive"`` (human-paced, NEVER a targeting candidate -- §5.2:
+    "Never interactive human-paced sessions"), or ``"idle"``.
+
+    ``record`` fields consumed (all optional; a session dict the caller
+    assembles from ``sessions.log`` (``cwd``, matching ``Interval.cwd`` /
+    ``build_session_rows``'s ``"cwd"``) plus this task's own rate output
+    plus Task 10's transcript-path layout (``_pressure_transcript_paths``,
+    FACT #6) -- deliberately NOT a coordinator-burn rollup, that's Task 13):
+      - ``rate_pct_per_min`` (float, this session's ``_session_rate()``
+        output)
+      - ``sample_count`` (int, # weighted burn samples seen in the rate
+        window -- distinct from a merely-stale-but-nonzero rate)
+      - ``cwd`` (str | None, ``sessions.log``'s ``cwd`` for this session)
+      - ``has_subagent_children`` (bool, this session's OWN project-slug dir
+        has nested ``<session_id>/subagents/agent-*.jsonl`` transcripts --
+        Task 10 FACT #6's path convention -- i.e. THIS session is itself
+        spawning subagents. A PRESENCE signal read off its own directory
+        layout, never a rollup of the children's burn.)
+      - ``has_workflow_children`` (bool, same but ``<session_id>/workflows/
+        *.jsonl``)
+
+    Heuristics, most-specific first, CONSERVATIVE by design (§5.2: a false
+    elastic label risks wrongly targeting a human, so an ambiguous/missing
+    signal falls back toward ``interactive``/``idle``, never toward an
+    elastic class):
+      1. ``idle`` -- no samples, or an (effectively) zero rate: nothing to
+         classify as either machine- or human-paced.
+      2. ``subagent-heavy`` -- ``has_subagent_children``: activity backed by
+         this session's own spawned subagents.
+      3. ``workflow`` -- ``has_workflow_children`` (no subagents
+         specifically): this session is running a workflow of its own.
+      4. ``committee-loop`` -- cwd sits under a ``.worktrees/<child>``
+         layout (``_in_worktree_cwd``): the parallel-worktree-per-agent
+         pattern.
+      5. ``workflow`` (generic-automation fallback) -- none of the
+         structural signals above are set, but the sustained rate itself
+         (``>= _CLASSIFY_HIGH_RATE_PCT_PER_MIN`` pct/min) is higher than a
+         human typing could plausibly sustain (design doc §3 lists "a high
+         sustained rate" itself among the elastic signals).
+      6. ``interactive`` -- the conservative default: real, sustained
+         activity with none of the above automation signals.
+    """
+    rate = float(record.get("rate_pct_per_min", 0.0) or 0.0)
+    sample_count = int(record.get("sample_count", 0) or 0)
+
+    if sample_count <= 0 or rate <= _CLASSIFY_IDLE_RATE_EPS:
+        return "idle"
+    if record.get("has_subagent_children"):
+        return "subagent-heavy"
+    if record.get("has_workflow_children"):
+        return "workflow"
+    if _in_worktree_cwd(record.get("cwd")):
+        return "committee-loop"
+    if rate >= _CLASSIFY_HIGH_RATE_PCT_PER_MIN:
+        return "workflow"
+    return "interactive"
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
