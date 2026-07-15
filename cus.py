@@ -7928,6 +7928,16 @@ def _safety_factor(residual_fraction: float, condition_number: float, cfg: dict)
 
 PRESSURE_JSON = ACCOUNTS_DIR / "pressure.json"
 
+# Task 23 (STAGE 1): root of every pressure-owned artifact that is NOT
+# pressure.json itself -- the shadow log (`_shadow_log`) and the cus-side
+# last-emit hysteresis registry (`_pressure_last_emit_path`). Same direct-
+# monkeypatch precedent as `PRESSURE_JSON` (an import-time constant a test
+# repoints wholesale, e.g. `monkeypatch.setattr(cus, "PRESSURE_ROOT", tmp)`)
+# rather than the `_swap_lock_path()`-style call-time function -- both
+# precedents already coexist in this file; this one is chosen for
+# consistency with `PRESSURE_JSON`, the other pressure-owned path.
+PRESSURE_ROOT = ACCOUNTS_DIR / "pressure"
+
 _PRESSURE_SESSION_ROW_KEYS = (
     "session_id", "account_shares", "model", "fable_share", "pane", "socket",
     "cwd", "class", "rate", "trend", "coordinator_of",
@@ -21599,6 +21609,637 @@ def pressure_cmd(as_json: bool) -> None:
         return
 
     _render_pressure_table(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Task 23 (spec-2 token-pressure forecaster, STAGE 1): the daemon's per-cycle
+# counterpart to `pressure_cmd` (Task 21) -- shadow-mode logging harness
+# (observe + log, never emit/act by default) plus the cus-side half of §4's
+# two-place emit hysteresis. Three named interfaces: `_pressure_cycle`,
+# `_pressure_emit_decision`, `_shadow_log`. Everything else below is
+# implementation support these three need but that no earlier task pins an
+# interface for (the emit-hysteresis key convention, the §4 payload builder,
+# the cross-cycle last-emit registry, the Stage-1 emit/marker choke-points,
+# and the blindness-fallback supply partition -- the USER-APPROVED safety
+# addition).
+# ---------------------------------------------------------------------------
+
+# Caller-owned, in-memory-only transcript-offset registry (Task 10's own
+# contract, applied at the daemon-process level): `_pressure_cycle` reads
+# and advances this IN PLACE via `_read_active_tails(..., persist=True)`.
+# There is no on-disk offsets store in Stage 1 -- a daemon restart is a
+# genuine cold start (blindness=True until the reader catches back up),
+# which is the correct, honest behavior (Task 19), not a bug to work around.
+_PRESSURE_TAIL_OFFSETS: dict[Path, int] = {}
+
+_PRESSURE_LEVEL_RANK = {"ok": 0, "elevated": 1, "critical": 2}
+
+
+def _pressure_supply_partition(state: dict, config: dict, now) -> "_PressureSupplyPartition":
+    """Build the blindness-fallback partition (see `_PressureSupplyPartition`
+    below) from `state`'s COARSE per-account rate fields
+    (`burn_rate_5h_pct_per_min`/`burn_rate_7d_pct_per_min` -- populated by
+    `_compute_burn_rate` at every poll, attribution-independent: no
+    transcript reads at all), converted to reference units/min via the SAME
+    pure `_pressure_acct_ratio`/`_pressure_burn_units` building blocks the
+    real attributed path uses (never a parallel ad-hoc conversion).
+
+    USER-APPROVED ADDITION (safety, carried forward from Task 19/20's own
+    review): under cold-start `attribution["blindness"]`, the real
+    per-message attributed partition (`_partition_burn`) is built from a
+    starved/absent read window and UNDERSTATES burn -- forecasting off it
+    would publish an artificially long, unsafe ETA. This coarse fallback
+    treats the account's ENTIRE observed burn as PINNED (conservative: the
+    real partition's rotatable/pinned split is exactly the information
+    blindness says we don't trust yet) -- `rotatable_burn_units` is always
+    0, so the pool math never credits this coarse burn as reducible/
+    rotatable demand, staying at least as conservative as the real
+    partition would be. `now` accepted for call-shape symmetry with the
+    rest of the Phase-D pipeline (a rate needs no timestamp of its own).
+    Read-only (G0): reads `state`, mutates nothing.
+    """
+    accounts_state = state.get("accounts", {})
+    disabled = _disabled_accounts(config)
+    pinned: dict[tuple[str, str], float] = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts_state.get(name, {})
+        ratio = _pressure_acct_ratio(acct_state, config)
+        for window in _PRESSURE_WINDOWS:
+            rate = acct_state.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
+            pinned[(name, window)] = _pressure_burn_units(float(rate), ratio)
+    return _PressureSupplyPartition(pinned)
+
+
+class _PressureSupplyPartition:
+    """Matches the `PartitionedTable`/`FakePartition` accessor protocol
+    (`pinned_burn_units(name, window)` / `rotatable_burn_units(name,
+    window)`, reference units/min, name-keyed per the Task-5 protocol) --
+    see `_pressure_supply_partition` above for why/how this is built.
+    """
+
+    def __init__(self, pinned: dict[tuple[str, str], float]) -> None:
+        self._pinned = pinned
+
+    def pinned_burn_units(self, name: str, window: str) -> float:
+        return self._pinned.get((name, window), 0.0)
+
+    def rotatable_burn_units(self, name: str, window: str) -> float:
+        return 0.0  # conservative: all coarse burn treated as pinned (see above)
+
+
+def _pressure_parse_binding_key(key: str) -> dict:
+    """Parse a `binding_constraint`-style emit-hysteresis `key` back into
+    its parts. `_pressure_triggers` (Task 9) already mints exactly this
+    string per trigger (`token-pressure:pool:<window>` /
+    `token-pressure:account:<name>:<window>` /
+    `token-pressure:account:<name>:fable`) -- Task 23 reuses that existing
+    convention verbatim as its own emit-hysteresis key rather than inventing
+    a second parallel scheme, mirroring `_pressure_binding_view`'s own
+    account-name parse of the same string. Read-only (G0): pure string
+    parsing, no I/O.
+    """
+    parts = key.split(":")
+    if parts[1] == "pool":
+        return {"view": "pool", "window": parts[2], "name": None, "fable": False}
+    name = parts[2]
+    tail = parts[3] if len(parts) > 3 else None
+    return {"view": "account", "window": None if tail == "fable" else tail,
+            "name": name, "fable": tail == "fable"}
+
+
+def _pressure_binding_key(binding: dict) -> str:
+    """The emit-hysteresis key string for a snapshot's `binding` block
+    (`_pressure_binding_view`'s own `{view, name, constraint, window,
+    eta_min}` shape) -- the exact INVERSE of `_pressure_parse_binding_key`.
+    """
+    if binding["view"] == "pool":
+        return f"token-pressure:pool:{binding['window']}"
+    if binding["constraint"] == "fable_weekly":
+        return f"token-pressure:account:{binding['name']}:fable"
+    return f"token-pressure:account:{binding['name']}:{binding['window']}"
+
+
+def _pressure_key_state(key: str, snapshot: dict, config: dict) -> dict:
+    """Current `{level, required_reduction, eta_min}` for one emit-
+    hysteresis `key`, read directly from the ALREADY-ASSEMBLED Task-20
+    `snapshot` -- never recomputed independently, so it always agrees with
+    what pressure.json / the statusline glyph publish for the same cycle.
+    The eta-threshold level classification mirrors `_pressure_level`'s own
+    per-trigger `is_critical` (Task 9) exactly, applied per-key rather than
+    fleet-wide; the Fable-weekly case reuses `_fable_binding` verbatim
+    (Task 18) rather than duplicating its cap/margin math.
+
+    A key with no eta AND (for the pool view) no `release_suppressed`
+    override is genuinely "ok" -- NOT currently binding at all, mirroring
+    `_pressure_trigger_is_binding`'s own binding condition (`level_bound` OR
+    `eta is not None` OR `view == "pool" and release_suppressed`) so this
+    function agrees with `_pressure_triggers`/`_pressure_level` about which
+    keys are live, including when called directly (not just for a key
+    already known-binding from `all_binding`). Read-only (G0).
+    """
+    parsed = _pressure_parse_binding_key(key)
+    critical_eta = float(config.get("pressure", {}).get("critical_eta_min", 60))
+
+    if parsed["view"] == "pool":
+        p = snapshot["pool"].get(parsed["window"], {}) or {}
+        eta = p.get("exhaustion_eta_min")
+        suppressed = bool(p.get("release_suppressed"))
+        if eta is None and not suppressed:
+            level = "ok"
+        elif eta is not None and eta < critical_eta:
+            level = "critical"
+        else:
+            level = "elevated"
+        return {"level": level,
+                "required_reduction": p.get("required_reduction_units_per_min"),
+                "eta_min": eta}
+
+    acct = snapshot["accounts"].get(parsed["name"], {}) or {}
+    if parsed["fable"]:
+        fw = acct.get("fable_weekly", {}) or {}
+        fb = _fable_binding(fw.get("pct"), config)
+        return {"level": fb["level"], "required_reduction": None, "eta_min": None}
+
+    w = acct.get(parsed["window"], {}) or {}
+    eta = w.get("pinned_eta_min")
+    if eta is None:
+        level = "ok"
+    elif eta < critical_eta:
+        level = "critical"
+    else:
+        level = "elevated"
+    return {"level": level,
+            "required_reduction": w.get("required_reduction_pct_per_min"),
+            "eta_min": eta}
+
+
+def _pressure_emit_decision(key: str, snapshot: dict, last_emit: dict | None,
+                            config: dict, now) -> tuple[bool, str]:
+    """THE cus half of §4's two-place emit hysteresis (Task 23) -- the
+    daemon's own when-to-emit decision for one binding `key` (a
+    `binding_constraint`-style string, see `_pressure_parse_binding_key`).
+    `last_emit` is this key's own prior `{level, required_reduction, ts}`
+    record, or `None`/`{}` for a never-before-seen key (treated as an
+    implicit prior level of "ok" -- so a first-ever emit is itself an
+    upward transition, not a special case).
+
+    EMIT iff (1) an UPWARD level transition (elevated/critical strictly
+    outranks the prior level), OR (2) newly-critical (current key is
+    critical, prior was not -- overlaps (1) whenever the prior level wasn't
+    already critical, by design: both are named separately in the brief and
+    checked separately here for exact traceability to §4's own two triggers),
+    OR (3) required-reduction GROWTH >25% since the last emit for this key
+    (the §4 third trigger -- catches a worsening-but-not-yet-level-crossing
+    breach, e.g. the ask jumps -8%/min -> -20%/min while staying "elevated").
+    All three BYPASS `reemit_cooldown_min` (default 20) -- a sharply
+    worsening ask must never go silent for up to 20 minutes. Otherwise EMIT
+    only once `reemit_cooldown_min` has elapsed since `last_emit["ts"]` (or
+    immediately, if no prior emit is on record for this key at all).
+
+    `level == "ok"` (nothing currently binding for this key) never emits,
+    regardless of `last_emit`. Read-only (G0): never mutates `snapshot` or
+    `last_emit`.
+    """
+    cur = _pressure_key_state(key, snapshot, config)
+    level = cur["level"]
+    if level == "ok":
+        return False, f"{key}: not currently binding (ok)"
+
+    last_emit = last_emit or {}
+    prior_level = last_emit.get("level", "ok")
+    prior_rr = last_emit.get("required_reduction")
+    required_reduction = cur["required_reduction"]
+
+    if _PRESSURE_LEVEL_RANK.get(level, 0) > _PRESSURE_LEVEL_RANK.get(prior_level, 0):
+        return True, f"{key}: upward transition {prior_level}->{level} (bypasses cooldown)"
+
+    if level == "critical" and prior_level != "critical":
+        return True, f"{key}: newly critical, was {prior_level!r} (bypasses cooldown)"
+
+    if (required_reduction is not None and prior_rr is not None and prior_rr > 0
+            and (required_reduction - prior_rr) / prior_rr > 0.25):
+        return True, (f"{key}: required_reduction grew >25% "
+                      f"({prior_rr!r} -> {required_reduction!r}) (bypasses cooldown)")
+
+    cooldown_min = float(config.get("pressure", {}).get("reemit_cooldown_min", 20))
+    last_ts = last_emit.get("ts")
+    last_dt = last_ts if isinstance(last_ts, datetime) else (
+        _pressure_parse_ts(last_ts) if last_ts else None)
+    if last_dt is None:
+        return True, f"{key}: no prior emit on record, due"
+    elapsed_min = (now - last_dt).total_seconds() / 60.0
+    if elapsed_min >= cooldown_min:
+        return True, f"{key}: cooldown elapsed ({elapsed_min:.1f}min >= {cooldown_min:.0f}min)"
+    return False, (f"{key}: same level ({level}) within cooldown "
+                   f"({elapsed_min:.1f}min < {cooldown_min:.0f}min)")
+
+
+def _pressure_build_emit_payload(key: str, snapshot: dict, cur: dict, now) -> dict:
+    """The §4 event-emission payload (sentinel design doc §4) for one
+    binding `key` admitted by `_pressure_emit_decision` -- severity + a
+    compact SELF-COMPOSED summary + a `pressure.json` detail pointer for
+    the sentineld-side corroboration re-read (§7b.2), never the raw numbers
+    standing in for a re-check on the receiving end.
+
+    `episode_id` (§6 minting/persistence) is `None`: no prior task builds
+    an episode ledger, it is not one of Task 23's three named interfaces,
+    and this is the SAME placeholder `_pressure_snapshot` (Task 20) already
+    defaults to. Read-only (G0).
+    """
+    parsed = _pressure_parse_binding_key(key)
+    if parsed["view"] == "pool":
+        dedupe_key = f"token-pressure:pool:{parsed['window']}"
+        account = None
+        constraint = parsed["window"]
+        subject = f"pool:{parsed['window']}"
+    else:
+        dedupe_key = f"token-pressure:{parsed['name']}"
+        account = parsed["name"]
+        constraint = "fable_weekly" if parsed["fable"] else parsed["window"]
+        subject = parsed["name"]
+
+    rr = cur["required_reduction"]
+    eta = cur["eta_min"]
+    if eta is not None and rr:
+        summary = (f"{cur['level']}: {subject} ({constraint}) breaches in "
+                  f"{eta / 60.0:.1f}h -- need -{rr:.3g}/min")
+    elif eta is not None:
+        summary = f"{cur['level']}: {subject} ({constraint}) breaches in {eta / 60.0:.1f}h"
+    else:
+        summary = f"{cur['level']}: {subject} ({constraint})"
+
+    return {
+        "dedupe_key": dedupe_key,
+        "severity": cur["level"],
+        "account": account,
+        "constraint": constraint,
+        "eta_min": eta,
+        "required_reduction": rr,
+        "summary": summary,
+        "detail_pointer": str(PRESSURE_JSON),
+        "episode_id": None,
+        "generated_at": now.isoformat(),
+    }
+
+
+def _pressure_emit_socket(payload: dict) -> None:
+    """Stage-1 stub for the cus -> sentineld authenticated §4 emit-socket
+    client. Task 32's real `EmitSocket` and Task 28's `_sentinel_available`
+    gate are not built yet, so the live (`shadow_mode: false`) emit path is
+    exercised via this single, monkeypatchable choke-point (a test spy
+    wraps/replaces it) rather than a hand-rolled socket call here. No-op
+    until Task 32/28 land.
+    """
+
+
+def _pressure_write_emit_marker(key: str, payload: dict, now) -> None:
+    """Stage-1 stub for the §6 advisory marker / episode-ledger write that
+    accompanies a real emit. §6 (episode_id minting, delivery/compliance
+    tracking) is explicitly out of Task 23's scope -- not one of its three
+    named interfaces, and no prior task builds an episode ledger. Kept as
+    its own choke-point (rather than inlined into `_pressure_cycle`) so a
+    future task only needs to fill this one function in, and so tests can
+    spy on it independently of the emit-socket call. No-op until then.
+    """
+
+
+def _pressure_last_emit_path() -> Path:
+    """Path of the cus-side cross-cycle last-emit hysteresis registry
+    (Task 23) -- call-time derived from `PRESSURE_ROOT` so a test
+    repointing `PRESSURE_ROOT` at a tmp tree never touches the real
+    `~/claude-accounts/pressure/`. Not one of Task 23's three named
+    interfaces, but SOME cross-cycle persistence is required for
+    `_pressure_emit_decision`'s hysteresis to mean anything across daemon
+    restarts -- `last_emit` cannot live in-process only (G0 also forbids
+    parking it in state.json; this artifact lives entirely outside it,
+    same as pressure.json).
+    """
+    return PRESSURE_ROOT / "last_emit.json"
+
+
+def _pressure_load_last_emit() -> dict:
+    """Best-effort read of the last-emit registry -- `{}` on missing/
+    corrupt (matches `_log_decision`'s tolerant style: a lost hysteresis
+    record degrades to "treat as first-ever emit for every key", never a
+    crash).
+    """
+    path = _pressure_last_emit_path()
+    try:
+        return read_json(path)
+    except (OSError, ValueError):
+        return {}
+
+
+def _pressure_save_last_emit(registry: dict) -> None:
+    """Atomic tmp+rename write of the last-emit registry (never
+    `save_state` -- this lives outside state.json entirely, G0/G1)."""
+    write_json(_pressure_last_emit_path(), registry)
+
+
+def _pressure_last_would_emit_path() -> Path:
+    """Path of the shadow-mode's OWN cross-cycle would-emit hysteresis
+    registry (Task 23 fix wave 1) -- a SEPARATE file from
+    `_pressure_last_emit_path`'s `last_emit.json`, never that file itself.
+    `last_emit.json` is read+written only by the live (`shadow_mode: false`)
+    path; in shadow-only operation (the Stage-1 default) it is NEVER
+    written, so a shadow path that consulted it directly would always see
+    an empty registry and `_pressure_emit_decision` would treat every cycle
+    as a first-ever emit -- `would_emit` firing on every cycle regardless of
+    level/cooldown/growth, defeating the whole point of the shadow log as
+    Stage-1 calibration data for the emit hysteresis. Giving shadow its own
+    registry also means flipping `shadow_mode` off later never inherits
+    (or corrupts) whatever hysteresis state the shadow path had accumulated
+    -- the live path starts its own `last_emit.json` clean, exactly as
+    today.
+    """
+    return PRESSURE_ROOT / "last_would_emit.json"
+
+
+def _pressure_load_last_would_emit() -> dict:
+    """Best-effort read of the shadow would-emit registry -- `{}` on
+    missing/corrupt, mirroring `_pressure_load_last_emit`'s tolerant style
+    exactly (a lost hysteresis record degrades to "treat as first-ever
+    would-emit for every key", never a crash)."""
+    path = _pressure_last_would_emit_path()
+    try:
+        return read_json(path)
+    except (OSError, ValueError):
+        return {}
+
+
+def _pressure_save_last_would_emit(registry: dict) -> None:
+    """Atomic tmp+rename write of the shadow would-emit registry (mirrors
+    `_pressure_save_last_emit`'s mechanism exactly, via the same
+    `write_json` atomic tmp+rename helper; never `save_state` -- this lives
+    outside state.json entirely, G0/G1)."""
+    write_json(_pressure_last_would_emit_path(), registry)
+
+
+def _pressure_shadow_dir() -> Path:
+    return PRESSURE_ROOT / "shadow"
+
+
+def _pressure_shadow_log_path(now) -> Path:
+    """Path of today's shadow-log file (Task 23) -- one JSONL file per UTC
+    calendar day, dated from `now` (the SAME `now` the cycle computed its
+    snapshot at -- never a freshly-sampled wall-clock time)."""
+    return _pressure_shadow_dir() / f"{now:%Y-%m-%d}.jsonl"
+
+
+def _shadow_log(record: dict, now) -> None:
+    """Atomic per-day JSONL append (Task 23) --
+    ``~/claude-accounts/pressure/shadow/<YYYY-MM-DD>.jsonl``, one line per
+    cycle. This is the STAGE-1 calibration data source, so the write uses
+    `os.open(O_APPEND) + fcntl.flock(LOCK_EX)` around the single-line write
+    (the same flock idiom `_swap_lock` uses elsewhere in this file) rather
+    than `_log_decision`'s bare best-effort `open("a")` -- the lock
+    additionally serializes a concurrent reader that wants a consistent
+    whole-file snapshot (e.g. the future calibration read), on top of
+    POSIX's own atomic-single-`write()`-under-PIPE_BUF guarantee. Read-only
+    over `record` (G0): builds the line, mutates nothing.
+    """
+    path = _pressure_shadow_log_path(now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, default=str, separators=(",", ":")) + "\n"
+    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _pressure_shadow_decayed_step(state: dict, config: dict, now) -> dict:
+    """The populate-able half of the shadow record's `reset_models` block
+    (per Task 23's own instruction: `decayed_step` CAN be populated -- Task
+    4, already built; `rolling_integral` stays `None`, wired at Task 26).
+
+    Per account/window, the Task-4 `_pressure_reset_knot` boundary --
+    minutes to the NEXT reset, only when it falls within the same
+    `H+margin=240` horizon the ETA/required-reduction paths use -- the one
+    piece of the decayed-step ramp model's own parameters (`T_w`) not
+    already published elsewhere in pressure.json's `accounts` block (which
+    only publishes the resulting curve VALUES, not the knot timing itself).
+    `None` per window when no reset lands in horizon (nothing to report,
+    not a failure). Read-only (G0).
+    """
+    horizon = _pressure_trigger_horizon(config)
+    accounts_state = state.get("accounts", {})
+    disabled = _disabled_accounts(config)
+    out: dict = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts_state.get(name, {})
+        out[name] = {
+            window: _pressure_reset_knot(acct_state, window, config, now, horizon=horizon)
+            for window in _PRESSURE_WINDOWS
+        }
+    return out
+
+
+def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now) -> dict:
+    """The shadow-log record for one cycle (Task 23) -- the STAGE-1 data
+    source the eventual calibration reads.
+
+    `would_emit` reflects the SAME `_pressure_emit_decision` hysteresis the
+    live (`shadow_mode: false`) path consults, scoped to the snapshot's
+    single most-severe `binding` (Task 9 `_pressure_binding`) -- the
+    daemon's own headline decision for this cycle. It reads+writes its OWN
+    on-disk `last_would_emit.json` registry (fix wave 1,
+    `_pressure_last_would_emit_path`) -- a file SEPARATE from the live
+    path's `last_emit.json`, NEVER that file itself, and NEVER written by
+    any other path. Consulting the live registry left it permanently empty
+    in shadow-only operation (the Stage-1 default writes it from nowhere
+    else), so `_pressure_emit_decision` always saw a first-ever-emit prior
+    and `would_emit` fired on every cycle -- never demonstrating the
+    cooldown/growth-gated suppression this shadow log exists to calibrate.
+    Giving shadow its own registry, updated on every cycle `would_emit`
+    fires (exactly as the live path updates `last_emit`), reproduces the
+    real cadence: fires on the first cycle of a bound condition, suppressed
+    on a sustained same-level within-cooldown no-growth cycle, and re-fires
+    on an upward transition or >25% required-reduction growth. The live
+    path's own `last_emit.json` is untouched either way -- shadow mode still
+    leaves no trace that would perturb the live path's hysteresis the
+    moment `shadow_mode` is flipped off.
+
+    `would_ask`/`would_target` are `None`/`[]`: Task 24's `dry_run_target`
+    (§5 targeting plan) is not built by any prior task. Read-only w.r.t.
+    `state`/`config`/`snapshot` and the live `last_emit.json` (G0); the only
+    mutation is the shadow-owned `last_would_emit.json` registry, a
+    pressure-owned store outside state.json entirely, same as
+    `last_emit.json` itself.
+    """
+    binding = snapshot.get("binding")
+    would_emit = None
+    if binding is not None:
+        key = _pressure_binding_key(binding)
+        registry = _pressure_load_last_would_emit()
+        prior = registry.get(key)
+        admit, _reason = _pressure_emit_decision(key, snapshot, prior, config, now)
+        if admit:
+            cur = _pressure_key_state(key, snapshot, config)
+            would_emit = _pressure_build_emit_payload(key, snapshot, cur, now)
+            registry[key] = {
+                "level": cur["level"],
+                "required_reduction": cur["required_reduction"],
+                "ts": now.isoformat(),
+            }
+            _pressure_save_last_would_emit(registry)
+
+    return {
+        "ts": now.isoformat(),
+        "level": snapshot["level"],
+        "binding": binding,
+        "would_emit": would_emit,
+        "would_ask": None,      # wired at Task 24 (dry_run_target, not built)
+        "would_target": [],     # wired at Task 24 (dry_run_target, not built)
+        "pool": snapshot["pool"],
+        "per_account": snapshot["accounts"],
+        "reset_models": {
+            "decayed_step": _pressure_shadow_decayed_step(state, config, now),
+            "rolling_integral": None,   # wired at Task 26 (not built)
+        },
+        "weight_fit": snapshot["weight_fit"],
+    }
+
+
+def _pressure_cycle(state: dict, config: dict, now) -> dict:
+    """The daemon's per-cycle Phase-D pipeline + snapshot assembly + shadow/
+    emit gate (Task 23) -- the persist=True twin of `pressure_cmd`'s
+    on-demand persist=False path (Task 21), sharing every Phase-D step
+    verbatim except transcript-offset persistence.
+
+    `state` is deep-copied immediately (G0/§10.11, `_pressure_load_state`'s
+    own established technique): this is the ONLY state object the rest of
+    the cycle touches; the caller's live `state` is never mutated in place,
+    and this function NEVER calls `save_state`. `state`/`config` are
+    explicit parameters (unlike `pressure_cmd`, which loads both itself) --
+    the caller (a future daemon task) owns load cadence/reload policy.
+
+    Cold-start blindness (Task 19) is judged against the offset registry AS
+    IT STOOD BEFORE this cycle's own read -- a snapshot taken prior to
+    `_read_active_tails(persist=True)`, NOT the post-read `_PRESSURE_TAIL_
+    OFFSETS`. `persist=True` advances the registry in place for whatever it
+    fully reads THIS cycle (Task 10), so feeding `_attribution_confidence`
+    the POST-read offsets would make a session look "already known" the
+    instant it is first read -- defeating cold-start detection on a
+    daemon's very first cycle (the read always happens before the
+    confidence check does, every cycle, including the first). Feeding it
+    the pre-read snapshot instead asks the right question -- "was this
+    session known as of the END of the PRIOR cycle" -- matching
+    `pressure_cmd`'s own persist=False path, whose `offsets` is always the
+    untouched pre-call dict by construction.
+
+    shadow_mode (config `pressure.shadow_mode`, default True): computes and
+    atomic-writes pressure.json exactly as `pressure_cmd` would, calls
+    `_shadow_log`, and RETURNS -- no emit, no §6 marker/delivery write,
+    ever (the STAGE-1 dark-by-default guarantee). shadow_mode false:
+    recomputes `_pressure_triggers`/`_pressure_level` from the SAME
+    `state`/`config`/`now`/`partition_for_snapshot` inputs `_pressure_
+    snapshot` already used internally (deterministically identical --
+    `_pressure_snapshot`'s own `all_binding` is not exposed on the
+    published snapshot, so this is the one clean way to recover every
+    currently-binding key without modifying `_pressure_snapshot`, which is
+    out of this task's scope) to get every currently-binding key, consults
+    `_pressure_emit_decision` per key, emits (via the Stage-1
+    `_pressure_emit_socket` spy point -- Task 32's real EmitSocket / Task
+    28's `_sentinel_available` gate are not built) only when admitted, and
+    persists the resulting last-emit registry so the hysteresis means
+    something across daemon cycles.
+    """
+    state = copy.deepcopy(state)
+
+    offsets = _PRESSURE_TAIL_OFFSETS
+    offsets_before_read = dict(offsets)  # blindness judged pre-read (see docstring)
+    tails = _read_active_tails(now, config, offsets, persist=True)
+
+    sessions_rows = _parse_sessions_log()
+    intervals = _session_account_intervals(sessions_rows)
+
+    A, b, _dropped_reason_counts = _build_weight_windows([], [], [])
+    weight_fit = fit_burn_weights(A, b, None, config)
+
+    message_weights = _pressure_message_weights(weight_fit["weights"])
+    attribution_table = _attribute_burn(tails, intervals, message_weights)
+    attributed_partition = _partition_burn(attribution_table, state, config)
+
+    projects_dir = CLAUDE_DIR / "projects"
+    coord_map = _pressure_coordinator_map(sessions_rows, projects_dir)
+    session_table = _pressure_build_session_table(
+        attribution_table, intervals, coord_map, projects_dir, now, config)
+
+    attribution = dict(_attribution_confidence(offsets_before_read, list(tails.keys()), now))
+    attribution["residual_fraction"] = attribution_table.residual_fraction
+
+    # USER-APPROVED ADDITION (safety): under cold-start blindness the real
+    # attributed partition is built from a starved/absent read window and
+    # UNDERSTATES burn -- forecasting off it would publish an artificially
+    # long, unsafe ETA. Fall back to cus's own coarse per-account rate for
+    # the SUPPLY forecast only; `session_table` still carries the real (if
+    # incomplete) per-session attribution -- display-only here, never fed
+    # back into the ETA/required-reduction math.
+    partition_for_snapshot = (
+        _pressure_supply_partition(state, config, now)
+        if attribution["blindness"] else attributed_partition
+    )
+
+    snapshot = _pressure_snapshot(
+        state, config, now,
+        partition=partition_for_snapshot,
+        session_table=session_table,
+        weight_fit=weight_fit,
+        attribution=attribution,
+    )
+
+    _pressure_write_json(snapshot)
+
+    pressure_cfg = config.get("pressure", {}) or {}
+    shadow_mode = pressure_cfg.get("shadow_mode", True)
+
+    if shadow_mode:
+        record = _pressure_build_shadow_record(state, snapshot, config, now)
+        _shadow_log(record, now)
+        return snapshot
+
+    # LIVE (shadow_mode: false) -- consult the cus-side emit hysteresis per
+    # currently-binding key; emit only when admitted.
+    triggers = _pressure_triggers(state, config, now, partition_for_snapshot)
+    level_out = _pressure_level(triggers, config)
+    binding_keys = [t["binding_constraint"] for t in level_out["all_binding"]]
+
+    registry = _pressure_load_last_emit()
+    changed = False
+    for key in binding_keys:
+        prior = registry.get(key)
+        admit, _reason = _pressure_emit_decision(key, snapshot, prior, config, now)
+        if not admit:
+            continue
+        cur = _pressure_key_state(key, snapshot, config)
+        payload = _pressure_build_emit_payload(key, snapshot, cur, now)
+        _pressure_emit_socket(payload)
+        _pressure_write_emit_marker(key, payload, now)
+        registry[key] = {
+            "level": cur["level"],
+            "required_reduction": cur["required_reduction"],
+            "ts": now.isoformat(),
+        }
+        changed = True
+    if changed:
+        _pressure_save_last_emit(registry)
+
+    return snapshot
 
 
 @cli.command(name="sos")
