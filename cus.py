@@ -7632,6 +7632,76 @@ def fit_burn_weights(
     return _result(w, "fit", seed_scale_out)
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    """``min(max(x, lo), hi)`` -- non-decreasing in ``x`` for any fixed
+    ``lo <= hi``, and returns ``hi`` (never ``inf``/``nan``) for ``x = inf``,
+    which is what lets `_safety_factor` absorb Task 16's ``math.inf``
+    condition-number/residual-fraction outputs without ever propagating a
+    non-finite value out."""
+    return min(max(x, lo), hi)
+
+
+def _safety_factor(residual_fraction: float, condition_number: float, cfg: dict) -> float:
+    """Confidence-widened safety factor (Task 17, G4) -- the load-bearing
+    "never blow the limit" defense (§3; gains shadow-tuned): a low-confidence
+    `fit_burn_weights` result (Task 16's ``"seed-fallback"``/
+    ``"insufficient-data"`` sources, which carry high/inf
+    ``condition_number`` and ``residual_fraction``) makes the forecaster
+    throttle MORE conservatively -- a wider multiplicative safety factor.
+
+        raw = base
+            + residual_gain * residual_fraction
+            + cond_gain * clamp(log10(max(condition_number, 1)) / log10(cond_max), 0, 1)
+        return clamp(raw, safety_factor_base, safety_factor_max)
+
+    Monotone non-decreasing in BOTH ``residual_fraction`` and
+    ``condition_number`` (every term above is non-decreasing in its input,
+    and `_clamp` is non-decreasing in its input) -- the final clamp only
+    ever flattens the curve at the floor/cap, never reverses it.
+
+    Handles ``inf`` in either input without ever returning non-finite:
+    ``condition_number = inf`` -> ``log10(inf) = inf`` -> the inner
+    `_clamp` saturates at its hi bound (1.0, `_clamp`'s ``min(max(x, lo),
+    hi)`` form returns ``hi`` for ``x = inf``), so the condition term
+    saturates at exactly ``cond_gain``. ``residual_fraction = inf`` makes
+    ``raw`` itself ``inf``, but the outer `_clamp` on ``raw`` then caps it
+    at ``safety_factor_max`` the same way -- the return is always a finite
+    float in ``[safety_factor_base, safety_factor_max]``.
+
+    ``cfg`` -- the FULL top-level config; reads ``cfg["pressure"]`` for the
+    ``safety_factor_*`` keys (G4 defaults below), matching every other
+    `_pressure_*` config read in this file. ``cond_max`` reuses
+    ``pressure.weight_refit.cond_max`` (`fit_burn_weights`'s own key, G4
+    default 1.0e6) rather than a second pressure-level copy, so a single
+    knob governs both the fit's own fallback threshold and how hard this
+    curve leans on a bad condition number.
+
+    Pure (G0): reads ``residual_fraction``/``condition_number``/``cfg``,
+    mutates nothing, no I/O, no ``save_state``.
+    """
+    # A nan input means "fit confidence is unknown/degenerate" -- coerce to
+    # +inf (not a finite sentinel) so it flows through the *same* saturating
+    # paths inf already uses below, widening conservatively toward the cap
+    # instead of silently collapsing to the floor (nan fails every `_clamp`
+    # comparison, which would otherwise leak nan straight out of this
+    # load-bearing "never blow the limit" function).
+    if math.isnan(residual_fraction):
+        residual_fraction = math.inf
+    if math.isnan(condition_number):
+        condition_number = math.inf
+
+    pressure_cfg = (cfg or {}).get("pressure", {}) or {}
+    base = float(pressure_cfg.get("safety_factor_base", 1.2))
+    cap = float(pressure_cfg.get("safety_factor_max", 3.0))
+    residual_gain = float(pressure_cfg.get("safety_factor_residual_gain", 1.8))
+    cond_gain = float(pressure_cfg.get("safety_factor_cond_gain", 0.6))
+    cond_max = float((pressure_cfg.get("weight_refit", {}) or {}).get("cond_max", 1.0e6))
+
+    cond_term = _clamp(math.log10(max(condition_number, 1.0)) / math.log10(cond_max), 0.0, 1.0)
+    raw = base + residual_gain * residual_fraction + cond_gain * cond_term
+    return _clamp(raw, base, cap)
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
