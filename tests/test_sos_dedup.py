@@ -12,6 +12,12 @@ The fix makes the function a genuine NO-OP when the SUBSTANTIVE conditions are
 unchanged since the last write, comparing bodies with the volatile timestamp
 line normalized out.
 
+The dedup key ALSO normalizes out per-poll metric jitter — usage percentages
+(`@ 62%`) and per-lane unit values (`0.28u`) — so an ongoing condition whose
+affected accounts and states are unchanged does not re-arm the sentinel's
+file_watch every cycle just because a number ticked. Bare counts (`2 premium
+lanes`) and status labels (`RATE_LIMITED`) stay material.
+
 Run standalone:  python3 tests/test_sos_dedup.py
 Or under pytest: pytest tests/test_sos_dedup.py
 """
@@ -115,6 +121,75 @@ def test_rewrite_when_action_only_changes(tmp_path, monkeypatch):
         "SOS.md was not rewritten despite a changed action string"
     )
     assert b"run cus force-poll A" in cus.SOS_MD.read_bytes()
+
+
+def test_no_rewrite_when_only_percentage_jitters(tmp_path, monkeypatch):
+    """Per-poll usage-percentage jitter is NOT a material change: same accounts,
+    same states, only the number moved — must not re-arm the file_watch
+    (2026-07-14 cus-sos re-fire storm)."""
+    _setup(tmp_path, monkeypatch)
+    cus.maybe_write_sos(
+        [_cond(action="lanes: gabai (slot-4/slot-5 @ 62%); rayi (slot-1 @ 61%)")], {}
+    )
+    first_bytes = cus.SOS_MD.read_bytes()
+    old_mtime_ns = _pin_old_mtime(cus.SOS_MD)
+
+    cus.maybe_write_sos(
+        [_cond(action="lanes: gabai (slot-4/slot-5 @ 63%); rayi (slot-1 @ 60%)")], {}
+    )
+
+    assert cus.SOS_MD.stat().st_mtime_ns == old_mtime_ns, (
+        "SOS.md mtime was bumped by usage-percentage jitter alone"
+    )
+    assert cus.SOS_MD.read_bytes() == first_bytes
+
+
+def test_no_rewrite_when_only_unit_values_jitter(tmp_path, monkeypatch):
+    """Per-lane unit values (`0.28u`) tick every poll; a unit-only change is not
+    material and must not rewrite."""
+    _setup(tmp_path, monkeypatch)
+    cus.maybe_write_sos(
+        [_cond(action="dichalane below per-lane headroom (0.28u/lane <= 0.30u across 1 lane(s))")], {}
+    )
+    old_mtime_ns = _pin_old_mtime(cus.SOS_MD)
+
+    cus.maybe_write_sos(
+        [_cond(action="dichalane below per-lane headroom (0.31u/lane <= 0.30u across 1 lane(s))")], {}
+    )
+
+    assert cus.SOS_MD.stat().st_mtime_ns == old_mtime_ns, (
+        "SOS.md mtime was bumped by per-lane unit jitter alone"
+    )
+
+
+def test_rewrite_when_status_label_flips_at_same_percentage(tmp_path, monkeypatch):
+    """A per-account status flip (RATE_LIMITED -> TOKEN_STALE) is material and
+    must rewrite even when every percentage is byte-identical."""
+    _setup(tmp_path, monkeypatch)
+    cus.maybe_write_sos([_cond(action="lost: yaz-myjli-com RATE_LIMITED @ 62%")], {})
+    old_mtime_ns = _pin_old_mtime(cus.SOS_MD)
+
+    cus.maybe_write_sos([_cond(action="lost: yaz-myjli-com TOKEN_STALE @ 62%")], {})
+
+    assert cus.SOS_MD.stat().st_mtime_ns != old_mtime_ns, (
+        "SOS.md was not rewritten despite a material status-label change"
+    )
+    assert b"TOKEN_STALE" in cus.SOS_MD.read_bytes()
+
+
+def test_rewrite_when_bare_count_changes(tmp_path, monkeypatch):
+    """Bare integer counts (lane count, target count) are material and must NOT
+    be normalized away — 2 lanes -> 3 lanes must rewrite."""
+    _setup(tmp_path, monkeypatch)
+    cus.maybe_write_sos([_cond(summary="2 premium lane(s) live, 0 valid swap targets")], {})
+    old_mtime_ns = _pin_old_mtime(cus.SOS_MD)
+
+    cus.maybe_write_sos([_cond(summary="3 premium lane(s) live, 0 valid swap targets")], {})
+
+    assert cus.SOS_MD.stat().st_mtime_ns != old_mtime_ns, (
+        "SOS.md was not rewritten despite a material lane-count change"
+    )
+    assert b"3 premium lane(s)" in cus.SOS_MD.read_bytes()
 
 
 def test_empty_conditions_removes_file(tmp_path, monkeypatch):

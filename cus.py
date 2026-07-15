@@ -12939,16 +12939,30 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
         lines.append("")
     new_body = ("\n".join(lines) + "\n").encode()
 
-    # Rewrite only when the SUBSTANTIVE content changed. Strip the volatile
-    # `_Updated <timestamp>_` line (which differs on every call) from both the
-    # new body and the on-disk copy before comparing; skip the atomic write —
-    # a genuine no-op, no mtime bump — when they match.
-    def _strip_updated(b: bytes) -> bytes:
-        return re.sub(rb"(?m)^_Updated .*$", b"_Updated", b)
+    # Rewrite only when the MATERIAL condition changed. Two volatile things differ
+    # between polls without the condition materially changing, and either one would
+    # otherwise bump SOS.md's mtime every cycle and re-arm the sentinel's file_watch
+    # (the 2026-07-14 cus-sos re-fire storm — count climbed 46→76 in one session):
+    #   1. the `_Updated <timestamp>_` line (differs on every call), and
+    #   2. per-poll metric jitter inside a condition's body — usage percentages
+    #      (`@ 62%`) and per-lane unit values (`0.28u`) tick every poll while the
+    #      SAME accounts stay in the SAME states.
+    # Normalize both out of the comparison KEY only (never the written body — when we
+    # do write, the body carries live values). Bare counts (`2 premium lanes`,
+    # `slot-4`) and status labels (`RATE_LIMITED`, `TOKEN_STALE`) are preserved, so a
+    # material change — a new/removed affected account, a status flip, a lane-count or
+    # severity change — still rewrites and correctly re-fires the watch. This finishes
+    # what stripping `_Updated` alone started (2026-07-14 fix): "no-op when the
+    # substantive condition is unchanged", now including metric-only jitter.
+    def _sos_dedup_key(b: bytes) -> bytes:
+        b = re.sub(rb"(?m)^_Updated .*$", b"_Updated", b)  # volatile timestamp line
+        b = re.sub(rb"\d+(?:\.\d+)?%", b"N%", b)            # usage percentages
+        b = re.sub(rb"\d+(?:\.\d+)?u\b", b"Nu", b)          # per-lane unit values
+        return b
 
     if SOS_MD.exists():
         try:
-            if _strip_updated(SOS_MD.read_bytes()) == _strip_updated(new_body):
+            if _sos_dedup_key(SOS_MD.read_bytes()) == _sos_dedup_key(new_body):
                 return
         except OSError:
             pass
