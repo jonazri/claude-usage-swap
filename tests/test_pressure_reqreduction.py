@@ -26,6 +26,14 @@ CFG = {
     "capacity_aware": {"reference_x": 5},
     "thresholds": {"steps": [70, 85, 94]},  # gate_5h = 94
 }
+# NON-default horizon config (fix-wave-1 finding 1): H = 1h*60 = 60,
+# margin = 1h*60 = 60 -> H240 (the assembler's dynamic trigger horizon) = 120,
+# NOT the library-wide default 240.
+CFG_H120 = {
+    "capacity_aware": {"reference_x": 5},
+    "thresholds": {"steps": [70, 85, 94]},  # gate_5h = 94
+    "pressure": {"horizon_hours": 1, "exit_margin_hours": 1},
+}
 
 
 def _iso(dt):
@@ -148,6 +156,55 @@ def test_reset_in_180_240_credited():
     assert credited["unmeetable"] is False
     assert burn_through["unmeetable"] is False
     assert credited["delta_pct_per_min"] < burn_through["delta_pct_per_min"]
+
+
+def test_pinned_horizon_param_matches_assembler_dynamic_horizon():
+    """Fix-wave-1 finding 1: under a NON-default `pressure.horizon_hours`/
+    `exit_margin_hours` config (H240 = 60+60 = 120, not the library-wide
+    default 240), `_required_reduction_pinned` MUST use the horizon it is
+    given, not an internally hardcoded 240 -- else its knot set diverges from
+    the SAME dynamic horizon `_pinned_account_eta`/`_account_knots` use for
+    the co-published `pinned_eta_min`, and the published required-reduction
+    silently mis-forecasts relative to it.
+
+    A reset at T_w=150 sits in (120, 240]: at the real trigger horizon (120)
+    it is OUT of range (no ramp credit -> pure burn-through knot set
+    {0, 120}), so the account is healthy at t=120 (slack 26-0.15*120=8 > 0)
+    and delta_pct_per_min clamps to 0. At the OLD hardcoded 240 the same
+    reset is wrongly IN range and earns ramp credit, producing knot set
+    {0, 150, 240} whose min-ratio falls at t=240 and yields a nonzero (wrong)
+    required reduction (~0.0542 %/min) for a window that, at the operative
+    120-min horizon, needs none. Pre-fix (no `horizon` kwarg at all) this
+    test fails with a TypeError on the `horizon=H240` call below.
+    """
+    H240 = cus._pressure_trigger_horizon(CFG_H120)
+    assert H240 == 120.0
+    acct = _acct(reset_min=150)
+    part = FakePartition(pinned={("A", "5h"): 0.006})
+
+    # Knot set at the assembler's dynamic horizon must exclude the T_w=150
+    # reset (out of [0,120]) -- the exact knot set `_pinned_account_eta`
+    # builds for the co-published `pinned_eta_min` at the same horizon.
+    knots = cus._account_knots(acct, "5h", CFG_H120, NOW, 0.006, horizon=H240)
+    assert knots == [0.0, 120.0]
+
+    out = cus._required_reduction_pinned(acct, "5h", CFG_H120, NOW, part,
+                                         horizon=H240)
+    # Healthy at t=120 (slack 26 - 0.15*120 = 8 > 0) -> clamps to 0, meetable.
+    assert out["delta_pct_per_min"] == pytest.approx(0.0, abs=1e-6)
+    assert out["unmeetable"] is False
+
+    # Co-published `pinned_eta_min` at the SAME horizon never breaches either
+    # -- the two fields stay consistent (the bug this fixes).
+    eta = cus._pinned_account_eta(acct, "5h", CFG_H120, NOW, part, horizon=H240)
+    assert eta is None
+
+    # The two horizons genuinely diverge here: the OLD hardcoded-240 default
+    # (no horizon arg) wrongly credits the out-of-range T_w=150 reset and
+    # reports a nonzero requirement instead of 0.
+    stale_240 = cus._required_reduction_pinned(acct, "5h", CFG_H120, NOW, part)
+    assert stale_240["delta_pct_per_min"] == pytest.approx(0.054167, abs=1e-4)
+    assert stale_240["unmeetable"] is False
 
 
 def test_pinned_unmeetable_when_supply_breaches():

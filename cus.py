@@ -5638,15 +5638,15 @@ def _required_reduction_pool(pool_curve, rotatable_burn: float, knots_rr, config
 
 
 def _required_reduction_pinned(acct: dict, window: str, config: dict, now,
-                               partition) -> dict:
+                               partition, *, horizon: float = 240) -> dict:
     """Smallest per-account cut (%/min) that clears the account's PINNED-burn
-    breach to ``H + exit_margin = 240`` min (Task 8, G6, §5.3/§5.4). Returns
+    breach to ``horizon`` min (Task 8, G6, §5.3/§5.4). Returns
     ``{"delta_pct_per_min": float, "unmeetable": bool}``.
 
     ``Δ*_a = clamp(pinned_burn%/min − min_{t_k ∈ K_rr}[h_a(t_k)/t_k], 0,
     pinned_burn)`` with ``h_a = (gate − pct)`` headroom on the account's
     decayed-step curve. Computed on the account's reference-UNITS curve (the exact
-    Task-4 ``_pressure_remaining_curve`` the ETA path uses, ``horizon=240``) and
+    Task-4 ``_pressure_remaining_curve`` the ETA path uses, at ``horizon``) and
     converted to %/min at the end: for a single account
     ``h_a%(t) = remaining_units(t)·100/ratio`` exactly (the ``ratio/100`` factor
     cancels in ``remaining0``, ``burn`` and the reset credit alike), so
@@ -5655,18 +5655,29 @@ def _required_reduction_pinned(acct: dict, window: str, config: dict, now,
     (rotation-blind, M1) and compares to §5.2 candidate share%/min directly.
 
     ``K_rr`` is built here for the single account via ``_account_knots(...,
-    horizon=240)`` — ``{0, 240}`` (240 included), its reset knots ``T_w``/
-    ``T_w+W``, and the ``Z_rr`` clamp-zero roots. A 5h reset in ``(180, 240]``
-    earns its ramp credit (finding 1), so Δ* is not over-stated by a dropped
-    reset. ``pinned_burn`` comes from ``_pinned_burn_rate`` (injected partition —
-    finding 2). ``unmeetable = min-ratio <= 0`` (pinned drain alone breaches the
-    supply) → §5.4. Read-only (G0).
+    horizon=horizon)`` — ``{0, horizon}`` (horizon included), its reset knots
+    ``T_w``/``T_w+W``, and the ``Z_rr`` clamp-zero roots. A reset landing in
+    ``(H, horizon]`` earns its ramp credit (finding 1), so Δ* is not
+    over-stated by a dropped reset.
+
+    ``horizon`` DECOUPLES this from an internally hardcoded 240 (fix-wave-1
+    finding 1 — mirrors ``_pinned_account_eta``'s own ``horizon`` param): it
+    defaults to 240 (``H + exit_margin`` under the DEFAULT config) so
+    existing callers/tests are unaffected, but the assembler (Task 20) passes
+    the SAME dynamic ``H240 = _pressure_trigger_horizon(config)`` it already
+    uses for ``pinned_eta_min`` and the pool required-reduction — so under a
+    non-default ``horizon_hours``/``exit_margin_hours`` the pinned
+    required-reduction's knot set stays consistent with the co-published
+    ``pinned_eta_min``'s (instead of silently diverging on a mismatched knot
+    set). ``pinned_burn`` comes from ``_pinned_burn_rate`` (injected
+    partition — finding 2). ``unmeetable = min-ratio <= 0`` (pinned drain
+    alone breaches the supply) → §5.4. Read-only (G0).
     """
     ratio = _pressure_acct_ratio(acct, config)
     pinned_units = _pinned_burn_rate(acct, window, partition)
     curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
-                                      horizon=240)
-    knots = _account_knots(acct, window, config, now, pinned_units, horizon=240)
+                                      horizon=horizon)
+    knots = _account_knots(acct, window, config, now, pinned_units, horizon=horizon)
     ratios = [curve(t) / t for t in knots if float(t) > 0.0]
     min_ratio = min(ratios) if ratios else 0.0
     unmeetable = min_ratio <= 0.0
@@ -8026,8 +8037,16 @@ def _pressure_snapshot(state: dict, config: dict, now, *, partition, session_tab
     own in-code default ladder top when `thresholds.steps` is empty/absent
     (G3).
 
-    Read-only (G0): never mutates `state` or any injected product; builds
-    only new dicts/lists. Performs NO filesystem I/O of its own.
+    Read-only (G0): never mutates `state` or any injected product, builds
+    only new dicts/lists, and never calls `save_state`. Performs no Phase-D
+    I/O of its own — no transcript reads / attribution / weight-fit; those
+    products are injected inputs, per above. It MAY transitively READ
+    credential-tier files for capacity, via cus's normal
+    `_account_raw_capacity_x` -> `_read_rate_limit_tier` path (reached
+    through `_pool_release_suppressed`/`_pressure_pool_set`), when an
+    account's state lacks a `capacity_x` override — a benign read, not a
+    state mutation (G0 still holds; fix-wave-1 finding 2, was overclaimed as
+    "no filesystem I/O of its own").
     """
     triggers = _pressure_triggers(state, config, now, partition)
     level_out = _pressure_level(triggers, config)
@@ -8096,7 +8115,8 @@ def _pressure_snapshot(state: dict, config: dict, now, *, partition, session_tab
             burn_pct_per_min = pinned_units * 100.0 / ratio if ratio else pinned_units * 100.0
             pinned_eta = _pinned_account_eta(acct, window, config, now, partition,
                                              horizon=H240)
-            rr = _required_reduction_pinned(acct, window, config, now, partition)
+            rr = _required_reduction_pinned(acct, window, config, now, partition,
+                                            horizon=H240)
             entry[window] = {
                 "pct": pct,
                 "gate": gate,
