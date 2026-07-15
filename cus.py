@@ -5105,6 +5105,138 @@ def _pressure_resolve_reference_x(state: dict, config: dict) -> float:
     return float(observed) if observed is not None else 1.0
 
 
+def _pressure_gate(window: str, config: dict) -> float:
+    """The effective breach gate (in raw %) for one window (Task 2, G3, FACT
+    #1/#7).
+
+    * ``5h`` → the LIVE top ladder step ``config['thresholds']['steps'][-1]``
+      (currently 94), read at RUNTIME — NEVER a hardcoded literal. A retuned or
+      defaulted ladder must not mis-forecast: an empty/absent ``steps`` falls
+      back to cus's own in-code default ``[50, 75, 90]`` top = 90 (hardcoding
+      94 would project a breach 4 points too late → under-throttle). There is
+      no distinct 5h hard cap.
+    * ``7d`` → ``hard_7d_cap_pct`` (``_hard_7d_cap_for_config``, default 80),
+      NOT the level-bound weekly 95 (which never enters the units path, FACT
+      #7).
+    """
+    if window == "5h":
+        steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+        return float(steps[-1])
+    if window == "7d":
+        return float(_hard_7d_cap_for_config(config))
+    raise ValueError(f"_pressure_gate: unknown window {window!r} (expected '5h'|'7d')")
+
+
+def _pressure_ratio(acct: str, acct_ctx: dict, config: dict) -> float:
+    """Capacity ratio ``capacity_x / reference_x`` for account ``acct`` (Task 2,
+    G0/G3, FACT #3/#4).
+
+    Built from the PURE ``_account_raw_capacity_x`` @4716 (config override →
+    credentials-parsed tier, never a state-cache write) + Task 1's
+    side-effect-free ``_pressure_resolve_reference_x`` — deliberately BYPASSING
+    the G0 mutators ``_capacity_ctx`` @4892 / ``_account_capacity_x`` @4767
+    (both freeze the snapshot / write the ``capacity_x`` cache in place; only
+    pin-dependently side-effect-free).
+
+    ``acct`` is the account NAME; ``acct_ctx`` is the deep-copied state snapshot
+    (``_pressure_load_state``) — its per-account views live under
+    ``acct_ctx['accounts'][name]``, hence "per-account view of the deep-copied
+    state" (finding 3). It is NOT a ``_capacity_ctx`` result. Reading it is
+    read-only: ``_account_raw_capacity_x`` and ``_pressure_resolve_reference_x``
+    never mutate it.
+
+    An account with no genuinely-known tier resolves to the neutral ratio 1.0
+    (exactly what ``_account_capacity_x``'s neutral fallback yields) — such an
+    account is excluded from the rotatable pool by ``_pressure_pool_set`` (C1),
+    but a defined ratio keeps every downstream unit computation divide-safe.
+    """
+    reference_x = _pressure_resolve_reference_x(acct_ctx, config)
+    raw_x, _warnings = _account_raw_capacity_x(acct, acct_ctx, config)
+    if raw_x is None:
+        return 1.0  # neutral tier -> ratio exactly 1 (never inflates/starves)
+    return float(raw_x) / float(reference_x)
+
+
+def _pressure_acct_ratio(acct_state: dict, config: dict) -> float:
+    """Capacity ratio for an account from its per-account STATE dict alone
+    (Task 4/5 internal), ``capacity_x / reference_x``.
+
+    The curve helpers (``_pressure_remaining_curve``, ``_pool_remaining_curve``)
+    receive the per-account state dict (as cus's ``projected_seven_day_reset``
+    does), not the fleet name+state pair ``_pressure_ratio`` takes — so they
+    source the tier from the account's cached ``capacity_x`` (populated at poll
+    time from the same ``_account_raw_capacity_x`` source) and resolve
+    ``reference_x`` via the side-effect-free Task 1 resolver. Using ONE ratio
+    source for both an account's own curve AND its pool-cap ``C_a`` is what
+    makes the pool the exact pointwise sum of the per-account curves (G6). A
+    missing/None ``capacity_x`` yields the neutral ratio 1.0 (such accounts are
+    excluded from the pool by ``_pressure_pool_set``).
+    """
+    reference_x = _pressure_resolve_reference_x(acct_state, config)
+    capacity_x = acct_state.get("capacity_x")
+    if not capacity_x:
+        return 1.0
+    return float(capacity_x) / float(reference_x)
+
+
+def _pressure_remaining_units(pct: float, gate: float, ratio: float) -> float:
+    """Remaining reference units measured **to the gate** (Task 2, §10.10,
+    committee I2/M1): ``((gate - pct) / 100) * ratio``, clamped ≥ 0.
+
+    This is a BUILDING BLOCK, NOT a drop-in for cus's ``_remaining_units``
+    @4940, which measures ``(100 - pct)`` (headroom to 100). The forecaster
+    measures headroom to the *effective gate* — a 20x account (ratio 4.0) at
+    90% for the 5h window (gate 94) has ``((94-90)/100)*4.0 = 0.16`` units left,
+    not the ``0.40`` a to-100 measure would report.
+    """
+    return max(0.0, (gate - pct) / 100.0 * ratio)
+
+
+def _pressure_cap_units(gate: float, ratio: float) -> float:
+    """Fresh-window capacity ``C_w = (gate / 100) * ratio`` (Task 2, G5) — the
+    upper clamp for a published remaining curve."""
+    return gate / 100.0 * ratio
+
+
+def _pressure_burn_units(burn_pct_per_min: float, ratio: float) -> float:
+    """Burn rate in reference units/min (Task 2): ``(burn%/min / 100) * ratio``.
+    0.5 %/min on a 20x account (ratio 4.0) = 0.02 units/min."""
+    return burn_pct_per_min / 100.0 * ratio
+
+
+def _pressure_pool_set(state: dict, window: str, config: dict) -> list[str]:
+    """Accounts eligible for the tier-normalized rotatable pool for ``window``
+    (Task 2, C1/M2, G3/G6).
+
+    Include an account iff it is ACTIVE (enabled — not operator-disabled) AND
+    its ``capacity_x`` is genuinely POPULATED (``_account_raw_capacity_x``
+    returns a known tier, NEVER the ratio-1 neutral fallback — C1) AND its
+    current usage ``pct < gate``. A gated (``pct >= gate``), a ratio-1
+    unknown-tier, and a disabled account are all excluded — a fixed
+    fleet-min-tier account is fine (it is genuinely known), only a ratio-1
+    fallback is not. Iterates the declared fleet (``config['accounts']``);
+    read-only over ``state``.
+    """
+    gate = _pressure_gate(window, config)
+    disabled = _disabled_accounts(config)
+    accounts = state.get("accounts", {})
+    eligible: list[str] = []
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is None:  # unknown tier -> ratio-1 neutral fallback -> exclude (C1)
+            continue
+        pct = accounts.get(name, {}).get(f"current_{window}_pct", 0.0) or 0.0
+        if pct >= gate:
+            continue
+        eligible.append(name)
+    return eligible
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
