@@ -150,6 +150,23 @@ def test_schema_shape():
     assert breach["binding"]["view"] in ("pool", "account")
 
 
+def test_pool_empty_no_spurious_zero_eta():
+    """When every pooled account is gated out (pool_set empty for a window),
+    `pool.<w>.exhaustion_eta_min` must be None ("not applicable"), NEVER a
+    false immediate 0.0 from `_first_crossing_eta`'s vacuous `g(0)<=0`
+    shortcut on an empty sum — matching `_pressure_triggers`'s own `if
+    pool:` guard, which never creates a pool trigger in this case either."""
+    breach_state = _state({"A": _acct(pct=96.0)})  # A alone, over gate -> pool empty
+    snap = _snapshot(state=breach_state)
+    assert cus._pressure_pool_set(breach_state, "5h", CFG) == []
+    assert snap["pool"]["5h"]["exhaustion_eta_min"] is None
+    assert snap["pool"]["5h"]["required_reduction_units_per_min"] == 0.0
+    # the account itself is still correctly reported as an immediate breach.
+    assert snap["accounts"]["A"]["5h"]["pinned_eta_min"] == 0.0
+    assert snap["binding"]["view"] == "account"
+    assert snap["binding"]["eta_min"] == 0.0
+
+
 # ======================= test_gate_reflects_live_ladder =========================
 
 def test_gate_reflects_live_ladder():

@@ -8045,8 +8045,20 @@ def _pressure_snapshot(state: dict, config: dict, now, *, partition, session_tab
                                            horizon=H240)
         rotatable = _pool_rotatable_burn(state, window, config, now, partition)
         knots = _pool_knots(state, window, config, now, partition, horizon=H240)
-        eta = _first_crossing_eta(pool_curve, rotatable, knots, config, now)
-        rr = _required_reduction_pool(pool_curve, rotatable, knots, config, now)
+        # Mirror `_pressure_triggers`'s own `if pool:` guard exactly: an EMPTY
+        # pool_set (every account gated/disabled/unknown-tier) has no pool to
+        # forecast at all, so the ETA is None ("not applicable") — NOT a false
+        # immediate 0.0. Without this guard `_first_crossing_eta`'s own
+        # `g(0) <= 0` shortcut (remaining is vacuously 0 for an empty sum)
+        # would publish a misleading "already exhausted" ETA for a pool that
+        # structurally has nothing in it, diverging from `_pressure_triggers`
+        # (which never even creates a pool trigger in this case).
+        if pool_set:
+            eta = _first_crossing_eta(pool_curve, rotatable, knots, config, now)
+            rr = _required_reduction_pool(pool_curve, rotatable, knots, config, now)
+        else:
+            eta = None
+            rr = {"delta_units": 0.0, "unmeetable": False}
         capacity_units = sum(
             _pressure_cap_units(gate, _pressure_acct_ratio(accounts_state.get(name, {}), config))
             for name in pool_set
