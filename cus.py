@@ -69,6 +69,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -6989,6 +6990,251 @@ def _build_weight_windows(pct_history: list[dict], token_totals_per_window: list
         b.append(b_i)
 
     return A, b, dropped_reason_counts
+
+
+# --- Task 15 (spec-2 token-pressure forecaster, STAGE 1): vendored
+# pure-Python NNLS core -- the burn-weight fit's (Task 16) constrained
+# least-squares solver. NO numpy/scipy anywhere (FACT #8/G4) -- lists and
+# the `math` module only. See `_nnls` below for the determinism contract
+# (§9.2 golden-replay backtest needs byte-identical output for the same
+# input, every run, every machine).
+
+_NNLS_ZERO_TOL = 1e-10  # absolute -- primal x_i treated as "hit the boundary"
+
+
+def _dot(a: list[float], b: list[float]) -> float:
+    """Pure-Python dot product (Task 15, NNLS primitive). Single ascending
+    index pass -- fixed summation order regardless of caller, never a
+    dict/set involved."""
+    total = 0.0
+    for i in range(len(a)):
+        total += a[i] * b[i]
+    return total
+
+
+def _matvec(A: list[list[float]], v: list[float]) -> list[float]:
+    """``A @ v`` for ``A`` a list of rows (Task 15, NNLS primitive)."""
+    return [_dot(row, v) for row in A]
+
+
+def _matvec_t(A: list[list[float]], v: list[float]) -> list[float]:
+    """``A^T @ v`` for ``A`` a list of rows (Task 15, NNLS primitive) --
+    computes the transpose-multiply without ever materializing ``A^T``."""
+    m = len(A)
+    n = len(A[0]) if m else 0
+    out = [0.0] * n
+    for i in range(m):
+        row = A[i]
+        vi = v[i]
+        for j in range(n):
+            out[j] += row[j] * vi
+    return out
+
+
+def _householder_qr_lstsq(A: list[list[float]], b: list[float]) -> list[float]:
+    """Unconstrained least squares ``argmin ||A x - b||^2`` via Householder
+    QR (Task 15) -- NEVER via the normal equations (``A^T A``), which would
+    square ``A``'s condition number; this is the inner solve `_nnls` calls
+    on the passive-set columns every active-set step.
+
+    ``A`` is a list of rows (m x n, full column rank, m >= n expected for
+    the overdetermined case `_nnls` calls this with). Reduces a WORKING
+    COPY of ``A`` to upper-triangular ``R`` via n Householder reflections,
+    applying each reflection to ``b`` in lockstep, then back-substitutes
+    ``R x = c[:n]`` for ``x``. Deterministic: every loop is a fixed
+    ascending index range, never a dict/set.
+    """
+    m = len(A)
+    n = len(A[0]) if m else 0
+    R = [row[:] for row in A]
+    c = list(b)
+
+    for k in range(n):
+        # Householder vector for column k, rows k..m-1.
+        norm_sq = 0.0
+        for i in range(k, m):
+            norm_sq += R[i][k] * R[i][k]
+        alpha = math.sqrt(norm_sq)
+        if alpha == 0.0:
+            continue  # degenerate column (rank-deficient) -- skip, handled at back-substitution
+        if R[k][k] > 0.0:
+            alpha = -alpha  # choose sign to avoid cancellation
+
+        v = [0.0] * m
+        v[k] = R[k][k] - alpha
+        for i in range(k + 1, m):
+            v[i] = R[i][k]
+
+        v_norm_sq = 0.0
+        for i in range(k, m):
+            v_norm_sq += v[i] * v[i]
+        if v_norm_sq == 0.0:
+            continue
+
+        # Apply the reflection H = I - 2 v v^T / (v^T v) to R's remaining
+        # columns and to c, in ascending column/row order.
+        for j in range(k, n):
+            s = 0.0
+            for i in range(k, m):
+                s += v[i] * R[i][j]
+            s = 2.0 * s / v_norm_sq
+            for i in range(k, m):
+                R[i][j] -= s * v[i]
+
+        s = 0.0
+        for i in range(k, m):
+            s += v[i] * c[i]
+        s = 2.0 * s / v_norm_sq
+        for i in range(k, m):
+            c[i] -= s * v[i]
+
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        s = c[i]
+        for j in range(i + 1, n):
+            s -= R[i][j] * x[j]
+        x[i] = 0.0 if R[i][i] == 0.0 else s / R[i][i]
+    return x
+
+
+def _nnls(M: list[list[float]], y: list[float], *, max_iter: int) -> tuple[list[float], bool]:
+    """Lawson-Hanson (1974) active-set NNLS (Task 15): ``min ||M x - y||^2
+    s.t. x >= 0`` -- the burn-weight fit's (Task 16) constrained solver.
+    Pure Python (FACT #8/G4, NO numpy/scipy), and DETERMINISTIC end to end:
+    the §9.2 golden-replay backtest needs byte-identical ``x`` for the same
+    ``(M, y)``, every run, every machine.
+
+    DETERMINISM (load-bearing, see `_dot`/`_matvec`/`_matvec_t`
+    above): every choice that could otherwise depend on dict/set iteration
+    order -- which variable enters the passive set, which variable(s) leave
+    it -- is made by scanning ``range(n)`` in strict ascending order and
+    keeping the FIRST (lowest-index) value on an exact tie (a strict ``>``
+    comparison naturally does this: a later, equal candidate never
+    displaces an earlier one). The passive-set column order is always
+    ``[j for j in range(n) if passive[j]]`` -- an ascending list, never a
+    ``set`` -- so the submatrix handed to `_householder_qr_lstsq` has a
+    fixed column order every call.
+
+    ALGORITHM: outer loop picks the inactive (non-passive) variable with
+    the largest dual/gradient ``w_j = (M^T (y - M x))_j`` (KKT-optimal once
+    every inactive ``w_j <= dual_tol``, a tolerance relative to the initial
+    dual's magnitude -- 1e-10 relative, per G4), adds it to the passive
+    set, then re-solves the unconstrained LS problem restricted to the
+    passive columns via Householder QR. If that solution has any
+    non-positive component, back off toward it by the largest ``alpha`` in
+    ``[0, 1]`` that keeps every passive ``x_i >= 0`` (the standard
+    Lawson-Hanson interpolation step), drop every passive index that hit
+    the zero boundary, and re-solve -- repeating until the passive-set
+    solution is all-positive, then returning to the outer loop.
+
+    ``max_iter`` bounds the TOTAL number of passive-set QR solves (outer
+    additions + inner backoff re-solves combined). Returns
+    ``converged=False`` on exhaustion rather than fabricate a partial
+    answer as final -- Task 16 owns the seed-fallback retry on that case,
+    this function never falls back on its own.
+    """
+    m = len(M)
+    n = len(M[0]) if m else 0
+    x = [0.0] * n
+    if n == 0:
+        return x, True
+
+    passive = [False] * n
+
+    # `Aty` (== the dual `w` at x=0, since the residual is `y - M@0 == y`)
+    # sets the KKT tolerance's scale only -- it is NOT reused as a Gram-form
+    # shortcut for the outer loop's own dual recompute below. That recompute
+    # is always done in RESIDUAL form (`r = y - M x`, `w = M^T r`, via
+    # `_matvec`/`_matvec_t`), never via the Gram matrix `M^T M`: forming
+    # `M^T M` would square `M`'s condition number for the variable-selection
+    # and termination decision (G4) -- the same condition-squaring
+    # Householder QR is pinned to avoid for the passive-set solve below.
+    Aty = _matvec_t(M, y)
+
+    dual_scale = max((abs(v) for v in Aty), default=0.0) or 1.0
+    dual_tol = 1e-10 * dual_scale
+
+    converged = False
+    iterations = 0
+    need_new_var = True
+
+    while iterations < max_iter:
+        if need_new_var:
+            Mx = _matvec(M, x)
+            w = _matvec_t(M, [y[i] - Mx[i] for i in range(m)])
+
+            best_j = -1
+            best_w = dual_tol
+            for j in range(n):
+                if passive[j]:
+                    continue
+                if w[j] > best_w:
+                    best_w = w[j]
+                    best_j = j
+
+            if best_j == -1:
+                converged = True
+                break
+
+            passive[best_j] = True
+            need_new_var = False
+
+        idxs = [j for j in range(n) if passive[j]]
+        if not idxs:
+            # Pathological floating-point edge case only: a just-selected
+            # variable's Householder-QR passive solve disagreed in sign
+            # with the residual-form dual test that selected it and dropped
+            # right back out, leaving the passive set empty without ever
+            # accepting. Retry variable selection rather than solving a
+            # zero-column system -- still bounded by max_iter like any
+            # other step, never a crash.
+            iterations += 1
+            need_new_var = True
+            continue
+
+        sub = [[row[j] for j in idxs] for row in M]
+        z_local = _householder_qr_lstsq(sub, y)
+        iterations += 1
+
+        min_z = min(z_local)
+        if min_z > 0.0:
+            new_x = [0.0] * n
+            for local_i, j in enumerate(idxs):
+                new_x[j] = z_local[local_i]
+            x = new_x
+            need_new_var = True
+            continue
+
+        # Interpolation step: largest alpha in [0, 1] keeping every passive
+        # x_i >= 0 -- ascending scan over idxs, numeric min (a tie in the
+        # minimizing ratio doesn't change the resulting alpha VALUE, so no
+        # index tie-break is needed here).
+        alpha = 1.0
+        for local_i, j in enumerate(idxs):
+            zi = z_local[local_i]
+            if zi <= 0.0:
+                xi = x[j]
+                denom = xi - zi
+                step = xi / denom if denom != 0.0 else 0.0
+                if step < alpha:
+                    alpha = step
+        alpha = max(0.0, alpha)
+
+        new_x = list(x)
+        for local_i, j in enumerate(idxs):
+            new_x[j] = x[j] + alpha * (z_local[local_i] - x[j])
+        x = new_x
+
+        # Drop every passive index that hit (or numerically crossed) zero --
+        # ascending scan over idxs, never a set.
+        for j in idxs:
+            if x[j] <= _NNLS_ZERO_TOL:
+                passive[j] = False
+                x[j] = 0.0
+
+        need_new_var = False  # re-solve on the shrunk passive set next
+
+    return x, converged
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
