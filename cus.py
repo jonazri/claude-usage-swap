@@ -6814,6 +6814,183 @@ def _rollup_children(table: AttributionTable, coord_map: dict[str, str]) -> Attr
     return rolled
 
 
+def _pressure_parse_ts(ts) -> datetime | None:
+    """Parse an ISO8601 timestamp (``Z`` or offset form) to a tz-aware
+    ``datetime``, or ``None`` if missing/unparseable (Task 14 internal --
+    same tolerant pattern used throughout the pressure module, e.g.
+    ``_pressure_reset_knot``/``_compute_burn_rate``)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+# Cache-create TTLs in minutes (Anthropic prompt-caching tiers: a 5-minute
+# default TTL and a 1-hour extended TTL), keyed by the pinned column name.
+_PRESSURE_CACHE_TTL_MINUTES = {"cache_create_5m": 5.0, "cache_create_1h": 60.0}
+
+
+def _build_weight_windows(pct_history: list[dict], token_totals_per_window: list[dict],
+                          resets: list[dict]) -> tuple[list[list[float]], list[float], dict[str, int]]:
+    """Task 14 (spec-2 token-pressure forecaster, STAGE 1, G4 attribution
+    boundary): assemble the regression inputs ``(A, b)`` for the burn-weight
+    NNLS fit (Task 15/16) -- ONE row per candidate attribution window. This
+    function IS the G4 boundary: every exclusion/correction/normalization
+    happens HERE so the solver receives a clean ``(A, b)`` and does no
+    filtering of its own.
+
+    INPUTS (``pct_history`` and ``token_totals_per_window`` are INDEX-ALIGNED
+    -- entry ``i`` of each describes the same candidate window; no earlier
+    task pins these shapes, the real producer is wired at Task 20):
+
+    * ``pct_history[i]`` -- one candidate attribution window: the interval
+      between two consecutive usage polls for ONE account::
+
+          {"account": str, "start_ts": iso8601, "end_ts": iso8601,
+           "pct_start": float, "pct_end": float, "ratio": float}
+
+      ``pct_start``/``pct_end`` are the SAME window-type's (e.g. both 5h)
+      polled usage percent at the interval boundaries. ``ratio`` is the
+      PRE-RESOLVED ``capacity_x / reference_x`` tier factor (Task 2
+      ``_pressure_ratio``/``_pressure_acct_ratio``) -- this function takes no
+      ``config``, so the caller resolves ratio upstream, once, before
+      building the window list.
+
+    * ``token_totals_per_window[i]`` -- the raw token totals accumulated
+      during that window's interval, keyed by the 5 pinned columns::
+
+          {"input": num, "output": num, "cache_read": num,
+           "cache_create_5m": num, "cache_create_1h": num}
+
+    * ``resets`` -- observed reset-boundary crossings, NOT index-aligned (an
+      account may have 0+ crossings inside any given window's interval)::
+
+          [{"account": str, "ts": iso8601}, ...]
+
+      Not type-tagged (5h vs 7d) deliberately: the brief's "a window whose
+      interval crosses a 5h/7d reset boundary" excludes on EITHER, since
+      either reset means the polled ``pct_end`` reflects a post-reset value
+      not comparable to ``pct_start`` for Δburn purposes.
+
+    OUTPUT:
+
+    * ``A`` -- list of 5-element rows, PINNED column order
+      ``[input, output, cache_read, cache_create_5m, cache_create_1h]`` (do
+      not reorder -- Task 15/16's monotone priors are keyed positionally).
+    * ``b`` -- tier-normalized Δburn, index-aligned with ``A`` (dropped rows
+      are absent from both, never a placeholder)::
+
+          b_i = (pct_end - pct_start) / 100 * ratio
+
+      so equal ABSOLUTE burn (reference units) on a 20x account (ratio 4.0)
+      and a 5x account (ratio 1.0) yields EQUAL ``b`` -- matches Task 2's
+      ``_pressure_burn_units`` normalization.
+    * ``dropped_reason_counts`` -- observability dict, keys present only for
+      reasons actually seen: ``"reset_crossing"`` (responsibility 1),
+      ``"zero_tokens"`` / ``"nonpositive_b"`` (responsibility 3). Every
+      dropped row is counted under exactly one reason (checked in this
+      order: reset_crossing, zero_tokens, nonpositive_b) -- never silently
+      discarded.
+
+    RESPONSIBILITY 2 -- within-window cache-create expiry correction: a
+    cache-create token's TTL (5 min / 1h) can expire partway through a
+    window whose duration exceeds the TTL, so only a fraction of the window
+    actually benefited from that cache entry. v1 correction (deliberately
+    simple -- shadow-calibrated later, NOT a simulation of individual token
+    creation instants, which ``token_totals_per_window`` doesn't carry):
+
+        factor = min(1.0, ttl_minutes / window_duration_minutes)
+        effective_count = raw_count * factor
+
+    applied independently to ``cache_create_5m`` (ttl=5) and
+    ``cache_create_1h`` (ttl=60); ``input``/``output``/``cache_read`` pass
+    through uncorrected (they don't expire). A window whose duration is <=
+    the TTL gets factor 1.0 (the cache entry was live for the entire
+    window -- no correction). A missing/zero/degenerate duration also
+    yields 1.0 (never divide by zero; a genuinely-degenerate window is
+    independently caught by the zero-token/nonpositive-b drops).
+
+    Pure (G0): reads its inputs, mutates nothing, no I/O.
+    """
+    resets_by_account: dict[str, list[datetime]] = {}
+    for r in resets:
+        account = r.get("account")
+        ts = _pressure_parse_ts(r.get("ts"))
+        if account is None or ts is None:
+            continue
+        resets_by_account.setdefault(account, []).append(ts)
+
+    A: list[list[float]] = []
+    b: list[float] = []
+    dropped_reason_counts: dict[str, int] = {}
+
+    def _drop(reason: str) -> None:
+        dropped_reason_counts[reason] = dropped_reason_counts.get(reason, 0) + 1
+
+    for window, totals in zip(pct_history, token_totals_per_window):
+        start_ts = _pressure_parse_ts(window.get("start_ts"))
+        end_ts = _pressure_parse_ts(window.get("end_ts"))
+        account = window.get("account")
+
+        # Responsibility 1: drop reset-crossing windows. A crossing is any
+        # reset for THIS account with start_ts < ts <= end_ts (half-open on
+        # the left so a reset exactly AT the window's start -- already
+        # reflected in pct_start -- doesn't spuriously exclude it).
+        crossed = False
+        if start_ts is not None and end_ts is not None:
+            crossed = any(
+                start_ts < reset_ts <= end_ts
+                for reset_ts in resets_by_account.get(account, ())
+            )
+        if crossed:
+            _drop("reset_crossing")
+            continue
+
+        raw = {
+            "input": float(totals.get("input", 0.0) or 0.0),
+            "output": float(totals.get("output", 0.0) or 0.0),
+            "cache_read": float(totals.get("cache_read", 0.0) or 0.0),
+            "cache_create_5m": float(totals.get("cache_create_5m", 0.0) or 0.0),
+            "cache_create_1h": float(totals.get("cache_create_1h", 0.0) or 0.0),
+        }
+        # Responsibility 3a: drop all-zero-token windows (checked on the RAW
+        # totals -- the expiry correction below only ever scales down, so it
+        # can never turn a non-zero row zero or vice versa).
+        if all(v == 0.0 for v in raw.values()):
+            _drop("zero_tokens")
+            continue
+
+        # Responsibility 4: tier-normalize b BEFORE the nonpositive-b check.
+        pct_start = float(window.get("pct_start", 0.0) or 0.0)
+        pct_end = float(window.get("pct_end", 0.0) or 0.0)
+        ratio = float(window.get("ratio", 1.0) or 1.0)
+        b_i = (pct_end - pct_start) / 100.0 * ratio
+
+        # Responsibility 3b: drop no-measurable-burn windows.
+        if b_i <= 0.0:
+            _drop("nonpositive_b")
+            continue
+
+        # Responsibility 2: within-window cache-create expiry correction.
+        duration_min = None
+        if start_ts is not None and end_ts is not None:
+            duration_min = (end_ts - start_ts).total_seconds() / 60.0
+        corrected = dict(raw)
+        for col, ttl in _PRESSURE_CACHE_TTL_MINUTES.items():
+            factor = 1.0 if not duration_min or duration_min <= 0 else min(1.0, ttl / duration_min)
+            corrected[col] = raw[col] * factor
+
+        A.append([
+            corrected["input"], corrected["output"], corrected["cache_read"],
+            corrected["cache_create_5m"], corrected["cache_create_1h"],
+        ])
+        b.append(b_i)
+
+    return A, b, dropped_reason_counts
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
