@@ -6901,6 +6901,120 @@ def _rollup_children(table: AttributionTable, coord_map: dict[str, str]) -> Attr
     return rolled
 
 
+# --------------------------------------------------------------------------
+# Task 19 (spec-2 token-pressure forecaster, STAGE 1, Phase D closer): the
+# blindness / cold-start guard (§3 "Blindness guard", §1 rule 1) -- holds
+# the attribution-DEPENDENT acting paths (§5.2 targeting, the residual-
+# driven safety-factor widening, Task 17) while Task 10's tail reader is
+# still catching up right after a daemon start/restart, WITHOUT holding the
+# SUPPLY-derived §5.4 escalate-before-gate (Tasks 5/7/9's
+# `_pressure_triggers`/`_pressure_binding`/`_required_reduction`), which is
+# computed from `state.json` burn rates alone and needs no per-session
+# attribution at all.
+# --------------------------------------------------------------------------
+
+# blindness fires once MORE than this fraction of active sessions have no
+# `offsets` entry yet -- distinguishes a genuine cold-start/restart backlog
+# (most or all active sessions unread) from routine steady-state churn (a
+# single freshly-launched session normally has no offsets entry either,
+# until the reader's NEXT cycle picks it up; that alone must not blind the
+# whole fleet's targeting/widening).
+_ATTRIBUTION_BLINDNESS_UNREAD_FRACTION = 0.5
+
+
+def _attribution_confidence(offsets: dict, active_sessions, now) -> dict:
+    """Task 19 (§3 "Blindness guard", §1 rule 1): tell a high residual
+    caused by Task 10's tail reader (`_read_active_tails` @6140) still
+    CATCHING UP after a daemon start/restart -- benign, transient -- apart
+    from a genuine steady-state attribution gap.
+
+    ``offsets`` is Task 10's caller-owned in-memory ``path -> recorded byte
+    offset`` registry: a path absent from it has never been read by this
+    reader's lifetime (cold start), so no burn from it has been attributed
+    yet. ``active_sessions`` is the set of sessions currently believed
+    alive; each element may be EITHER a plain session_id string -- matched
+    against ``offsets`` by ``Path.stem``, the established top-level
+    transcript-naming convention ``<slug>/<session_id>.jsonl``
+    (`_pressure_transcript_paths` @6002, `_resolve_transcript` @15199's
+    ``f"{session_id}.jsonl"``) -- OR a transcript ``Path`` itself, matched
+    by direct membership in ``offsets``. Accepting both means a caller
+    holding either representation on hand (Task 10's own paths, or a
+    session_id-keyed view like Task 12/13's per-session records) gets a
+    correct match without being forced into a lookup it may not have.
+    ``now`` is accepted for call-shape symmetry with the rest of the
+    Phase-D read paths (Task 10/11/13 all take ``now``, e.g.
+    `_read_active_tails`/`_pressure_transcript_paths`); unused by this
+    cut's pure fraction-of-active-sessions-read computation.
+
+    blindness = True once MORE than
+    ``_ATTRIBUTION_BLINDNESS_UNREAD_FRACTION`` of active sessions are
+    unread -- the high residual this cycle is explained by cold-start
+    backlog, NOT a real attribution failure. blindness = False once the
+    reader has caught up (at most that fraction of active sessions are
+    still unread) -- ANY residual remaining at that point is genuine
+    steady-state residual (a real fit-quality signal), never blindness, no
+    matter how large.
+
+    Returns a dict shaped to compose directly into the pressure.json
+    ``attribution`` block (Task 20: ``{confidence, blindness,
+    residual_fraction, reason}`` -- ``residual_fraction`` comes from Task
+    11's `_attribute_burn`/``AttributionTable.residual_fraction``, merged
+    in by the CALLER, never computed here) PLUS the three gating decisions
+    the downstream acting paths consume directly:
+
+      - ``suppress_targeting`` = ``blindness`` -- §5.2 targeting must not
+        run on incomplete attribution.
+      - ``suppress_residual_widening`` = ``blindness`` -- the confidence-
+        widened safety factor (Task 17, `_safety_factor`) must not widen on
+        a residual that is just cold-start backlog, not a real fit-quality
+        signal.
+      - ``allow_supply_escalation`` = ALWAYS ``True`` -- §5.4
+        escalate-before-gate (`_pressure_triggers`/`_pressure_binding`/
+        `_required_reduction`) is computed from ``state.json`` burn rates
+        alone and needs NO per-session attribution, so blindness must NEVER
+        suppress it.
+
+    ``confidence`` = fraction of active sessions WITH an ``offsets`` entry
+    (``1.0`` when there are no active sessions -- nothing to be blind
+    about, so targeting/widening are NOT suppressed either). Pure (G0):
+    reads ``offsets``/``active_sessions``, mutates nothing.
+    """
+    offset_paths = {p if isinstance(p, Path) else Path(str(p)) for p in offsets}
+    read_stems = {p.stem for p in offset_paths}
+    sessions = list(active_sessions)
+    total = len(sessions)
+
+    def _is_read(item) -> bool:
+        if isinstance(item, Path):
+            return item in offset_paths
+        return str(item) in read_stems
+
+    read_count = sum(1 for item in sessions if _is_read(item))
+
+    if total == 0:
+        confidence = 1.0
+        blindness = False
+        reason = "no active sessions"
+    else:
+        confidence = read_count / total
+        unread = total - read_count
+        blindness = (1.0 - confidence) > _ATTRIBUTION_BLINDNESS_UNREAD_FRACTION
+        reason = (
+            f"cold-start: {unread}/{total} sessions unread"
+            if blindness
+            else f"steady-state: {read_count}/{total} sessions read"
+        )
+
+    return {
+        "blindness": blindness,
+        "confidence": confidence,
+        "reason": reason,
+        "suppress_targeting": blindness,
+        "suppress_residual_widening": blindness,
+        "allow_supply_escalation": True,
+    }
+
+
 def _pressure_parse_ts(ts) -> datetime | None:
     """Parse an ISO8601 timestamp (``Z`` or offset form) to a tz-aware
     ``datetime``, or ``None`` if missing/unparseable (Task 14 internal --
