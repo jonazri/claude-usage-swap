@@ -5237,6 +5237,58 @@ def _pressure_pool_set(state: dict, window: str, config: dict) -> list[str]:
     return eligible
 
 
+def _pressure_reset_knot(acct: dict, window: str, config: dict, now,
+                         *, horizon) -> float | None:
+    """Minutes ``T_w`` to the NEXT reset boundary for ``window`` (Task 3, G5,
+    reset-decay risk #2). ``acct`` is the per-account state dict; ``now`` a
+    timezone-aware ``datetime``.
+
+    * ``5h`` — minutes to ``acct['five_hour_resets_at']``. If that boundary is
+      STALE (at/before ``now``), roll it forward by whole ``W5 = 300`` min
+      periods until it is in the future, so ``T_w`` is never ≤ 0 (never a false
+      immediate post-reset credit — risk #2). A missing/unparseable timestamp
+      returns ``None``.
+    * ``7d`` — minutes to ``projected_seven_day_reset`` @4587 (already
+      self-rolled to the next upcoming ~72h refresh).
+
+    Returns the offset ONLY when ``0 < T_w <= horizon``; else ``None``. The
+    ``horizon`` argument DECOUPLES the knot from a hardcoded 180 (finding 1):
+    BOTH the trigger/exit-ETA path (Task 6 via Task 9) AND the
+    required-reduction path (Task 4/5 curves + Task 8) pass
+    ``horizon = H+margin = 240`` so a 5h reset in ``(180, 240]`` is retained;
+    ``H = 180`` is the ENTER threshold applied to the resulting ETA (Task 9),
+    never the knot horizon. Pure/read-only (G0): reads ``acct``, mutates
+    nothing.
+    """
+    W5 = 300.0
+    if window == "5h":
+        reset_at = acct.get("five_hour_resets_at")
+        if not reset_at:
+            return None
+        try:
+            reset_dt = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        t = (reset_dt - now).total_seconds() / 60.0
+        # Stale boundary -> roll forward whole W5 periods so T_w > 0 (risk #2).
+        while t <= 0:
+            t += W5
+    elif window == "7d":
+        projected = projected_seven_day_reset(acct, config, now)
+        if not projected:
+            return None
+        try:
+            reset_dt = datetime.fromisoformat(str(projected).replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        t = (reset_dt - now).total_seconds() / 60.0
+    else:
+        raise ValueError(f"_pressure_reset_knot: unknown window {window!r}")
+    if 0 < t <= horizon:
+        return t
+    return None
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
