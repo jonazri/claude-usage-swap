@@ -6105,6 +6105,407 @@ def _read_active_tails(now: datetime, cfg: dict, offsets: dict, *,
     return result
 
 
+# --------------------------------------------------------------------------
+# Task 11 (spec-2 token-pressure forecaster, STAGE 1, Phase D linchpin):
+# per-message account time-join + launch-time degradation + unattributed
+# residual + disjoint rotatable/pinned burn partition (§3, FACT #5, G8).
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Interval:
+    """One (account, pane, tmux_socket, cwd) binding window for a session,
+    built from a single `sessions.log` row (launch/resume/rotation alike).
+    `end=None` means open-ended -- this is the session's MOST RECENT known
+    binding, covering every usage timestamp from `start` onward. FACT #5:
+    today's sessions.log carries only launch/resume rows (no rotation
+    rows), so a session normally has exactly ONE interval -- see
+    `_session_account_intervals` / `_join_usage_account`."""
+
+    start: datetime
+    end: datetime | None
+    account: str | None
+    session_id: str
+    pane: str | None
+    tmux_socket: str | None
+    cwd: str | None
+
+
+def _session_account_intervals(rows: list[dict]) -> dict[str, list[Interval]]:
+    """Task 11: build each session's chronologically-ordered account-binding
+    intervals from `sessions.log` rows.
+
+    `rows` is `_parse_sessions_log()`'s (@13326) ALREADY-NORMALIZED output --
+    that function owns the two on-disk CSV shapes (6-col
+    `ts,session_id,account,pane,tmux_socket,cwd` vs legacy 5-col
+    `ts,session_id,account,pane,cwd` via `split(",", 4)`, cwd last so it may
+    embed commas; 5-col rows normalize to `tmux_socket=None`) -- so this
+    function only groups already-parsed rows by `session_id` and turns each
+    session's sorted rows into a covering-interval list, one interval
+    boundary per row. A row with a missing/unparseable `session_id`/`ts` is
+    skipped defensively (should not happen for a real
+    `_parse_sessions_log()` row, but a directly-constructed test row
+    could be malformed).
+
+    FACT #5 / committee #10: `sessions.log` today emits only launch/resume
+    rows, never a rotation row on an account swap mid-session -- so a real
+    session normally yields exactly ONE interval here (the degraded,
+    launch-time case `_join_usage_account` falls back to). This function
+    itself is time-join-agnostic: feed it synthetic multi-row sessions (as
+    `test_rotation_rows_would_join_midwindow` does) and it builds the SAME
+    multi-interval structure a rotation-aware `sessions.log` would.
+    """
+    grouped: dict[str, list[tuple[datetime, dict]]] = {}
+    for row in rows:
+        session_id = row.get("session_id")
+        ts_raw = row.get("ts")
+        if not session_id or not ts_raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        grouped.setdefault(session_id, []).append((ts, row))
+
+    result: dict[str, list[Interval]] = {}
+    for session_id, entries in grouped.items():
+        entries.sort(key=lambda e: e[0])
+        intervals: list[Interval] = []
+        for i, (ts, row) in enumerate(entries):
+            end = entries[i + 1][0] if i + 1 < len(entries) else None
+            intervals.append(Interval(
+                start=ts,
+                end=end,
+                account=row.get("account") or None,
+                session_id=session_id,
+                pane=row.get("pane") or None,
+                tmux_socket=row.get("tmux_socket") or None,
+                cwd=row.get("cwd") or None,
+            ))
+        result[session_id] = intervals
+    return result
+
+
+def _log_launch_time_fallback(session_id: str, account: str | None) -> None:
+    """G8 / committee #10: launch-time degradation is a KNOWN, LOGGED
+    limitation, never silent. One structured, greppable line per fallback
+    join -- same `click.echo`-to-stdout convention as CRED-AUDIT (@7116),
+    not a new log file. Never raises into its caller (observability must
+    never break attribution)."""
+    try:
+        click.echo(
+            "pressure.attribution.launch_time_fallback "
+            f"session_id={session_id} account={account} "
+            'reason="no rotation rows in sessions.log; single launch-time interval"'
+        )
+    except Exception:  # noqa: BLE001 -- observability must never break attribution
+        pass
+
+
+def _join_usage_account(usage_ts: datetime,
+                         intervals: list[Interval]) -> tuple[str | None, str]:
+    """Task 11: time-join one usage-line timestamp to the account active
+    then, via the covering interval `start <= usage_ts < end` (`end=None`
+    treated as +inf -- the session's current/most-recent binding).
+
+    FACT #5: a single-interval session (today's only real shape -- no
+    rotation rows) can never fail the join once it exists, so its
+    confidence is unconditionally downgraded to `"launch-time"` (a KNOWN
+    degrade, logged via `_log_launch_time_fallback` -- G8) rather than
+    reported as a genuine multi-candidate join. A multi-interval session
+    (synthetic rotation rows today; real ones if committee #10's pin is
+    later confirmed) is time-join-DRIVEN: `test_rotation_rows_would_join_
+    midwindow` proves a mid-window usage line lands on the account active
+    at ITS timestamp, not the launch account -- i.e. today's single-interval
+    behavior is the *degraded* case, not a hardcoded assumption.
+
+    No covering interval (usage_ts before the earliest known binding, or no
+    sessions.log history for this session at all -- `intervals=[]`) returns
+    `(None, "unattributed")`: the caller (`_attribute_burn`) keeps this as
+    residual, never guessing an account.
+    """
+    if not intervals:
+        return None, "unattributed"
+    if len(intervals) == 1:
+        iv = intervals[0]
+        _log_launch_time_fallback(iv.session_id, iv.account)
+        return iv.account, "launch-time"
+    for iv in sorted(intervals, key=lambda i: i.start):
+        if iv.start <= usage_ts and (iv.end is None or usage_ts < iv.end):
+            return iv.account, "joined"
+    return None, "unattributed"
+
+
+def _message_burn_units(usage: dict, weights: dict) -> float:
+    """Task 11: one usage line's weighted burn -- Σ usage[k] × weights[k]
+    over the keys BOTH dicts share. Deliberately schema-agnostic: a real
+    transcript `usage` carries `input_tokens`/`output_tokens`/
+    `cache_read_input_tokens`/`cache_creation_input_tokens` (verified from a
+    live transcript) and MAY carry a nested `cache_creation` 5m/1h
+    breakdown; whether `weights` is flat or split that finely is the
+    caller's choice -- weight FITTING (Task 14, NNLS) owns picking the
+    actual values, this is just the dot product."""
+    total = 0.0
+    for key, w in weights.items():
+        v = usage.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            total += v * w
+    return total
+
+
+class AttributionTable:
+    """Task 11 output of `_attribute_burn`: per-`(account, session_id)`
+    weighted burn, plus an explicit, NEVER-rescaled unattributed residual
+    for burn whose account could not be time-joined at all (§3, G8).
+
+    SCOPE NOTE: this is the narrower "join failed" residual only --
+    `_attribute_burn` does not take `state`, so it cannot compute the
+    broader §3 residual (an account's OWN observed `burn_rate` minus the
+    summed session shares read from a byte-capped/truncated transcript,
+    §10.9 (a)/(b)); that comparison needs `state.json`'s per-account rate
+    and is deferred to whichever later task combines this table with
+    `state`. Keyed `"unattributed"` rather than per real account name,
+    because a join failure inherently means no account is known for that
+    burn (see `_join_usage_account`) -- there is nothing else to key it by.
+    """
+
+    def __init__(self) -> None:
+        self.per_session: dict[tuple[str, str], float] = {}
+        self.session_pane: dict[str, str | None] = {}
+        self.unattributed_residual: dict[str, float] = {}
+        self.residual_fraction: float = 0.0
+
+    def burn_for(self, account: str, session_id: str) -> float:
+        return self.per_session.get((account, session_id), 0.0)
+
+    def residual_for(self, key: str = "unattributed") -> float:
+        return self.unattributed_residual.get(key, 0.0)
+
+
+_ATTRIBUTION_DEDUP_WINDOW = timedelta(days=7)  # §10.9: dedup set width
+
+
+def _attribute_burn(tails: dict, intervals: dict, weights: dict) -> AttributionTable:
+    """Task 11: attribute transcript burn to (account, session), per §3's
+    "Demand & attribution" model.
+
+    - Flattens every line across all `tails` (Task 10's `_read_active_tails`
+      output, `dict[Path, list[dict]]`), keeping only `type == "assistant"`
+      lines with a `message.usage` dict, `uuid`, `sessionId`, and a
+      parseable `timestamp` -- anything else (user/tool/system lines,
+      malformed timestamps) is silently skipped, not counted as residual
+      (it carries no burn to attribute in the first place).
+    - Dedups on `(session_id, uuid)` (§10.9): lines are processed in
+      chronological-timestamp order so the FIRST occurrence of a given
+      message wins; an exact repeat (the same message re-read by an
+      overlapping tail window) within `_ATTRIBUTION_DEDUP_WINDOW` (7d, the
+      widest attribution window) of its first occurrence is dropped. This
+      pure function scopes the dedup set to the batch it's given -- a
+      caller persisting it across daemon cycles (Task 20, §10.9(a)) is a
+      separate, later concern.
+    - Time-joins each line via `_join_usage_account` and sums weighted burn
+      (`_message_burn_units`) per `(account, session_id)`.
+    - A line whose join fails (`account is None`) is NEVER rescaled onto a
+      joined session -- it accumulates into `unattributed_residual` instead
+      (see `AttributionTable`'s scope note), and `residual_fraction` is
+      published as `residual / (residual + attributed)` (0.0 when both are
+      zero, never a divide-by-zero).
+    """
+    entries: list[tuple[datetime, str, str, dict]] = []
+    for _path, lines in tails.items():
+        for line in lines:
+            if not isinstance(line, dict) or line.get("type") != "assistant":
+                continue
+            message = line.get("message")
+            if not isinstance(message, dict):
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            uid = line.get("uuid")
+            session_id = line.get("sessionId")
+            ts_raw = line.get("timestamp")
+            if not (uid and session_id and ts_raw):
+                continue
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            entries.append((ts, session_id, uid, usage))
+
+    entries.sort(key=lambda e: e[0])  # chronological -> deterministic dedup
+
+    table = AttributionTable()
+    seen_at: dict[tuple[str, str], datetime] = {}
+
+    for ts, session_id, uid, usage in entries:
+        key = (session_id, uid)
+        prior = seen_at.get(key)
+        if prior is not None and abs(ts - prior) <= _ATTRIBUTION_DEDUP_WINDOW:
+            continue  # duplicate re-read of the same message -- drop
+        seen_at[key] = ts
+
+        burn = _message_burn_units(usage, weights)
+        session_intervals = intervals.get(session_id, [])
+        account, _confidence = _join_usage_account(ts, session_intervals)
+
+        if account is None:
+            table.unattributed_residual["unattributed"] = (
+                table.unattributed_residual.get("unattributed", 0.0) + burn)
+            continue
+
+        table.per_session[(account, session_id)] = (
+            table.per_session.get((account, session_id), 0.0) + burn)
+        if session_id not in table.session_pane and session_intervals:
+            table.session_pane[session_id] = session_intervals[0].pane
+
+    attributed_total = sum(table.per_session.values())
+    residual_total = sum(table.unattributed_residual.values())
+    denom = attributed_total + residual_total
+    table.residual_fraction = (residual_total / denom) if denom > 0 else 0.0
+    return table
+
+
+class PartitionedTable:
+    """Task 11 output of `_partition_burn`: disjoint rotatable vs pinned
+    burn, keyed by `(account_name, window)` to match the `FakePartition`
+    double Tasks 5/7/9 already consume (`pinned_burn_units`/
+    `rotatable_burn_units`, see `tests/test_pressure_{pool_curve,pinned,
+    reqreduction,level}.py`).
+
+    UNITS NOTE (documented, not silently diverged): a value here is the RAW
+    weighted burn `_attribute_burn` summed for that account's bucket over
+    the batch it was given -- NOT yet a true units/min RATE. Converting to
+    a rate is Task 12's job ("per-session trend/accel"), which does not
+    exist yet as of Task 11 (see `.superpowers/sdd/progress.md`); `window`
+    is therefore accepted (for FakePartition signature-parity -- Tasks 5/7
+    call `pinned_burn_units(name, "5h")` positionally) but does not change
+    the returned value -- burn itself has no window dimension, only each
+    window's own cap/reset does (which Tasks 5/7's OWN logic already
+    handles). Task 20's real wiring should revisit this once Task 12 lands.
+    """
+
+    def __init__(self, pinned_by_account: dict[str, float],
+                 rotatable_by_account: dict[str, float],
+                 per_session: dict[tuple[str, str], tuple[float, float]]) -> None:
+        self._pinned = dict(pinned_by_account)
+        self._rotatable = dict(rotatable_by_account)
+        self.per_session = dict(per_session)  # (account, session_id) -> (pinned, rotatable)
+
+    def pinned_burn_units(self, name: str, window: str) -> float:
+        return self._pinned.get(name, 0.0)
+
+    def rotatable_burn_units(self, name: str, window: str) -> float:
+        return self._rotatable.get(name, 0.0)
+
+
+def _partition_burn(attribution_table: AttributionTable, state: dict,
+                     config: dict) -> PartitionedTable:
+    """Task 11 (the Phase-D LINCHPIN, §3 disjoint-population model): split
+    each `(account, session_id)` attributed burn into DISJOINT rotatable vs
+    pinned components, from cus's per-SESSION binding/lane/pool state.
+
+    SIGNATURE NOTE: the brief pins `_partition_burn(attribution_table,
+    state)`; this extends it with `config` because the pinned/lock
+    predicate below (`session_locks.pinned`, `_locked_slots`) and the
+    slot's pool-account resolution both need it, and neither is reachable
+    from `attribution_table`/`state` alone (documented per the brief's
+    "extend the signature minimally and document why" allowance).
+
+    PREDICATE (per-SLOT, not per-account -- a slot's BACKING ACCOUNT can
+    rotate but a session's SLOT binding is for life; verbatim from the
+    investigated task instructions, not re-derived here):
+      1. `slot = session_current_slot(session_id)` -- pane/tmux_socket ->
+         mount -> slot join (module-level, monkeypatchable, so tests
+         control slot resolution without a live sessions.log/mount, the
+         same pattern `tests/test_per_session_cycle.py` already uses).
+      2. `slot is None` (bare/global-mode, no `slot-` mount, Gap A): a
+         non-lane session can never rotate through the pool, so it is
+         PINNED to its own (attributed) account either way. `session_locks
+         .pinned` (pane or session_id, same two-key lookup
+         `session_is_pinned` @14050 uses) is still consulted below for the
+         SAME reason `session_is_pinned` checks it -- but it does NOT
+         change the bucket here: both "explicitly pinned" and "no lane at
+         all" land in PINNED, credited to the burn's own attributed
+         account (there is no pool-backing account to defer to for a
+         session that was never on a slot). This is the brief's own
+         decision, restated: "a non-lane session is never a pool
+         rotatable, so its burn is PINNED to its account."
+      3. `slot in _locked_slots(config)` -> PINNED (the slot's account is
+         frozen -- ladder/hard-cap/reactive-429/idle-gc all skip it),
+         credited to the burn's attributed account (== the locked slot's
+         current account, by construction).
+      4. Else -> ROTATABLE, credited to the account CURRENTLY backing that
+         slot: `state["slots"][slot]["account"]` (the same field
+         `occupied_slot_accounts` @9310 reads).
+
+    MISMATCH REPORTED (per the brief's "if you find a mismatch... report
+    it" instruction): the investigated instructions said step 4 credits
+    "the pool `_slot_pool(state, slot, config)`" -- but `_slot_pool`
+    (cus.py ~9381) returns a rotation-set POOL NAME (`"premium"`/
+    `"standard"`, GH #99), not an account, and the `FakePartition`/
+    `PartitionedTable` contract keys `rotatable_burn_units(name, window)`
+    by ACCOUNT NAME (matching `_pressure_pool_set`/`_pool_rotatable_burn`,
+    Task 5, which iterate account names, not pool names). So step 4
+    instead resolves the slot's CURRENT BACKING ACCOUNT and credits that --
+    the only value that type-checks against the accessor contract;
+    `_slot_pool` plays no role in this predicate.
+
+    KEYS ON SLOT, NOT ACCOUNT: two live slots can share one account name
+    via independent-login families (Gap C), so an account-keyed rollup
+    would conflate a pinned and a rotatable slot. Because each session maps
+    to exactly one slot -> exactly one bucket, the disjoint-and-sums-to-
+    total invariant holds trivially -- asserted below, not just hoped for.
+
+    Gap B (accepted v1 limitation, NOT fixed here): `_locked_slots` freezes
+    a slot's CURRENT account; `state` is a live snapshot, so burn history
+    that straddles a lock/unlock toggle mid-window is attributed by the
+    session's CURRENT slot-lock state, not the state at burn-time.
+    """
+    pinned_by_account: dict[str, float] = {}
+    rotatable_by_account: dict[str, float] = {}
+    per_session: dict[tuple[str, str], tuple[float, float]] = {}
+
+    pinned_map = config.get("session_locks", {}).get("pinned", {}) or {}
+    locked_slots = _locked_slots(config)
+
+    for (account, session_id), burn in attribution_table.per_session.items():
+        slot = session_current_slot(session_id)
+
+        if slot is None:
+            pane = attribution_table.session_pane.get(session_id)
+            # Consulted per step 2 (mirrors session_is_pinned's two-key
+            # lookup) -- intentionally not branched on, see docstring.
+            _is_config_pinned = (pane is not None and pane in pinned_map) or (
+                session_id in pinned_map)
+            pinned_by_account[account] = pinned_by_account.get(account, 0.0) + burn
+            per_session[(account, session_id)] = (burn, 0.0)
+            continue
+
+        if slot in locked_slots:
+            pinned_by_account[account] = pinned_by_account.get(account, 0.0) + burn
+            per_session[(account, session_id)] = (burn, 0.0)
+            continue
+
+        slot_account = (state.get("slots", {}).get(slot, {}) or {}).get("account") or account
+        rotatable_by_account[slot_account] = rotatable_by_account.get(slot_account, 0.0) + burn
+        per_session[(account, session_id)] = (0.0, burn)
+
+    # INVARIANT (asserted, not just tested): rotatable + pinned are disjoint
+    # and sum to each session's total attributed burn -- never both, never
+    # neither. A wrong partition here silently corrupts every downstream
+    # trigger (Tasks 5/7), so this is a hard `assert`, not a soft check.
+    for (account, session_id), (p, r) in per_session.items():
+        total = attribution_table.per_session[(account, session_id)]
+        assert p == 0.0 or r == 0.0, (
+            f"session {session_id} ({account}) split across BOTH pinned and "
+            f"rotatable -- partition must be disjoint")
+        assert abs((p + r) - total) < 1e-9, (
+            f"session {session_id} ({account}) partition {p + r} != total {total}")
+
+    return PartitionedTable(pinned_by_account, rotatable_by_account, per_session)
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
