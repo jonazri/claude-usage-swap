@@ -6659,6 +6659,161 @@ def _classify_session(record: dict) -> str:
     return "interactive"
 
 
+# --------------------------------------------------------------------------
+# Task 13 (spec-2 token-pressure forecaster, STAGE 1, Phase D): coordinator
+# cwd-prefix rollup (§3 "Coordinator rollup", committee #9, FACT #10) --
+# rolls a child session's burn up to its coordinator for §5.2
+# classification + targeting ONLY; Task 11's per-(account, session)
+# attribution is never altered by any function here.
+# --------------------------------------------------------------------------
+
+def _matches_coordinator_layout(cwd: str) -> bool:
+    """FACT #10 (pinned, verbatim): a cwd sits under a coordinator worktree
+    layout iff it matches ONE of exactly two pinned layouts -- ``<repo>/
+    .claude/worktrees/<name>`` (a ``worktrees`` segment immediately
+    preceded by a ``.claude`` segment) or ``<repo>/.worktrees/<name>`` (a
+    single dotted ``.worktrees`` segment) -- each followed by a FURTHER
+    ``<name>`` segment: the registered coordinator IS that ``<name>`` dir,
+    not the ``worktrees``/``.worktrees`` container itself.
+
+    A BARE ``worktrees`` segment with no ``.claude`` immediately preceding
+    it (a plain `git worktree` convention, ``<repo>/worktrees/<name>``) is
+    deliberately NOT a Claude coordinator layout and must NOT match here --
+    matching it would fold a genuine burner session nesting under such a
+    cwd into a false "coordinator" and drop it from the §5.2 targeting
+    candidate set (wrong-session targeting). Segment-wise match throughout
+    (``Path(...).parts``), never a substring/raw-string check."""
+    parts = Path(cwd).parts
+    for i, part in enumerate(parts):
+        if i + 1 >= len(parts):
+            continue
+        if part == ".worktrees":
+            return True
+        if part == "worktrees" and i > 0 and parts[i - 1] == ".claude":
+            return True
+    return False
+
+
+def _has_nested_children(session_id: str, projects_dir: Path) -> bool:
+    """FACT #10's alternate registration condition: a child transcript
+    nests under THIS session's own project-slug dir --
+    ``<slug>/<session_id>/subagents/agent-*.jsonl`` or ``<slug>/
+    <session_id>/workflows/*.jsonl`` -- the same FACT #6 layout
+    `_pressure_transcript_paths` (Task 10) already globs, here checked for
+    one specific ``session_id`` across every slug dir (cwd->slug has no
+    cheap inverse, so this scans, same read-only glob-only cost class as
+    Task 10's own directory walk). Missing ``projects_dir`` -> False."""
+    if not projects_dir.is_dir():
+        return False
+    for slug_dir in projects_dir.iterdir():
+        if not slug_dir.is_dir():
+            continue
+        if any(slug_dir.glob(f"{session_id}/subagents/agent-*.jsonl")):
+            return True
+        if any(slug_dir.glob(f"{session_id}/workflows/*.jsonl")):
+            return True
+    return False
+
+
+def _registered_coordinators(sessions_rows: list[dict], projects_dir: Path) -> set[str]:
+    """Task 13 -- PRODUCER of the coordinator-cwd set (finding 14,
+    previously undefined): a cwd is a coordinator iff (a) it appears as a
+    session launch ``cwd`` in sessions.log (FACT #5, ``sessions_rows`` is
+    the already-parsed ``_parse_sessions_log()``-shaped list of dicts) AND
+    (b) it matches a pinned FACT #10 coordinator layout
+    (`_matches_coordinator_layout`) OR a child transcript nests under THIS
+    session's own dir (`_has_nested_children`). Pattern-detected from the
+    pinned layouts -- NOT an external registry: a launch-row cwd with
+    neither signal is NOT a coordinator."""
+    registered: set[str] = set()
+    for row in sessions_rows:
+        cwd = row.get("cwd")
+        session_id = row.get("session_id")
+        if not cwd:
+            continue
+        if _matches_coordinator_layout(cwd) or (
+                session_id and _has_nested_children(session_id, projects_dir)):
+            registered.add(cwd)
+    return registered
+
+
+def _coordinator_of(child_cwd: str | None,
+                     registered_coordinator_cwds: set[str]) -> str | None:
+    """Task 13: the LONGEST registered-coordinator cwd (the set
+    `_registered_coordinators` produces) that prefixes ``child_cwd``,
+    matched on path SEGMENT boundaries -- never a raw string prefix, which
+    would wrongly match a partial-segment sibling (``/repo/.worktrees/foo``
+    must NOT match ``/repo/.worktrees/foobar``). Ties can't occur (two
+    distinct cwds of equal segment-length are never both a prefix of the
+    same child). Unrecognized (no registered coordinator prefixes it,
+    including a falsy ``child_cwd``) -> ``None`` -- the caller attaches
+    low_confidence downstream, this function only resolves the prefix."""
+    if not child_cwd:
+        return None
+    child_parts = Path(child_cwd).parts
+    best: str | None = None
+    best_len = -1
+    for coord_cwd in registered_coordinator_cwds:
+        coord_parts = Path(coord_cwd).parts
+        if len(coord_parts) > len(child_parts):
+            continue
+        if child_parts[:len(coord_parts)] == coord_parts and len(coord_parts) > best_len:
+            best_len = len(coord_parts)
+            best = coord_cwd
+    return best
+
+
+def _rollup_children(table: AttributionTable, coord_map: dict[str, str]) -> AttributionTable:
+    """Task 13: sum child burn up to the coordinator for §5.2
+    classification + targeting, returning a NEW `AttributionTable`-shaped
+    VIEW -- the input ``table`` (Task 11's per-(account, session)
+    attribution) is NEVER mutated, so per-account attribution stays exactly
+    as Task 11 produced it.
+
+    ``coord_map`` is ``{child_session_id: coordinator_session_id}`` (built
+    by the caller by joining each session's ``cwd`` through
+    `_coordinator_of` against the set `_registered_coordinators` produces,
+    then resolving that coordinator cwd back to ITS OWN session_id via the
+    same sessions_rows -- outside this function's scope, which only sums
+    burn given an already-resolved map). A session_id absent from
+    ``coord_map`` (no registered coordinator, or IS a coordinator itself)
+    passes through unchanged as its own candidate.
+
+    COUNTED ONCE (§1, load-bearing): every entry is re-keyed to
+    ``(account, coord_map.get(session_id, session_id))`` and summed -- a
+    child session_id that maps to a coordinator NEVER also survives as its
+    own key, so the same unit of burn is never double-counted (once as
+    itself, once inside its coordinator) once fed to §5.2's targeting
+    candidate walk.
+
+    NOT a re-attribution: the burn's account key is untouched by the
+    regroup -- a child rolled into a coordinator backed by a DIFFERENT
+    account still lands under its OWN account, just grouped under the
+    coordinator's session_id (rollup groups for targeting; it does not
+    move burn across accounts).
+
+    ``session_pane`` is PRUNED (not copied wholesale) to only the
+    session_ids still present in the rolled-up ``per_session`` -- a
+    dropped child's own ``session_pane`` entry must not survive on this
+    view once its burn has been folded into its coordinator, or the
+    returned table would carry a stale entry for a session_id that no
+    longer appears anywhere in it.
+    """
+    rolled = AttributionTable()
+    rolled.unattributed_residual = dict(table.unattributed_residual)
+    rolled.residual_fraction = table.residual_fraction
+
+    for (account, session_id), burn in table.per_session.items():
+        target_session_id = coord_map.get(session_id, session_id)
+        key = (account, target_session_id)
+        rolled.per_session[key] = rolled.per_session.get(key, 0.0) + burn
+
+    surviving_session_ids = {sid for _account, sid in rolled.per_session}
+    rolled.session_pane = {sid: pane for sid, pane in table.session_pane.items() if sid in surviving_session_ids}
+
+    return rolled
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
