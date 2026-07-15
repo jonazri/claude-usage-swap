@@ -21144,6 +21144,372 @@ def decisions_cmd(tail: int, swaps_only: bool, as_json: bool) -> None:
             click.echo(f"             where: {where.get('live_pane_count', len(panes))} panes — {shown}")
 
 
+# ---------------------------------------------------------------------------
+# Task 21 (spec-2 token-pressure forecaster, STAGE 1): `cus pressure [--json]`
+# -- the on-demand CALLER that performs the Phase-D I/O (round-3 finding 2:
+# the pure `_pressure_snapshot`, Task 20, cannot reach the filesystem itself)
+# and prints the result. READ-ONLY end to end: loads state through the
+# deep-copying `_pressure_load_state` (Task 1), reads transcript tails with
+# `persist=False` (never advances the offset registry -- CLI/daemon can't
+# race, §3), and NEVER calls `save_state` or `_pressure_write_json` (this
+# command only prints; writing pressure.json to disk is a daemon-cycle
+# concern, not this on-demand path).
+# ---------------------------------------------------------------------------
+
+# `fit_burn_weights` publishes weights keyed by the pinned
+# `_PRESSURE_WEIGHT_COLUMNS` (`input`/`output`/`cache_read`/
+# `cache_create_5m`/`cache_create_1h`), but `_attribute_burn`'s
+# per-MESSAGE `_message_burn_units` dot-products against the REAL
+# transcript `usage` field names (verified real-transcript-shaped in
+# `tests/test_pressure_attribution.py`: `input_tokens`/`output_tokens`/
+# `cache_read_input_tokens`/`cache_creation_input_tokens`) -- ONE flat
+# cache-creation field, no per-message 5m/1h TTL split (that split only
+# exists in Task 14's WINDOW-level regression input, built from
+# account-level polled token totals, not from individual transcript
+# lines). This is the translation table Task 21 needs to bridge the two;
+# it did not exist before this task. 5m is Anthropic's DEFAULT cache TTL,
+# so the 5m weight is used as the per-message cache-creation proxy -- the
+# 1h weight has no per-message target and is intentionally not used here.
+_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_read": "cache_read_input_tokens",
+    "cache_create_5m": "cache_creation_input_tokens",
+}
+
+
+def _pressure_message_weights(weight_fit_weights: dict) -> dict:
+    """Translate a `fit_burn_weights` (Task 16) weights dict into the
+    real-usage-field-keyed weights `_attribute_burn` (Task 11) needs -- see
+    `_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN` for the documented Stage-1
+    5m/1h collapse. Pure: reads its argument, mutates nothing."""
+    return {
+        usage_key: weight_fit_weights[col]
+        for col, usage_key in _PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN.items()
+    }
+
+
+def _pressure_session_child_flags(session_id: str, projects_dir: Path) -> tuple[bool, bool]:
+    """``(has_subagent_children, has_workflow_children)`` for
+    `_classify_session` (Task 12) -- the SAME FACT #6 nested-transcript glob
+    `_has_nested_children` (Task 13) checks, split into its two constituent
+    signals (that helper ORs them together for coordinator-DETECTION, which
+    doesn't need to distinguish the two; `_classify_session`'s heuristic
+    ladder ranks ``"subagent-heavy"`` above generic ``"workflow"``, so it
+    needs them separately). Read-only glob-only, same cost class as Task
+    10/13's own directory walks. Missing ``projects_dir`` -> ``(False,
+    False)``."""
+    has_subagent = False
+    has_workflow = False
+    if projects_dir.is_dir():
+        for slug_dir in projects_dir.iterdir():
+            if not slug_dir.is_dir():
+                continue
+            if any(slug_dir.glob(f"{session_id}/subagents/agent-*.jsonl")):
+                has_subagent = True
+            if any(slug_dir.glob(f"{session_id}/workflows/*.jsonl")):
+                has_workflow = True
+    return has_subagent, has_workflow
+
+
+def _pressure_build_session_table(attribution_table, intervals: dict, coord_map: dict[str, str],
+                                  projects_dir: Path, now: datetime, config: dict) -> list[dict]:
+    """Assemble the ``sessions[]`` rows `_pressure_snapshot` (Task 20) needs
+    (Task 21 wiring -- no earlier task pins this exact shape): coordinator
+    rollup (`_rollup_children`, Task 13) over the raw per-message
+    attribution (`_attribute_burn`, Task 11), then per-(rolled)session
+    ``rate``/``class``/``trend`` (Task 12).
+
+    NO ACCUMULATED HISTORY (documented, not a bug): this on-demand path has
+    no persisted per-session rate history (that is daemon-persistence
+    territory, a later task) -- so `_session_rate` is fed a single sample
+    (this batch's total attributed burn for the session) and `_trend_class`
+    is fed a single-point history, which its own ``len(rate_history) < 3``
+    rule already defines as ``"steady"`` -- the correct, honest answer for
+    a caller with no history, not a fabricated trend.
+
+    ``account_shares``: a session's rolled-up burn split by account (a
+    session can be joined to more than one account across its own
+    `sessions.log` intervals, e.g. an account swap mid-session, FACT #5).
+    ``model``/``fable_share`` are not derivable at this attribution
+    granularity (no per-model breakdown at Phase D, only at cus's own
+    per-account `per_model_weekly_pct`) and are left ``None`` --
+    `_pressure_session_row` (Task 20) already defaults absent keys, so this
+    is not silently dropping a value the pipeline could otherwise produce.
+    ``coordinator_of`` publishes the (sorted) list of child session_ids
+    that rolled INTO this row (``None`` when this row is not a
+    coordinator) -- observability only, `_pressure_snapshot` does not
+    interpret it.
+    """
+    rolled = _rollup_children(attribution_table, coord_map)
+
+    coordinated_children: dict[str, list[str]] = {}
+    for child_sid, coord_sid in coord_map.items():
+        coordinated_children.setdefault(coord_sid, []).append(child_sid)
+
+    totals_by_session: dict[str, dict[str, float]] = {}
+    for (account, sid), burn in rolled.per_session.items():
+        acct_burns = totals_by_session.setdefault(sid, {})
+        acct_burns[account] = acct_burns.get(account, 0.0) + burn
+
+    pressure_cfg = config.get("pressure", {}) or {}
+    rate_window_min = float(pressure_cfg.get("rate_window_min", 10))
+    accel_thresh = float(pressure_cfg.get("trend_accel_thresh", 0.02))
+
+    session_table: list[dict] = []
+    for sid, acct_burns in totals_by_session.items():
+        total_burn = sum(acct_burns.values())
+        account_shares = {
+            a: (v / total_burn if total_burn > 0 else 0.0) for a, v in acct_burns.items()
+        }
+        ivs = intervals.get(sid)
+        last_iv = ivs[-1] if ivs else None
+        session_age_s = max(0.0, (now - last_iv.start).total_seconds()) if last_iv else 0.0
+        rate = _session_rate([total_burn], session_age_s, rate_window_min)
+        trend = _trend_class([rate], accel_thresh)
+        has_sub, has_wf = _pressure_session_child_flags(sid, projects_dir)
+        cwd = last_iv.cwd if last_iv else None
+        record = {
+            "rate_pct_per_min": rate,
+            "sample_count": 1 if total_burn > 0 else 0,
+            "has_subagent_children": has_sub,
+            "has_workflow_children": has_wf,
+            "cwd": cwd,
+        }
+        session_table.append({
+            "session_id": sid,
+            "account_shares": account_shares,
+            "model": None,
+            "fable_share": None,
+            "pane": rolled.session_pane.get(sid) or (last_iv.pane if last_iv else None),
+            "socket": last_iv.tmux_socket if last_iv else None,
+            "cwd": cwd,
+            "class": _classify_session(record),
+            "rate": rate,
+            "trend": trend,
+            "coordinator_of": sorted(coordinated_children.get(sid, [])) or None,
+        })
+    return session_table
+
+
+def _pressure_coordinator_map(sessions_rows: list[dict], projects_dir: Path) -> dict[str, str]:
+    """Build the ``{child_session_id: coordinator_session_id}`` map
+    `_rollup_children` (Task 13) needs, from `_registered_coordinators`'
+    coordinator-CWD set and `_coordinator_of`'s per-child prefix match
+    (both Task 13) -- neither function resolves a coordinator cwd back to
+    its OWN session_id, so this is the join Task 21 supplies. Uses the
+    FIRST sessions.log row seen for a given cwd as that cwd's session_id
+    (a coordinator's cwd is registered once, at its own launch row)."""
+    registered_cwds = _registered_coordinators(sessions_rows, projects_dir)
+    session_id_by_cwd: dict[str, str] = {}
+    for row in sessions_rows:
+        cwd, sid = row.get("cwd"), row.get("session_id")
+        if cwd and sid and cwd not in session_id_by_cwd:
+            session_id_by_cwd[cwd] = sid
+
+    coord_map: dict[str, str] = {}
+    for row in sessions_rows:
+        sid, cwd = row.get("session_id"), row.get("cwd")
+        if not sid or not cwd:
+            continue
+        coord_cwd = _coordinator_of(cwd, registered_cwds)
+        if coord_cwd is None:
+            continue
+        coord_sid = session_id_by_cwd.get(coord_cwd)
+        if coord_sid and coord_sid != sid:
+            coord_map[sid] = coord_sid
+    return coord_map
+
+
+def _render_pressure_table(snapshot: dict) -> None:
+    """`cus pressure` default (non-``--json``) render (Task 21): level, per-
+    window pool remaining/burn + exhaustion ETA, binding view+constraint+
+    ETA, required reduction, weight-fit confidence, per-session rows.
+    ``rich`` imports stay INSIDE this function (same pattern
+    `_render_status_pretty` @18152 already uses) so a plain/`--json`
+    invocation never pays for them."""
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console(highlight=False)
+    level = snapshot["level"]
+    level_style = {"ok": "green", "elevated": "yellow", "critical": "red"}.get(level, "white")
+    ref_x = snapshot["reference_x"]
+    horizon = snapshot["horizon_min"]
+    console.print(
+        f"[bold {level_style}]{level.upper()}[/bold {level_style}]  "
+        f"generated={snapshot['generated_at']}  reference_x={ref_x:.2f}  horizon={horizon:.0f}m"
+    )
+
+    binding = snapshot.get("binding")
+    if binding:
+        # `binding['name']` is already fully-qualified for a pool binding
+        # (`_pressure_binding_view`: `f"pool:{window}"`), so prefixing it
+        # again with `view` here would print "pool:pool:5h" -- only an
+        # ACCOUNT binding's bare account name needs the `view:` prefix.
+        label = binding["name"] if binding["view"] == "pool" else f"{binding['view']}:{binding['name']}"
+        console.print(
+            f"binding: {label}  "
+            f"constraint={binding['constraint']}  window={binding['window']}  "
+            f"eta_min={binding['eta_min']}"
+        )
+    else:
+        console.print("binding: none")
+    console.print()
+
+    pool_tbl = Table(title="Pool", box=box.SIMPLE_HEAD, pad_edge=False)
+    pool_tbl.add_column("window")
+    pool_tbl.add_column("remaining (u)")
+    pool_tbl.add_column("burn (u/min)")
+    pool_tbl.add_column("exhaustion ETA (min)")
+    pool_tbl.add_column("required reduction (u/min)")
+    for window, p in snapshot["pool"].items():
+        eta = p["exhaustion_eta_min"]
+        pool_tbl.add_row(
+            window,
+            f"{p['remaining_units']:.3f}",
+            f"{p['burn_units_per_min']:.4f}",
+            "-" if eta is None else f"{eta:.0f}",
+            f"{p['required_reduction_units_per_min']:.4f}",
+        )
+    console.print(pool_tbl)
+
+    wf = snapshot["weight_fit"]
+    console.print(
+        f"weight_fit: source={wf['source']}  n_windows={wf['n_windows']}  "
+        f"condition_number={wf['condition_number']}  "
+        f"residual_fraction={wf['residual_fraction']:.3f}  "
+        f"safety_factor={snapshot['safety_factor']:.3f}"
+    )
+
+    attribution = snapshot["attribution"]
+    console.print(
+        f"attribution: confidence={attribution['confidence']:.2f}  "
+        f"blindness={attribution['blindness']}  reason={attribution['reason']}"
+    )
+    console.print()
+
+    sessions = snapshot["sessions"]
+    if sessions:
+        sess_tbl = Table(title="Sessions", box=box.SIMPLE_HEAD, pad_edge=False)
+        sess_tbl.add_column("session_id")
+        sess_tbl.add_column("account_shares")
+        sess_tbl.add_column("class")
+        sess_tbl.add_column("rate (%/min)")
+        sess_tbl.add_column("trend")
+        sess_tbl.add_column("cwd")
+        for row in sessions:
+            shares = ", ".join(f"{a}={v:.2f}" for a, v in (row["account_shares"] or {}).items())
+            rate = row["rate"]
+            sess_tbl.add_row(
+                str(row["session_id"])[:12],
+                shares,
+                str(row["class"]),
+                "-" if rate is None else f"{rate:.3f}",
+                str(row["trend"]),
+                str(row["cwd"]),
+            )
+        console.print(sess_tbl)
+    else:
+        console.print("No attributed sessions this cycle.")
+
+
+@cli.command(name="pressure")
+@click.option("--json", "as_json", is_flag=True, help="Emit the pressure snapshot as JSON instead of a table.")
+def pressure_cmd(as_json: bool) -> None:
+    """Token-pressure forecaster snapshot (spec-2 §3/§10.11) -- level,
+    normalized pool/per-account curves + exhaustion ETAs, binding
+    constraint, required reduction, weight-fit confidence, per-session
+    rows.
+
+    READ-ONLY, on-demand (Task 21, round-3 finding 2): this command PERFORMS
+    the Phase-D I/O the pure `_pressure_snapshot` (Task 20) cannot reach
+    itself -- state load, transcript tails, sessions.log intervals, a
+    weight fit, per-message attribution/partition, per-session rate/class/
+    trend -- and hands the results to `_pressure_snapshot` as explicit
+    products, then only PRINTS. It never `save_state`s, never
+    `_pressure_write_json`s (writing pressure.json to disk is a future
+    daemon-cycle concern, not this on-demand path), and reads transcript
+    tails with ``persist=False`` (a fresh, empty ``offsets`` dict every
+    invocation) so the CLI can never race the daemon over a shared offset
+    registry (§3) -- there is no on-disk offsets registry in Stage 1 either
+    way (Task 10: caller-owned in-memory only).
+
+    NO ACCUMULATED HISTORY (documented, not a bug, matches the on-demand
+    nature of this path): the weight-fit regression windows this command
+    can assemble are empty every call (there is no persisted >=200-window
+    history -- that is daemon-persistence territory, a later task), so
+    `fit_burn_weights` naturally reports ``source="insufficient-data"``
+    (seed weights) rather than a fabricated fit. For the identical reason
+    the ``offsets`` dict is always empty, `_attribution_confidence` (Task
+    19) naturally reports low confidence / ``blindness=True`` whenever
+    sessions are active -- an honest reflection of a stateless snapshot
+    having no persisted read history to compare against, not a targeting
+    bug (`_attribution_confidence`'s own gating already keeps this from
+    ever suppressing §5.4 supply-side escalation).
+    """
+    config = load_config()
+    now = datetime.now(timezone.utc)
+
+    # 1. Read-only deep-copied state (Task 1, G0) -- the ONLY state object
+    #    this command may touch; the daemon's live state is never reached.
+    state = _pressure_load_state(config)
+
+    # 2. Bounded transcript tails (Task 10), persist=False -- on-demand must
+    #    never advance the offset registry (G0/§3). A fresh, empty `offsets`
+    #    dict every call; `_read_active_tails` guarantees it is left
+    #    untouched when persist=False.
+    offsets: dict[Path, int] = {}
+    tails = _read_active_tails(now, config, offsets, persist=False)
+
+    # 3. sessions.log -> per-session account-binding intervals (Task 11).
+    sessions_rows = _parse_sessions_log()
+    intervals = _session_account_intervals(sessions_rows)
+
+    # 4. Weight-fit inputs: NO accumulated regression history on this
+    #    on-demand path (see docstring) -- pass the minimal/empty windows
+    #    actually available rather than fabricate history; this naturally
+    #    falls out to source="insufficient-data" (seed weights) below.
+    A, b, _dropped_reason_counts = _build_weight_windows([], [], [])
+    weight_fit = fit_burn_weights(A, b, None, config)
+
+    # 5. Per-message attribution (Task 11) -> disjoint pinned/rotatable
+    #    partition (Task 11) -- the real `partition` Task 20 needs.
+    message_weights = _pressure_message_weights(weight_fit["weights"])
+    attribution_table = _attribute_burn(tails, intervals, message_weights)
+    partition = _partition_burn(attribution_table, state, config)
+
+    # 6. Per-session rate/class/trend + coordinator rollup (Task 12/13).
+    projects_dir = CLAUDE_DIR / "projects"
+    coord_map = _pressure_coordinator_map(sessions_rows, projects_dir)
+    session_table = _pressure_build_session_table(
+        attribution_table, intervals, coord_map, projects_dir, now, config)
+
+    # 7. Blindness / cold-start confidence (Task 19). `offsets` is still
+    #    exactly the empty dict from step 2 -- persist=False guarantees it
+    #    (see docstring for why this makes blindness the honest default).
+    attribution = dict(_attribution_confidence(offsets, list(tails.keys()), now))
+    attribution["residual_fraction"] = attribution_table.residual_fraction
+
+    # 8. Assemble the pure snapshot (Task 20) -- NEVER (state, config, now)
+    #    alone; every Phase-D product above is an explicit injected input
+    #    (round-3 finding 2).
+    snapshot = _pressure_snapshot(
+        state, config, now,
+        partition=partition,
+        session_table=session_table,
+        weight_fit=weight_fit,
+        attribution=attribution,
+    )
+
+    if as_json:
+        click.echo(json.dumps(snapshot, indent=2, default=str))
+        return
+
+    _render_pressure_table(snapshot)
+
+
 @cli.command(name="sos")
 @click.option("--quiet", is_flag=True, help="No output if all clear (for scripting).")
 def sos_cmd(quiet: bool) -> None:
