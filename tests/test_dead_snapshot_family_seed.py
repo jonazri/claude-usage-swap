@@ -124,6 +124,13 @@ class _Env:
         self._saved_mount_pids = cus.mount_pids
         self.live_slots: set[str] = set()
         cus.mount_pids = lambda mount: [1] if Path(mount).name in self.live_slots else []
+        # A live slot's fake holder (pid 1) is a genuine claude SESSION. The
+        # session-aware occupancy checks (mount_has_live_session / the #104
+        # collision guard, orphan-holds-slot fix 2026-07-10) read _pid_comm, so the
+        # mocked live pid must report a claude comm — otherwise every mocked live
+        # lane reads as a dead orphan and the session-aware guards never fire.
+        self._saved_pid_comm = cus._pid_comm
+        cus._pid_comm = lambda pid: "claude" if pid == 1 else None
         cus._OCCUPIED_SLOTS_CACHE.clear()
         cus._reset_blank_tracking()
 
@@ -176,6 +183,7 @@ class _Env:
         for k, v in self._saved.items():
             setattr(cus, k, v)
         cus.mount_pids = self._saved_mount_pids
+        cus._pid_comm = self._saved_pid_comm
         cus._OCCUPIED_SLOTS_CACHE.clear()
         cus._reset_blank_tracking()
         self._tmp.cleanup()

@@ -1,0 +1,80 @@
+{
+  "burn_soon": {
+    "action": "swap",
+    "gate": "burn_before_reset",
+    "pick": "reset-soon",
+    "target": "reset-soon"
+  },
+  "heterogeneous_5h_mix": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "p60",
+    "target": "p60"
+  },
+  "heterogeneous_7d_mix": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "q60",
+    "target": "q60"
+  },
+  "homogeneous_idle": {
+    "action": "hold",
+    "gate": "below_threshold",
+    "pick": "acct0",
+    "target": null
+  },
+  "homogeneous_loaded": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acct0",
+    "target": "acct0"
+  },
+  "ladder_custom_thresholds": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acct_75",
+    "target": "acct_75"
+  },
+  "ladder_defaults": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acctX",
+    "target": "acctX"
+  },
+  "no_reset_soon": {
+    "action": "hold",
+    "gate": "below_threshold",
+    "pick": "spare",
+    "target": null
+  },
+  "strategy_drain": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acctC",
+    "target": "acctC"
+  },
+  "strategy_headroom": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acctA",
+    "target": "acctA"
+  },
+  "strategy_lowest_usage": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acctA",
+    "target": "acctA"
+  },
+  "strategy_smart": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acctA",
+    "target": "acctA"
+  },
+  "strategy_strict_priority": {
+    "action": "swap",
+    "gate": "ladder",
+    "pick": "acctB",
+    "target": "acctB"
+  }
+}

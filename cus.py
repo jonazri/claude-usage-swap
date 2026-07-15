@@ -118,6 +118,14 @@ INBOX_MD = ACCOUNTS_DIR / "inbox.md"
 SOS_MD = ACCOUNTS_DIR / "SOS.md"
 LAST_NOTIFY = ACCOUNTS_DIR / ".last_notify.json"
 
+# Capacity-aware anti-herding rollout (capacity-aware spec 2026-07-10, Phase 2b
+# / Task 5). Flipped True once every swap-decision call site of pick_swap_target
+# / decide_swap / _target_would_immediately_re_trip / _launch_candidate_saturated
+# threads or stashes a capacity ctx (or is a documented percent-path carve-out).
+# The caller-inventory oracle (tests/test_capacity_ctx_caller_inventory.py, Test
+# B) reads this to assert no site is left on the un-converted "pending" path.
+CAPACITY_AWARE_PLUMBING_COMPLETE = True
+
 # GH #79: how many timestamped `.credentials.json.bak.<ts>` files to keep per
 # directory. Each account's OAuth payload (incl. the ~30-day refresh token)
 # lives in exactly ONE authoritative place at a time, so every overwrite of a
@@ -815,6 +823,96 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "The quota-limited account was swapped automatically. Continue from "
             "exactly where you stopped, preserving all existing context."
         ),
+        # Fix #2 (2026-07-10 halt incident): a 429 hook record used to just sit
+        # in 429.log until the next poll_interval_seconds cycle picked it up —
+        # with a 300s interval and Claude Code's session-limit modal giving up
+        # in ~1-2 min, the reactive swap routinely landed AFTER the user had
+        # already hit the halt. `wake_on_429: true` makes the daemon's
+        # inter-cycle sleep interruptible: the PostToolUseFailure/StopFailure
+        # hooks touch `$ACCOUNTS_DIR/wake-429` (unconditionally — a hook script
+        # can't read config), and the daemon polls for that file in small
+        # slices during its sleep, starting the next cycle immediately when it
+        # appears instead of waiting out the rest of poll_interval_seconds.
+        # Set false to restore pure poll-interval cadence (walk-back): the
+        # daemon reverts to a single uninterrupted time.sleep() and the wake
+        # file, though still touched by the hooks, is never consumed.
+        "wake_on_429": True,
+        # Review finding (2026-07-12, follow-up to fix #2): with wake_on_429
+        # on, hooks can recreate wake-429 faster than a cycle can consume it —
+        # a session 429-ing every few seconds drove back-to-back full cycle
+        # bodies (state I/O, log parsing, log spam) for the whole
+        # min_seconds_between_reactive_swaps window. Per-account HTTP polls
+        # stayed capped by that hysteresis window, but the cycle BODY itself
+        # had no floor. wake_min_interval_seconds bounds how often an early
+        # wake may fire: an early wake is only honored if this many seconds of
+        # MONOTONIC time have passed since the previous one; otherwise the
+        # wake-429 file is left in place (not consumed) and the sleep
+        # continues in slices until the floor elapses, so the event still
+        # fires — just no sooner than the floor — nothing is dropped. Walk-back:
+        # set to 0 to disable the bound (every early wake fires immediately,
+        # pre-2026-07-12 behavior).
+        "wake_min_interval_seconds": 30,
+        # Fix #1a (2026-07-10 halt incident): a session can sit parked at Claude
+        # Code's rate-limit modal with NO fresh 429 event pending — the daemon
+        # was down when the halt fired, the event expired from the pending
+        # queue, or the halt came from a path the hooks never saw (so wake_on_429
+        # and the reactive path never learned of it). Each per_session cycle the
+        # halted-lane sweep reads every live slotted session's pane tail once for
+        # the modal's halt signatures; on a match it SYNTHESIZES a reactive entry
+        # (token `halted_lane_sweep`) into the SAME pending queue the hooks feed —
+        # so the existing reactive machinery does the credential move + modal
+        # dismiss + continue — when the account is still at/over its leave line,
+        # or just nudges the pane directly when its account has since reset (the
+        # halt is stale). The sweep NEVER moves credentials itself and is cheap:
+        # it skips entirely when tmux is unavailable and captures each pane at
+        # most once per cycle. Walk-back: set false to disable the sweep (only
+        # fresh hook-delivered 429s drive reactive moves, pre-2026-07-10
+        # behavior).
+        "halted_lane_sweep": True,
+        # Extra case-sensitive substrings that also mark a pane as halted at the
+        # rate-limit modal, appended to the built-in HALT_PANE_SIGNATURES — for
+        # Claude Code locales/versions whose modal wording differs.
+        "halt_signatures_extra": [],
+        # Review finding (2026-07-12, follow-up to fix #1a): the sweep's
+        # under-line direct-nudge path (halt signature matched, account already
+        # below its leave line) had no floor or dedup — it re-fired every
+        # per_session cycle (45-300s) for as long as the signature persisted in
+        # the pane, e.g. a developer viewing this repo's own source (which
+        # contains the halt signatures verbatim) got double-Escape + resume-text
+        # injected every cycle, and a stale halt the nudge can't clear looped
+        # forever. nudge_min_interval_seconds bounds this per SLOT: a nudge is
+        # skipped (logged, not silent) if state["slots"][slot]["last_sweep_nudge_ts"]
+        # is younger than this many wall-clock seconds. The over-line synthesis
+        # path needs no such floor — the pending-entry dedup (`covered`) already
+        # bounds it to one synthesis per slot until the reactive path consumes
+        # it. Walk-back: set to 0 to disable the cooldown (every under-line
+        # match nudges, pre-2026-07-12 behavior).
+        "nudge_min_interval_seconds": 900,
+        # Fix #1b (2026-07-10 halt incident, 2nd occurrence): the gentle resume
+        # above dismisses Claude's modal, but the RUNNING process keeps the OLD
+        # OAuth access token cached in memory — after an in-place credential move
+        # the fresh creds sit on disk unread, so the session can keep burning /
+        # re-429ing the just-capped account until the in-memory token expires. The
+        # deterministic recovery the operator validated by hand: `/exit` the
+        # session, then re-run the pane's ORIGINAL launch command (a wrapper like
+        # `headroom wrap claude … -- --resume <id>`) in the SAME pane — the fresh
+        # process reads the slot's CURRENT credentials. escalate_relaunch automates
+        # exactly that, but ONLY as an ESCALATION when the gentle resume
+        # demonstrably didn't stick: a SECOND reactive-429 on the same slot within
+        # escalate_window_seconds of the last resume. It recovers the launch command
+        # FIRST (pane_pid via tmux → the shell's first child's /proc cmdline) and
+        # only /exits the pane when that command matches the safety pattern (contains
+        # 'claude'); any failure at any step falls back to the normal resume-message
+        # path plus an SOS note — a pane is never left dead. The same slot is never
+        # escalated twice within the window (fall back to resume + SOS instead).
+        # Walk-back: set false to disable (a repeat 429 gets the gentle resume only,
+        # pre-2026-07-10 behavior — leaving the stale-token halt for a human).
+        "escalate_relaunch": True,
+        # How recent the last gentle resume must be for a fresh reactive-429 on the
+        # same slot to count as "the resume didn't stick" and trigger the /exit +
+        # relaunch escalation; also the window in which a slot is escalated at most
+        # once. Matches the reactive hysteresis / nudge cadence.
+        "escalate_window_seconds": 900,
     },
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
@@ -1783,7 +1881,8 @@ def _shared_mount_holds(account: str, state: dict, config: dict | None = None) -
 
 
 def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None,
-                                      config: dict | None = None) -> bool:
+                                      config: dict | None = None,
+                                      session_aware: bool = False) -> bool:
     """True iff `account` is currently live on a mount OTHER than `this_slot` — a
     live slot or the shared ~/.claude mount.
 
@@ -1803,8 +1902,18 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
     _shared_mount_holds). Optional/back-compat: None re-loads it. The daemon's
     slot targets never include state["active"] (it's in exclude_for_slots), so
     the shared-mount clause is a no-op there — it only bites the manual
-    `cus slot move` path, which has no such exclusion (issue #141)."""
-    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+    `cus slot move` path, which has no such exclusion (issue #141).
+
+    session_aware (default False, opt-in): when True, a slot counts as an
+    occupied mount only if a live claude SESSION holds it, not merely any process
+    that inherited CLAUDE_CONFIG_DIR. The pool-family DECISION sites (slot-move
+    preview + execute_swap) pass True so an orphaned dev-server that outlived its
+    session no longer makes the account's family look occupied (orphan-holds-slot
+    bug, 2026-07-10). Default False keeps every OTHER caller (lane-capacity, the
+    divergence detector) reading "any holder", unchanged."""
+    occ = (occupied_slot_accounts_live_session(state) if session_aware
+           else occupied_slot_accounts(state, max_age_seconds=0.0))
+    for s in occ.get(account, []):
         if s != this_slot:
             return True
     # The shared mount counts too: a slot copying merkos while the shared mount
@@ -1813,7 +1922,8 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
 
 
 def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: str | None,
-                               state: dict, config: dict | None = None) -> bool:
+                               state: dict, config: dict | None = None,
+                               session_aware: bool = False) -> bool:
     """True iff the refresh-token FAMILY in `candidate_creds` already runs on
     ANOTHER live mount of `account` — the shared ~/.claude mount or another live
     lane. That is the GH #104 clobber itself: two live mounts on one refresh-token
@@ -1839,6 +1949,13 @@ def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: s
     max_age_seconds=0 (ground-truth occupancy) for the same reason as
     `_account_held_by_other_live_mount`: this is a credential-safety check on the
     rare swap path, so it must not read a stale cache mid-fan-out.
+
+    session_aware (default False, opt-in): when True, only slots with a live
+    claude SESSION are counted as other live mounts, so an orphaned subprocess
+    holding a slot after its session closed doesn't manufacture a phantom family
+    collision (orphan-holds-slot bug, 2026-07-10). The pool-family DECISION sites
+    pass True; the divergence detector (`_divergence_risk_lanes`) keeps the
+    default so its "any holder" semantics are unchanged.
     """
     try:
         cand_rt = _credential_refresh_token(read_json(candidate_creds))
@@ -1851,7 +1968,9 @@ def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: s
     other_mounts: list[Path] = []
     if _shared_mount_holds(account, state, config):
         other_mounts.append(CREDS_JSON)  # ~/.claude/.credentials.json (bare sessions)
-    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+    occ = (occupied_slot_accounts_live_session(state) if session_aware
+           else occupied_slot_accounts(state, max_age_seconds=0.0))
+    for s in occ.get(account, []):
         if s != this_slot:
             other_mounts.append(mount_creds_path(slot_path(s)))
     for p in other_mounts:
@@ -2274,6 +2393,82 @@ def mount_pids(mount: Path) -> list[int]:
     return pids
 
 
+# The comm values a genuinely-live claude SESSION top process reports. The
+# launcher sets CLAUDE_CONFIG_DIR and then execs claude, so a live session
+# ALWAYS has one of these among a mount's env holders; "claude.exe" is the
+# node-binary variant seen live. comm is kernel-truncated to 15 chars — both
+# fit — so this is an exact, not a prefix, match.
+CLAUDE_SESSION_COMMS = ("claude", "claude.exe")
+
+
+def _is_claude_session_comm(comm: str) -> bool:
+    """True iff `comm` names a live claude SESSION top process (see
+    CLAUDE_SESSION_COMMS).
+
+    Ground truth for "is this env holder a real session, or a leftover?"
+    (orphan-holds-slot bug, 2026-07-10). After a session closes, a subprocess it
+    spawned — a `vite`/`next dev` dev server, a `tail -f`, etc. — can reparent to
+    init (ppid 1) while still carrying the CLAUDE_CONFIG_DIR it inherited, which
+    keeps the slot "in use" forever. Those orphans carry OTHER comms (bash, node,
+    vite, python, tail), so a comm test cleanly separates them from the session.
+
+    Why comm and NOT a cmdline substring: a subagent's `/bin/bash -c source
+    /home/rayi/claude-accounts/slot-N/shell-snapshots/...` contains the literal
+    string "claude" via the mount PATH, so cmdline matching false-positives on
+    every subagent shell. comm is the executable name only, so it doesn't.
+
+    Pure (no /proc), so it's unit-testable in isolation."""
+    return comm in CLAUDE_SESSION_COMMS
+
+
+def _pid_comm(pid: int) -> str | None:
+    """A process's comm (executable name), read robustly from /proc/<pid>/stat.
+
+    The comm field is wrapped in parens and may itself contain spaces or parens,
+    so it is parsed between the FIRST '(' and the LAST ')' — the same robust
+    parse `_find_descendant_claude_pid` uses. Returns None if the process is gone
+    or its stat is unreadable/malformed."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, PermissionError):
+        return None
+    open_paren = stat_text.find("(")
+    close_paren = stat_text.rfind(")")
+    if open_paren == -1 or close_paren == -1 or close_paren < open_paren:
+        return None
+    return stat_text[open_paren + 1 : close_paren]
+
+
+def mount_session_pids(mount: Path) -> list[int]:
+    """Subset of mount_pids(mount) that represent a live claude SESSION.
+
+    A mount is session-occupied iff at least one of its env holders has a claude
+    session comm (see _is_claude_session_comm). Rationale: the launch sets
+    CLAUDE_CONFIG_DIR then execs claude, so a live session ALWAYS has its own
+    claude-comm process among the holders. When the only holders are non-claude
+    comms, the session is already dead and those holders are orphaned leftovers
+    (a dev server / tail reparented to init that kept the inherited env var) —
+    the orphan-holds-slot bug (2026-07-10) that kept a slot's login family pinned
+    forever after its session closed.
+
+    Returns the claude-comm holder pids (empty ⇒ no live session)."""
+    return [pid for pid in mount_pids(mount)
+            if _is_claude_session_comm(_pid_comm(pid) or "")]
+
+
+def mount_has_live_session(mount: Path) -> bool:
+    """True iff a live claude SESSION holds this mount — NOT merely any process
+    that inherited CLAUDE_CONFIG_DIR (which `mount_in_use` reports).
+
+    Session-aware counterpart of mount_in_use. Used ONLY at the gc-reap and
+    pool-family DECISION sites, so an orphaned dev-server that outlived its
+    session neither blocks slot gc nor makes the account's login family look
+    occupied (orphan-holds-slot bug, 2026-07-10). Every OTHER caller of
+    mount_in_use/mount_pids (swap-window detection, SOS double-mount detectors,
+    status display) legitimately means "any holder" and is left unchanged."""
+    return bool(mount_session_pids(mount))
+
+
 def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
     """Which mount ('slot-N' / 'account-X') a tmux pane's claude process uses.
 
@@ -2372,12 +2567,21 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     if state.get("active") and mount_in_use(CLAUDE_DIR):
         live_occupied.add(state["active"])
 
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): stash a fleet ctx
+    # onto every picker shim so the launch pick ranks in reference UNITS (G1) and
+    # the G10 raw fallbacks below pick by per-lane remaining units. Lane occupancy
+    # from occupied_slot_accounts(state) (via _capacity_ctx). Built only gate-on,
+    # so gate-off stays bit-for-bit (no stash, no credential/occupancy reads).
+    _cap_ctx_launch = _capacity_ctx(state, config) if _capacity_gate_on(config) else None
+
     def _try(excluded: set) -> SwapTarget | None:
         shim = dict(state)
         shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in excluded}
         shim["active"] = "\x00launch-sentinel"  # never a real account name
         if not shim["accounts"]:
             return None
+        if _cap_ctx_launch is not None:
+            shim["_capacity_ctx"] = _cap_ctx_launch
         try:
             return pick_swap_target(shim, config)
         except Exception:
@@ -2396,7 +2600,15 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
                  if not a.get("token_expired") and not a.get("poll_error")
                  and n not in live_occupied and n not in disabled]
         if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            if _cap_ctx_launch is not None:
+                # G10 (capacity-aware spec 2026-07-10): rank raw fallbacks by
+                # per-lane remaining reference units, not lowest raw percent — a
+                # loaded big-tier lane can out-headroom an idle small-tier one.
+                n, _ = max(cands, key=lambda p: _remaining_units(
+                    _account_estimated_effective_pct(p[1], config), p[0], _cap_ctx_launch, config)
+                    / (_cap_ctx_launch.get("lane_load_by_name", {}).get(p[0], 0) + 1))
+            else:
+                n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
     # Lane-share final fallback (GH #109 lanes, 2026-07-03): every healthy
     # account is on a live mount. Joining a live mount is safe (shared dir,
@@ -2408,12 +2620,19 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
                  if not a.get("token_expired") and not a.get("poll_error")
                  and n in live_occupied and n not in disabled]
         if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            if _cap_ctx_launch is not None:
+                # G10 (capacity-aware spec 2026-07-10): lane-share fallback picks
+                # the lane with the most per-lane remaining reference units.
+                n, _ = max(cands, key=lambda p: _remaining_units(
+                    _account_estimated_effective_pct(p[1], config), p[0], _cap_ctx_launch, config)
+                    / (_cap_ctx_launch.get("lane_load_by_name", {}).get(p[0], 0) + 1))
+            else:
+                n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
     return target
 
 
-def _launch_candidate_saturated(acct: dict, config: dict) -> tuple[bool, str]:
+def _launch_candidate_saturated(acct: dict, config: dict, name: str | None = None, ctx: dict | None = None) -> tuple[bool, str]:
     """Does a launch candidate's (freshly-polled) reading sit AT/OVER any HARD
     saturation line pick_swap_target treats as a wall? Returns (saturated, why).
 
@@ -2442,13 +2661,20 @@ def _launch_candidate_saturated(acct: dict, config: dict) -> tuple[bool, str]:
     matches the launch's pool semantics.
     """
     steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): when the caller
+    # threads name+ctx and the gate is on, the launch-accept wall judges in
+    # reference UNITS — the ladder step via G3/formula 2 (through
+    # _target_would_immediately_re_trip) and the aggregate 7d cap via G9/formula
+    # 3 — so a healthy big-tier account (e.g. 20x@80%) is not walled by percent.
+    _cap = _capacity_gate_on(config) and ctx is not None and name is not None
     # 5h / effective ladder step (the primary stale-low-idle failure mode).
-    if _target_would_immediately_re_trip(acct, config):
+    if _target_would_immediately_re_trip(acct, config, name=name, ctx=(ctx if _cap else None)):
         return True, f"5h/effective={_account_estimated_effective_pct(acct, config):.0f}% >= step {steps[0]}%"
     # Aggregate weekly hard cap (a lower line than the ladder step).
     hard_7d = _hard_7d_cap_for_config(config)
-    if acct.get("current_7d_pct", 0) >= hard_7d:
-        return True, f"7d={acct.get('current_7d_pct', 0):.0f}% >= 7d cap {hard_7d}%"
+    _cur_7d = acct.get("current_7d_pct", 0)
+    if (_remaining_units(_cur_7d, name, ctx, config) <= (100.0 - hard_7d) / 100.0) if _cap else (_cur_7d >= hard_7d):
+        return True, f"7d={_cur_7d:.0f}% >= 7d cap {hard_7d}%"
     # Per-model (Fable) weekly gate — premium pool only (no-op config for standard).
     gate_enabled, _ = _per_model_weekly_gate(config)
     if gate_enabled:
@@ -2728,6 +2954,125 @@ def sync_mount_claude_json(mount: Path, canonical: dict) -> dict:
     return {"changed": bool(updated), "keys_updated": updated}
 
 
+# ---------------------------------------------------------------------------
+# MCP OAuth carry-over (2026-07-10).
+#
+# Claude Code stores OAuth tokens for REMOTE MCP servers (atlassian,
+# singlemcp-*) in the SAME .credentials.json as the account OAuth, under a
+# sibling "mcpOAuth" key, keyed "serverName|configHash". Those tokens are
+# bound to the MCP server (its URL + a dynamically-registered OAuth client),
+# NOT to the Claude account or the config dir — so one authentication is
+# valid on every mount. But because cus installs .credentials.json wholesale
+# (execute_swap copies the account snapshot over the slot's live file), every
+# swap silently clobbered the slot's MCP tokens with whatever stale/empty
+# mcpOAuth the snapshot happened to carry: a session that had authenticated
+# atlassian kept working from its in-memory token, while ON DISK the tokens
+# were gone — and every NEW session on that slot opened to "needs
+# authentication" (the 2026-07-10 jira2a/slot-11 report; at that point not
+# one of the 13 slots held a live MCP token on disk, only registration stubs).
+#
+# Fix: a canonical per-machine store (~/claude-accounts/mcp-oauth.json, 0600)
+# that
+#   (a) HARVESTS live mcpOAuth entries whenever cus reads a mount's creds
+#       (swap-out at the install point, every save-back, and a periodic
+#       daemon pass), freshest expiresAt winning, and
+#   (b) INJECTS the canonical entries whenever cus writes creds to a live
+#       mount (the swap install point) plus the periodic pass over all live
+#       mounts — so authenticating an MCP server ONCE in ANY session
+#       propagates to every current and future slot within one poll cycle.
+#
+# claudeAiOauth (the account token, with its whole #3/#77/#104/#141 guard
+# stack) is NEVER touched by any of this — mcpOAuth is a disjoint key.
+MCP_OAUTH_STORE = ACCOUNTS_DIR / "mcp-oauth.json"
+
+
+def _mcp_entry_live(entry: Any) -> bool:
+    """A usable mcpOAuth entry: carries an access token or at least a refresh
+    token (expired-but-refreshable is still valuable — Claude Code refreshes
+    it silently on connect). Registration-only stubs (clientId +
+    discoveryState with empty token fields) are what a needs-auth server
+    looks like on disk — those are NOT live and must never overwrite a real
+    token during a merge."""
+    return isinstance(entry, dict) and bool(entry.get("accessToken") or entry.get("refreshToken"))
+
+
+def _mcp_entry_score(entry: Any) -> float:
+    """Freshness ordering between two LIVE entries for the same server key:
+    expiresAt (ms epoch) when present. A live entry without expiresAt (rare:
+    a non-expiring grant) scores 0 so it never beats a dated token — a
+    non-expiring token doesn't rotate, so losing that comparison is harmless,
+    whereas letting it win could pin a long-revoked token forever."""
+    exp = entry.get("expiresAt") if isinstance(entry, dict) else None
+    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+
+
+def _mcp_merge(dst: dict, src: dict) -> int:
+    """Merge src's LIVE mcpOAuth entries into dst (both are mcpOAuth-shaped
+    dicts, mutating dst). Returns how many keys changed. Never deletes a dst
+    entry, never downgrades a fresher live entry, and an identical entry is a
+    no-op — so repeated merges are idempotent and backup-rotation-friendly."""
+    changed = 0
+    for key, entry in (src or {}).items():
+        if not _mcp_entry_live(entry):
+            continue
+        cur = dst.get(key)
+        if cur == entry:
+            continue
+        if _mcp_entry_live(cur) and _mcp_entry_score(cur) >= _mcp_entry_score(entry):
+            continue
+        dst[key] = entry
+        changed += 1
+    return changed
+
+
+def _load_mcp_oauth_store() -> dict:
+    """The canonical mcpOAuth map, {} when absent/unreadable. Unreadable is
+    treated as empty rather than fatal: the store is a cache rebuilt every
+    daemon cycle from the mounts, so losing it costs one re-harvest, while
+    raising here would break swaps over an observability file."""
+    if not MCP_OAUTH_STORE.exists():
+        return {}
+    try:
+        data = read_json(MCP_OAUTH_STORE)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    mo = data.get("mcpOAuth")
+    return mo if isinstance(mo, dict) else {}
+
+
+def harvest_mcp_oauth(creds: Any) -> int:
+    """Fold a credentials blob's live mcpOAuth entries into the canonical
+    store. Returns how many store keys changed. Read-modify-write without a
+    lock is acceptable here: a lost update is self-healing because the next
+    daemon cycle re-harvests from the same source files."""
+    if not isinstance(creds, dict):
+        return 0
+    src = creds.get("mcpOAuth")
+    if not isinstance(src, dict) or not src:
+        return 0
+    merged = dict(_load_mcp_oauth_store())
+    n = _mcp_merge(merged, src)
+    if n:
+        atomic_write_bytes(MCP_OAUTH_STORE,
+                           json.dumps({"mcpOAuth": merged}, indent=2).encode(), mode=0o600)
+    return n
+
+
+def inject_mcp_oauth(creds: dict) -> int:
+    """Merge the canonical store's live entries into a credentials blob
+    (mutating it in place; claudeAiOauth untouched). Returns the number of
+    entries injected/upgraded — 0 means the blob was already current and the
+    caller can skip its write entirely."""
+    canonical = _load_mcp_oauth_store()
+    if not canonical:
+        return 0
+    merged = dict(creds.get("mcpOAuth") or {})
+    n = _mcp_merge(merged, canonical)
+    if n:
+        creds["mcpOAuth"] = merged
+    return n
+
+
 def saveback_mount_credentials(mount: Path, expected_account: str | None, state: dict,
                                only_if_fresher: bool = False) -> dict:
     """Save a mount's live credentials back to the owning account dir, with the
@@ -2752,6 +3097,17 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         live_creds = json.loads(creds_path.read_bytes())
     except (json.JSONDecodeError, OSError) as e:
         return {"action": "skipped", "account": expected_account, "detail": f"unreadable live creds: {e}"}
+
+    # MCP OAuth carry-over (2026-07-10): fold any live MCP-server tokens out
+    # of this mount into the canonical store BEFORE the guards below can skip
+    # the save — they reason about claudeAiOauth freshness/identity, which
+    # says nothing about mcpOAuth, and a skipped snapshot save-back must not
+    # drop a freshly-authenticated atlassian token. Best-effort: a harvest
+    # failure never blocks the account-token save.
+    try:
+        harvest_mcp_oauth(live_creds)
+    except OSError:
+        pass
 
     # Pool model (#109): a LEASED mount's live tokens belong to its claimed
     # login family, not the account snapshot — route the save-back to the
@@ -2865,24 +3221,45 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
     force=True skips only the in-use refusal (for cleaning up after a
     /proc-invisible holder the operator knows is dead) — the save-back and
     its guards always run.
+
+    Session-aware in-use gate (orphan-holds-slot bug, 2026-07-10): the refusal
+    triggers on a live claude SESSION (mount_has_live_session), NOT on any process
+    that inherited CLAUDE_CONFIG_DIR (mount_in_use). After a session closes, a
+    subprocess it spawned — a `vite`/`next dev` dev server, a `tail -f` — can
+    reparent to init and keep the env var, holding the slot "in use" forever and
+    permanently blocking gc (which never released the slot's login family, GH
+    #104 repro: onemitzvah2a's orphaned vite pinned slot-11/rayi3). When only such
+    orphans remain, the slot has no live session and IS reaped; the stepped-over
+    orphan pids are reported so the caller can surface them and the operator can
+    kill them. `force` still skips the whole gate.
     """
     d = slot_path(name)
     entry = state.get("slots", {}).get(name, {})
     if not d.exists():
         state.get("slots", {}).pop(name, None)
         return {"action": "dropped_stale_entry", "slot": name}
-    if not force and mount_in_use(d):
-        return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
+    if not force and mount_has_live_session(d):
+        return {"action": "refused_in_use", "slot": name, "pids": mount_session_pids(d)}
+    # No live claude session. Any remaining env holders are orphaned non-session
+    # leftovers (see the session-aware note above); record them so the reap can be
+    # reported as "stepped over N orphaned holders" and the operator can clean up.
+    orphan_pids = [] if force else mount_pids(d)
     if not force and _slot_reserved(entry):
         # An in-flight launch has claimed this slot but not exec'd claude yet
         # (no PID). rmtree'ing it now would pull the dir out from under the
         # launch that's mid-install (review finding 2026-07-02: gc-mid-launch).
+        # NOTE: this guard stays AFTER the session gate so the launch window is
+        # still protected even when only orphans hold the slot.
         return {"action": "refused_reserved", "slot": name, "reserved_until": entry.get("reserved_until")}
     expected = state.get("slots", {}).get(name, {}).get("account")
     saveback = saveback_mount_credentials(d, expected, state)
     shutil.rmtree(d)
     state.get("slots", {}).pop(name, None)
-    return {"action": "reaped", "slot": name, "saveback": saveback}
+    result = {"action": "reaped", "slot": name, "saveback": saveback}
+    if orphan_pids:
+        # Reaped over orphaned non-session holders (no live claude among them).
+        result["orphan_pids"] = orphan_pids
+    return result
 
 
 def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
@@ -3199,6 +3576,60 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     return False, f"{role}: {elapsed:.0f}s < {interval:.0f}s"
 
 
+def _account_creds_candidates(account_name: str, state: dict) -> list[Path]:
+    """Ordered candidate credentials-file paths for `account_name`, freshest
+    source first — factored out of `_read_access_token_with_expiry` (2026-07-03
+    token-stale blindness incident, GH #130) so other readers of an account's
+    stored credentials can resolve through the exact SAME freshest-wins chain
+    without duplicating it (capacity-aware spec 2026-07-10 adds the first
+    other reader, `_read_rate_limit_tier`).
+
+    Preference order (see `_read_access_token_with_expiry`'s docstring for the
+    full rationale):
+      1. the live shared mount (CREDS_JSON), only when this account is the
+         shared-active one;
+      2. any SLOT backing this account whose dir exists, live slots (a
+         session actually running, `mount_in_use`) before idle ones;
+      3. the account's primary store (`account_creds_path`) — always last,
+         always included as the final fallback.
+
+    Pure/read-only: only stats/existence-checks paths, never opens or parses
+    the files themselves — that stays with each caller, since what they read
+    out of a candidate (accessToken+expiresAt vs. rateLimitTier) differs.
+    """
+    candidates: list[Path] = []
+    # (1) live shared mount, only when this account is the shared-active one.
+    if state.get("active") == account_name and CREDS_JSON.exists():
+        candidates.append(CREDS_JSON)
+    # (2) slots backing this account; live slots first, idle slots after. A
+    # live slot's creds are refreshed by the session running on it, so they
+    # beat both an idle slot and (usually) the primary store for freshness.
+    live_slot_creds: list[Path] = []
+    idle_slot_creds: list[Path] = []
+    for slot_name, entry in state.get("slots", {}).items():
+        if (entry or {}).get("account") != account_name:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists():
+            continue
+        cred = d / ".credentials.json"
+        if not cred.exists():
+            continue
+        try:
+            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
+            # per cycle, but a direct call here is cheap enough (one slot) and
+            # a few seconds of staleness only picks idle-vs-live ordering, not
+            # correctness — both get tried.
+            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
+        except Exception:
+            idle_slot_creds.append(cred)
+    candidates.extend(live_slot_creds)
+    candidates.extend(idle_slot_creds)
+    # (3) primary account store — historical fallback, always last.
+    candidates.append(account_creds_path(account_name))
+    return candidates
+
+
 def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int | None]:
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
@@ -3272,38 +3703,10 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         except (TypeError, ValueError):
             return True
 
-    # Assemble candidate creds paths in preference order (see docstring).
-    candidates: list[Path] = []
-    # (1) live shared mount, only when this account is the shared-active one.
-    if state.get("active") == account_name and CREDS_JSON.exists():
-        candidates.append(CREDS_JSON)
-    # (2) slots backing this account; live slots first, idle slots after. A
-    # live slot's creds are refreshed by the session running on it, so they
-    # beat both an idle slot and (usually) the primary store for freshness.
-    live_slot_creds: list[Path] = []
-    idle_slot_creds: list[Path] = []
-    for slot_name, entry in state.get("slots", {}).items():
-        if (entry or {}).get("account") != account_name:
-            continue
-        d = slot_path(slot_name)
-        if not d.exists():
-            continue
-        cred = d / ".credentials.json"
-        if not cred.exists():
-            continue
-        try:
-            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
-            # per cycle, but a direct call here is cheap enough (one slot) and
-            # a few seconds of staleness only picks idle-vs-live ordering, not
-            # correctness — both get tried.
-            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
-        except Exception:
-            idle_slot_creds.append(cred)
-    candidates.extend(live_slot_creds)
-    candidates.extend(idle_slot_creds)
-    # (3) primary account store — historical fallback, always last.
+    # Assemble candidate creds paths in preference order (see docstring),
+    # shared with `_read_rate_limit_tier` via `_account_creds_candidates`.
+    candidates = _account_creds_candidates(account_name, state)
     primary = account_creds_path(account_name)
-    candidates.append(primary)
 
     # First non-stale candidate wins. Track the primary's pair (task contract:
     # all-stale returns the primary) and the first present-but-stale pair (so a
@@ -3321,6 +3724,67 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         if first_stale_pair[0] is None:
             first_stale_pair = (token, expires_at)
     return primary_pair if primary_pair[0] is not None else first_stale_pair
+
+
+# Nx tier suffix/prefix, mid-string tolerant: "_20x_v2", "20x", "tier-20x" all
+# parse to 20; requires an `_`/`-`/string-start immediately before the digits
+# and an `_`/`-`/string-end immediately after the "x" so e.g. "box20xyz" does
+# NOT spuriously match (capacity-aware spec 2026-07-10, "Normalization model").
+_RATE_LIMIT_TIER_RE = re.compile(r"(?:[_-]|^)(\d+)x(?=[_-]|$)")
+
+
+def _read_rate_limit_tier(account_name: str) -> tuple[int | None, str | None]:
+    """Parsed Claude subscription rate-limit tier for `account_name`, e.g. 20
+    from a stored `claudeAiOauth.rateLimitTier` of "tier-20x".
+
+    WHY (capacity-aware spec 2026-07-10, "Normalization model"): routing used
+    to assume every account has equal capacity; a hardcoded tier map is
+    replaced by reading each account's OWN tier straight out of its stored
+    credentials. Resolved through the exact SAME freshest-wins multi-source
+    chain `_read_access_token_with_expiry` uses (`_account_creds_candidates`)
+    for the same GH #130 reason: a stale primary snapshot must never shadow a
+    live slot's fresher value.
+
+    Returns (parsed_x, raw_tier_string):
+      - (None, None) when NO candidate has a `claudeAiOauth.rateLimitTier`
+        value at all (missing — e.g. no creds file, or an older snapshot
+        predating this field);
+      - (None, raw) when a value IS present but doesn't match the `Nx` shape
+        (unparseable);
+      - (N, raw) on a successful parse — N is always the first digit group,
+        so "_20x_v2" / "20x" / "tier-20x" all yield 20.
+    Validation that N must be >= 1 (a `_0x` parse is pathological — a
+    zero-capacity account is unroutable, not "reference-scale") is the
+    CALLER's job (`_account_capacity_x`), not this function's — this is a
+    pure parse, not a policy decision.
+
+    READ-ONLY, same contract as `_read_access_token_with_expiry`: never
+    writes, refreshes, or rotates anything. Local file reads only — never
+    HTTP.
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except Exception:
+        state = {}
+
+    for path in _account_creds_candidates(account_name, state):
+        try:
+            if not path.exists():
+                continue
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue
+        oauth = creds.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or "rateLimitTier" not in oauth:
+            continue
+        raw = oauth.get("rateLimitTier")
+        if raw is None:
+            continue
+        match = _RATE_LIMIT_TIER_RE.search(str(raw))
+        if match:
+            return int(match.group(1)), raw
+        return None, raw
+    return None, None
 
 
 def _refresh_account_token(account_name: str, creds_path: Path | None = None) -> bool:
@@ -3362,6 +3826,16 @@ def _refresh_account_token(account_name: str, creds_path: Path | None = None) ->
 
     if creds_path is None:
         creds_path = account_creds_path(account_name)
+        # Aliased snapshot guard (2026-07-10 heal-from-family): if the SNAPSHOT's
+        # refresh token belongs to a pooled login family, a snapshot-side refresh
+        # grant would rotate the family's single-use token and clobber its live
+        # holder (#104). Only the default (snapshot) target is gated — the
+        # blank-preempt path passes an explicit lane `creds_path` and refreshes
+        # that mount's OWN family, which is exactly the safe direction. Callers
+        # treat False as "fall back to token_stale behavior"; the daemon's
+        # heal-from-family pass refreshes the snapshot safely instead.
+        if _snapshot_alias_family(account_name) is not None:
+            return False
     if not creds_path.exists():
         return False
     try:
@@ -3491,6 +3965,21 @@ def _unstale_account_snapshot(account: str, state: dict, config: dict | None = N
         _cred_audit("unstale-refresh", "failed", "no usable refresh token in account snapshot",
                     account=account, token_fp="none")
         return False
+
+    # Aliased snapshot (2026-07-10 heal-from-family): the snapshot's refresh token
+    # BELONGS to a pooled login family (a heal reseed or a `--from-existing`
+    # bootstrap copy). Probing it from the snapshot side would rotate the family's
+    # single-use token and log the family's live holder out (#104). Reseed from the
+    # family store instead — same outcome (a fresh, valid snapshot access token)
+    # with zero rotation risk; heal failure degrades to the plain token_stale flag.
+    if _snapshot_alias_family(account, state) is not None:
+        res = heal_snapshot_from_live_family(account, state, config)
+        _cred_audit("unstale-refresh", "skipped-aliased",
+                    "snapshot refresh token belongs to a pooled login family — skipped the "
+                    "snapshot-side refresh grant (#104 rotation hazard) and attempted "
+                    f"heal-from-family instead: {res['action']}",
+                    account=account, token_fp=_audit_token_fp(creds))
+        return bool(res.get("healed"))
 
     verdict, tok = _oauth_refresh_grant(rt)
     if verdict != "alive" or not isinstance(tok, dict):
@@ -4424,7 +4913,8 @@ def projected_seven_day_reset(acct: dict, config: dict, now=None) -> str | None:
         return projected_ts or api_ts
 
 
-def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
+def _target_would_immediately_re_trip(acct: dict, config: dict,
+                                      name: str | None = None, ctx: dict | None = None) -> bool:
     """Return True if this candidate is "full" — its effective utilization is
     at/above the FIRST ladder step — and so should not be swapped onto. Used to
     prune "doomed" candidates that would cause a swap-back loop. GH #17.
@@ -4442,12 +4932,28 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     regardless of where its ladder happens to sit. Degraded/all-full pools are
     still handled downstream by headroom_fallback + the min-improvement gate, so
     progressive-return semantics survive.
+
+    Capacity-aware conversion (G2, capacity-aware spec 2026-07-10, "The formula
+    changes" formula 2): when the gate is on AND the caller threads the
+    candidate's `name` + fleet `ctx`, "full" is judged in reference-scale UNITS
+    per lane instead of raw percent — the candidate is HEALTHY (not full) iff
+    `remaining_units(extrapolated pct) / (lanes + 1) > (100 − steps[0]) / 100`.
+    A big-tier account at a high percent can still clear the line (it has more
+    absolute headroom to give a lane); a small-tier account can't. `ctx=None`
+    (or the gate off) keeps today's raw-percent path bit-for-bit — that is the
+    default for every caller not yet converted (Task 5 threads the rest).
     """
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
     # Estimator (C): use the extrapolated %, so a target polled just under the
     # step but climbing fast (will be over it by the time the swap lands) is
     # still treated as full. Falls back to polled when no rate is known.
-    return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
+    est_pct = _account_estimated_effective_pct(acct, config)
+    if _capacity_gate_on(config) and name is not None and ctx is not None:
+        lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+        remaining = _remaining_units(est_pct, name, ctx, config)
+        healthy = remaining / (lanes + 1) > (100.0 - cfg_steps[0]) / 100.0
+        return not healthy
+    return est_pct >= cfg_steps[0]
 
 
 def _disabled_accounts(config: dict) -> set:
@@ -4463,6 +4969,334 @@ def _disabled_accounts(config: dict) -> set:
     stops NEW placements. Re-enable by deleting the key or setting false."""
     return {a.get("name") for a in config.get("accounts", [])
             if isinstance(a, dict) and a.get("disabled")}
+
+
+# ---------------------------------------------------------------------------
+# Capacity-aware anti-herding — Normalization model (capacity-aware spec
+# 2026-07-10, docs/plans/2026-07-10-capacity-aware-anti-herding.md). Phase 1:
+# tier sourcing, reference_x, and ctx helpers. ALL INERT until Phase 2 wires
+# gate-on callers — the only site anything here is invoked from today is the
+# `one_cycle` poll-cycle wiring point (caches `capacity_x` at poll time).
+#
+# Units model: ratio = capacity_x / reference_x; remaining_units =
+# (100 - pct) / 100 * ratio. A hardcoded "every account has equal capacity"
+# assumption is what caused the 2026-07-10 halt incident (fix #3) this spec
+# addresses — a 5x account and a 20x account at the same raw percent do NOT
+# have the same remaining headroom, and treating them as if they did is what
+# herds swaps onto (and floods 429s on) the smaller-tier accounts.
+# ---------------------------------------------------------------------------
+
+def _account_raw_capacity_x(name: str, state: dict, config: dict) -> tuple[int | None, list[str]]:
+    """The account's raw N-in-`Nx` tier, BEFORE the neutral/reference_x
+    fallback layer `_account_capacity_x` adds on top.
+
+    WHY split out (capacity-aware spec 2026-07-10): `_observed_fleet_min_x`
+    must compute the fleet-relative `reference_x` from ONLY genuinely-known
+    tiers (a valid config override or a parseable, >= 1 credentials-parsed
+    tier) — folding in `_account_capacity_x`'s own neutral fallback here would
+    be circular, since that fallback IS `reference_x`, and computing
+    `reference_x` from a value that already assumes `reference_x` is
+    meaningless. This function never looks at `reference_x` at all.
+
+    Precedence: `accounts[].capacity_x` in config wins outright when it is
+    numeric (bool excluded — `True`/`False` are not intended tier values even
+    though `bool` is an `int` subclass) and >= 1. An invalid override (wrong
+    type, or numeric but < 1) is reported via a warning and does NOT
+    short-circuit — resolution falls through to the account's credentials-
+    parsed `claudeAiOauth.rateLimitTier` (`_read_rate_limit_tier`). A parsed
+    tier < 1 (the pathological `_0x` case — a zero-capacity account is
+    unroutable, not "reference-scale") is likewise reported and treated as
+    unknown.
+
+    Returns (value, warnings): value is None when neither source yields a
+    usable (>= 1) number for `name` — exactly the "this account would become
+    neutral" case `_account_capacity_x` handles next.
+    """
+    warnings: list[str] = []
+    override = None
+    for a in config.get("accounts", []):
+        if isinstance(a, dict) and a.get("name") == name:
+            override = a.get("capacity_x")
+            break
+    if override is not None:
+        is_number = isinstance(override, (int, float)) and not isinstance(override, bool)
+        if is_number and override >= 1:
+            return int(override), warnings
+        warnings.append(
+            f"account {name!r}: config capacity_x override {override!r} is invalid "
+            "(must be numeric and >= 1) — falling back to the credentials-parsed tier"
+        )
+    parsed_x, raw_tier = _read_rate_limit_tier(name)
+    if parsed_x is not None:
+        if parsed_x >= 1:
+            return parsed_x, warnings
+        warnings.append(
+            f"account {name!r}: parsed rate-limit tier {raw_tier!r} -> {parsed_x}x is "
+            "invalid (must be >= 1) — treating as an unknown/neutral tier"
+        )
+    return None, warnings
+
+
+def _account_capacity_x(name: str, state: dict, config: dict) -> tuple[int, list[str]]:
+    """Resolved per-account `capacity_x` (capacity-aware spec 2026-07-10,
+    "Normalization model"): the hardcoded-equal-capacity assumption is
+    replaced by reading each account's OWN rate-limit tier — a config
+    override when the operator has pinned one, else the credentials-parsed
+    tier, else NEUTRAL (the resolved `reference_x` itself, giving the account
+    a ratio of exactly 1 so an unknown tier neither inflates nor starves its
+    scoring in either direction).
+
+    Note on the neutral value's type: `reference_x` is a float in general
+    (a pinned `capacity_aware.reference_x` may be any value >= 1). The `int`
+    return type mirrors the common case (real tiers and the typical fleet-min
+    reference are integers); a neutral account's `capacity_x` is returned
+    EXACTLY equal to `reference_x` regardless, because the ratio being
+    exactly 1 is the load-bearing invariant, not the numeric type.
+
+    Caching: whenever a genuinely-known value (override or parsed — never the
+    neutral fallback, which is derived, not observed) is resolved and differs
+    from the cached `state["accounts"][name]["capacity_x"]`, the cache is
+    refreshed in place. The wiring call inside `one_cycle`'s poll state-update
+    section invokes this once per JUST-polled account every cycle for exactly
+    that reason; `_capacity_ctx`'s eager fill is the other caller, for
+    accounts a poll cycle hasn't reached yet.
+    """
+    raw_x, warnings = _account_raw_capacity_x(name, state, config)
+    if raw_x is not None:
+        acct_state = state.setdefault("accounts", {}).setdefault(name, {})
+        if acct_state.get("capacity_x") != raw_x:
+            acct_state["capacity_x"] = raw_x
+        return raw_x, warnings
+    reference_x, ref_warnings = _resolve_reference_x(state, config)
+    return reference_x, warnings + ref_warnings
+
+
+def _observed_fleet_min_x(state: dict, config: dict) -> float | None:
+    """Fleet-relative candidate for `reference_x` (capacity-aware spec
+    2026-07-10, "Normalization model"): the smallest raw `capacity_x` among
+    ENABLED accounts that have a genuinely-known tier (config override or a
+    parseable, >= 1 credentials tier) — NEVER neutral/unknown accounts, since
+    those are defined AS the reference and including them would be circular.
+
+    Returns None when the enabled fleet has NO account with a known tier at
+    all (the "all-unknown" case) — the caller decides the fallback (1) and
+    whether a None here should suppress a drift comparison, rather than this
+    function silently coercing to 1 and losing that distinction.
+
+    "The same domain rule, resolved once and reused" (brief item 4): callers
+    that need the observed fleet minimum call THIS directly rather than each
+    re-deriving their own filtered-subset notion of it — `_resolve_reference_x`
+    (the bootstrap/snapshot path) and `_capacity_warnings` (the drift check)
+    both do.
+    """
+    disabled = _disabled_accounts(config)
+    known: list[int] = []
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is not None:
+            known.append(raw_x)
+    return float(min(known)) if known else None
+
+
+def _resolve_reference_x(state: dict, config: dict) -> tuple[float, list[str]]:
+    """Resolved `reference_x` (capacity-aware spec 2026-07-10, "Normalization
+    model"): the capacity scale every account's `capacity_x` is divided by to
+    get its unit ratio. Precedence:
+
+      1. `capacity_aware.reference_x` PINNED in config, when numeric and >= 1.
+         A present-but-invalid pin (wrong type, or numeric but < 1) is treated
+         EXACTLY as absent (falls through to 2/3) plus a warning about the
+         invalid value.
+      2. Absent (or invalid) → the PERSISTED snapshot at
+         `state["capacity_reference_snapshot"]`, if one has already been
+         computed — used SILENTLY, no warning. Once snapshotted, `reference_x`
+         deliberately stays STABLE across cycles even if the fleet's observed
+         minimum later drifts: removing/disabling the smallest account must
+         NOT silently rescale every other account's ratio fleet-wide (the
+         round-2 instability this pin/snapshot design exists to avoid).
+      3. No pin, no snapshot yet (first-ever resolution) → compute the
+         observed fleet minimum (`_observed_fleet_min_x`; falls back to 1 if
+         the enabled fleet has no known tier at all), PERSIST it as the
+         snapshot, and emit an SOS-instruction warning telling the operator to
+         pin `capacity_aware.reference_x` explicitly — a computed snapshot is
+         a reasonable bootstrap, never a substitute for a stated operator
+         intent.
+    """
+    warnings: list[str] = []
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    if pinned is not None:
+        is_number = isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+        if is_number and pinned >= 1:
+            return float(pinned), warnings
+        warnings.append(
+            f"capacity_aware.reference_x override {pinned!r} is invalid "
+            "(must be numeric and >= 1) — treating as unpinned"
+        )
+    snapshot = state.get("capacity_reference_snapshot")
+    if snapshot is not None:
+        return float(snapshot), warnings
+    observed = _observed_fleet_min_x(state, config)
+    value = observed if observed is not None else 1.0
+    state["capacity_reference_snapshot"] = value
+    warnings.append(
+        "capacity_aware.reference_x is not pinned — bootstrapped a snapshot of "
+        f"{value:g}x from the observed fleet minimum tier and persisted it to "
+        "state.json's capacity_reference_snapshot; pin capacity_aware.reference_x "
+        "explicitly in config.yaml to make this an intentional, stable choice "
+        "rather than an incidental one."
+    )
+    return value, warnings
+
+
+def _capacity_gate_on(config: dict) -> bool:
+    """Master gate for the capacity-aware Normalization model (capacity-aware
+    spec 2026-07-10). Default OFF — every gate-off golden
+    (tests/test_capacity_gate_off_goldens.py) must reproduce today's
+    hardcoded-equal-capacity behavior bit-for-bit until Phase 2 wires gate-on
+    callers (Rollout §1)."""
+    return bool(config.get("capacity_aware", {}).get("enabled", False))
+
+
+def _capacity_ctx(state: dict, config: dict) -> dict:
+    """Build the fleet-level capacity-aware context (capacity-aware spec
+    2026-07-10, "Normalization model"):
+    `{"reference_x": float, "capacity_x_by_name": {name: int},
+    "lane_load_by_name": {name: int}}`.
+
+    Self-sufficient by design: standalone entry points (`diagnose()`, `cus
+    status`, ...) must never see a "partially-known fleet" — for any ENABLED
+    account missing a cached `capacity_x` in state, this EAGERLY reads+caches
+    its tier right here (a local credentials-file read, same mechanism
+    `_read_rate_limit_tier` always uses — never an HTTP poll), rather than
+    waiting for that account's next due poll cycle to populate the cache via
+    the `one_cycle` wiring point. An operator-disabled account missing the
+    cache is left out of `capacity_x_by_name` rather than spending a read on
+    an account nothing routes to this cycle — the poll-time wiring point
+    fills it once the account is re-enabled and actually polled.
+
+    `lane_load_by_name` mirrors `_lane_load`'s slot/mount occupancy counting
+    (`occupied_slot_accounts(state)`, live-session-per-/proc semantics, same
+    as the anti-clustering `base_lane_load` in `decide_slot_swaps`) — callers
+    that need claim-aware counts (this-cycle's in-flight moves, not just
+    what's live right now) may overwrite entries after building this ctx.
+    """
+    reference_x, _warnings = _resolve_reference_x(state, config)
+    disabled = _disabled_accounts(config)
+    capacity_x_by_name: dict[str, int] = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name:
+            continue
+        cached = state.get("accounts", {}).get(name, {}).get("capacity_x")
+        if cached is not None:
+            capacity_x_by_name[name] = cached
+            continue
+        if name in disabled:
+            continue
+        value, _acct_warnings = _account_capacity_x(name, state, config)
+        capacity_x_by_name[name] = value
+    lane_load_by_name = {acct: len(slots) for acct, slots in occupied_slot_accounts(state).items()}
+    return {
+        "reference_x": reference_x,
+        "capacity_x_by_name": capacity_x_by_name,
+        "lane_load_by_name": lane_load_by_name,
+    }
+
+
+def _remaining_units(pct: float, name: str, ctx: dict, config: dict) -> float:
+    """Remaining capacity in reference-scale UNITS for account `name` at usage
+    `pct` (capacity-aware spec 2026-07-10, "Normalization model"):
+    `ratio = capacity_x / reference_x`; `remaining_units = (100 - pct) / 100 *
+    ratio`. A 20x account at 0% carries 20x the reference account's remaining
+    headroom at 0%; the same 20x account at 80% carries only 0.2 * 20 = 4x —
+    letting a big-tier account's LOW percent still correctly outrank a
+    small-tier account's headroom on a shared scale, instead of comparing raw
+    percents as if every account had the same underlying capacity (the
+    hardcoded-equal-capacity assumption behind the 2026-07-10 halt incident).
+
+    `name` missing from `ctx["capacity_x_by_name"]` (e.g. a spare account
+    `_capacity_ctx` never populated) falls back to `reference_x` itself —
+    ratio 1, the same neutral `_account_capacity_x` would resolve.
+
+    `config` is accepted, unused by this base formula today, for call-shape
+    symmetry with the gate-on callers Phase 2 threads this into.
+    """
+    reference_x = ctx.get("reference_x") or 1.0
+    capacity_x = ctx.get("capacity_x_by_name", {}).get(name, reference_x)
+    ratio = capacity_x / reference_x
+    return (100.0 - pct) / 100.0 * ratio
+
+
+def _capacity_warnings(state: dict, config: dict) -> list[str]:
+    """Diagnostic warnings for the capacity-aware Normalization model
+    (capacity-aware spec 2026-07-10). Pure computation — SOS wiring (folding
+    these into `diagnose()`'s SOSCondition list) is a later task; this only
+    returns the strings.
+
+    Two independent checks:
+
+      1. Drift: the observed fleet minimum has fallen BELOW the pinned
+         `capacity_aware.reference_x`. Silent when the observed minimum is AT
+         or ABOVE the pin (removing/disabling small accounts so the fleet
+         floor RISES is a deliberate, healthy pin state — nothing to warn
+         about) and silent when the enabled fleet has no known tier at all
+         (`_observed_fleet_min_x` returns None — nothing observed to drift).
+         Only meaningful when a valid pin actually exists in config; an
+         unpinned/snapshotted `reference_x` has nothing to "drift" from by
+         definition (it tracks the observed minimum by construction, once).
+      2. Sub-reference: any account (enabled OR operator-disabled) whose
+         ratio `capacity_x / reference_x` is at or below the first ladder
+         step's headroom fraction, `(100 - steps[0]) / 100` — a warn-and-run
+         heads-up, not a block, since such an account will legitimately trip
+         the ladder sooner than the rest of the fleet in reference-scale
+         units. Downgraded to a soft `"INFO: "`-prefixed string for accounts
+         the operator has already disabled (cus.py:10680-10693 is the
+         existing per-account SOS-severity-split precedent this mirrors) —
+         it isn't being routed to right now, so the same condition is
+         informational rather than actionable.
+    """
+    warnings: list[str] = []
+    reference_x, _ref_warnings = _resolve_reference_x(state, config)
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    has_valid_pin = (isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+                     and pinned >= 1)
+    observed_min = _observed_fleet_min_x(state, config)
+    if has_valid_pin and observed_min is not None and observed_min < reference_x:
+        warnings.append(
+            f"capacity-aware: observed fleet minimum tier ({observed_min:g}x) has drifted "
+            f"BELOW the pinned reference_x ({reference_x:g}x) — every account's unit ratio "
+            "is now computed against a reference bigger than any live account; re-pin "
+            "capacity_aware.reference_x to the new floor if this is intentional."
+        )
+    disabled = _disabled_accounts(config)
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    sub_reference_threshold = (100.0 - steps[0]) / 100.0
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or reference_x <= 0:
+            continue
+        capacity_x, _acct_warnings = _account_capacity_x(name, state, config)
+        ratio = capacity_x / reference_x
+        if ratio <= sub_reference_threshold:
+            message = (
+                f"account {name!r}: capacity_x/reference_x ratio ({ratio:.2f}) is at or "
+                f"below the first ladder step's headroom fraction ({sub_reference_threshold:.2f}) "
+                "— expect it to trip the swap ladder sooner than the rest of the fleet in "
+                "reference-scale units (warn-and-run, not blocked)"
+            )
+            if name in disabled:
+                message = f"INFO: {message} (operator-disabled — informational only)"
+            warnings.append(message)
+    return warnings
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
@@ -4488,13 +5322,47 @@ def _lane_load_penalty(name: str, state: dict, config: dict) -> float:
     caller — SOS probes, `cus switch`, global mode — passes no `_lane_load`, so
     their scoring is untouched), or when the candidate backs no lanes. Scales
     linearly with lane count, so a magnet that has already accreted 2-3 lanes is
-    penalized 2-3× and the fleet disperses within a cycle or two."""
+    penalized 2-3× and the fleet disperses within a cycle or two.
+
+    Capacity-aware (G1, capacity-aware spec 2026-07-10, "The formula changes"):
+    0.0 whenever the gate is on — the reference-unit ranking key
+    (`_capacity_rank_key`) folds lane isolation into its own `÷(lanes+1)`
+    contention divisor plus a units-scale linear term, so this point-scale
+    penalty is deliberately NOT applied on top of it."""
     if not _spread_lanes_enabled(config):
+        return 0.0
+    if _capacity_gate_on(config):
         return 0.0
     load = (state.get("_lane_load") or {}).get(name, 0)
     if not load:
         return 0.0
     return float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0)) * load
+
+
+def _capacity_rank_key(score_pts: float, name: str, ctx: dict, config: dict) -> float:
+    """Gate-on swap-target ranking key (G1, capacity-aware spec 2026-07-10,
+    "The formula changes" formula 1):
+
+        key = (score_pts / 100) × ratio ÷ (lanes + 1) − (cluster_penalty / 100) × lanes
+
+    where `ratio = capacity_x / reference_x` and `lanes` is the candidate's
+    live-lane count (both from `ctx`). `score_pts` is the strategy's existing
+    point-scale score (e.g. `100 − effective_pct` for lowest_usage, the
+    weighted headroom/burn-soon score for headroom/smart) fed in verbatim — NOT
+    clamped or re-weighted. Candidates rank by this key DESCENDING.
+
+    Both terms are in reference units: the first is per-lane capacity density
+    for the score's headroom component (a big-tier account's low percent
+    correctly outranks a small-tier account's); the second is the isolation
+    preference (co-located lanes share fate on a 429/token failure), 0.60u per
+    lane at `cluster_penalty: 60`, scale-stable because `reference_x` is pinned.
+    This replaces the point-scale `_lane_load_penalty` (which returns 0 gate-on).
+    """
+    reference_x = ctx.get("reference_x") or 1.0
+    ratio = ctx.get("capacity_x_by_name", {}).get(name, reference_x) / reference_x
+    lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+    cluster_penalty = float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0))
+    return (score_pts / 100.0) * ratio / (lanes + 1) - (cluster_penalty / 100.0) * lanes
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
@@ -4665,6 +5533,19 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # below): the aggregate 7d hard cap.
     hard_7d = _hard_7d_cap_for_config(config)
     model_cap = _model_weekly_target_cap_for_config(config)
+
+    # Capacity-aware gate (capacity-aware spec 2026-07-10). When on, ranking, the
+    # aggregate-7d filter, and the per-model reserve preference below all run in
+    # reference UNITS, not raw percent. ctx comes from the stash Task 5 lays down
+    # (claim-aware lane counts); absent that, build a fresh one here — the
+    # deliberate fallback resolution is that a missing stash must NEVER silently
+    # mean "percent path" while the gate is on. Built only gate-on (the fresh
+    # build reads credentials/occupancy and is a no-op cost gate-off, keeping
+    # gate-off bit-for-bit). Hoisted above the reserve elif so its self-call
+    # converts too (capacity-aware spec 2026-07-10, Task 5).
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = (state.get("_capacity_ctx") or _capacity_ctx(state, config)) if _cap_on else None
+
     model_safe = [(n, a) for n, a in candidates
                   if _max_model_weekly_from_acct(a, config) < model_cap]
     if gate_enabled and not model_safe:
@@ -4685,9 +5566,16 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # filters — under the aggregate 7d hard cap AND not immediately re-tripping its
         # own ladder. Otherwise narrowing would strand the lane on a degraded
         # model-spent account while a healthy Fable-fresh target exists in the full pool.
-        if any(a.get("current_7d_pct", 0) < hard_7d
-               and not _target_would_immediately_re_trip(a, config)
-               for _, a in model_spent):
+        # G2/G9 (capacity-aware spec 2026-07-10): gate-on, "survives both
+        # downstream filters" is judged in reference units — 7d headroom
+        # (formula 3) AND per-lane re-trip health (formula 2, name+ctx threaded).
+        # Gate-off (_cap_on False → name/ctx None) reduces to the original raw
+        # percent form exactly, so gate-off stays bit-for-bit.
+        _reserve_ctx = _cap_ctx if _cap_on else None
+        if any((_remaining_units(a.get("current_7d_pct", 0), n, _cap_ctx, config) > (100.0 - hard_7d) / 100.0
+                    if _cap_on else a.get("current_7d_pct", 0) < hard_7d)
+               and not _target_would_immediately_re_trip(a, config, name=(n if _cap_on else None), ctx=_reserve_ctx)
+               for n, a in model_spent):
             candidates = model_spent
 
     # Universal filter (GH #17, all strategies): exclude candidates above
@@ -4696,7 +5584,18 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
     # (system is degraded; swap somewhere rather than stay on a hot active). Runs
     # on the per-model-safe survivors from the HARD gate above.
-    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+    #
+    # G9 (capacity-aware spec 2026-07-10): gate-on, the ceiling is a reference-
+    # unit line — a candidate is safe iff `remaining_7d_units > (100 −
+    # hard_7d_cap_pct)/100` (no lane divisor; the 7d cap is aggregate, not a
+    # per-lane ladder). A big-tier account at a high 7d percent can still clear
+    # it. Reduces exactly to `current_7d_pct < hard_7d` at ratio 1.
+    if _cap_on:
+        _hard_7d_units_line = (100.0 - hard_7d) / 100.0
+        safe_7d = [(n, a) for n, a in candidates
+                   if _remaining_units(a.get("current_7d_pct", 0), n, _cap_ctx, config) > _hard_7d_units_line]
+    else:
+        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -4707,7 +5606,13 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # Falls back to "any candidate" if NONE have headroom; the hysteresis
     # gate (GH #16) and usage-growth gate (GH #15) protect against the
     # resulting potential loop.
-    with_headroom = [(n, a) for n, a in candidates if not _target_would_immediately_re_trip(a, config)]
+    # G2 (capacity-aware spec 2026-07-10): gate-on, "would re-trip" is the
+    # per-lane reference-units health line (formula 2), so a healthy big-tier
+    # candidate (e.g. idle 20x@80%) is not pruned by raw percent. Gate-off
+    # (name/ctx None) is the original raw-percent filter, bit-for-bit.
+    _wh_ctx = _cap_ctx if _cap_on else None
+    with_headroom = [(n, a) for n, a in candidates
+                     if not _target_would_immediately_re_trip(a, config, name=(n if _cap_on else None), ctx=_wh_ctx)]
     headroom_fallback = not with_headroom
     if with_headroom:
         candidates = with_headroom
@@ -4730,29 +5635,63 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # by 5h for stability. Anti-cluster (2026-07-06): a lane-load penalty is
         # ADDED to the effective-util sort key (higher util = sorted later), so a
         # candidate already backing live lanes is deprioritized vs an empty one.
-        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
-                                        + _lane_load_penalty(kv[0], state, config),
-                                        kv[1].get("current_5h_pct", 0.0)))
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, rank by the reference-
+        # unit key DESCENDING — score_pts here is `100 − effective_pct` (this
+        # strategy's existing point score) — keeping the 5h tiebreak. At ratio 1
+        # / zero lane-load this reduces to today's effective-pct ordering.
+        if _cap_on:
+            candidates.sort(key=lambda kv: (
+                -_capacity_rank_key(100.0 - _account_effective_pct(kv[1], config), kv[0], _cap_ctx, config),
+                kv[1].get("current_5h_pct", 0.0)))
+        else:
+            candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
+                                            + _lane_load_penalty(kv[0], state, config),
+                                            kv[1].get("current_5h_pct", 0.0)))
         chosen, _ = candidates[0]
-        return SwapTarget(name=chosen, reason=_annotate("lowest_usage: lowest effective util"))
+        return SwapTarget(name=chosen, reason=_annotate(
+            "lowest_usage[capacity]: highest remaining-units-per-lane" if _cap_on
+            else "lowest_usage: lowest effective util"))
 
     if strategy == "drain":
         # cux drain: pass 1 = candidates with effective_pct under their own
         # next_swap_at (i.e. headroom for an arrival). Pass 2 = any candidate
         # below 100% 5h. Pass 2 still applies the universal cap_fallback /
         # headroom_fallback filters above.
-        ordered = [
-            (n, a) for n, a in candidates
-            if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
-        ]
+        #
+        # G7 (capacity-aware spec 2026-07-10): drain is non-scoring (no G1 key).
+        # Gate-on converts BOTH halves to reference units — (a) the pass-1 ACCEPT
+        # `effective_pct < next_swap_at` becomes `remaining_units(effective_pct)
+        # > (100 − next_swap_at)/100` (a big-tier account with real unit headroom
+        # is admitted even above its raw rung); (b) the deplete-first ORDERING
+        # `-current_7d_pct` (closest-to-cap first) becomes fewest-remaining-7d-
+        # units-first — same deplete-first intent, but a 5x@60% (0.4u) drains
+        # before a 20x@85% (0.6u) even though 85 > 60 in raw percent.
+        if _cap_on:
+            ordered = [
+                (n, a) for n, a in candidates
+                if _remaining_units(_account_effective_pct(a, config), n, _cap_ctx, config)
+                > (100.0 - a.get("next_swap_at_pct", 50)) / 100.0
+            ]
+        else:
+            ordered = [
+                (n, a) for n, a in candidates
+                if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
+            ]
         if ordered:
-            ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
+            if _cap_on:
+                ordered.sort(key=lambda kv: _remaining_units(kv[1].get("current_7d_pct", 0.0), kv[0], _cap_ctx, config))
+            else:
+                ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
             chosen, _ = ordered[0]
             return SwapTarget(name=chosen, reason=_annotate("drain: under own threshold"))
         # Pass 2: any candidate with some 5h room
         ordered = [(n, a) for n, a in candidates if a.get("current_5h_pct", 0.0) < 100]
         if ordered:
-            ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
+            if _cap_on:
+                ordered.sort(key=lambda kv: _remaining_units(kv[1].get("current_7d_pct", 0.0), kv[0], _cap_ctx, config))
+            else:
+                ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
             chosen, _ = ordered[0]
             return SwapTarget(name=chosen, reason=_annotate("drain: 5h has room"))
         return None
@@ -4764,7 +5703,16 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         cfg_accounts = {a["name"]: a for a in config.get("accounts", [])}
         candidates.sort(key=lambda kv: cfg_accounts.get(kv[0], {}).get("priority", 99))
         for name, acct in candidates:
-            if _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50):
+            # G7 (capacity-aware spec 2026-07-10): non-scoring — priority ORDER
+            # is untouched; only the per-account headroom ACCEPT converts to the
+            # reference-unit line (reduces to `effective_pct < next_swap_at` at
+            # ratio 1).
+            if _cap_on:
+                accepted = (_remaining_units(_account_effective_pct(acct, config), name, _cap_ctx, config)
+                            > (100.0 - acct.get("next_swap_at_pct", 50)) / 100.0)
+            else:
+                accepted = _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50)
+            if accepted:
                 return SwapTarget(name=name, reason=_annotate("strict_priority: highest priority with headroom"))
         return None
 
@@ -4804,6 +5752,17 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
         # Anti-cluster (2026-07-06): subtract the lane-load penalty so an account
         # already backing live lanes scores below a distinct empty one.
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, feed the weighted
+        # headroom `score` in as score_pts and rank by the reference-unit key
+        # DESCENDING (which supplies its own lane isolation, so the point-scale
+        # penalty is not applied). Reduces to today's score ordering at ratio 1 /
+        # zero lane-load.
+        if _cap_on:
+            candidates.sort(key=lambda kv: -_capacity_rank_key(score(kv[1]), kv[0], _cap_ctx, config))
+            chosen, chosen_acct = candidates[0]
+            k = _capacity_rank_key(score(chosen_acct), chosen, _cap_ctx, config)
+            return SwapTarget(name=chosen, reason=_annotate(f"headroom[capacity]: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% key={k:.2f}"))
         candidates.sort(key=lambda kv: -(score(kv[1]) - _lane_load_penalty(kv[0], state, config)))
         chosen, chosen_acct = candidates[0]
         s = score(chosen_acct) - _lane_load_penalty(chosen, state, config)
@@ -4890,19 +5849,33 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # so a magnet that has already accreted lanes falls behind a distinct
         # empty account and the fleet disperses. Inert when spread_lanes is off or
         # no _lane_load map was supplied (non-lane callers).
+        #
+        # G1 (capacity-aware spec 2026-07-10): gate-on, the unclamped smart
+        # score (headroom + burn-soon + reset-proximity, NOT 0-100 bounded) is
+        # fed in as score_pts to the reference-unit key, which supplies its own
+        # ÷(lanes+1) isolation in place of the point-scale cluster penalty. The
+        # burn-soon bonus scales with a candidate's ratio (a soon-resetting 20x
+        # wastes 4× a 5x's capacity), so it stays a deliberate magnet until it
+        # accretes enough lanes for the divisor + linear term to overtake it.
         scored = []
         for n, a in candidates:
             sc, rz = smart_score(a)
-            pen = _lane_load_penalty(n, state, config)
-            if pen:
-                sc -= pen
-                rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
-            scored.append((n, a, sc, rz))
+            if _cap_on:
+                rank = _capacity_rank_key(sc, n, _cap_ctx, config)
+                rz = (rz + f" capacity-key({rank:.2f})").strip()
+            else:
+                pen = _lane_load_penalty(n, state, config)
+                if pen:
+                    sc -= pen
+                    rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
+                rank = sc
+            scored.append((n, a, rank, rz))
         scored.sort(key=lambda x: -x[2])
-        chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
+        chosen, chosen_acct, chosen_rank, chosen_reasons = scored[0]
+        _metric = "key" if _cap_on else "score"
         return SwapTarget(
             name=chosen,
-            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={chosen_score:.1f} {chosen_reasons}"),
+            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% {_metric}={chosen_rank:.1f} {chosen_reasons}"),
         )
 
     return None
@@ -6226,7 +7199,13 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     install_src = None
     used_independent = False
     if (slot is not None and independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config)):
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)):
+        # session_aware=True (orphan-holds-slot bug, 2026-07-10): only a slot with
+        # a LIVE claude session counts as double-booking the account here. An
+        # orphaned dev-server that inherited CLAUDE_CONFIG_DIR after its session
+        # closed refreshes no token, so it must not force a needless family claim /
+        # pool-exhaustion refuse onto an account whose family is actually free.
         # #127: liveness-verified claim — probes each free family's refresh
         # token, retires dead stores (the pre-PR#126 poisoning landmines), and
         # persists the rotation into the store this install copies from.
@@ -6341,9 +7320,28 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # catches a mis-provisioned pool family that happens to share the snapshot's
     # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
     # does. The login-free remedy is another pooled family (`cus login-mount`).
-    if (slot is not None and independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config)
-            and _live_family_would_collide(target_name, install_src, slot, state, config)):
+    #
+    # 2026-07-10 (heal-from-family follow-up): the guard now ALSO covers the
+    # SHARED-mount install (slot is None) — previously slot-scoped. A snapshot
+    # reseeded from a live family (heal-from-family) or a `--from-existing`
+    # bootstrap carries a family that may be LIVE on a lane; installing that copy
+    # into ~/.claude while the lane runs is the same #104 double-book, just with
+    # the shared mount as the second holder. `_account_held_by_other_live_mount` /
+    # `_live_family_would_collide` both accept this_slot=None (they then compare
+    # against every live lane of the target), so the same bytes-level check
+    # applies unchanged; a non-aliased snapshot (its own family, live nowhere)
+    # still installs exactly as before.
+    #
+    # session_aware=True (orphan-holds-slot bug, 2026-07-10): an orphaned holder
+    # on another slot is not a live mount that could rotate the token out from
+    # under this one, so it must not trigger the family-collision refuse. Keeps
+    # this execute-time guard consistent with the slot-move preview, which also
+    # judges occupancy session-aware.
+    if (independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)
+            and _live_family_would_collide(target_name, install_src, slot, state, config,
+                                           session_aware=True)):
         # The refusal that prevents the divergence-logout: this install source's
         # token family is already live on another mount of `target_name`. shared=true
         # is the whole reason we refuse; token_fp names the colliding family.
@@ -6353,10 +7351,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             _collide_fp = "unreadable"
         _cred_audit("family-collision-refuse", "refused-collision",
                     "install source shares a live family on another mount (#104)",
-                    slot=slot, account=target_name, login_family=(claimed_family or "legacy/snapshot"),
+                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                    login_family=(claimed_family or "legacy/snapshot"),
                     shared=True, token_fp=_collide_fp)
         raise RuntimeError(
-            f"refusing to install '{target_name}' onto lane {slot}: the credentials about to be "
+            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
+            f"the credentials about to be "
             f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
             f"or another lane of '{target_name}'. Two live mounts on one token family log one of "
             f"them out on the next rotation (GH #104 divergence — the 2026-07-07 chats1a logout). "
@@ -6386,7 +7386,32 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
             f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
             f"backup (`cus restore-creds {target_name}`).")
-    atomic_copy(install_src, live_creds_path, mode=0o600)
+    # ---- MCP OAuth carry-over (2026-07-10) ----
+    # This wholesale install is exactly the write that used to clobber the
+    # mount's MCP-server tokens (mcpOAuth rides in the same file as
+    # claudeAiOauth). Harvest the outgoing live file's tokens into the
+    # canonical store first, then install the source WITH the canonical
+    # tokens merged in — so a swap never downgrades a mount's MCP auth, and
+    # an MCP authentication done on any mount survives onto whichever
+    # account lands here next. Both steps are best-effort: MCP carry-over
+    # must never block or fail an account swap.
+    try:
+        if live_creds_path.exists():
+            harvest_mcp_oauth(read_json(live_creds_path))
+    except (json.JSONDecodeError, OSError):
+        pass  # unreadable outgoing file: nothing to harvest
+    try:
+        _mcp_injected = inject_mcp_oauth(_install_src_creds)
+    except (json.JSONDecodeError, OSError):
+        _mcp_injected = 0
+    if _mcp_injected:
+        # Write the merged payload instead of the raw source bytes. Only the
+        # mcpOAuth key differs from install_src; claudeAiOauth is byte-for-
+        # byte the validated source tokens, so every guard above still holds.
+        atomic_write_bytes(live_creds_path,
+                           json.dumps(_install_src_creds, indent=2).encode(), mode=0o600)
+    else:
+        atomic_copy(install_src, live_creds_path, mode=0o600)
     # THE install-point: the target account's creds are now live on this mount.
     # source = which store we copied from (claimed pool family / legacy / snapshot);
     # existing = target's trusted anchor identity; token_fp names the family that is
@@ -6944,6 +7969,26 @@ def _maybe_burn_before_reset(
     )
 
 
+def _below_ladder_leave_line(cur_pct: float, name: str, cap_ctx: dict | None,
+                             config: dict, threshold: float, cap_on: bool) -> bool:
+    """G4 ladder leave-line test, shared by decide_swap's Trigger 2 and the
+    halted-lane sweep (fix #1a, 2026-07-10) so both judge "has this account
+    crossed its swap-away step?" with byte-identical logic.
+
+    True  = still BELOW the step → HOLD (nothing to do).
+    False = AT/OVER the step → the lane should leave its account.
+
+    Gate-on the test is in reference UNITS — reuse `_remaining_units` (do NOT
+    duplicate the units formula): HOLD iff remaining_units > (100 − threshold)/100.
+    Gate-off it is the raw `cur_pct < threshold`, and the units form reduces to
+    exactly that at capacity ratio 1, so gate-off callers stay bit-for-bit.
+    Judges the CURRENT account (the G4 trip form), NOT a target's health —
+    threshold is the account's own clamped `next_swap_at_pct`, no lane divisor."""
+    if cap_on:
+        return _remaining_units(cur_pct, name, cap_ctx, config) > (100.0 - threshold) / 100.0
+    return cur_pct < threshold
+
+
 def decide_swap(
     state: dict,
     config: dict,
@@ -6979,9 +8024,55 @@ def decide_swap(
 
     active_acct = state["accounts"][current]
     cur_usage = usage_by_account.get(current)
+    # Per-model weekly cap is a HARD invariant that poll_account_usage persists
+    # into state.json (`per_model_weekly_pct`) on every poll. Read it from
+    # persisted state here — BEFORE the no-fresh-poll guard — so the force-swap-OFF
+    # side is SYMMETRIC with target selection, which already consults persisted
+    # per-model via `_max_model_weekly_from_acct`. Without this, an account backing
+    # a live lane that is NOT the freshly-polled active mount (inactive cadence
+    # ~600s) has no `usage_by_account` entry, so the guard below used to
+    # `return None` ("no fresh usage poll") BEFORE reaching Trigger 1 — leaving the
+    # lane pinned at e.g. Fable 100% until its next poll landed (found 2026-07-05:
+    # `cus launch auto` on 'default' at Fable 100% never force-swapped because
+    # 'default' polled slow while another account held the mount).
+    model_cap = _model_weekly_cap_for_config(config)
+    persisted_model = _max_model_weekly_from_acct(active_acct, config)
     if cur_usage is None:
+        # No fresh poll this cycle: the aggregate 5h/7d ladder can't be judged (it
+        # needs live window data), but the per-model hard cap CAN — from the last
+        # persisted read. Enforce only that here; everything else still correctly
+        # waits for a fresh poll.
+        if persisted_model > 0 and persisted_model >= model_cap:
+            target = pick_swap_target(state, config)
+            if target is None or (
+                "[DEGRADED:" in target.reason and "no targets below 7d cap" in target.reason
+            ):
+                _note("model_cap_no_target", "hold",
+                      f"{current} model-week {persisted_model:.1f}% >= {model_cap}% "
+                      f"but no eligible swap target")
+                return None
+            reason = (f"per-model weekly cap: {current} model-week {persisted_model:.1f}% "
+                      f">= {model_cap}% (persisted; no fresh poll this cycle); "
+                      f"target: {target.reason}")
+            _note("hard_7d_cap", "swap", reason)
+            return SwapDecision(
+                target=target.name,
+                reason=reason,
+                tier=determine_tier(active_acct, config),
+                gate="hard_7d_cap",
+                deferrable=False,
+            )
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
+
+    # Capacity-aware gate (capacity-aware spec 2026-07-10). When on, the trigger
+    # comparisons below run in reference UNITS for the ACTIVE account `current`,
+    # not raw percent. ctx comes from the Task-5 stash (claim-aware lane counts);
+    # absent that, build fresh — a missing stash must never silently mean the
+    # percent path while the gate is on (deliberate fallback resolution). Built
+    # only gate-on, so gate-off stays bit-for-bit.
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = (state.get("_capacity_ctx") or _capacity_ctx(state, config)) if _cap_on else None
 
     # Fix A — extrapolation-aware trigger (2026-07-06 rayi3 incident). The ladder
     # (Trigger 2) and hard-cap (Trigger 1) trips below compare against the
@@ -7019,8 +8110,10 @@ def decide_swap(
     # The model comparison uses its own threshold (per_model_weekly.cap_pct,
     # falling back to hard_7d_cap) so e.g. "Fable at 90" can coexist with an
     # aggregate ceiling of 80.
-    cur_model = _max_model_weekly_from_usage(cur_usage, config)
-    model_cap = _model_weekly_cap_for_config(config)
+    # Take the max of the fresh-poll reading and the persisted reading (computed
+    # above, next to the no-fresh-poll guard) so a maxed model trips regardless of
+    # whether this cycle repolled the account. model_cap is already set above.
+    cur_model = max(_max_model_weekly_from_usage(cur_usage, config), persisted_model)
     # Fix A: force the hard-cap trips on the burn-EXTRAPOLATED values, not the
     # stale poll. Aggregate 7d extrapolates via estimate_window_pct (same base as
     # cur_usage.seven_day.utilization — they're synced by update_state_with_usage).
@@ -7034,7 +8127,16 @@ def decide_swap(
         if cur_model > 0:
             cur_model = min(100.0, cur_model + _burn_extrapolation_delta(
                 active_acct, "7d", config, _trig_now, _trig_look_ahead))
-    agg_tripped = cur_7d >= hard_7d_cap
+    # G9 Trigger-1 arm (capacity-aware spec 2026-07-10): the AGGREGATE 7d cap
+    # trips in reference units — `remaining_7d_units <= (100 − hard_7d_cap)/100`
+    # (no lane divisor; aggregate cap, same shape as the picker's safe_7d line
+    # G9). Keeps the site's own `cur_7d` source (burn-extrapolated under
+    # poll-accel, raw otherwise). The per-model arm is deliberately untouched.
+    # Reduces to `cur_7d >= hard_7d_cap` at ratio 1.
+    if _cap_on:
+        agg_tripped = _remaining_units(cur_7d, current, _cap_ctx, config) <= (100.0 - hard_7d_cap) / 100.0
+    else:
+        agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
         # Preserve the FORCING caps before the display reassignment below stomps
@@ -7194,7 +8296,18 @@ def decide_swap(
     ladder_threshold_bbr = active_acct.get("next_swap_at_pct", cfg_steps_bbr[0])
     if ladder_threshold_bbr >= 100:
         ladder_threshold_bbr = cfg_steps_bbr[-1]
-    if current_max_pct(cur_usage, config) < ladder_threshold_bbr:
+    # G6 (capacity-aware spec 2026-07-10): the "ladder won't fire, so run bbr"
+    # precheck runs in reference units — bbr is eligible iff `remaining_units >
+    # (100 − clamped next_swap_at)/100`. Keeps its RAW current_max_pct source (no
+    # look-ahead): the asymmetry with G4's look-ahead-maxed cur_pct is today's
+    # behavior, deliberately preserved. Reduces to `< ladder_threshold_bbr` at
+    # ratio 1.
+    _bbr_max_pct = current_max_pct(cur_usage, config)
+    if _cap_on:
+        _bbr_below_step = _remaining_units(_bbr_max_pct, current, _cap_ctx, config) > (100.0 - ladder_threshold_bbr) / 100.0
+    else:
+        _bbr_below_step = _bbr_max_pct < ladder_threshold_bbr
+    if _bbr_below_step:
         bbr_decision = _maybe_burn_before_reset(
             state, config, current, active_acct, cur_usage, usage_by_account
         )
@@ -7228,7 +8341,15 @@ def decide_swap(
     if _poll_accel_enabled(config):
         cur_pct = max(cur_pct, _account_estimated_effective_pct(
             active_acct, config, _trig_now, look_ahead_seconds=_trig_look_ahead))
-    if cur_pct < threshold:
+    # G4 (capacity-aware spec 2026-07-10): the ladder trips in reference units —
+    # HOLD (below step) iff `remaining_units > (100 − clamped threshold)/100`,
+    # trip iff `<=`. Keeps this site's own cur_pct source (raw max-ed with the
+    # look-ahead only under poll-accel) and its already-clamped local threshold
+    # (>=100 → steps[-1]). A 20x@80% with next_swap_at=70 has 0.8u > 0.3u so it
+    # HOLDS gate-on (trips gate-off), and only trips at >= 92.5%. Reduces to
+    # `cur_pct < threshold` at ratio 1.
+    _below_threshold = _below_ladder_leave_line(cur_pct, current, _cap_ctx, config, threshold, _cap_on)
+    if _below_threshold:
         _note("below_threshold", "hold",
               f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
         return None
@@ -7394,15 +8515,37 @@ def decide_swap(
     # leak 1-2pp drift through small `min_improvement_pct` margins.
     if hyst_cfg.get("enabled", True):
         min_improvement = hyst_cfg.get("min_improvement_pct", 3)
-        active_eff = _account_effective_pct(active_acct, config)
-        target_eff = _account_effective_pct(state["accounts"][target.name], config)
-        if target_eff > active_eff - min_improvement:
-            msg = (
-                f"ladder swap suppressed: target {target.name} at "
-                f"{target_eff:.1f}% would not improve on active {current} at "
-                f"{active_eff:.1f}% by min_improvement_pct={min_improvement}pp "
-                f"(picker reason: {target.reason})"
-            )
+        # G5 (capacity-aware spec 2026-07-10): gate-on, "must improve" is judged
+        # in reference units — HOLD iff `target_units − active_units <
+        # min_improvement/100` (min_improvement_pct is percent points, so /100
+        # puts it on the units scale: default 3 → 0.03u). A move to a bigger-tier
+        # account with more absolute headroom is a genuine improvement even at a
+        # higher raw percent (active 5x@71% has 0.29u; idle 20x@75% has 1.0u, so
+        # gate-on proceeds where gate-off holds). The diagnostic logs the units
+        # comparison gate-on — the percent numbers would not be what held it.
+        if _cap_on:
+            active_metric = _remaining_units(_account_effective_pct(active_acct, config), current, _cap_ctx, config)
+            target_metric = _remaining_units(_account_effective_pct(state["accounts"][target.name], config), target.name, _cap_ctx, config)
+            insufficient = target_metric - active_metric < min_improvement / 100.0
+        else:
+            active_metric = _account_effective_pct(active_acct, config)
+            target_metric = _account_effective_pct(state["accounts"][target.name], config)
+            insufficient = target_metric > active_metric - min_improvement
+        if insufficient:
+            if _cap_on:
+                msg = (
+                    f"ladder swap suppressed: target {target.name} at "
+                    f"{target_metric:.2f}u would not improve on active {current} at "
+                    f"{active_metric:.2f}u by min_improvement={min_improvement / 100.0:.2f}u "
+                    f"(picker reason: {target.reason})"
+                )
+            else:
+                msg = (
+                    f"ladder swap suppressed: target {target.name} at "
+                    f"{target_metric:.1f}% would not improve on active {current} at "
+                    f"{active_metric:.1f}% by min_improvement_pct={min_improvement}pp "
+                    f"(picker reason: {target.reason})"
+                )
             click.echo(f"  {msg}")
             _note("min_improvement_gate", "hold", msg)
             return None
@@ -7464,6 +8607,35 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
         if d.exists() and mount_in_use(d):
             out.setdefault(acct, []).append(name)
     _OCCUPIED_SLOTS_CACHE[key] = (now, out)
+    return out
+
+
+def occupied_slot_accounts_live_session(state: dict) -> dict[str, list[str]]:
+    """Like occupied_slot_accounts, but counts a slot only when a live claude
+    SESSION holds it (mount_has_live_session), not merely any process that
+    inherited CLAUDE_CONFIG_DIR (mount_in_use).
+
+    The credential-safety pool-family DECISION reads this instead of
+    occupied_slot_accounts so an orphaned subprocess that outlived its session —
+    a `vite`/`next dev` dev server or `tail -f` reparented to init while still
+    carrying the inherited env var — does NOT make the account's login family
+    look occupied (orphan-holds-slot bug, 2026-07-10; GH #104 repro: onemitzvah2a
+    closed but its orphaned vite held slot-11/rayi3, so `cus slot move slot-1
+    rayi3` refused "no free login family"). No holder-inheriting orphan ever
+    refreshes the account's OAuth token, so it can't cause the #104 clobber the
+    pool-family gate exists to prevent — treating it as occupancy is a false
+    positive that strands a genuinely-free family.
+
+    Always ground-truth (no cache): only the rare swap/move path calls it, and it
+    mirrors the max_age_seconds=0.0 the credential guards already used."""
+    out: dict[str, list[str]] = {}
+    for name, entry in sorted(state.get("slots", {}).items()):
+        acct = entry.get("account")
+        if not acct:
+            continue
+        d = slot_path(name)
+        if d.exists() and mount_has_live_session(d):
+            out.setdefault(acct, []).append(name)
     return out
 
 
@@ -7626,12 +8798,32 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     # piling every lane onto the single burn-soon magnet (the rayi5→rayi4 pile-up).
     base_lane_load: dict[str, int] = {a: len(s) for a, s in occupied.items()}
 
+    # Capacity-aware (G2 fan-out threading, capacity-aware spec 2026-07-10):
+    # gate-on, the fan-out re-pick's "would it immediately re-trip" health check
+    # is judged in reference units per lane, so thread the candidate name + a
+    # fleet ctx directly into `_target_would_immediately_re_trip` at that call
+    # site. This is the only ctx threading this task does outside the
+    # picker/decide_swap fresh-build fallback; the full stash cadence (incl.
+    # claim-aware lane counts) is Task 5. Built only gate-on so gate-off is
+    # bit-for-bit (no credential/occupancy reads on the default path).
+    _cap_on = _capacity_gate_on(config)
+    _cap_ctx = _capacity_ctx(state, config) if _cap_on else None
+
     def _cur_lane_load() -> dict[str, int]:
         """account → lanes it will back = pre-existing live lanes + moves already
         queued onto it THIS cycle. Recomputed per pick so each successive fan-out
         re-pick sees the accreting load and steers to a fresh account."""
         names = set(base_lane_load) | set(round_claims)
         return {a: base_lane_load.get(a, 0) + round_claims.get(a, 0) for a in names}
+
+    def _stash_cap_ctx(shim: dict) -> None:
+        """Stash the fleet capacity ctx onto `shim` with THIS pick's CLAIM-AWARE
+        lane counts (base occupancy + this-round claims from _cur_lane_load), so
+        the picker/decide_swap read fresh lane loads and never stale claim counts
+        (capacity-aware spec 2026-07-10, Task 5 stash cadence — pop/rebuild every
+        time _lane_load is refreshed). Gate-off (_cap_ctx is None): no-op."""
+        if _cap_ctx is not None:
+            shim["_capacity_ctx"] = {**_cap_ctx, "lane_load_by_name": shim.get("_lane_load", {})}
 
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
     # — dropped here so a group whose slots are all locked never burns a
@@ -7668,6 +8860,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # decide_swap → pick_swap_target) penalizes an account already backing
         # lanes and prefers a distinct empty one.
         shim["_lane_load"] = _cur_lane_load()
+        _stash_cap_ctx(shim)
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
         effective_pool = pool
@@ -7760,9 +8953,12 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 # Anti-cluster: the re-pick sees the accreting lane-load too, so it
                 # steers to a fresh account rather than the loaded magnet.
                 shim2["_lane_load"] = _cur_lane_load()
+                _stash_cap_ctx(shim2)
                 retry = pick_swap_target(shim2, cfg_view)
                 retry_healthy = retry is not None and not _target_would_immediately_re_trip(
-                    state.get("accounts", {}).get(retry.name, {}), cfg_view)
+                    state.get("accounts", {}).get(retry.name, {}), cfg_view,
+                    name=(retry.name if _cap_on else None),
+                    ctx=(shim2.get("_capacity_ctx") if _cap_on else None))
                 # Anti-clustering HOLD (2026-07-06 rayi5→rayi4 pile-up). The #109
                 # pool double-book below is what lets several lanes STACK onto one
                 # burn-soon account in a single cycle (4 mounts on 3 families → the
@@ -7938,6 +9134,12 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
     # committed onto it — the exact GH #104 clobber the pool exists to prevent
     # (execution refuses the 2nd, but noisily, and the lane is stranded anyway).
     round_claims: dict[str, int] = {}
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): build one fleet ctx
+    # for the reactive escape picks; each per-slot shim gets it re-stashed with
+    # THIS slot's claim-aware lane counts below. Built only gate-on so gate-off
+    # stays bit-for-bit.
+    _cap_on_ps = _capacity_gate_on(config)
+    _cap_ctx_ps = _capacity_ctx(state, config) if _cap_on_ps else None
     for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
@@ -7978,6 +9180,11 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         occ_now = occupied_slot_accounts(state)
         shim["_lane_load"] = {a: len(occ_now.get(a, [])) + round_claims.get(a, 0)
                               for a in set(occ_now) | set(round_claims)}
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): re-stash the ctx
+        # with this slot's claim-aware lane counts so the escape pick ranks in
+        # reference units and the unsafe-target veto below judges health in units.
+        if _cap_ctx_ps is not None:
+            shim["_capacity_ctx"] = {**_cap_ctx_ps, "lane_load_by_name": shim["_lane_load"]}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
         # a premium slot's may not.
@@ -7990,8 +9197,15 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
                        "event retained for the next cycle and SOS will surface capacity")
             continue
         target_acct = state.get("accounts", {}).get(target.name, {})
+        # Post-merge (reactive self-heal PR): the picked target is vetted for
+        # immediate re-trip. Thread name+ctx so gate-on this veto is the per-lane
+        # UNITS health line — else reactive refuses a healthy idle 20x@75% by raw
+        # percent and HOLDs the lane on a capped account (capacity-aware 2026-07-10).
         if (target_acct.get("token_expired") or target_acct.get("poll_error")
-                or _target_would_immediately_re_trip(target_acct, pool_config)
+                or _target_would_immediately_re_trip(
+                    target_acct, pool_config,
+                    name=(target.name if _cap_on_ps else None),
+                    ctx=(shim.get("_capacity_ctx") if _cap_on_ps else None))
                 or "[DEGRADED:" in target.reason):
             retry_entries.extend(slot_to_entries[slot_name])
             click.echo(f"  reactive-429 on {slot_name}: HOLDING on '{acct}' — refusing unsafe "
@@ -8015,13 +9229,28 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
             continue
         round_claims[target.name] = round_claims.get(target.name, 0) + 1
         taken.add(target.name)
-        moves.append({
+        move = {
             "slot": slot_name, "from": acct, "to": target.name,
             "gate": "reactive_429", "tier": 3, "deferrable": False,
             "reason": f"user-facing 429 on the '{acct}' session in {slot_name}; {target.reason}",
             "pool": pool,
             "_reactive_entries": slot_to_entries[slot_name],
-        })
+        }
+        # Escalation-relaunch decision (Fix #1b): a gentle resume that fired within
+        # escalate_window_seconds but a fresh 429 landed anyway means the running
+        # process is still on the stale in-memory token — flag the move so
+        # _execute_slot_moves /exits + relaunches instead of resuming. Never
+        # escalate the same slot twice in the window (skip_repeat → resume + SOS).
+        _esc = _escalation_decision(state, config, slot_name)
+        if _esc == "escalate":
+            move["_escalate"] = True
+            click.echo(f"  reactive-429 on {slot_name}: 2nd 429 within the escalate window — will "
+                       f"/exit + relaunch the pane (the gentle resume didn't shed the stale token)")
+        elif _esc == "skip_repeat":
+            move["_escalate_skip_repeat"] = True
+            click.echo(f"  reactive-429 on {slot_name}: already escalated within the window — "
+                       f"resume-message only this time (SOS note added; a human may be needed)")
+        moves.append(move)
     if owns_entries:
         _store_pending_rate_limit_entries(state, retry_entries)
     else:
@@ -8056,9 +9285,76 @@ def _lazy_warm_slot_sessions(move: dict, config: dict) -> list:
     return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
 
 
+def _sync_mcp_oauth(state: dict, no_execute: bool) -> None:
+    """Periodic MCP-token sync (2026-07-10, see the MCP_OAUTH_STORE block):
+    harvest live mcpOAuth entries from every mount and account snapshot into
+    the canonical store, then inject the store back into every LIVE mount
+    that is missing them or holds staler ones. Runs every daemon cycle, so
+    authenticating an MCP server once in ANY session reaches all slots (and
+    the bare shared mount) within one poll interval — including mounts whose
+    tokens a pre-fix swap already clobbered.
+    """
+    slot_names = sorted(state.get("slots", {}))
+    live_paths = [CREDS_JSON] + [mount_creds_path(slot_path(n)) for n in slot_names]
+    # Snapshots are harvest-only: they receive tokens naturally via the next
+    # save-back/install, and writing them here would churn the GH #79 backup
+    # rotation for no benefit. (They matter as SOURCES because pre-fix
+    # save-backs parked the only surviving copies of some MCP refresh tokens
+    # inside whichever account snapshot the slot happened to hold.)
+    harvest_paths = live_paths + sorted(ACCOUNTS_DIR.glob("account-*/.credentials.json"))
+    for p in harvest_paths:
+        try:
+            if p.exists():
+                harvest_mcp_oauth(read_json(p))
+        except (json.JSONDecodeError, OSError):
+            continue  # unreadable file: nothing to harvest, next cycle retries
+
+    for p in live_paths:
+        if not p.exists():
+            continue
+        try:
+            creds = read_json(p)
+        except (json.JSONDecodeError, OSError):
+            continue
+        try:
+            n = inject_mcp_oauth(creds)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not n:
+            continue
+        mount_name = p.parent.name if p.parent.name.startswith(SLOT_PREFIX) else "shared-mount"
+        if no_execute:
+            click.echo(f"  mcp-oauth (--no-execute): WOULD inject {n} MCP-server token(s) into {mount_name}")
+            continue
+        # Serialize against execute_swap so this rewrite can't interleave
+        # with a swap's install/save-back on the same file. The residual race
+        # against Claude Code itself refreshing claudeAiOauth in the same
+        # window is the same one every existing cus write path carries, and
+        # the read→write window here is milliseconds; a lost MCP injection
+        # simply retries next cycle. Lock contention (a swap in flight) is a
+        # skip, not an error.
+        try:
+            with _swap_lock(timeout_seconds=5.0):
+                backup_credentials_file(p)  # GH #79 choke point
+                atomic_write_bytes(p, json.dumps(creds, indent=2).encode(), mode=0o600)
+        except RuntimeError:
+            continue
+        _cred_audit("mcp-oauth-inject", "wrote",
+                    f"injected {n} canonical MCP-server token(s) (mcpOAuth only; claudeAiOauth untouched)",
+                    mount=mount_name, token_fp=_audit_token_fp(creds))
+        click.echo(f"  mcp-oauth: injected {n} MCP-server token(s) into {mount_name}")
+
+
 def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
     """Periodic per-slot credential save-back + long-idle slot gc. Shared by
     the per_session and hybrid cycles (extracted 2026-07-02, GH #99)."""
+    # MCP OAuth carry-over sync (2026-07-10): run FIRST so freshly harvested
+    # tokens ride along in this same cycle's snapshot save-backs. Best-effort:
+    # a sync failure must never take down save-back/gc.
+    try:
+        _sync_mcp_oauth(state, no_execute)
+    except OSError as e:
+        click.echo(f"  mcp-oauth sync failed (non-fatal): {e}")
     # 3.5 — periodic save-back: a live session refreshes OAuth tokens into its
     # slot's .credentials.json; without this, a machine crash loses the newest
     # refresh token for every slotted account. only_if_fresher keeps it a
@@ -8105,7 +9401,22 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
                 click.echo(f"  lane-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
 
 
-def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
+def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
+    """Dismiss Claude's quota modal on one pane (double-Escape) and submit a
+    context-preserving continuation. Best-effort; returns True on a sent
+    continuation. Shared by the reactive resume path and the escalation fallback."""
+    if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
+        click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
+        return False
+    if tmux_send_text(pane, message, tmux_socket=tmux_socket):
+        socket_note = f" via {tmux_socket}" if tmux_socket else ""
+        click.echo(f"    reactive resume: pane {pane}{socket_note} continued after credential swap")
+        return True
+    click.echo(f"    reactive resume: pane {pane} continuation send failed")
+    return False
+
+
+def _resume_reactive_slot_sessions(slot_name: str, config: dict, state: dict | None = None) -> list[str]:
     """Dismiss Claude's quota modal and continue sessions after a lane escape.
 
     Rewriting a live lane's credentials is necessary but not sufficient: a
@@ -8113,6 +9424,12 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
     the pane(s) actually backed by `slot_name`, send the established double-Escape
     safety prefix, then submit a context-preserving continuation. Best-effort and
     config-gated; a swap remains successful even when tmux is unavailable.
+
+    When `state` is threaded (the reactive move call site), each successfully
+    continued pane stamps `state["slots"][slot]["last_resume_ts"]` — the signal the
+    escalation-relaunch decision reads to tell a gentle resume that DID stick from
+    one that didn't (a second 429 on the same slot within escalate_window_seconds).
+    Kept optional (default None) so external callers keep the 2-arg signature.
     """
     reactive = config.get("reactive", {})
     if not reactive.get("resume_after_slot_swap", True):
@@ -8127,16 +9444,312 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict) -> list[str]:
         if not pane or pane == "no-tmux" or pane_key in seen:
             continue
         seen.add(pane_key)
-        if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
-            click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
-            continue
-        if tmux_send_text(pane, message, tmux_socket=tmux_socket):
+        if _resume_pane(pane, tmux_socket, message):
             panes.append(pane)
-            socket_note = f" via {tmux_socket}" if tmux_socket else ""
-            click.echo(f"    reactive resume: pane {pane}{socket_note} continued after credential swap")
-        else:
-            click.echo(f"    reactive resume: pane {pane} continuation send failed")
+            if state is not None:
+                state.setdefault("slots", {}).setdefault(slot_name, {})["last_resume_ts"] = now_iso()
     return panes
+
+
+# --------------------------------------------------------------------------
+# Escalation relaunch (Fix #1b, 2026-07-10 halt incident, 2nd occurrence)
+# --------------------------------------------------------------------------
+# A running Claude keeps its OAuth access token cached in memory; after an
+# in-place credential move + gentle resume it can keep burning / re-429ing the
+# just-capped account until that token expires. The operator-validated recovery
+# is deterministic: `/exit` the session and re-run the pane's ORIGINAL launch
+# command so a FRESH process reads the slot's current credentials. We automate it
+# ONLY as an escalation — a second reactive-429 on the same slot within
+# escalate_window_seconds — and only ever after recovering a 'claude' launch
+# command, so a pane is never exited without a relaunch command in hand.
+
+# Slot-state fields the resume/escalation bookkeeping writes; persisted via a
+# reload-merge so they survive the cycle without clobbering execute_swap's writes.
+_REACTIVE_SLOT_BOOKKEEPING = (
+    "last_resume_ts", "last_escalation_ts", "escalation_skip_note", "escalation_skip_ts",
+)
+
+
+def _within_escalate_window(ts_iso: str | None, window_s: float) -> bool:
+    """True when `ts_iso` (an ISO/Z timestamp) is within `window_s` of now.
+    Unparseable / missing → False (fail safe: no escalation)."""
+    if not ts_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    return (datetime.now(timezone.utc) - dt).total_seconds() <= window_s
+
+
+def _escalation_decision(state: dict, config: dict, slot_name: str) -> str:
+    """Decide the reactive path for a 429 on `slot_name`:
+
+      "escalate"    — a gentle resume fired within the window but a fresh 429
+                      landed anyway; /exit + relaunch to shed the stale token.
+      "skip_repeat" — already escalated this slot within the window; fall back to
+                      the gentle resume + SOS note (never escalate twice in a row).
+      "none"        — first 429 / stale prior resume / feature off: normal resume.
+    """
+    reactive = config.get("reactive", {})
+    if not reactive.get("escalate_relaunch", True):
+        return "none"
+    window = reactive.get("escalate_window_seconds", 900)
+    slot = state.get("slots", {}).get(slot_name, {})
+    if not _within_escalate_window(slot.get("last_resume_ts"), window):
+        return "none"
+    if _within_escalate_window(slot.get("last_escalation_ts"), window):
+        return "skip_repeat"
+    return "escalate"
+
+
+def _record_escalation_skip(state: dict, slot_name: str, note: str) -> None:
+    """Stamp a one-line escalation-skip note on the slot (surfaced by `cus sos`
+    via _diagnose_escalation_skips) and log it in the established style."""
+    slot = state.setdefault("slots", {}).setdefault(slot_name, {})
+    slot["escalation_skip_note"] = note
+    slot["escalation_skip_ts"] = now_iso()
+    click.echo(f"    reactive escalate: {note}")
+
+
+def _persist_slot_reactive_state(state: dict, slot_name: str) -> None:
+    """Persist this slot's resume/escalation bookkeeping to disk WITHOUT clobbering
+    execute_swap's own account writes: reload the freshly-swapped state, merge only
+    the bookkeeping fields, save. Needed because the reactive resume/escalation run
+    AFTER _per_session_cycle's save_state, and the SOS pass reloads from disk."""
+    src = state.get("slots", {}).get(slot_name, {})
+    fields = {k: src[k] for k in _REACTIVE_SLOT_BOOKKEEPING if k in src}
+    if not fields:
+        return
+    try:
+        fresh = load_state()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return  # best-effort: bookkeeping is non-critical vs. the completed move
+    fresh.setdefault("slots", {}).setdefault(slot_name, {}).update(fields)
+    try:
+        save_state(fresh)
+    except (OSError, ValueError):
+        pass
+
+
+def _reactive_escalate_or_resume(move: dict, state: dict, config: dict) -> list[str]:
+    """Escalation-relaunch handler for a reactive-429 move flagged `_escalate`.
+
+    Runs AFTER the lane move has executed (the fresh creds are already on disk).
+    Per pane on the slot: recover the launch command FIRST; only if it matches the
+    safety pattern (contains 'claude') do we /exit + wait + relaunch — otherwise we
+    fall back to the gentle resume-message and drop an SOS note, never leaving a
+    pane dead. Records last_escalation_ts when at least one pane relaunched, so the
+    same slot is not escalated again within the window."""
+    slot_name = move["slot"]
+    reactive = config.get("reactive", {})
+    window = reactive.get("escalate_window_seconds", 900)
+    message = str(reactive.get("resume_message") or DEFAULT_CONFIG["reactive"]["resume_message"])
+    last_resume = state.get("slots", {}).get(slot_name, {}).get("last_resume_ts")
+    relaunched: list[str] = []
+    seen: set[tuple[str | None, str]] = set()
+    for session in live_sessions_on_slot(slot_name):
+        pane = getattr(session, "pane", None)
+        tmux_socket = getattr(session, "tmux_socket", None)
+        pane_key = (tmux_socket, pane)
+        if not pane or pane == "no-tmux" or pane_key in seen:
+            continue
+        seen.add(pane_key)
+        relaunch, claude_pid = _recover_pane_relaunch_cmd(pane, tmux_socket)
+        # Safety posture: never /exit a pane without a claude relaunch command.
+        if not relaunch or "claude" not in relaunch:
+            click.echo(f"    reactive escalate: {slot_name} pane {pane} — could not recover a claude "
+                       f"launch command; falling back to resume-message (pane left intact)")
+            _resume_pane(pane, tmux_socket, message)
+            _record_escalation_skip(
+                state, slot_name, f"escalation skipped: could not recover launch command for {slot_name}")
+            continue
+        click.echo(f"    reactive escalate: {slot_name} pane {pane} relaunching (resume at "
+                   f"{last_resume} was < {int(window)}s; shedding stale in-memory token)")
+        did_relaunch, exited = _escalate_relaunch_pane(pane, tmux_socket, relaunch, claude_pid, config)
+        if did_relaunch:
+            relaunched.append(pane)
+        elif not exited:
+            # /exit never landed — the pane is untouched, so the gentle resume is
+            # still a valid, non-destructive fallback.
+            click.echo(f"    reactive escalate: {slot_name} pane {pane} /exit failed; "
+                       f"falling back to resume-message")
+            _resume_pane(pane, tmux_socket, message)
+            _record_escalation_skip(
+                state, slot_name, f"escalation skipped: /exit send failed for {slot_name}")
+        else:
+            # /exit landed but the relaunch didn't — the pane is at a bare shell.
+            # Do NOT type a resume-message into a shell; flag it for a human.
+            _record_escalation_skip(
+                state, slot_name,
+                f"escalation relaunch FAILED after /exit for {slot_name} — pane at a shell, needs manual relaunch")
+    if relaunched:
+        state.setdefault("slots", {}).setdefault(slot_name, {})["last_escalation_ts"] = now_iso()
+    return relaunched
+
+
+# Case-sensitive substrings that mark a pane parked at Claude Code's rate-limit
+# / session-limit modal (fix #1a, 2026-07-10 halt incident). Extend per-install
+# via reactive.halt_signatures_extra. Matched against the pane tail as plain
+# substrings, so keep them specific enough not to false-positive on ordinary
+# output that quotes the phrase.
+HALT_PANE_SIGNATURES = (
+    "Stop and wait for limit to reset",
+    "You've hit your",
+    "/rate-limit-options",
+    "hit your session limit",
+)
+
+
+def _sweep_halted_lanes(state: dict, config: dict,
+                        reactive_moves: list[dict] | None = None) -> list[dict]:
+    """Fix #1a (2026-07-10 halt incident): revive lanes parked at Claude Code's
+    rate-limit modal with NO fresh 429 event pending — the daemon was down when
+    the halt fired, the event expired from the pending queue, or the halt came
+    from a path the hooks never saw.
+
+    For each live slotted session we read its pane tail ONCE and match the halt
+    signatures. On a match:
+      • account AT/OVER its leave line (same G4 comparison decide_swap uses) and
+        the slot is not already covered by a queued reactive move or a still-
+        pending reactive entry → SYNTHESIZE a reactive entry (token
+        `halted_lane_sweep`) into the SAME pending queue the hooks feed, so the
+        EXISTING reactive machinery does the credential move + modal dismiss +
+        continue on the next cycle. The sweep NEVER moves credentials itself.
+      • account BELOW its leave line (e.g. it already reset) → the halt is stale;
+        a nudge suffices, so dismiss+continue the pane directly via
+        `_resume_reactive_slot_sessions`. This direct-nudge path is called AT
+        MOST ONCE PER SLOT per cycle (it already iterates the slot's own panes
+        internally — a second matching pane on the same slot is a no-op here),
+        and is further floored by `reactive.nudge_min_interval_seconds` (review
+        finding 2026-07-12): a slot nudged within that many seconds
+        (state["slots"][slot]["last_sweep_nudge_ts"]) is skipped — logged, not
+        silent — rather than re-fired every cycle for as long as the signature
+        persists in the pane (a stale halt the nudge can't clear, or a
+        false-positive like this very source file's halt-signature strings
+        showing in a developer's pane, would otherwise loop forever).
+
+    Cheap by construction: returns immediately when disabled or tmux is absent,
+    and captures each pane at most once per cycle. Returns the synthesized
+    entries (for logging/testing)."""
+    reactive = config.get("reactive", {})
+    if not reactive.get("halted_lane_sweep", True):
+        return []
+    # tmux gone ⇒ no panes to read and no way to nudge; skip the whole sweep
+    # before spending a single subprocess (item 4 cheapness constraint).
+    if not tmux_is_available():
+        return []
+    signatures = [*HALT_PANE_SIGNATURES, *(reactive.get("halt_signatures_extra") or [])]
+
+    # Slots already covered — never double-synthesize: a reactive move queued
+    # this cycle for the slot, or a still-pending reactive entry (a held/deferred
+    # 429 the reactive path retained) whose slot matches.
+    covered: set[str] = {m.get("slot") for m in (reactive_moves or [])}
+    for e in (state.get("pending_429_entries") or []):
+        if e.get("slot"):
+            covered.add(e["slot"])
+
+    cap_on = _capacity_gate_on(config)
+    cap_ctx = _capacity_ctx(state, config) if cap_on else None
+    locked = _locked_slots(config)
+    nudge_min_interval = reactive.get("nudge_min_interval_seconds", 900)
+    synthesized: list[dict] = []
+    seen_panes: set[tuple[str | None, str]] = set()
+    # Slots already handled by the under-line direct-nudge path THIS cycle —
+    # a second matching pane on the same slot must not re-nudge or re-log
+    # (review finding 2026-07-12: `_resume_reactive_slot_sessions` already
+    # walks every pane on the slot internally, so per-pane calls double-fired
+    # it for a slot with two matching panes).
+    nudged_this_cycle: set[str] = set()
+    for slot_name in sorted(state.get("slots", {})):
+        acct = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
+        if not acct or acct not in state.get("accounts", {}):
+            continue
+        if slot_name in locked:
+            continue  # user froze this slot; never auto-move or nudge it
+        for session in live_sessions_on_slot(slot_name):
+            pane = getattr(session, "pane", None)
+            tmux_socket = getattr(session, "tmux_socket", None)
+            pane_key = (tmux_socket, pane)
+            if not pane or pane == "no-tmux" or pane_key in seen_panes:
+                continue
+            seen_panes.add(pane_key)  # at most one capture per pane per cycle
+            tail = tmux_capture_pane(pane, tmux_socket=tmux_socket)
+            if not tail or not any(sig in tail for sig in signatures):
+                continue
+            acct_dict = state["accounts"][acct]
+            # G4 leave-line for the CURRENT account (reuse decide_swap's exact
+            # trip comparison + the same clamped ladder step; not the target
+            # health form). cur_pct is the dict-native extrapolate-to-now
+            # effective %, matching how the reactive path reads a slot account.
+            cur_pct = _account_estimated_effective_pct(acct_dict, config)
+            threshold = _next_ladder_step(acct_dict, config)
+            over_line = not _below_ladder_leave_line(
+                cur_pct, acct, cap_ctx, config, threshold, cap_on)
+            if not over_line:
+                if slot_name in nudged_this_cycle:
+                    continue  # another pane on this slot already handled the nudge this cycle
+                nudged_this_cycle.add(slot_name)
+                # Cooldown (review finding 2026-07-12): without this floor the
+                # nudge re-fired every cycle for as long as the signature sat
+                # in the pane tail — including a stale halt the nudge itself
+                # can't clear, or a false positive (e.g. this repo's own source
+                # containing the halt signatures verbatim in a developer's
+                # pane). last_sweep_nudge_ts is wall-clock (persisted in
+                # state), so it survives across daemon restarts, unlike the
+                # module-level monotonic floor used for wake_min_interval_seconds.
+                last_nudge = (state.get("slots", {}).get(slot_name, {}) or {}).get(
+                    "last_sweep_nudge_ts")
+                on_cooldown = False
+                elapsed = None
+                if nudge_min_interval > 0 and last_nudge:
+                    try:
+                        last_nudge_dt = datetime.fromisoformat(last_nudge.replace("Z", "+00:00"))
+                        elapsed = (datetime.now(timezone.utc) - last_nudge_dt).total_seconds()
+                        on_cooldown = elapsed < nudge_min_interval
+                    except ValueError:
+                        pass  # unparseable timestamp: fail open, treat as not on cooldown
+                if on_cooldown:
+                    click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted but '{acct}' "
+                               f"is below its leave line — nudged {int(elapsed)}s ago "
+                               f"(< nudge_min_interval_seconds={nudge_min_interval}s); "
+                               "skipping repeat nudge")
+                    continue
+                click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted but '{acct}' "
+                           f"is below its leave line ({cur_pct:.1f}% < step {threshold:.0f}%) — "
+                           "stale halt; nudging the pane, not moving credentials")
+                _resume_reactive_slot_sessions(slot_name, config)
+                state["slots"][slot_name]["last_sweep_nudge_ts"] = now_iso()
+                continue
+            if slot_name in covered:
+                click.echo(f"  halted-lane sweep: {slot_name} halted on capped '{acct}' but a "
+                           "reactive entry already covers it — leaving it to the reactive path")
+                continue
+            if not session.session_id:
+                # The reactive path indexes e["session_id"]; without one we
+                # cannot round-trip a resumable entry. Skip synthesis (extremely
+                # rare for a live slotted session) rather than store a broken record.
+                click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted on capped "
+                           f"'{acct}' but has no resolvable session id — skipping synthesis")
+                continue
+            covered.add(slot_name)
+            synthesized.append({
+                "ts": now_iso(),
+                "session_id": session.session_id,
+                "match": "halted-lane sweep",
+                "source": "halted_lane_sweep",
+                "slot": slot_name,
+                "account": acct,
+            })
+            click.echo(f"  halted-lane sweep: {slot_name} pane {pane} halted on capped '{acct}' "
+                       f"({cur_pct:.1f}% >= step {threshold:.0f}%) with no pending 429 — synthesizing "
+                       "a reactive entry so the next cycle moves + resumes the lane")
+    if synthesized:
+        # Append semantics (like _requeue_rate_limit_entries): merge onto any
+        # existing pending so an unrelated held 429 is not clobbered.
+        existing = state.get("pending_429_entries", []) or []
+        _store_pending_rate_limit_entries(state, [*existing, *synthesized])
+    return synthesized
 
 
 def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute: bool) -> None:
@@ -8178,7 +9791,24 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
             ladder_bumped.add(move["from"])
             click.echo(f"    moved in place — session on {move['slot']} continues uninterrupted")
             if move.get("gate") == "reactive_429":
-                _resume_reactive_slot_sessions(move["slot"], config)
+                # The credential move is done; the running process still holds the
+                # OLD OAuth token in memory. Normally a gentle resume (modal-dismiss
+                # + continue) suffices. But when this is the 2nd 429 on the slot
+                # inside the window, the gentle resume demonstrably didn't shed the
+                # stale token — escalate to /exit + relaunch so a fresh process
+                # reads the slot's current creds (Fix #1b). Recovery/relaunch is
+                # best-effort and self-falls-back to the gentle resume + SOS note.
+                if move.get("_escalate"):
+                    _reactive_escalate_or_resume(move, state, config)
+                else:
+                    _resume_reactive_slot_sessions(move["slot"], config, state=state)
+                    if move.get("_escalate_skip_repeat"):
+                        _record_escalation_skip(
+                            state, move["slot"],
+                            f"escalation skipped: {move['slot']} already escalated within the window")
+                # Persist last_resume_ts / last_escalation_ts / skip note without
+                # clobbering execute_swap's on-disk account write (reload-merge).
+                _persist_slot_reactive_state(state, move["slot"])
             _log_decision(_build_decision_record(
                 state, config, action="swap", gate=move["gate"], reason=move["reason"],
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
@@ -8228,6 +9858,15 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     # global cycle's step 0).
     moves = check_rate_limit_reactive_per_session(state, config, exclude_accounts=exclude_for_slots)
     reactive_pending = bool(state.pop("_reactive_retry_pending", False))
+
+    # Halted-lane sweep (fix #1a, 2026-07-10 halt incident): after the fresh-event
+    # reactive pass, catch lanes parked at the rate-limit modal with no pending
+    # 429 (daemon-down / expired / non-hook halt). It synthesizes reactive entries
+    # into the pending queue (moved + resumed by the reactive machinery next cycle)
+    # or nudges stale-halt panes directly — never moves credentials itself. Slots
+    # already handled by a move THIS cycle are passed so they are not re-synthesized.
+    _sweep_halted_lanes(state, config, reactive_moves=moves)
+
     traces: dict = {}
     if not moves and not reactive_pending:
         moves = decide_slot_swaps(state, config, usage_by_account, traces,
@@ -8375,8 +10014,14 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         global_decision = None
     else:
         shared_excl = slot_accts | {m["to"] for m in slot_moves}
-        global_decision = decide_swap(
-            _state_excluding_accounts(state, shared_active, shared_excl), config, usage_by_account, {})
+        _bare_decide_state = _state_excluding_accounts(state, shared_active, shared_excl)
+        if _capacity_gate_on(config):
+            # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): stash a
+            # fresh ctx onto the (shallow-copied) shim, never the raw state, so
+            # the shared-mount decision runs in reference units. {**...} always
+            # copies, so this can't mutate the daemon's persistent state.
+            _bare_decide_state = {**_bare_decide_state, "_capacity_ctx": _capacity_ctx(state, config)}
+        global_decision = decide_swap(_bare_decide_state, config, usage_by_account, {})
 
     # Persist usage + 429 watermark BEFORE acting (crash-safe ordering).
     save_state(state)
@@ -8939,6 +10584,12 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
     only the refresh grant can (the same lesson as #127 / classify_live_creds_owner).
 
     Verdict:
+      * snapshot ALIASES a pooled login family (`_snapshot_alias_family` — the
+        2026-07-10 heal-from-family reseed, or a legacy `--from-existing`
+        bootstrap copy) → dead-FOR-INSTALL, checked FIRST and with zero network:
+        installing it would double-book that family (#104) and probing it would
+        rotate the family's single-use token out from under its live holder.
+        The install fallback then claims a family properly (leased, distinct).
       * access token currently VALID (non-blank, within expiry) → NOT dead: the
         snapshot authenticates right now, so no (token-rotating) probe is needed.
         This cheap path keeps the common healthy-account case network-free.
@@ -8967,6 +10618,18 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
         # Unreadable snapshot: the #141 install-point guard already refuses it as
         # blank. Not our (dead-refresh) call to make.
         return False
+    # ---- Aliased snapshot (2026-07-10 heal-from-family) — check FIRST, before the
+    # cheap valid-access path and before any token-rotating probe. A snapshot whose
+    # refresh token belongs to a pooled login FAMILY (the heal-from-family reseed, or
+    # a legacy `--from-existing` bootstrap copy) must be treated as NOT independently
+    # installable even while its access token is valid: installing it double-books
+    # that family (#104 — the next rotation on either side logs the other out), and
+    # PROBING its refresh token from the snapshot side would itself rotate the
+    # family's single-use token and clobber the live holder. Returning True here
+    # routes the install fallback to claim_verified_login_family, which leases the
+    # (same or another) family properly — the #104-safe path — with zero network.
+    if _snapshot_alias_family(account) is not None:
+        return True
     # Cheap path: a currently-valid access token means the snapshot authenticates
     # right now — definitively not dead, and no token-rotating probe needed. The 30s
     # grace mirrors poll_account_usage so we don't probe a token about to expire.
@@ -9027,6 +10690,296 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
     # endpoint isn't hammered, but never let a transient refuse a swap.
     _SNAPSHOT_DEAD_PROBE[account] = (now, False)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Dead-snapshot self-heal from a live login family (2026-07-10 rayi2 incident)
+#
+# THE INCIDENT: rayi2's canonical snapshot (account-rayi2/.credentials.json)
+# held a DEAD refresh token (invalid_grant) while BOTH of its pooled login
+# families (family-1 on slot-9, family-2 on slot-5) were live, valid, and being
+# refreshed every cycle (blank-preempt + pooled-store save-back kept the family
+# stores fresh). Because every family was LEASED to a live lane,
+# has_free_login_family() was False, so SOS condition 10.6 screamed
+# "[URGENT] relogin required" for DAYS — even though a perfectly valid,
+# identity-verified rayi2 token sat on disk the whole time.
+#
+# WHY THE SNAPSHOT ROTS IN THE POOL MODEL: the #109 pooled save-back
+# deliberately routes a leased lane's token rotations to the FAMILY store, never
+# the canonical snapshot (routing them to the snapshot was the 2026-07-03
+# regression that stomped account-rayi3). So while all activity happens on
+# leased lanes, NOTHING refreshes the snapshot; its refresh-token family ages
+# out or is rotated away (e.g. by a shared-mount session that was seeded from
+# it) and eventually probes invalid_grant. That is a NORMAL end state for a
+# pool-model account, not a logout — the account itself is fine.
+#
+# THE HEAL: reseed the dead snapshot from the freshest VALID family store of the
+# SAME account, with the full clobber-guard stack: identity anchor verification
+# (guard_canonical_identity_write — never save a clobbered/foreign token, the
+# 2026-07-06 wrong-account incident), structural validity (a currently-valid,
+# non-blank access token + a refresh token), the GH #77 freshness guard (never
+# let an older file clobber a fresher snapshot, e.g. one just re-logged-in), and
+# the GH #79 backup rotation.
+#
+# THE ALIASING INVARIANT (#104) — the reason the helpers below travel together:
+# after a heal, the snapshot is a byte-copy of a family's creds, i.e. the
+# snapshot ALIASES that family's single-use OAuth refresh-token lineage. Two
+# things must then never happen:
+#   (a) the snapshot must never be INSTALLED onto a mount while that family is
+#       live elsewhere (double-booking → rotation logout, the chats1a shape);
+#   (b) cus must never REFRESH the snapshot's token from the snapshot side
+#       (the rotation would invalidate the live family's copy and log the lane
+#       out at its next refresh).
+# `_snapshot_alias_family` detects the aliasing from token bytes (fingerprints,
+# never raw tokens) so it needs no state marker and self-corrects the moment a
+# browser relogin gives the snapshot its own family again. The probe/refresh
+# paths (`_account_snapshot_dead`, `_unstale_account_snapshot`,
+# `_refresh_account_token`) consult it and skip; the install path already
+# refuses double-booked installs (`_account_held_by_other_live_mount` +
+# `_live_family_would_collide`) and `_account_snapshot_dead`'s alias-first
+# verdict routes new-lane installs to a properly LEASED family claim instead of
+# the raw snapshot copy.
+# ---------------------------------------------------------------------------
+
+def _snapshot_alias_family(account: str, state: dict | None = None) -> str | None:
+    """Which pooled login family the canonical snapshot's refresh token belongs
+    to, or None when the snapshot carries its own independent lineage.
+
+    Compares refresh-token FINGERPRINTS (never raw tokens) between
+    account-<X>/.credentials.json and (a) every usable family STORE under
+    logins/<X>/family-*/ and (b) the live MOUNT of every slot leasing a family
+    of this account (the mount can be one rotation ahead of its store, and a
+    heal that copied mount-fresh bytes must still be recognized as aliased).
+
+    Purely computed from bytes on every call — deliberately NOT a state marker,
+    so a browser relogin (which mints a brand-new family for the snapshot)
+    clears the aliasing automatically and stale markers can't refuse a healthy
+    snapshot."""
+    snap = account_creds_path(account)
+    if not snap.exists():
+        return None
+    try:
+        snap_rt = _credential_refresh_token(read_json(snap))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not snap_rt:
+        return None
+    snap_fp = _refresh_fingerprint(snap_rt)
+    # (a) family stores — the canonical persisted copy of each family's lineage.
+    for fam in list_login_families(account):
+        try:
+            fam_rt = _credential_refresh_token(read_json(login_family_creds_path(account, fam)))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if fam_rt and _refresh_fingerprint(fam_rt) == snap_fp:
+            return fam
+    # (b) leased live mounts — catches a snapshot healed from a mount that had
+    # rotated past its store's copy (save-back lag of up to one cycle).
+    if state is None:
+        try:
+            state = load_state()
+        except (json.JSONDecodeError, OSError):
+            return None
+    for slot_name, entry in (state.get("slots", {}) or {}).items():
+        if not isinstance(entry, dict) or entry.get("account") != account:
+            continue
+        lease = slot_leased_family(state, slot_name)
+        if lease is None or lease[0] != account:
+            continue
+        try:
+            m_rt = _credential_refresh_token(read_json(mount_creds_path(slot_path(slot_name))))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if m_rt and _refresh_fingerprint(m_rt) == snap_fp:
+            return lease[1]
+    return None
+
+
+def _snapshot_heal_candidate(account: str, state: dict, config: dict | None = None) -> dict | None:
+    """PURE finder (no writes, no network): the freshest usable family-store
+    creds of `account` that could reseed its dead canonical snapshot, or None.
+
+    A candidate family store must clear every guard the actual heal applies:
+      * structural validity — parses, non-blank access token, positive expiry
+        (`_live_mount_creds_invalid` is the same bar the install-point uses);
+      * the access token is CURRENTLY valid (expiresAt at least a minute out) —
+        the point is to reseed from a token that provably authenticates right
+        now, not to gamble on another refresh lineage of unknown health;
+      * a refresh token is present (an access-only file can't sustain a store);
+      * identity — the family dir's own /login-recorded .claude.json identity
+        must pass guard_canonical_identity_write against the account's trusted
+        anchor (meta.yaml + families). A family clobbered with a FOREIGN
+        account's login makes the anchor ambiguous, and the guard refuses —
+        exactly the never-save-a-clobbered-token rule (2026-07-06 incident).
+
+    Reads the family STORE (not the live lane mount): the pooled save-back +
+    blank-preempt keep the store within one rotation of the mount, and copying
+    store bytes guarantees `_snapshot_alias_family`'s store comparison
+    recognizes the healed snapshot immediately. Returns
+    {"family", "path", "creds", "bytes", "expires_at", "leased_live"} for the
+    freshest (max expiresAt) qualifying family."""
+    if not independent_logins_enabled(config):
+        return None
+    now_ms = int(time.time() * 1000)
+    live_leases = leased_families(account, state)
+    best: dict | None = None
+    for fam in list_login_families(account):
+        path = login_family_creds_path(account, fam)
+        try:
+            raw = path.read_bytes()
+            creds = json.loads(raw)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _live_mount_creds_invalid(creds):
+            continue  # blank-shaped — nothing worth seeding from
+        if not _credential_refresh_token(creds):
+            continue
+        exp = _creds_expires_at(creds)
+        # 60s margin: a token seconds from expiry is not a useful reseed — the
+        # snapshot would be dead-again before the next daemon cycle sees it.
+        if exp is None or int(exp) <= now_ms + 60_000:
+            continue
+        ok, why = guard_canonical_identity_write(account, family_identity(account, fam))
+        if not ok:
+            _cred_audit("snapshot-heal-from-family", "refused-identity", why,
+                        account=account, login_family=f"{account}/{fam}",
+                        incoming_identity=family_identity(account, fam), emit_identity=True,
+                        existing_identity=account_identity_anchor(account)[0],
+                        token_fp=_audit_token_fp(creds))
+            continue
+        if best is None or int(exp) > int(best["expires_at"]):
+            best = {"family": fam, "path": path, "creds": creds, "bytes": raw,
+                    "expires_at": int(exp), "leased_live": fam in live_leases}
+    return best
+
+
+def heal_snapshot_from_live_family(account: str, state: dict, config: dict | None = None,
+                                   no_execute: bool = False) -> dict:
+    """Reseed a refresh-DEAD canonical snapshot from a live, valid, identity-
+    verified login family of the SAME account — the self-heal that replaces the
+    false "[URGENT] relogin required" SOS when the account is actually fine
+    (2026-07-10 rayi2: dead snapshot, two live valid families, days of SOS).
+
+    Mutates `state` (clears snapshot_refresh_dead / token_stale on success);
+    the CALLER persists via save_state. Returns
+    {"healed": bool, "action": str, "reason": str, "family": str | None}.
+
+    Guard stack (see the section comment above):
+      * pool-gate on; snapshot file must already EXIST (a missing snapshot is
+        `cus init` / relogin territory — this never creates account dirs);
+      * "already valid" short-circuit — a snapshot with a currently-valid,
+        non-blank access token needs no reseed; just clear the stale flags
+        (makes the daemon's heal pass idempotent: re-runs are read-only);
+      * candidate guards — structural validity + identity anchor
+        (`_snapshot_heal_candidate`);
+      * GH #77 freshness — never let an older family copy clobber a FRESHER
+        snapshot (e.g. a browser relogin that landed between flag and heal);
+      * GH #79 — rotated backup of the snapshot before the write.
+
+    Never raises into the caller — a heal failure leaves the flag set and the
+    existing URGENT SOS path intact (degrade-to-report, never degrade-to-blank)."""
+    cfg = config if config is not None else load_config()
+    if not independent_logins_enabled(cfg):
+        return {"healed": False, "action": "skipped", "family": None,
+                "reason": "independent-logins gate off — pool-model heal does not apply"}
+    snap = account_creds_path(account)
+    if not snap.exists():
+        return {"healed": False, "action": "skipped", "family": None,
+                "reason": "no canonical snapshot on disk (cus init / relogin territory)"}
+    acct = state.get("accounts", {}).get(account)
+    acct = acct if isinstance(acct, dict) else {}
+
+    def _clear_dead_flags() -> None:
+        acct.pop("snapshot_refresh_dead", None)
+        acct.pop("token_stale", None)
+        acct["token_expired"] = False
+        # Reset the dead-probe cooldown cache so the next install-point check
+        # re-reads the (now healed) snapshot instead of a cached "dead".
+        _SNAPSHOT_DEAD_PROBE.pop(account, None)
+
+    # Already-valid short-circuit: a currently-valid access token means the
+    # snapshot authenticates right now (same 30s grace as poll/_account_snapshot_dead)
+    # — nothing to reseed; just reconcile the flags. Keeps repeated heal passes
+    # byte-for-byte read-only on a healthy snapshot.
+    try:
+        snap_creds = read_json(snap)
+    except (json.JSONDecodeError, OSError):
+        return {"healed": False, "action": "skipped", "family": None,
+                "reason": "snapshot unreadable — owned by the #141 blank/restore guards"}
+    snap_exp = _creds_expires_at(snap_creds)
+    now_ms = int(time.time() * 1000)
+    _oauth = snap_creds.get("claudeAiOauth") if isinstance(snap_creds, dict) else None
+    _access = _oauth.get("accessToken") if isinstance(_oauth, dict) else None
+    if (isinstance(_access, str) and _access.strip()
+            and snap_exp is not None and int(snap_exp) > now_ms - 30_000):
+        if acct.get("snapshot_refresh_dead") or acct.get("token_stale"):
+            _clear_dead_flags()
+        return {"healed": True, "action": "already-valid", "family": None,
+                "reason": "snapshot access token is currently valid — cleared stale flags only"}
+
+    cand = _snapshot_heal_candidate(account, state, cfg)
+    if cand is None:
+        return {"healed": False, "action": "no-source", "family": None,
+                "reason": "no live, valid, identity-verified login family to reseed from — "
+                          "genuine relogin territory"}
+    # GH #77: never let an older family copy clobber a fresher snapshot (a
+    # browser relogin may have restored the snapshot after the flag was set).
+    if snap_exp is not None and int(snap_exp) > cand["expires_at"]:
+        return {"healed": False, "action": "skipped-stale", "family": cand["family"],
+                "reason": "snapshot is fresher than the best family source (GH #77) — not clobbering"}
+    if no_execute:
+        return {"healed": False, "action": "would-heal", "family": cand["family"],
+                "reason": f"dry-run: would reseed snapshot from {account}/{cand['family']}"}
+    try:
+        backup_credentials_file(snap)
+        atomic_write_bytes(snap, cand["bytes"], mode=0o600)
+    except OSError as e:
+        return {"healed": False, "action": "write-failed", "family": cand["family"],
+                "reason": f"could not write snapshot: {e}"}
+    _clear_dead_flags()
+    _cred_audit("snapshot-heal-from-family", "wrote",
+                "canonical snapshot refresh token was DEAD but a live login family of the same "
+                "account holds a valid token — reseeded the snapshot from the family store "
+                "(no browser relogin needed; 2026-07-10 rayi2 incident)",
+                account=account, login_family=f"{account}/{cand['family']}",
+                incoming_identity=family_identity(account, cand["family"]), emit_identity=True,
+                existing_identity=account_identity_anchor(account)[0],
+                token_fp=_audit_token_fp(cand["creds"]),
+                extra=f"new_expiry={_expiry_repr(cand['creds'])}")
+    return {"healed": True, "action": "healed", "family": cand["family"],
+            "reason": f"reseeded snapshot from live family {account}/{cand['family']}"}
+
+
+def _auto_heal_dead_snapshots(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Daemon pass: heal every account flagged `snapshot_refresh_dead` whose
+    live login families can vouch for it (heal_snapshot_from_live_family).
+
+    Runs in `_emit_sos_after` BEFORE `diagnose()` — the same funnel as the
+    blank-mount/lane heals — so a healable dead snapshot never reaches the
+    operator as an "[URGENT] relogin required" SOS: the heal reseeds the
+    snapshot, clears the flag, and diagnose then sees a healthy account. Only
+    an account with NO valid family source falls through to the URGENT SOS
+    (genuine human/browser needed).
+
+    Persists state itself when anything changed: `_emit_sos_after`'s callers
+    pass throwaway load_state() copies, so without a save the cleared flag
+    would resurrect each cycle and re-trigger heal attempts forever. Returns
+    the healed account names."""
+    healed: list[str] = []
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict) or not acct.get("snapshot_refresh_dead"):
+            continue
+        try:
+            res = heal_snapshot_from_live_family(name, state, config, no_execute=no_execute)
+        except Exception as e:  # never let a heal failure break the SOS cycle
+            click.echo(f"  snapshot-heal: unexpected error healing '{name}': {e}")
+            continue
+        if res.get("healed"):
+            healed.append(name)
+            click.echo(f"  snapshot-heal: '{name}' canonical snapshot {res['action']} — {res['reason']}")
+    if healed and not no_execute:
+        save_state(state)
+    return healed
 
 
 def _lane_lastvalid_path(mount_creds: Path) -> Path:
@@ -9897,7 +11850,37 @@ def _diagnose_stuck_lanes(state: dict, config: dict) -> list[SOSCondition]:
     return out
 
 
-def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
+def _diagnose_escalation_skips(state: dict, config: dict) -> list[SOSCondition]:
+    """Surface lanes where the reactive escalation-relaunch (Fix #1b) had to be
+    SKIPPED — recovery of the launch command failed, or the slot was already
+    escalated within the window — so the gentle resume was used instead. If the
+    session keeps 429-ing on a capped account the operator likely needs to relaunch
+    it by hand. Warning-severity (the fallback resume was still applied); notes age
+    out after escalate_window_seconds so a cleared lane stops surfacing."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    window = config.get("reactive", {}).get("escalate_window_seconds", 900)
+    out: list[SOSCondition] = []
+    for slot_name, slot in sorted(state.get("slots", {}).items()):
+        note = slot.get("escalation_skip_note")
+        ts = slot.get("escalation_skip_ts")
+        if not note or not _within_escalate_window(ts, window):
+            continue
+        out.append(SOSCondition(
+            severity="warning",
+            summary=f"lane {slot_name}: reactive escalation skipped — {note}",
+            action=(
+                f"A repeat 429 on lane {slot_name} could not be recovered by the /exit + relaunch "
+                f"escalation (Fix #1b); the gentle resume-message was used instead. The running "
+                f"process may still hold a stale in-memory OAuth token on the capped account. If it "
+                f"keeps 429-ing, relaunch the session in place so it re-reads the slot's credentials:\n"
+                f"      cus launch <account> --lane {slot_name} -- --continue"),
+            affected=slot_name,
+        ))
+    return out
+
+
+def _premium_target_loss_reason(name: str, acct: dict, config: dict, ctx: dict | None = None) -> str:
     """Human label for WHY a reachable account is NOT a valid premium swap target.
 
     Used only to name the LOST capacity in the pre-emptive headroom SOS
@@ -9928,12 +11911,32 @@ def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
     est = _account_estimated_effective_pct(acct, config)
     if est >= config.get("never_swap_to_pct", 100):
         return f"SATURATED ({est:.0f}%)"
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): with a fleet ctx
+    # from the diagnose caller, the 7d cap (G9 SOS labeller) and the ladder step
+    # (G2, via _target_would_immediately_re_trip) are judged in reference units,
+    # so the label never disagrees with the gate-on eligibility verdict. ctx=None
+    # keeps the percent path (single-account tooling).
+    _cap = _capacity_gate_on(config) and ctx is not None
     hard_7d = _hard_7d_cap_for_config(config)
-    if acct.get("current_7d_pct", 0) >= hard_7d:
-        return f"over 7d cap ({acct.get('current_7d_pct', 0):.0f}% ≥ {hard_7d:.0f}%)"
+    cur_7d = acct.get("current_7d_pct", 0)
+    if (_remaining_units(cur_7d, name, ctx, config) <= (100.0 - hard_7d) / 100.0) if _cap else (cur_7d >= hard_7d):
+        return f"over 7d cap ({cur_7d:.0f}% ≥ {hard_7d:.0f}%)"
     if _max_model_weekly_from_acct(acct, config) >= _model_weekly_target_cap_for_config(config):
         return "over per-model weekly cap"
-    if _target_would_immediately_re_trip(acct, config):
+    if _target_would_immediately_re_trip(acct, config, name=name, ctx=(ctx if _cap else None)):
+        if _cap:
+            # The gate-on verdict above is the PER-LANE units line, which can
+            # fire while raw percent is still under the step — the percent
+            # template below would then print an arithmetically false
+            # comparison, e.g. "at ladder step (47% ≥ 70%)" (live SOS,
+            # 2026-07-12). State the comparison actually used.
+            cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+            lanes = ctx.get("lane_load_by_name", {}).get(name, 0)
+            per_lane = _remaining_units(
+                _account_estimated_effective_pct(acct, config), name, ctx, config
+            ) / (lanes + 1)
+            return (f"below per-lane headroom line ({per_lane:.2f}u/lane "
+                    f"≤ {(100.0 - cfg_steps[0]) / 100.0:.2f}u across {lanes + 1} lane(s))")
         eff = _account_effective_pct(acct, config)
         return f"at ladder step ({eff:.0f}% ≥ {acct.get('next_swap_at_pct', 50):.0f}%)"
     return "unavailable"
@@ -9960,6 +11963,12 @@ def _candidate_is_valid_premium_target(
     shim = dict(state)
     shim["accounts"] = {leaver: accounts[leaver], candidate: accounts[candidate]}
     shim["active"] = leaver
+    if _capacity_gate_on(premium_config):
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): the picker must
+        # judge this candidate in reference units (G2, formula 2). Build the ctx
+        # from the FULL fleet state so reference_x / lane counts are fleet-wide,
+        # not the two-account shim.
+        shim["_capacity_ctx"] = _capacity_ctx(state, premium_config)
     tgt = pick_swap_target(shim, premium_config)
     if tgt is None:
         return False
@@ -10068,6 +12077,9 @@ def _diagnose_premium_headroom(
     #    becomes a usable target and it alone (with over-cap/blocked candidates) can
     #    still produce the URGENT line.
     premium_config = _config_for_pool(config, "premium")
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): a fresh fleet ctx
+    # so the lost-capacity labeller names caps in reference units. Gate-off: None.
+    _cap_ctx_ph = _capacity_ctx(state, premium_config) if _capacity_gate_on(config) else None
     disabled = _disabled_accounts(config)   # operator-parked: never a target, not lost capacity
     valid_targets: list[str] = []       # fresh, below every cap → clean swap
     stale_refreshable: list[str] = []   # idle token_stale, below caps → refresh-on-swap
@@ -10102,12 +12114,12 @@ def _diagnose_premium_headroom(
             if is_valid:
                 stale_refreshable.append(name)
             else:
-                lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+                lost.append(f"{name} {_premium_target_loss_reason(name, acct, config, ctx=_cap_ctx_ph)}")
             continue
         if is_valid:
             valid_targets.append(name)
         else:
-            lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+            lost.append(f"{name} {_premium_target_loss_reason(name, acct, config, ctx=_cap_ctx_ph)}")
 
     n_lanes = len(premium_lanes)
     m = len(valid_targets)           # FRESH, below-cap targets (drive the existing tiers)
@@ -10387,6 +12399,11 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             {shared_active} if (config.get("mode") == "hybrid" and shared_active) else set())
         sat_pct = config.get("usage_growth_gate", {}).get("saturation_pct", 95)
         thr_cfg = config.get("thresholds", {})
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): a fleet ctx for
+        # the source-side lane precondition (formula 3) and the target-side picker
+        # shims (formula 2). Gate-off: None → percent path, bit-for-bit.
+        _cap_ctx_2b = _capacity_ctx(state, config) if _capacity_gate_on(config) else None
+        _steps_2b = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS
         for acct_name, slots in sorted(occupied.items()):
             acct = accounts.get(acct_name, {})
             if not is_valid(acct):
@@ -10398,7 +12415,15 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             if thr_cfg.get("seven_day", True):
                 cand.append(acct.get("current_7d_pct", 0))
             lane_pct = max(cand) if cand else 0
-            if lane_pct < lane_thr:
+            # G8 source-side (capacity-aware spec 2026-07-10, Task 5): "is this
+            # lane over its ladder step?" is formula 3 gate-on (G4's form), using
+            # the SAME sentinel-clamped next_swap_at G4 uses (≥100 → steps[-1]),
+            # so a healthy big-tier lane isn't falsely reported unable to rotate.
+            if _cap_ctx_2b is not None:
+                _clamped_lane_thr = _steps_2b[-1] if lane_thr >= 100 else lane_thr
+                if _remaining_units(lane_pct, acct_name, _cap_ctx_2b, config) > (100.0 - _clamped_lane_thr) / 100.0:
+                    continue  # lane still has unit headroom — nothing to rotate
+            elif lane_pct < lane_thr:
                 continue  # lane below its ladder step — nothing to rotate
             # Build the same shim decide_slot_swaps builds for this group:
             # active = the lane's own account, candidate pool minus every OTHER
@@ -10415,6 +12440,9 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             if drop:
                 shim["accounts"] = {n: a for n, a in accounts.items() if n not in drop}
             shim["active"] = acct_name
+            if _cap_ctx_2b is not None:
+                # Target-side (formula 2): the picker ranks in reference units.
+                shim["_capacity_ctx"] = _cap_ctx_2b
             pool = _slot_pool(state, sorted(slots)[0], config)
             tgt = pick_swap_target(shim, _config_for_pool(config, pool))
             starved = tgt is None or (
@@ -10691,10 +12719,35 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # the operator reloginss before the account silently drops out of rotation. An
     # account that is dead-snapshot but HAS a free family is deliberately NOT alarmed
     # here — the install-point seeds new lanes from the family, so it's still usable.
+    #
+    # 2026-07-10 (rayi2 incident, heal-from-family): "no FREE family" is NOT the same
+    # as "no valid login" — rayi2 sat urgent-flagged for DAYS while BOTH its families
+    # were live, valid, and refreshed every cycle (merely LEASED, so
+    # has_free_login_family was False). When a live, valid, identity-verified family
+    # source exists, the daemon's `_auto_heal_dead_snapshots` pass reseeds the
+    # snapshot automatically — so report that as a self-healing WARNING, not a
+    # "relogin required" URGENT. Only an account whose families can't vouch for it
+    # (no valid source at all) still needs the browser and keeps the URGENT.
     for acct_name, acct in state.get("accounts", {}).items():
         if not isinstance(acct, dict):
             continue
         if acct.get("snapshot_refresh_dead") and not has_free_login_family(acct_name, state):
+            _heal_cand = _snapshot_heal_candidate(acct_name, state, config)
+            if _heal_cand is not None:
+                out.append(SOSCondition(
+                    severity="warning",
+                    summary=(f"'{acct_name}' snapshot creds are dead — auto-heal from live login "
+                             f"family {acct_name}/{_heal_cand['family']} pending (no relogin needed)"),
+                    action=(f"account-{acct_name}/.credentials.json's refresh token is dead, but "
+                            f"login family {acct_name}/{_heal_cand['family']} holds a live, valid, "
+                            f"identity-verified token. The daemon reseeds the snapshot from that "
+                            f"family automatically on its next cycle "
+                            f"(heal-from-family, 2026-07-10). Existing lanes keep working "
+                            f"throughout. If the daemon is not running, `cus daemon --once` "
+                            f"performs the heal; a browser relogin is NOT required."),
+                    affected=acct_name,
+                ))
+                continue
             out.append(SOSCondition(
                 severity="urgent",
                 summary=(f"'{acct_name}' snapshot creds are dead and no valid login family remains — "
@@ -10840,15 +12893,37 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 ))
             out = kept
 
+    # Capacity-aware fleet warnings (capacity-aware spec 2026-07-10; Task 3
+    # computes them, Task 5 wires them into the SOS cycle report). Gate-on only:
+    # reference-drift + sub-reference-account heads-up (warn-and-run). An
+    # INFO:-prefixed string (operator-disabled account) becomes a soft info line.
+    # affected="system", so the disabled-account suppression above never drops it.
+    if _capacity_gate_on(config):
+        for w in _capacity_warnings(state, config):
+            _info = w.startswith("INFO:")
+            out.append(SOSCondition(
+                severity="info" if _info else "warning",
+                summary=(w if len(w) <= 90 else w[:87] + "..."),
+                action=w,
+                affected="system",
+            ))
+
     return out
 
 
 def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
     """Write or remove SOS.md and (optionally) fire desktop notification.
 
-    Idempotent: writes the same content given the same conditions. To avoid
-    notify-send spam, we hash the conditions and only fire if it changed
-    since the last notification.
+    Idempotent: given the same substantive conditions this is a genuine no-op —
+    it does NOT rewrite SOS.md. The body embeds a volatile `_Updated <ts>_`
+    line, and `atomic_write_bytes` uses os.replace() (which bumps mtime on every
+    call), so writing unconditionally would make an mtime-based file_watch
+    re-fire indefinitely for any non-self-healing condition (this is called from
+    both the daemon poll loop and the `cus sos` CLI). We therefore normalize the
+    volatile timestamp line out of both the new body and the on-disk copy and
+    only write when the substantive content actually differs (or on first write
+    / when the file is absent). To avoid notify-send spam, we also hash the
+    conditions and only fire the desktop notification if it changed since last.
     """
     if not conditions:
         if SOS_MD.exists():
@@ -10862,7 +12937,22 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
         lines.append("")
         lines.append(c.action)
         lines.append("")
-    atomic_write_bytes(SOS_MD, ("\n".join(lines) + "\n").encode())
+    new_body = ("\n".join(lines) + "\n").encode()
+
+    # Rewrite only when the SUBSTANTIVE content changed. Strip the volatile
+    # `_Updated <timestamp>_` line (which differs on every call) from both the
+    # new body and the on-disk copy before comparing; skip the atomic write —
+    # a genuine no-op, no mtime bump — when they match.
+    def _strip_updated(b: bytes) -> bytes:
+        return re.sub(rb"(?m)^_Updated .*$", b"_Updated", b)
+
+    if SOS_MD.exists():
+        try:
+            if _strip_updated(SOS_MD.read_bytes()) == _strip_updated(new_body):
+                return
+        except OSError:
+            pass
+    atomic_write_bytes(SOS_MD, new_body)
 
     # Desktop notification — only when SOS hash changes (avoid spam every poll)
     signature = "|".join(f"{c.severity}:{c.summary}" for c in conditions)
@@ -11380,6 +13470,27 @@ def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> boo
         return False
 
 
+def tmux_capture_pane(pane: str, tmux_socket: str | None = None, lines: int = 30) -> str | None:
+    """Best-effort capture of a tmux pane's visible tail (last `lines` lines).
+
+    Returns the captured text, or None on any failure or when tmux/the pane is
+    unavailable. Read-only (`capture-pane -p`), never sends keys — used by the
+    halted-lane sweep to look for Claude Code's rate-limit modal without ever
+    touching credentials."""
+    if not tmux_is_available() or not pane or pane == "no-tmux":
+        return None
+    try:
+        result = subprocess.run(
+            [*_tmux_cmd(tmux_socket), "capture-pane", "-p", "-t", pane, "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+
+
 def _pane_pid(pane: str, tmux_socket: str | None = None) -> int | None:
     """Return the shell PID running inside the given tmux pane, or None.
 
@@ -11397,6 +13508,11 @@ def _pane_pid(pane: str, tmux_socket: str | None = None) -> int | None:
         return int(pid_str) if pid_str else None
     except (subprocess.SubprocessError, FileNotFoundError, ValueError):
         return None
+
+
+# Filesystem root for /proc walks. A module constant so tests can monkeypatch it
+# onto a fake tree (cus._PROC_ROOT = tmp/proc) — no real /proc is touched in tests.
+_PROC_ROOT = Path("/proc")
 
 
 def _find_descendant_claude_pid(root_pid: int) -> int | None:
@@ -11468,6 +13584,144 @@ def _read_claude_session_id_from_cmdline(pid: int) -> str | None:
         if arg.startswith("--resume="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _proc_cmdline_args(pid: int) -> list[str]:
+    """argv of `pid` from _PROC_ROOT/<pid>/cmdline (NUL-separated). [] on any
+    failure. Distinct from _read_claude_session_id_from_cmdline (which hardcodes
+    /proc) so the escalation path can be pointed at a fake tree in tests."""
+    try:
+        raw = (_PROC_ROOT / str(pid) / "cmdline").read_bytes()
+    except (OSError, ValueError):
+        return []
+    return [c.decode("utf-8", errors="replace") for c in raw.split(b"\x00") if c]
+
+
+def _proc_child_pids(pid: int) -> list[int]:
+    """Direct child PIDs of `pid`, via _PROC_ROOT/<pid>/task/<tid>/children.
+
+    The main thread (tid == pid) is read first so the FIRST element is the pane
+    shell's first child — the original wrapper invocation we relaunch. Best-effort:
+    any unreadable task/children file is skipped; [] when the process is gone."""
+    task_dir = _PROC_ROOT / str(pid) / "task"
+    kids: list[int] = []
+    try:
+        tids = sorted(task_dir.iterdir(), key=lambda p: (p.name != str(pid), p.name))
+    except OSError:
+        return kids
+    for tid in tids:
+        try:
+            raw = (tid / "children").read_text()
+        except OSError:
+            continue
+        for tok in raw.split():
+            try:
+                kids.append(int(tok))
+            except ValueError:
+                continue
+    return kids
+
+
+def _deepest_claude_descendant(root_pid: int) -> int | None:
+    """Deepest descendant of `root_pid` whose /proc cmdline contains 'claude' — the
+    live process to wait on after /exit (claude runs as `node … claude …`, so the
+    leaf is what actually dies). None when no descendant matches or /proc is
+    unavailable. Cmdline-based (per the brief) and cycle-guarded."""
+    best_pid: int | None = None
+    best_depth = -1
+    seen: set[int] = set()
+    stack: list[tuple[int, int]] = [(c, 1) for c in _proc_child_pids(root_pid)]
+    while stack:
+        pid, depth = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if any("claude" in a for a in _proc_cmdline_args(pid)) and depth > best_depth:
+            best_pid, best_depth = pid, depth
+        for c in _proc_child_pids(pid):
+            if c not in seen:
+                stack.append((c, depth + 1))
+    return best_pid
+
+
+def _recover_pane_relaunch_cmd(pane: str, tmux_socket: str | None = None) -> tuple[str | None, int | None]:
+    """Recover (relaunch_command, claude_pid_to_wait_on) from a pane's process
+    tree, or (None, None). The relaunch command is the pane shell's FIRST child's
+    full cmdline (the original `headroom wrap claude … -- --resume <id>` wrapper);
+    the wait pid is the deepest 'claude' descendant. Best-effort, Linux /proc only —
+    the caller treats (None, …) or a non-'claude' command as recovery failure and
+    falls back to the gentle resume."""
+    pane_pid = _pane_pid(pane, tmux_socket)
+    if pane_pid is None:
+        return None, None
+    kids = _proc_child_pids(pane_pid)
+    if not kids:
+        return None, None
+    argv = _proc_cmdline_args(kids[0])
+    if not argv:
+        return None, None
+    relaunch = shlex.join(argv)
+    claude_pid = _deepest_claude_descendant(pane_pid)
+    if claude_pid is None and "claude" in relaunch:
+        claude_pid = kids[0]  # fall back to waiting on the wrapper itself
+    return relaunch, claude_pid
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while _PROC_ROOT/<pid> exists (the process, or a fake-tree stand-in)."""
+    try:
+        return (_PROC_ROOT / str(pid)).exists()
+    except OSError:
+        return False
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 10.0, interval: float = 0.5) -> bool:
+    """Poll /proc until `pid` exits or `timeout` seconds elapse. True if it exited
+    (so the pane's shell prompt is back before we type the relaunch command)."""
+    deadline = time.monotonic() + timeout
+    while _pid_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+    return True
+
+
+def _escalate_relaunch_pane(pane: str, tmux_socket: str | None, relaunch_cmd: str,
+                            claude_pid: int | None, config: dict) -> tuple[bool, bool]:
+    """`/exit` the pane, wait ≤10s for the claude child to die, then re-run the
+    recovered launch command in the SAME pane so a fresh process reads the slot's
+    current credentials. The caller has already verified a claude launch command is
+    in hand (safety posture: never /exit without one).
+
+    Returns (relaunched, exited):
+      (True,  True)  — relaunch sent; success.
+      (False, False) — /exit could not be sent; the pane was NOT touched, so the
+                       caller may safely fall back to the gentle resume-message.
+      (False, True)  — /exit was sent (claude is gone) but the relaunch could not
+                       be sent even after retries; the pane is at a bare shell — the
+                       caller must NOT type a resume-message into it, only SOS.
+    All steps best-effort."""
+    if not tmux_send_text(pane, "/exit", tmux_socket=tmux_socket):
+        click.echo(f"    reactive escalate: pane {pane} /exit send failed; pane untouched")
+        return (False, False)
+    # From here the pane's claude is on its way out — we own the relaunch.
+    if claude_pid is not None:
+        if not _wait_for_pid_exit(claude_pid, timeout=10.0):
+            click.echo(f"    reactive escalate: pane {pane} claude pid {claude_pid} still alive after "
+                       f"10s — relaunching anyway (best-effort)")
+    else:
+        time.sleep(2.0)  # no wait target — give the shell a moment to return
+    for attempt in range(3):
+        if tmux_send_text(pane, relaunch_cmd, tmux_socket=tmux_socket):
+            socket_note = f" via {tmux_socket}" if tmux_socket else ""
+            click.echo(f"    reactive escalate: pane {pane}{socket_note} relaunched — fresh process "
+                       f"reads the slot's current credentials")
+            return (True, True)
+        if attempt < 2:
+            time.sleep(0.5)
+    click.echo(f"    reactive escalate: pane {pane} relaunch command send failed after /exit — "
+               f"pane is at a bare shell and needs a manual relaunch")
+    return (False, True)
 
 
 def pane_live_session_id(pane: str, tmux_socket: str | None = None) -> str | None:
@@ -12958,14 +15212,28 @@ def check_rate_limit_reactive(state: dict, config: dict, entries: list | None = 
             except ValueError:
                 pass
 
-    target = pick_swap_target(state, config)
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): the global reactive
+    # escape ranks in reference units and vets its target's health in units. Build
+    # ctx on a LOCAL shim — the raw `state` handed in here must never carry ctx.
+    # Gate-off: _r_shim IS state, so behavior stays bit-for-bit.
+    _cap_on_r = _capacity_gate_on(config)
+    _cap_ctx_r = None
+    _r_shim = state
+    if _cap_on_r:
+        _cap_ctx_r = _capacity_ctx(state, config)
+        _r_shim = dict(state)
+        _r_shim["_capacity_ctx"] = _cap_ctx_r
+    target = pick_swap_target(_r_shim, config)
     if target is None:
         click.echo(f"  429 detected on {active} session {matched_session['session_id'][:8]} but no valid swap target")
         _finish([matched_session])
         return None
     target_acct = state.get("accounts", {}).get(target.name, {})
     if (target_acct.get("token_expired") or target_acct.get("poll_error")
-            or _target_would_immediately_re_trip(target_acct, config)
+            or _target_would_immediately_re_trip(
+                target_acct, config,
+                name=(target.name if _cap_on_r else None),
+                ctx=_cap_ctx_r)
             or "[DEGRADED:" in target.reason):
         click.echo(f"  429 detected on {active} but refusing unsafe target "
                    f"'{target.name}' ({target.reason}); event retained for retry")
@@ -13391,6 +15659,11 @@ def status(pretty: bool) -> None:
     first_step = cfg_steps[0] if cfg_steps else 50
     click.echo("Ladder steps: " + " → ".join(f"{s}%" for s in cfg_steps))
     click.echo()
+    # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): display-only
+    # per-account tier + remaining reference units, so the operator can read the
+    # normalized fleet the router now decides on. Gate-off: no extra column.
+    _cap_on_st = _capacity_gate_on(config)
+    _cap_ctx_st = _capacity_ctx(state, config) if _cap_on_st else None
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 91)
     for name, a in sorted(state["accounts"].items()):
@@ -13400,7 +15673,13 @@ def status(pretty: bool) -> None:
                            for win, (e, rate) in row["est"].items())
         nxt_note = (f"  [next-swap: {row['next_swap_pct']:.0f}%]"
                     if row["next_swap_pct"] is not None else "")
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}")
+        cap_note = ""
+        if _cap_ctx_st is not None:
+            _cx = _cap_ctx_st.get("capacity_x_by_name", {}).get(name, _cap_ctx_st.get("reference_x", 1.0))
+            _ru = _remaining_units(max(a.get("current_5h_pct", 0), a.get("current_7d_pct", 0)),
+                                   name, _cap_ctx_st, config)
+            cap_note = f"  [{_cx:g}x, {_ru:.2f}u free]"
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}{cap_note}")
         # Stale/unknown per-model treatment lives in _fmt_model_pct; which
         # models to show and their order comes from _account_row.
         if row["per_model"]:
@@ -13932,40 +16211,72 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     return ("ok", txt)
 
 
+def _account_family_conflict(name_a: str, name_b: str) -> bool:
+    """True only when two account names belong to DIFFERENT identity families.
+
+    Compares the two accounts' canonical oauthAccount identities. Returns True
+    iff they share comparable evidence (accountUuid/emailAddress) that DISAGREES.
+    Returns False when they match, when they are the same account, or when there
+    is no shared evidence to compare (can't say → don't override). This is the
+    cross-check that lets a NAME-based resolution (state.slots occupant or an
+    account-<name> dir) be overridden only by a genuinely foreign on-disk
+    identity, never by a mere pro/max sibling (which shares one identity)."""
+    if name_a == name_b:
+        return False
+    return _identities_match(_dir_identity(name_a), _dir_identity(name_b)) is False
+
+
 def _resolve_mount_account(mount: str | None, state: dict) -> tuple[str | None, str]:
     """Resolve a live mount's TRUE account + the evidence source used.
 
-    Ground-truth ladder for GH #137, strongest evidence first:
-      1. on-disk oauthAccount — the slot/account dir's .claude.json is what
-         Claude Code actually authenticates as, independent of BOTH sessions.log
-         (launch-time label) and state.slots (the daemon's record, which itself
-         lags an in-place move by up to a cycle). Reverse-mapped to an account
-         name via each account's canonical snapshot identity.
-      2. state.slots[mount].account — the daemon's recorded occupant, used when
-         the on-disk identity matches no known account (e.g. a pooled backup
-         login the snapshots don't cover).
-      3. account-<name> mount — a relogin-style launch where the dir IS the
-         account name.
+    Ground-truth ladder (GH #137; corrected 2026-07-12 sessions-view incident):
+      1. NAME evidence — for a slot mount, state.slots[mount].account (the
+         daemon's recorded occupant, which is the operational truth the daemon
+         acts on); for an account-<name> mount, the dir name itself. This is the
+         PRIMARY source because it is the ONLY evidence that disambiguates a
+         pro/max sibling pair (e.g. yaz-myjli-com vs yaz-myjli-com-max) and the
+         shared `default` account — all of which carry ONE identical
+         oauthAccount identity, so identity matching CANNOT tell them apart.
+      2. on-disk oauthAccount — a CROSS-CHECK only. It overrides the name
+         evidence solely when it names a DIFFERENT identity family (an in-place
+         /login of a foreign account into the slot, or a mislabeled account
+         dir); a same-family on-disk identity never displaces the recorded
+         sibling. Also the sole source when there is no name evidence at all.
+
+    The 2026-07-12 bug: this ladder previously tried on-disk identity FIRST for
+    every mount, and _account_for_mount_identity returns the FIRST account in
+    state["accounts"] whose identity matches. With sibling/`default` identity
+    collapse, that returned the wrong sibling for one slot and `default` (or
+    whatever sorts first) for every other slot sharing an identity — so distinct
+    slots all rendered as one account with one account's usage numbers.
 
     Returns (account_or_None, source) where source is one of
-    {"disk-identity", "state-slot", "account-dir", "unresolved"}.
+    {"state-slot", "account-dir", "disk-identity", "unresolved"}.
     """
     if not mount:
         return (None, "unresolved")
-    if mount.startswith("account-"):
-        # A relogin/login-mount launch: the dir name is the account. Still
-        # prefer the on-disk identity if it resolves (catches a mislabeled dir).
-        disk = _account_for_mount_identity(slot_path(mount), state)
-        if disk:
-            return (disk, "disk-identity")
-        return (mount.removeprefix("account-"), "account-dir")
-    # Slot mount: on-disk identity wins, else the daemon's recorded occupant.
     disk = _account_for_mount_identity(slot_path(mount), state)
-    if disk:
-        return (disk, "disk-identity")
+    if mount.startswith("account-"):
+        # A relogin/login-mount launch: the dir name IS the account. Trust it
+        # unless the on-disk identity resolves to a genuinely different family
+        # (a mislabeled dir); a same-family disk hit must not flip a sibling.
+        name = mount.removeprefix("account-")
+        if disk and _account_family_conflict(disk, name):
+            return (disk, "disk-identity")
+        return (name, "account-dir")
+    # Slot mount: the daemon's recorded occupant is the operational truth and the
+    # only evidence that disambiguates siblings/`default`. Keep it unless the live
+    # identity CONTRADICTS its family (a foreign account was mounted in place),
+    # in which case the record is stale and the on-disk identity wins.
     recorded = (state.get("slots", {}).get(mount, {}) or {}).get("account")
     if recorded:
+        if disk and _account_family_conflict(disk, recorded):
+            return (disk, "disk-identity")
         return (recorded, "state-slot")
+    # No recorded occupant (a slot the daemon hasn't claimed): fall back to the
+    # on-disk identity if it resolves.
+    if disk:
+        return (disk, "disk-identity")
     return (None, "unresolved")
 
 
@@ -14024,7 +16335,18 @@ def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[
         # resolved a real mount — a bare/global pane has no mount to compare and
         # "follows global creds" by design, which is not the #137 defect.
         logged = r.get("logged_account")
+        source = r.get("source", "unresolved")
         drift = bool(mount) and bool(resolved_account) and logged != resolved_account
+        # Two very different situations both trip `drift`, and they deserve
+        # different framing (2026-07-12): when the account came from the daemon's
+        # own record (state-slot / account-dir), a launch-label mismatch just
+        # means the lane was swapped AFTER this pane launched — expected, benign.
+        # When the on-disk identity had to OVERRIDE the record (disk-identity on
+        # a real mount), a foreign account was mounted in place — the genuine
+        # alarm case. `bare/unresolved` never drifts.
+        drift_kind = None
+        if drift:
+            drift_kind = "identity-clobber" if source == "disk-identity" else "lane-moved"
 
         rows.append({
             "session_id": r.get("session_id"),
@@ -14036,8 +16358,9 @@ def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[
             "pool": pool,
             "logged_account": logged,
             "account": resolved_account,
-            "resolution_source": r.get("source", "unresolved"),
+            "resolution_source": source,
             "drift": drift,
+            "drift_kind": drift_kind,
             "five_h_pct": acct.get("current_5h_pct"),
             "seven_d_pct": acct.get("current_7d_pct"),
             "per_model_weekly": dict(acct.get("per_model_weekly_pct") or {}),
@@ -14146,8 +16469,17 @@ def sessions_cmd(as_json: bool) -> None:
                 acct = f"{acct} {click.style('[disabled]', fg='yellow')}"
             # Line 1: identity + where mounted.
             drift_tag = ""
-            if r["drift"]:
-                drift_tag = click.style(f"  DRIFT: sessions.log said '{r['logged_account']}'", fg="red", bold=True)
+            if r["drift"] and r.get("drift_kind") == "identity-clobber":
+                # The on-disk identity had to override the daemon's record — a
+                # foreign account is mounted in place. This is the real alarm.
+                drift_tag = click.style(
+                    f"  DRIFT: on-disk identity is '{r['account']}', not launch label '{r['logged_account']}'",
+                    fg="red", bold=True)
+            elif r["drift"]:
+                # Benign: the lane was swapped after this pane launched, so its
+                # sessions.log label is simply out of date. Informational only.
+                drift_tag = click.style(
+                    f"  (launched as '{r['logged_account']}' — lane moved since)", fg="yellow")
             click.echo(f"  {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
             # Line 2: usage numbers.
             five = "?" if r["five_h_pct"] is None else f"{r['five_h_pct']:.0f}%"
@@ -14304,7 +16636,14 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
         chosen_name = target
         reason = f"explicit (auto-swap {target})"
     else:
-        picked = pick_swap_target(state, config)
+        # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): the auto-swap
+        # CLI pick ranks in reference units. Build ctx on a local shim so the raw
+        # state is never mutated; gate-off passes state directly (bit-for-bit).
+        _asc_state = state
+        if _capacity_gate_on(config):
+            _asc_state = dict(state)
+            _asc_state["_capacity_ctx"] = _capacity_ctx(state, config)
+        picked = pick_swap_target(_asc_state, config)
         if picked is None:
             click.echo("No valid swap target available. All non-current accounts are blocked.")
             click.echo("Run `cus sos` for diagnosis.")
@@ -14931,6 +17270,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
         # global mode / when no lane is blanked.
         _auto_heal_live_lanes(state, config, no_execute=no_execute)
+        # Dead-snapshot heal (2026-07-10 rayi2 incident): BEFORE diagnose, reseed
+        # any account whose canonical snapshot is refresh-DEAD
+        # (snapshot_refresh_dead) from a live, valid, identity-verified login
+        # family of the SAME account. Same funnel-placement rationale as the two
+        # heals above: a healable dead snapshot never reaches the operator as an
+        # "[URGENT] relogin required" SOS — the heal reseeds the snapshot and
+        # clears the flag, and diagnose() then sees a healthy account. Only an
+        # account with NO valid family source (a genuine full logout) falls
+        # through to the URGENT relogin SOS.
+        _auto_heal_dead_snapshots(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
         # PRE-EMPTIVE creds-health early-warning (2026-07-06): AFTER the reactive
         # auto-heals above (so a just-healed mount reads valid, not near-blank) and
@@ -14947,6 +17296,11 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # file-heal won't help. Reads the in-process heal history recorded by
         # `_auto_heal_live_lanes` above.
         conditions.extend(_diagnose_stuck_lanes(state, config))
+        # Fix #1b (2026-07-10): a reactive escalation-relaunch that had to be
+        # skipped (launch command unrecoverable, or already escalated this window)
+        # leaves a note on the slot; surface it so a persistently-stuck lane gets a
+        # human. Ages out after escalate_window_seconds.
+        conditions.extend(_diagnose_escalation_skips(state, config))
         maybe_write_sos(conditions, state)
         if conditions:
             for c in conditions:
@@ -15039,6 +17393,17 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
+        # capacity-aware spec 2026-07-10 (Normalization model, Phase 1): cache
+        # each JUST-polled account's parsed rate-limit tier alongside its usage
+        # update, so state.json's capacity_x tracks the SAME poll cadence as
+        # current_5h_pct/current_7d_pct instead of going stale. Local
+        # credentials-file read only (never HTTP) — the same freshest-wins
+        # chain _read_access_token_with_expiry already uses. Inert today:
+        # nothing yet reads the cached value (Phase 2 wires the gate-on
+        # consumers); warnings are discarded here on purpose (a later task
+        # folds them into SOS).
+        for _capx_name in usage_by_account:
+            _account_capacity_x(_capx_name, state, config)
         # Fix 4 (2026-07-07): cheap self-healing pass — un-stale every account the
         # poll just left token_stale (idle account, valid refresh token) via a
         # direct OAuth refresh grant. Keeps cus's readings correct and prevents the
@@ -15091,6 +17456,12 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # accounts from the candidate pool (no-op when there are no slots).
         trace: dict = {}
         decide_state = _state_excluding_accounts(state, state.get("active"), _live_slot_accounts(state))
+        if _capacity_gate_on(config):
+            # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): stash the
+            # ctx onto the shallow-copied decide shim (never the raw state), so
+            # the shared-mount decision AND the no-target diagnostic below both
+            # judge in reference units off the SAME ctx decide_swap used.
+            decide_state = {**decide_state, "_capacity_ctx": _capacity_ctx(state, config)}
         decision = decide_swap(decide_state, config, usage_by_account, trace)
 
         # Persist usage updates BEFORE acting on swap (so a crash during
@@ -15111,19 +17482,38 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             active_acct = state["accounts"][active]
             threshold = active_acct.get("next_swap_at_pct", THRESHOLD_STEPS[0])
             active_usage = usage_by_account.get(active)
-            wanted = (
-                active_usage is not None
-                and not active_usage.token_expired
-                and current_max_pct(active_usage, config) >= threshold
-            )
+            # G8 source-side (capacity-aware spec 2026-07-10, Task 5): the
+            # global-mode "threshold tripped" diagnostic asks "does the active
+            # account WANT to rotate?" Gate-on that is formula 3 (G4's form) —
+            # remaining units at/under the (sentinel-clamped) next_swap_at line —
+            # so a healthy big-tier active (20x@80%) is not falsely reported.
+            if _capacity_gate_on(config) and active_usage is not None:
+                _cap_ctx_oc = decide_state.get("_capacity_ctx") or _capacity_ctx(state, config)
+                _steps_oc = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS
+                _clamped_thr_oc = _steps_oc[-1] if threshold >= 100 else threshold
+                wanted = (
+                    not active_usage.token_expired
+                    and _remaining_units(current_max_pct(active_usage, config), active, _cap_ctx_oc, config)
+                    <= (100.0 - _clamped_thr_oc) / 100.0
+                )
+            else:
+                wanted = (
+                    active_usage is not None
+                    and not active_usage.token_expired
+                    and current_max_pct(active_usage, config) >= threshold
+                )
             if wanted:
                 # Distinguish "no target available" from "gate suppressed."
                 # The gate-suppression paths (growth gate, hysteresis) already
                 # logged their own reason inside decide_swap. We only print
                 # "no valid swap target" if pick_swap_target would also fail
                 # — otherwise we'd be misleading the operator about WHY the
-                # swap didn't fire. Bug fixed 2026-05-25 (GH #19).
-                if pick_swap_target(state, config) is None:
+                # swap didn't fire. Bug fixed 2026-05-25 (GH #19). Gate-on the
+                # re-pick runs on the SAME ctx-stashed decide_state decide_swap
+                # used, not raw state (capacity-aware spec 2026-07-10, Task 5);
+                # gate-off it stays raw `state`, bit-for-bit.
+                _diag_state = decide_state if _capacity_gate_on(config) else state
+                if pick_swap_target(_diag_state, config) is None:
                     click.echo(f"  threshold tripped on {active} ({current_max_pct(active_usage, config):.1f}% >= {threshold}%) but no valid swap target")
             for name, acct in state["accounts"].items():
                 marker = " *" if name == state["active"] else "  "
@@ -15247,7 +17637,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 click.echo(f"[{now_iso()}]   WARNING: cycle body ({cycle_secs:.0f}s) exceeded "
                            f"the {stall_threshold:.0f}s stall threshold — in-cycle stall (GH #91)")
             slept_t0 = time.monotonic()
-            time.sleep(intended)
+            # Fix #2 (2026-07-10 halt incident): interruptible in place of a
+            # flat time.sleep(intended) — a 429 hook touching
+            # ACCOUNTS_DIR/wake-429 can end this wait early instead of leaving
+            # the reactive swap stranded until the rest of `intended` elapses.
+            # Gated by reactive.wake_on_429 (default True); gate-off is a
+            # single uninterrupted time.sleep(intended), bit-for-bit as before.
+            woke_early = _interruptible_sleep(intended, config)
             overslept = time.monotonic() - slept_t0 - intended
             # Oversleep slop scales with the intended sleep: adaptive repoll can
             # shrink `intended` to ~30s near a 5h reset, where a fixed 30s slop
@@ -15255,7 +17651,7 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             # 2026-07-02). max(30, 0.5*intended) keeps the absolute floor for
             # long sleeps while widening the band for short adaptive ones.
             slop = max(30.0, 0.5 * intended)
-            if overslept > slop:
+            if woke_early is None and overslept > slop:
                 click.echo(f"[{now_iso()}] WARNING: overslept by {overslept:.0f}s "
                            f"(intended {intended:.0f}s, slop {slop:.0f}s) — scheduler "
                            f"starvation or system suspend (GH #91)")
@@ -15320,7 +17716,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
     "token_self_refresh": "OAuth self-refresh for `token_stale` accounts (2026-07-02, GH #13 follow-up). `enabled: true` (default): before flagging an inactive account token_stale, POST a refresh_token grant to the same undocumented endpoint the `claude` CLI itself uses (extracted from the installed binary — not a published API). Costs no usage quota and creates no session, unlike spawning a real `claude` probe session would. Any failure (network, non-200, malformed response) falls straight through to the pre-existing token_stale flag. Set `enabled: false` to revert to never talking to this endpoint, e.g. if Anthropic changes its shape and it starts erroring.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
-    "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
+    "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll). `wake_on_429: true` (default, fix #2 2026-07-10) makes the daemon's inter-cycle sleep interruptible so that swap actually starts within seconds of the hook firing instead of waiting out the rest of poll_interval_seconds — set false to restore pure poll-interval cadence. `wake_min_interval_seconds: 30` (review finding 2026-07-12) bounds how often an early wake may fire: under a hook storm (a session 429-ing every few seconds), wake_on_429 alone let hooks recreate wake-429 faster than a cycle could consume it, driving back-to-back full cycle bodies. An early wake now only fires if this many monotonic seconds have passed since the previous one; otherwise wake-429 is left in place (not consumed) and picked up as soon as the floor elapses — no event is lost, just rate-limited. Set 0 to disable the bound.",
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
@@ -15756,6 +18152,139 @@ def _adaptive_sleep_seconds(state: dict, config: dict, base_interval: float) -> 
     buffer = cfg.get("repoll_buffer_seconds", 20)
     floor = cfg.get("min_repoll_seconds", 30)
     return max(floor, min(intended, soonest + buffer))
+
+
+_WAKE_SLICE_SECONDS = 5.0
+_WAKE_MTIME_EPSILON_SECONDS = 2.0
+
+# Module-level, mirrors _DAEMON_SINGLETON_FD: monotonic timestamp of the last
+# honored early wake, across ALL _interruptible_sleep calls for the life of
+# the daemon process. Used to enforce reactive.wake_min_interval_seconds
+# (review finding 2026-07-12) — see that function's docstring.
+_last_wake_cycle_monotonic: float | None = None
+
+
+def _interruptible_sleep(total_seconds: float, config: dict) -> str | None:
+    """Sleep `total_seconds`, but wake early if a 429 hook fires (fix #2,
+    2026-07-10 halt incident).
+
+    Without this, a 429 hook record just sits in 429.log until the next
+    poll_interval_seconds cycle picks it up — with a 300s interval and Claude
+    Code's session-limit modal giving up in ~1-2 min, the reactive swap
+    routinely landed AFTER the halt. cus_post_tool_use_failure.sh and
+    cus_stop_failure.sh unconditionally `touch $ACCOUNTS_DIR/wake-429` after
+    logging a 429 (they can't read config, so the touch itself isn't gated —
+    see the hook scripts). Consumption of that file IS gated here, by
+    `reactive.wake_on_429` (default True).
+
+    Gate off ⇒ a single uninterrupted `time.sleep(total_seconds)`, byte-
+    identical to the pre-fix behavior, and the wake file (even if the hooks
+    keep touching it) is never looked at.
+
+    Gate on ⇒ sleep in `_WAKE_SLICE_SECONDS`-second slices. Between slices,
+    check for the wake file. An event that arrived *during the previous
+    cycle's body* (before this wait even started) should shorten THIS wait
+    rather than be silently dropped, so the file is *eligible* unconditionally
+    if it already exists at wait-start. Otherwise, only a touch whose mtime is
+    at/after this wait's start makes it eligible (guards against a leftover
+    file somehow surviving a previous consumption).
+
+    Review finding (2026-07-12): under a hook storm (a session 429-ing every
+    few seconds), hooks can recreate wake-429 faster than a cycle consumes
+    it — an eligible file used to be consumed unconditionally, driving
+    back-to-back full cycle bodies (state I/O, log parsing, log spam) for the
+    whole min_seconds_between_reactive_swaps window even though per-account
+    HTTP polling stayed capped. `reactive.wake_min_interval_seconds` (default
+    30, 0 disables) bounds this: an eligible file is only actually consumed
+    once >= that many MONOTONIC seconds have passed since the previous
+    early wake (tracked in the module-level `_last_wake_cycle_monotonic`,
+    since a single logical hook storm can span many `_interruptible_sleep`
+    calls as the daemon loops). Below the floor, the file is left in place —
+    NOT consumed, NOT re-validated by mtime — and the slice loop just keeps
+    going; the pending wake fires the moment the floor elapses (which may be
+    in a later slice of this same call, or, if `total_seconds` runs out
+    first, on a subsequent call — the event is delayed, never dropped).
+
+    Consuming means: delete the file and return immediately — "start the
+    next cycle immediately" — which is also what bounds this to (at most)
+    one early wake per call: once we've returned, nothing in THIS wait checks
+    the file again. A second hook touch landing after that just becomes the
+    "already exists at wait-start" case for the *next* wait. Per-account rate
+    limiting on the reactive swap itself is handled separately, by
+    `swap_hysteresis.min_seconds_between_reactive_swaps`.
+
+    Returns "wake-429" if woken early, else None (mirrors the plain-sleep
+    return of "nothing happened").
+    """
+    reactive_cfg = config.get("reactive", {})
+    if not reactive_cfg.get("wake_on_429", True):
+        time.sleep(total_seconds)
+        return None
+
+    wake_min_interval = reactive_cfg.get("wake_min_interval_seconds", 30)
+    wake_file = Path(ACCOUNTS_DIR) / "wake-429"
+    wait_start_wall = time.time()
+    wait_start_mono = time.monotonic()
+
+    def _floor_elapsed(now_mono: float) -> bool:
+        if wake_min_interval <= 0:
+            return True
+        if _last_wake_cycle_monotonic is None:
+            return True
+        return (now_mono - _last_wake_cycle_monotonic) >= wake_min_interval
+
+    def _consume(elapsed: float) -> str:
+        global _last_wake_cycle_monotonic
+        try:
+            wake_file.unlink()
+        except OSError:
+            pass
+        _last_wake_cycle_monotonic = time.monotonic()
+        click.echo(f"[{now_iso()}] wake: 429 hook event — starting cycle early "
+                   f"({elapsed:.0f}s into a {total_seconds:.0f}s sleep)")
+        return "wake-429"
+
+    # `pending` tracks "this file has already passed its one-time relevance
+    # check (unconditional at wait-start, or fresh-mtime mid-sleep) and is
+    # just waiting on the wake_min_interval floor" — once True, later loop
+    # iterations skip the mtime re-check (it would wrongly see a since-stale
+    # mtime on a file we already validated) and only re-poll the floor.
+    pending = wake_file.exists()
+    if pending and _floor_elapsed(wait_start_mono):
+        return _consume(0.0)
+
+    remaining = total_seconds
+    while remaining > 0:
+        this_slice = min(_WAKE_SLICE_SECONDS, remaining)
+        time.sleep(this_slice)
+        remaining -= this_slice
+        if not wake_file.exists():
+            pending = False
+            continue
+        if not pending:
+            try:
+                mtime = wake_file.stat().st_mtime
+            except OSError:
+                mtime = None
+            # A small epsilon guards against filesystem mtime granularity /
+            # clock skew: a touch that lands within microseconds of
+            # wait_start_wall can legitimately stat() a hair EARLIER than a
+            # time.time() read captured moments before the write (observed:
+            # ~1-2ms of negative lag on ext4). This is only ever a tolerance
+            # for "did this happen around wait-start", not a loophole for
+            # genuinely stale files — a leftover file from hours/cycles ago
+            # (the case the mtime guard exists for) is still far outside it.
+            if mtime is not None and mtime >= wait_start_wall - _WAKE_MTIME_EPSILON_SECONDS:
+                pending = True
+        if pending:
+            now_mono = time.monotonic()
+            if _floor_elapsed(now_mono):
+                elapsed = now_mono - wait_start_mono
+                return _consume(elapsed)
+            # Floor not yet reached: leave the file in place and keep
+            # sleeping in slices — it'll be re-checked (against the floor
+            # only, no mtime re-validation) next slice.
+    return None
 
 
 def _fmt_render_stamp_eastern() -> str:
@@ -17248,12 +19777,21 @@ def slot_gc_cmd(slot_name_opt: str | None, force: bool) -> None:
         result = gc_slot(name, state, force=force)
         action = result["action"]
         if action == "refused_in_use":
-            click.echo(f"  {name}: in use (pids {result['pids']}) — skipped")
+            click.echo(f"  {name}: live claude session (pids {result['pids']}) — skipped")
+        elif action == "refused_reserved":
+            click.echo(f"  {name}: reserved by an in-flight launch (until {result.get('reserved_until')}) — skipped")
         elif action == "dropped_stale_entry":
             click.echo(f"  {name}: state entry with no dir — dropped")
         else:
             sb = result["saveback"]
-            click.echo(f"  {name}: reaped (creds save-back: {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")")
+            msg = f"  {name}: reaped (creds save-back: {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")"
+            # Orphan-holds-slot bug (2026-07-10): if the slot had no live session
+            # but leftover env-inheriting holders (a dev server / tail reparented
+            # to init), we reaped over them — surface the pids so the operator can
+            # kill the stragglers.
+            if result.get("orphan_pids"):
+                msg += click.style(f" (stepped over {len(result['orphan_pids'])} orphaned non-session holders: {result['orphan_pids']})", fg="yellow")
+            click.echo(msg)
     save_state(state)
 
 
@@ -17297,16 +19835,20 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     plus the shared ~/.claude mount), for the operator-facing message.
     """
     current = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
-    # Ground-truth occupancy (max_age_seconds=0 bypasses the cache) — the same
-    # source the real clobber guard reads, so preview and reality can't diverge.
-    held_by = [s for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(target, []) if s != slot_name]
+    # Ground-truth, SESSION-aware occupancy — the same source the real clobber
+    # guard reads (session_aware=True below), so preview and reality can't diverge.
+    # Session-aware (orphan-holds-slot bug, 2026-07-10): a slot whose only holder
+    # is an orphaned dev-server that outlived its session is NOT a live mount, so
+    # it must not appear as an occupant that forces a family claim / refuse.
+    held_by = [s for s in occupied_slot_accounts_live_session(state).get(target, []) if s != slot_name]
     # Shared-mount holder: mode-aware, NOT gated on mount_in_use(CLAUDE_DIR) —
     # bare sessions on ~/.claude set no CLAUDE_CONFIG_DIR so mount_pids can't see
     # them (issue #141). _shared_mount_holds treats global/hybrid state["active"]
     # as an unconditional live holder; per_session keeps the detectable-only rule.
     if _shared_mount_holds(target, state, config):
         held_by = held_by + ["~/.claude (shared mount)"]
-    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config)
+    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config,
+                                                       session_aware=True)
     gate = independent_logins_enabled(config)
     if target == current:
         plan, detail = "noop", f"{slot_name} is already on '{target}'"
@@ -17316,7 +19858,8 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     elif gate and (has_free_login_family(target, state)
                    or (has_independent_login(target, slot_name)
                        and not _live_family_would_collide(
-                           target, login_store_creds_path(target, slot_name), slot_name, state, config))):
+                           target, login_store_creds_path(target, slot_name), slot_name, state, config,
+                           session_aware=True))):
         # Claimable = a free POOLED family, OR a legacy per-slot login whose token
         # is GENUINELY distinct from every live mount's family. The legacy branch
         # is now token-CHECKED (2026-07-07 chats1a): a stale-copy legacy store
@@ -17599,8 +20142,14 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                 # genuinely-broken account is surfaced downstream (install-point /
                 # daemon SOS), not by refusing the launch here.
                 break
+            # Capacity-aware (capacity-aware spec 2026-07-10, Task 5): build a
+            # fresh ctx AFTER the force-poll (so lane/tier reads reflect the fresh
+            # state) and thread name+ctx, so the re-check agrees with the picker —
+            # a fresh-polled idle 20x@80% is accepted, not walled by percent.
+            _cap_ctx_vp = _capacity_ctx(state, pool_config) if _capacity_gate_on(pool_config) else None
             saturated, why = _launch_candidate_saturated(
-                state.get("accounts", {}).get(cand, {}), pool_config)
+                state.get("accounts", {}).get(cand, {}), pool_config,
+                name=cand, ctx=_cap_ctx_vp)
             if not saturated:
                 break  # fresh reading confirms the candidate is genuinely clean
             # Stale-low → actually capped: reject it and re-pick without it.

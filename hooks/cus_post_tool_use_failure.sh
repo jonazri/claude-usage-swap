@@ -22,6 +22,15 @@
 #
 # Walk-back: set hooks.install_post_tool_use_failure: false (StopFailure remains
 # the real detector) or remove the entry from ~/.claude/settings.json.
+#
+# Fix #2 (2026-07-10 halt incident, wake-on-429): also touches
+# $ACCOUNTS_DIR/wake-429 so the daemon's inter-cycle sleep can end early
+# instead of waiting out the rest of poll_interval_seconds. This touch is
+# UNCONDITIONAL — a hook script can't read config.yaml, so it can't check
+# reactive.wake_on_429 itself. Whether the daemon actually acts on the file is
+# gated daemon-side by that key (see _interruptible_sleep in cus.py); with the
+# gate off, the file is written but never consumed, so this is a no-op stray
+# file, not a behavior change.
 
 set -euo pipefail
 
@@ -84,5 +93,9 @@ ACCOUNT=${BINDING#*$'\t'}
 
 mkdir -p "$ACCOUNTS_DIR"
 echo "$TS,$SESSION_ID,$TOKEN,$TOOL,$SLOT,$ACCOUNT" >> "$LOG"
+
+# wake-on-429: best-effort, unconditional (see comment above). Never fail the
+# hook over this.
+touch "$ACCOUNTS_DIR/wake-429" || true
 
 exit 0
