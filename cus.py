@@ -5437,6 +5437,75 @@ def _pool_rotatable_burn(state: dict, window: str, config: dict, now,
                for name in _pressure_pool_set(state, window, config))
 
 
+def _first_crossing_eta(remaining_curve, burn: float, knots, config: dict, now):
+    """Earliest ``t`` where pool slack ``g(t) = remaining_curve(t) - burn*t``
+    reaches 0, via a stdlib segmented bracket-then-bisect (Task 6, G6, §10.12,
+    committee C2 — NOT ``Σremaining/Σburn``, NOT scipy; FACT #8 pure stdlib).
+
+    ``remaining_curve`` is the (possibly-clamped) supply callable ``f(t)`` —
+    Task 5's ``_pool_remaining_curve`` for the pool ETA, Task 4's per-account
+    curve for the pinned ETA. ``burn`` is the DEMAND rate the evaluator subtracts
+    (``rotatable_burn`` for the pool; 0 for a pinned account whose own burn is
+    already drained inside its curve).
+
+    ``knots`` is the per-account reset+clamp knot list the CALLER builds from
+    ``state`` (a bare callable cannot expose its own breakpoints — §8)::
+
+        K = sorted({0, cap} ∪ {t_r,a} ∪ {t_r,a+W} ∪ Z) ∩ [0, cap]
+
+    where ``Z`` = each account's closed-form ``remaining_a(t)=0`` clamp-to-zero
+    root (finding 1) — WITHOUT which the lower clamp at 0 activates at an
+    interior point ∉ K and ``g``'s slope can jump upward mid-segment (one account
+    floors while another's reset ramp lifts it), so ``g`` dips ≤0 then recovers
+    >0 UNSEEN by an endpoint-only bracket — an unsafe under-forecast. With ``Z``
+    every clamp term is fully linear or fully floored per refined segment, so
+    ``g`` is truly monotone per segment and endpoint evaluation is sufficient.
+
+    This helper is HORIZON-AGNOSTIC — it just walks the knots it is given and
+    returns the first crossing anywhere in the supplied ``[0, cap]``. BOTH the
+    trigger/exit-ETA path (Task 9) AND the required-reduction path (Task 8) pass
+    knots capped at ``H+margin = 240`` (round-3 finding 1) so a breach/reset in
+    ``(180, 240]`` is never dropped.
+
+    Rule: ``g(0) <= 0`` → ``0.0`` (already drained); else walk consecutive
+    ``(t_i, t_{i+1})`` and at the FIRST segment with ``g(t_i) > 0`` and
+    ``g(t_{i+1}) <= 0`` bisect to ``g(t*) = 0``; if ``g > 0`` over all segments →
+    ``None``. Constants pinned: ``TTE_TOL = 0.5`` min, ``BISECT_MAX_ITERS = 64``,
+    ``EPS = 0`` (breach predicate ``g(t) <= 0``). ``config``/``now`` are accepted
+    for call-shape symmetry (the constants are pinned literals, not config).
+    Read-only (G0): evaluates the supplied closures, mutates nothing.
+    """
+    TTE_TOL = 0.5
+    BISECT_MAX_ITERS = 64
+    EPS = 0.0
+
+    def g(t: float) -> float:
+        return remaining_curve(t) - burn * t
+
+    if g(0.0) <= EPS:
+        return 0.0
+    # sorted, de-duplicated knots; 0.0 is always a segment origin (caller
+    # includes it, but guarantee it so the [0, K[0]] gap is never skipped).
+    K = sorted({0.0} | {float(k) for k in knots})
+    for i in range(len(K) - 1):
+        lo, hi = K[i], K[i + 1]
+        if hi <= lo:
+            continue
+        g_lo = g(lo)
+        g_hi = g(hi)
+        if g_lo > EPS and g_hi <= EPS:
+            for _ in range(BISECT_MAX_ITERS):
+                if (hi - lo) <= TTE_TOL:
+                    break
+                mid = 0.5 * (lo + hi)
+                if g(mid) > EPS:
+                    lo = mid
+                else:
+                    hi = mid
+            return 0.5 * (lo + hi)
+    return None
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
