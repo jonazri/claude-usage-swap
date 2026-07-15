@@ -5877,6 +5877,234 @@ def _pressure_level(triggers: list[dict], config: dict) -> dict:
             "all_binding": binding}
 
 
+# ---------------------------------------------------------------------------
+# Task 10 (spec-2 STAGE 1, Phase D burn-unit attribution): bounded
+# reverse-tail transcript reader (§8, FACT #6). Reads ONLY the trailing tail
+# of each *recently-active* transcript JSONL under ~/.claude/projects — never
+# the full 2.6 GB corpus. Timestamp-bounded, truncation/inode-safe,
+# READ-ONLY offsets (G0-analogous: `persist` gates whether the caller's
+# offset registry is mutated at all).
+#
+# Pinned constants (verbatim): RATE_WINDOW_S = rate_window_min*60;
+# TAIL_LOOKBACK_MIN = 3*rate_window_min (30 min at the G2 default
+# rate_window_min=10) bounds both the mtime "recently-active" filter and the
+# `since_ts` cutoff passed to `_reverse_tail_since`; PER_SESSION_TAIL_BYTES
+# (below) is the per-file cold-start/reset reverse-seek cap;
+# PER_CYCLE_TAIL_BYTES is `config['pressure']['tail_bytes_per_cycle']`
+# (default 64 MiB, G2) — the aggregate cap across all files read in one
+# `_read_active_tails` call. Truncation predicate: `recorded_offset >
+# current_size` => reset (`_detect_truncation`).
+# ---------------------------------------------------------------------------
+
+PER_SESSION_TAIL_BYTES = 4 * 1024 * 1024  # 4 MiB per-file cold-start/reset cap
+
+_PRESSURE_TAIL_CHUNK_BYTES = 65536  # backward-read chunk size for the reverse scan
+
+TAIL_LOOKBACK_WINDOW_MULT = 3  # TAIL_LOOKBACK_MIN = TAIL_LOOKBACK_WINDOW_MULT * rate_window_min
+
+
+def _tail_lookback_minutes(rate_window_min: float) -> float:
+    """Single source of truth for ``TAIL_LOOKBACK_MIN = 3*rate_window_min``
+    (§8). ``rate_window_min`` is config-derived -- NOT a compile-time
+    constant -- so only the multiplier is fixed (``TAIL_LOOKBACK_WINDOW_MULT``);
+    this is the one place the `3` and the resulting minutes value are
+    computed, so both call sites below stay in sync."""
+    return TAIL_LOOKBACK_WINDOW_MULT * float(rate_window_min)
+
+
+def _pressure_transcript_paths(projects_dir: Path, now: datetime,
+                                rate_window_min: float) -> list[Path]:
+    """Task 10 (§8, FACT #6): every *recently-active* transcript JSONL under
+    ``projects_dir`` — top-level ``<slug>/*.jsonl`` PLUS the nested child
+    transcripts ``<slug>/<parent-sessionId>/subagents/agent-*.jsonl`` and
+    ``<slug>/<parent-sessionId>/workflows/*.jsonl`` (FACT #6) — filtered to
+    mtime >= ``now - TAIL_LOOKBACK_MIN*60`` where
+    ``TAIL_LOOKBACK_MIN = 3*rate_window_min``. Read-only: globs + ``stat()``
+    only, never opens a file. Missing ``projects_dir`` -> ``[]``.
+    """
+    if not projects_dir.is_dir():
+        return []
+    lookback_min = _tail_lookback_minutes(rate_window_min)
+    cutoff = now - timedelta(minutes=lookback_min)
+    patterns = ("*.jsonl", "*/subagents/agent-*.jsonl", "*/workflows/*.jsonl")
+    paths: list[Path] = []
+    for slug_dir in sorted(p for p in projects_dir.iterdir() if p.is_dir()):
+        for pattern in patterns:
+            for candidate in sorted(slug_dir.glob(pattern)):
+                if not candidate.is_file():
+                    continue
+                try:
+                    mtime = datetime.fromtimestamp(candidate.stat().st_mtime,
+                                                    tz=timezone.utc)
+                except OSError:
+                    continue
+                if mtime >= cutoff:
+                    paths.append(candidate)
+    return paths
+
+
+def _detect_truncation(recorded_offset: int, current_size: int) -> bool:
+    """Task 10: pure truncation predicate — a transcript was truncated
+    (rotated/replaced) under our recorded offset iff that offset now points
+    PAST the file's current size (`recorded_offset > current_size`).
+    Equal is NOT a truncation (the file simply has no new data yet)."""
+    return recorded_offset > current_size
+
+
+def _reverse_tail_since(path: Path, since_ts: datetime, *, start_offset: int | None,
+                         byte_cap: int) -> tuple[list[dict], int, bool]:
+    """Task 10 (§8, FACT #6): bounded reverse-tail read of ONE transcript
+    JSONL. Never ``read()``s the whole file — chunked backward reads
+    (``os.SEEK_END``-anchored, ``_PRESSURE_TAIL_CHUNK_BYTES`` at a time),
+    splitting on ``\\n`` and parsing each line's ISO-ms ``timestamp``,
+    walking back only until EITHER the resume floor is reached OR the first
+    (chronologically-ordered, FACT #6) line older than ``since_ts`` is found
+    — whichever comes first scanning backward from EOF.
+
+    Steady state (``start_offset`` given, no truncation) never re-reads
+    before ``start_offset``. Cold start (``start_offset is None``) — or a
+    detected truncation (``_detect_truncation``) — seeks to
+    ``EOF - byte_cap`` (NEVER byte 0) instead.
+
+    Returns ``(lines, new_offset, reset)``: ``lines`` are the parsed JSON
+    dicts (``json.loads``) with ``timestamp >= since_ts``, oldest-first;
+    ``new_offset`` is the file's CURRENT EOF byte offset — what a caller
+    persists for next cycle's steady-state resume; ``reset`` is True iff
+    truncation was detected on this call.
+    """
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return [], (start_offset if start_offset is not None else 0), False
+
+    # Accumulate complete lines scanning backward (newest-first); `carry`
+    # holds the not-yet-newline-terminated leftmost fragment of the chunks
+    # read so far. It is only a genuine (complete) line once the walk stops
+    # exactly at `resume_floor` -- true start-of-file (0), or a prior
+    # steady-state `start_offset`, which (being a previously-recorded EOF) is
+    # always itself a line boundary. If instead the walk stops because
+    # `byte_cap` bound it short of `resume_floor`, that cut is NOT guaranteed
+    # line-aligned and the leftover fragment is safely dropped.
+    with fh:
+        current_size = fh.seek(0, os.SEEK_END)  # single consistent EOF view for this call
+
+        reset = False
+        resume_floor = 0
+        if start_offset is not None:
+            if _detect_truncation(start_offset, current_size):
+                reset = True
+            else:
+                resume_floor = start_offset
+
+        floor = max(resume_floor, current_size - max(byte_cap, 0), 0)
+
+        raw_lines: list[bytes] = []
+        boundary_hit = False
+        pos = current_size
+        carry = b""
+        while pos > floor and not boundary_hit:
+            read_size = min(_PRESSURE_TAIL_CHUNK_BYTES, pos - floor)
+            pos -= read_size
+            fh.seek(pos)
+            chunk = fh.read(read_size) + carry
+            parts = chunk.split(b"\n")
+            carry = parts[0]
+            for raw in reversed(parts[1:]):
+                if not raw.strip():
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                    ts = datetime.fromisoformat(
+                        str(parsed["timestamp"]).replace("Z", "+00:00"))
+                    older = ts < since_ts
+                except (ValueError, KeyError, TypeError):
+                    # A malformed line OR a syntactically-valid-but-NAIVE (no
+                    # Z/offset) timestamp -- comparing a naive ts against the
+                    # tz-aware since_ts raises TypeError. Either way, skip
+                    # this one line rather than crashing the whole read (a
+                    # torn/partial final line is exactly the truncation-
+                    # safety case this task is about).
+                    continue
+                if older:
+                    boundary_hit = True
+                    break
+                raw_lines.append(raw)
+
+        if not boundary_hit and pos == resume_floor and carry.strip():
+            try:
+                parsed = json.loads(carry)
+                ts = datetime.fromisoformat(
+                    str(parsed["timestamp"]).replace("Z", "+00:00"))
+                if ts >= since_ts:
+                    raw_lines.append(carry)
+            except (ValueError, KeyError, TypeError):
+                pass
+
+    lines: list[dict] = []
+    for raw in reversed(raw_lines):  # restore chronological (oldest-first) order
+        try:
+            lines.append(json.loads(raw))
+        except ValueError:
+            continue
+
+    return lines, current_size, reset
+
+
+def _read_active_tails(now: datetime, cfg: dict, offsets: dict, *,
+                        persist: bool) -> dict[Path, list[dict]]:
+    """Task 10 (§8, FACT #6, G0): read this cycle's recently-active
+    transcript tails, aggregate-bounded to
+    ``config['pressure']['tail_bytes_per_cycle']`` (default 64 MiB, G2) —
+    never the full corpus. Each file is additionally capped at
+    ``PER_SESSION_TAIL_BYTES`` per read.
+
+    ``offsets`` is the caller-owned in-memory ``path -> recorded byte
+    offset`` registry (Task 10 does not define an on-disk registry).
+    ``persist=False`` (on-demand ``--json``/CLI, G0/§3) leaves ``offsets``
+    byte-identical, so the CLI path can never race the daemon over the same
+    registry; ``persist=True`` (daemon cycle only) advances it to each
+    file's new EOF offset for next cycle's steady-state resume.
+
+    Returns ``{path: [parsed line dicts]}``. A path whose per-cycle budget
+    is exhausted before its turn still keys into the result (with whatever
+    partial/empty list it got) — low-confidence, never dropped — so a
+    caller never mistakes a merely-unread-this-cycle transcript for one
+    with zero activity. Correspondingly, when ``persist=True``: a file
+    whose ``byte_cap`` this cycle was reduced below ``PER_SESSION_TAIL_BYTES``
+    by the aggregate budget is NOT guaranteed fully read, so its
+    ``offsets[path]`` entry is left UNCHANGED (never advanced to the file's
+    new EOF) — advancing it on an incomplete read would silently and
+    permanently skip whatever wasn't actually read this cycle. The next
+    cycle (with hopefully more budget) resumes from that same,
+    still-accurate offset instead of losing data.
+    """
+    pressure_cfg = cfg.get("pressure", {})
+    rate_window_min = float(pressure_cfg.get("rate_window_min", 10))
+    lookback_min = _tail_lookback_minutes(rate_window_min)
+    since_ts = now - timedelta(minutes=lookback_min)
+    per_cycle_cap = int(pressure_cfg.get("tail_bytes_per_cycle", 64 * 1024 * 1024))
+
+    projects_dir = CLAUDE_DIR / "projects"
+    paths = _pressure_transcript_paths(projects_dir, now, rate_window_min)
+
+    result: dict[Path, list[dict]] = {}
+    budget = per_cycle_cap
+    for path in paths:
+        byte_cap = max(0, min(PER_SESSION_TAIL_BYTES, budget))
+        # The aggregate per-cycle budget cut this file's allotment below its
+        # normal per-session cap -- its read this cycle isn't guaranteed
+        # complete, so its offset must not be advanced (C1 fix).
+        starved = byte_cap < PER_SESSION_TAIL_BYTES
+        start_offset = offsets.get(path)
+        lines, new_offset, _reset = _reverse_tail_since(
+            path, since_ts, start_offset=start_offset, byte_cap=byte_cap)
+        result[path] = lines
+        budget -= byte_cap
+        if persist and not starved:
+            offsets[path] = new_offset
+    return result
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
