@@ -5601,6 +5601,80 @@ def _pinned_account_eta(acct: dict, window: str, config: dict, now, partition,
     return _first_crossing_eta(curve, 0.0, knots, config, now)
 
 
+def _required_reduction_pool(pool_curve, rotatable_burn: float, knots_rr, config: dict,
+                             now) -> dict:
+    """Smallest pool cut (reference units/min) that clears the breach to
+    ``H + exit_margin = 240`` min, as an EXACT closed-form min-ratio (Task 8, G6,
+    §5.4). Returns ``{"delta_units": float, "unmeetable": bool}``.
+
+    ``Δ* = clamp(rotatable_burn − min_{t_k ∈ K_rr, 0<t_k<=240}[pool_remaining(t_k)
+    / t_k], 0, rotatable_burn)``. The extremum of ``remaining(t)/t`` on a linear
+    segment is at a knot, so the min over ``K_rr`` is exact (no bisection).
+
+    ``knots_rr`` = ``K_rr = sorted({0, H+margin} ∪ {t_r,a} ∪ {t_r,a+W} ∪ Z_rr) ∩
+    [0, H+margin]`` — built by the CALLER from ``state`` at ``horizon=240``,
+    INCLUDING ``t=240`` itself (the final-segment min lands there — round-1
+    finding) and the ``Z_rr`` clamp-zero roots (interior kinks — round-1
+    finding). The caller MUST build ``pool_curve`` via ``_pool_remaining_curve(
+    ..., horizon=240)`` and the reset knots via ``_pressure_reset_knot(...,
+    horizon=240)`` — the SAME 240 horizon the ETA/trigger path uses (round-2/3
+    finding 1); a 180-cap on either would drop a 5h reset in ``(180, 240]`` and
+    understate the min-ratio (Δ* over-throttles).
+
+    ``unmeetable = min-ratio <= 0 at any knot`` — pool supply itself breaches
+    (pinned drain alone gates) even at zero rotatable demand → §5.4
+    escalate-before-gate. ``now`` accepted for call-shape symmetry. Read-only
+    (G0): evaluates the supplied curve, mutates nothing.
+    """
+    ratios = [pool_curve(t) / t for t in knots_rr if float(t) > 0.0]
+    if not ratios:
+        return {"delta_units": 0.0, "unmeetable": False}
+    min_ratio = min(ratios)
+    unmeetable = min_ratio <= 0.0
+    delta = rotatable_burn - min_ratio
+    delta = max(0.0, min(rotatable_burn, delta))
+    return {"delta_units": delta, "unmeetable": unmeetable}
+
+
+def _required_reduction_pinned(acct: dict, window: str, config: dict, now,
+                               partition) -> dict:
+    """Smallest per-account cut (%/min) that clears the account's PINNED-burn
+    breach to ``H + exit_margin = 240`` min (Task 8, G6, §5.3/§5.4). Returns
+    ``{"delta_pct_per_min": float, "unmeetable": bool}``.
+
+    ``Δ*_a = clamp(pinned_burn%/min − min_{t_k ∈ K_rr}[h_a(t_k)/t_k], 0,
+    pinned_burn)`` with ``h_a = (gate − pct)`` headroom on the account's
+    decayed-step curve. Computed on the account's reference-UNITS curve (the exact
+    Task-4 ``_pressure_remaining_curve`` the ETA path uses, ``horizon=240``) and
+    converted to %/min at the end: for a single account
+    ``h_a%(t) = remaining_units(t)·100/ratio`` exactly (the ``ratio/100`` factor
+    cancels in ``remaining0``, ``burn`` and the reset credit alike), so
+    ``Δ*_pct = Δ*_units · 100/ratio`` — identical to the raw-% formulation but
+    reusing one curve for both paths. The %/min form is ratio-invariant
+    (rotation-blind, M1) and compares to §5.2 candidate share%/min directly.
+
+    ``K_rr`` is built here for the single account via ``_account_knots(...,
+    horizon=240)`` — ``{0, 240}`` (240 included), its reset knots ``T_w``/
+    ``T_w+W``, and the ``Z_rr`` clamp-zero roots. A 5h reset in ``(180, 240]``
+    earns its ramp credit (finding 1), so Δ* is not over-stated by a dropped
+    reset. ``pinned_burn`` comes from ``_pinned_burn_rate`` (injected partition —
+    finding 2). ``unmeetable = min-ratio <= 0`` (pinned drain alone breaches the
+    supply) → §5.4. Read-only (G0).
+    """
+    ratio = _pressure_acct_ratio(acct, config)
+    pinned_units = _pinned_burn_rate(acct, window, partition)
+    curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
+                                      horizon=240)
+    knots = _account_knots(acct, window, config, now, pinned_units, horizon=240)
+    ratios = [curve(t) / t for t in knots if float(t) > 0.0]
+    min_ratio = min(ratios) if ratios else 0.0
+    unmeetable = min_ratio <= 0.0
+    delta_units = pinned_units - min_ratio
+    delta_units = max(0.0, min(pinned_units, delta_units))
+    delta_pct = delta_units * 100.0 / ratio if ratio else delta_units * 100.0
+    return {"delta_pct_per_min": delta_pct, "unmeetable": unmeetable}
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
