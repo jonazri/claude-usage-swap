@@ -5289,6 +5289,80 @@ def _pressure_reset_knot(acct: dict, window: str, config: dict, now,
     return None
 
 
+def _pressure_reset_ramp(t: float, T_w: float, W_w: float, R_w: float, k: float) -> float:
+    """Decayed-step reset ramp (Task 4, G5, committee #8): the fraction of the
+    constant reset credit ``R_w`` restored by minute ``t``.
+
+    ``R_w * clamp((t - T_w) / W_w, 0, 1) ** k`` — a LINEAR ramp (``k = 1.0``
+    shipped) anchored AT the reset boundary ``T_w`` and restored over the full
+    window ``W_w``. ramp is 0 for ``t <= T_w`` (no false pre-boundary headroom —
+    an in-window tail keeps burning), rises linearly to exactly ``R_w`` at
+    ``t = T_w + W_w`` (a full fresh window), and holds ``R_w`` thereafter.
+
+    ``R_w = C_w - remaining_w(0)`` is the CANONICAL constant credit (NOT a
+    boundary-anchored ``cap - remaining(t_r⁻)``); Task 5's pool curve reuses
+    this exact ramp + credit so the pool is the pointwise sum of per-account
+    curves (G6).
+    """
+    frac = (t - T_w) / W_w
+    frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
+    return R_w * (frac ** k)
+
+
+def _pressure_remaining_curve(acct: dict, window: str, config: dict, now,
+                              pinned_burn_units: float, *, horizon: float = 180,
+                              model: str = "decayed_step"):
+    """Per-account decayed-step remaining curve ``f(t)`` (Task 4, G5). ``acct``
+    is the per-account state dict; ``now`` a timezone-aware ``datetime``.
+
+    Returns the UNCLAMPED remaining as a callable of minutes-ahead ``t``::
+
+        remaining_w(t) = remaining_w(0) - pinned_burn_units*t + reset_ramp(t; k)
+
+    with ``remaining_w(0) = _pressure_remaining_units(pct, gate, ratio)``,
+    ``C_w = _pressure_cap_units(gate, ratio)``, and the constant credit
+    ``R_w = C_w - remaining_w(0) = (min(pct, gate)/100)*ratio``. The published
+    curve is ``clamp(f(t), 0, C_w)``; the UNCLAMPED callable is returned because
+    the pool sum (Task 5) applies its own per-account clamp and the pinned-ETA
+    first-crossing (Task 6/7) crosses on the unclamped expression (G5).
+
+    ``pinned_burn_units`` is INJECTED (finding 2) — the account's PINNED burn
+    component (units/min) from the Task 11 ``_partition_burn`` partition, NOT the
+    account-total ``state.burn_rate`` (which would double-count the rotatable
+    portion: subtracted here in supply AND counted as pool demand in Task 5).
+    Phase-F callers pass a synthetic value; the real value is wired at Task 20.
+
+    ``horizon`` reconciles the reset ramp with the two forecast paths (finding
+    1): the ramp is applied for any reset knot ``T_w in (0, horizon]`` (via
+    ``_pressure_reset_knot(..., horizon=horizon)``). BOTH the trigger/exit-ETA
+    path and the required-reduction path pass ``H+margin = 240`` so a 5h reset
+    in ``(180, 240]`` still earns its ramp credit; ``H = 180`` is only the ENTER
+    threshold applied downstream (Task 9). ``model`` is reserved for Task 26's
+    shadow-only ``rolling_integral`` branch; the live path is always
+    ``decayed_step``.
+
+    Read-only (G0): reads ``acct`` + resolves ``reference_x`` side-effect-free;
+    mutates nothing. Returns a fresh closure over immutable scalars.
+    """
+    gate = _pressure_gate(window, config)
+    ratio = _pressure_acct_ratio(acct, config)
+    pct = acct.get(f"current_{window}_pct", 0.0) or 0.0
+    remaining0 = _pressure_remaining_units(pct, gate, ratio)
+    cap = _pressure_cap_units(gate, ratio)
+    R_w = cap - remaining0  # == (min(pct, gate)/100)*ratio, the canonical credit
+    W_w = 300.0 if window == "5h" else 10080.0
+    k = float(config.get("pressure", {}).get("reset_decay", {}).get("ramp_k", 1.0))
+    T_w = _pressure_reset_knot(acct, window, config, now, horizon=horizon)
+
+    def f(t: float) -> float:
+        val = remaining0 - pinned_burn_units * t
+        if T_w is not None:
+            val += _pressure_reset_ramp(t, T_w, W_w, R_w, k)
+        return val
+
+    return f
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
