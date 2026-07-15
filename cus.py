@@ -12121,9 +12121,16 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
 def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
     """Write or remove SOS.md and (optionally) fire desktop notification.
 
-    Idempotent: writes the same content given the same conditions. To avoid
-    notify-send spam, we hash the conditions and only fire if it changed
-    since the last notification.
+    Idempotent: given the same substantive conditions this is a genuine no-op —
+    it does NOT rewrite SOS.md. The body embeds a volatile `_Updated <ts>_`
+    line, and `atomic_write_bytes` uses os.replace() (which bumps mtime on every
+    call), so writing unconditionally would make an mtime-based file_watch
+    re-fire indefinitely for any non-self-healing condition (this is called from
+    both the daemon poll loop and the `cus sos` CLI). We therefore normalize the
+    volatile timestamp line out of both the new body and the on-disk copy and
+    only write when the substantive content actually differs (or on first write
+    / when the file is absent). To avoid notify-send spam, we also hash the
+    conditions and only fire the desktop notification if it changed since last.
     """
     if not conditions:
         if SOS_MD.exists():
@@ -12137,7 +12144,22 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
         lines.append("")
         lines.append(c.action)
         lines.append("")
-    atomic_write_bytes(SOS_MD, ("\n".join(lines) + "\n").encode())
+    new_body = ("\n".join(lines) + "\n").encode()
+
+    # Rewrite only when the SUBSTANTIVE content changed. Strip the volatile
+    # `_Updated <timestamp>_` line (which differs on every call) from both the
+    # new body and the on-disk copy before comparing; skip the atomic write —
+    # a genuine no-op, no mtime bump — when they match.
+    def _strip_updated(b: bytes) -> bytes:
+        return re.sub(rb"(?m)^_Updated .*$", b"_Updated", b)
+
+    if SOS_MD.exists():
+        try:
+            if _strip_updated(SOS_MD.read_bytes()) == _strip_updated(new_body):
+                return
+        except OSError:
+            pass
+    atomic_write_bytes(SOS_MD, new_body)
 
     # Desktop notification — only when SOS hash changes (avoid spam every poll)
     signature = "|".join(f"{c.severity}:{c.summary}" for c in conditions)
