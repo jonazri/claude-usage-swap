@@ -5878,6 +5878,92 @@ def _pressure_level(triggers: list[dict], config: dict) -> dict:
             "all_binding": binding}
 
 
+def _fable_rate(pct_snapshots: list[tuple[str, float]]) -> float:
+    """Fable-weekly %/min burn rate DERIVED from consecutive % snapshots (Task
+    18, G8/FACT #7): the Fable per-model weekly cap exposes ONLY a % level via
+    ``accounts[name].per_model_weekly_pct["Fable"]`` (the literal string key --
+    matching the read at cus.py:5819 and the `per_model_weekly` field comment
+    at cus.py:1242) -- no per-model burn rate and no per-model reset timestamp
+    are available, unlike the 5h/7d windows which ship a real
+    ``burn_rate_*_pct_per_min``. So the rate has to be RE-DERIVED here from
+    whatever consecutive polls the caller has on hand.
+
+    ``pct_snapshots`` is a list of ``(ts, pct)`` pairs (ISO-8601 ``ts``,
+    oldest first) taken from successive polls of one account's Fable %.
+    Reuses `_compute_burn_rate` (unchanged) over the LATEST consecutive pair
+    -- same upward-only semantics as every other burn-rate estimator in this
+    file: a % that DROPS between polls means the weekly window reset between
+    them, and the clamp returns 0.0 (never negative) rather than a bogus
+    negative "rate". Fewer than two snapshots -> 0.0 (nothing to derive a
+    slope from yet).
+
+    Pure (G0): no I/O, no state mutation. The derived rate is SHADOW-ONLY in
+    v1 (see `_fable_binding`) -- it is computed (for logging/future use) but
+    never turned into an ETA that drives the binding: `_fable_binding` takes
+    no rate argument at all, so this value cannot reach it (G8's known
+    limitation -- Fable binds by LEVEL, not ETA).
+    """
+    if len(pct_snapshots) < 2:
+        return 0.0
+    old_ts, old_pct = pct_snapshots[-2]
+    new_ts, new_pct = pct_snapshots[-1]
+    return _compute_burn_rate(old_pct, new_pct, old_ts, new_ts)
+
+
+def _fable_binding(fable_pct: float | None, cfg: dict, *, reset=None) -> dict:
+    """LEVEL-bound Fable-weekly binding (Task 18, G8/FACT #7) -- a standalone,
+    directly-testable counterpart to the inline Fable trigger
+    `_pressure_triggers` builds at cus.py:5819-5825 (same cap/margin config
+    reads, same literal ``"Fable"`` key convention upstream).
+
+    Unlike every ETA-bound trigger in this file, Fable has no per-model rate
+    or reset ts to root-find a breach time from (see `_fable_rate`), so this
+    binds purely on the raw LEVEL: ``critical`` iff
+    ``fable_pct >= cap_pct - weekly_gate_margin_pct`` (defaults 95 - 2 = 93 --
+    `per_model_weekly.cap_pct` / `pressure.weekly_gate_margin_pct`, the SAME
+    two config reads `_pressure_triggers` uses for its inline Fable trigger).
+    ``eta`` and ``required_reduction`` are ALWAYS ``None`` -- there is no
+    numeric cut to compute here, only a QUALITATIVE Fable->Sonnet ask ("stop
+    routing this account's Fable-model lane, move it to Sonnet") once
+    critical. `_fable_rate`'s derived rate is deliberately NOT a parameter of
+    this function: the shadow-only rate can never feed this binding in v1,
+    by construction (there is no argument for it to arrive through).
+
+    ``reset`` is an optional caller-supplied weekly-reset PROXY -- Fable has
+    no reset timestamp of its own, so a caller that wants one passes
+    ``projected_seven_day_reset(acct, cfg, now)`` (the account's real 7d
+    reset, reused as the best available proxy for when the Fable % will next
+    drop) through this kwarg; it is carried straight into the returned dict
+    for display and otherwise plays no role in the level computation.
+
+    Pure (G0): no I/O, no state mutation.
+    """
+    pm_cfg = (cfg or {}).get("per_model_weekly", {}) or {}
+    cap_pct = float(pm_cfg.get("cap_pct", 95))
+    margin = float((cfg or {}).get("pressure", {}).get("weekly_gate_margin_pct", 2))
+    threshold = cap_pct - margin
+
+    critical = fable_pct is not None and float(fable_pct) >= threshold
+    if fable_pct is None:
+        level = "ok"
+    elif critical:
+        level = "critical"
+    else:
+        level = "elevated"
+
+    return {
+        "level": level,
+        "critical": critical,
+        "level_bound": True,
+        "eta": None,
+        "required_reduction": None,
+        "cap_pct": cap_pct,
+        "threshold_pct": threshold,
+        "fable_pct": fable_pct,
+        "reset": reset,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Task 10 (spec-2 STAGE 1, Phase D burn-unit attribution): bounded
 # reverse-tail transcript reader (§8, FACT #6). Reads ONLY the trailing tail
