@@ -5675,6 +5675,208 @@ def _required_reduction_pinned(acct: dict, window: str, config: dict, now,
     return {"delta_pct_per_min": delta_pct, "unmeetable": unmeetable}
 
 
+def _pool_knots(state: dict, window: str, config: dict, now, partition,
+                *, horizon: float) -> list[float]:
+    """The pool's reset+clamp knot set for ``window`` (Task 9/6/8 support, G6):
+    the union of every pooled account's ``_account_knots`` (``{0, horizon}`` ∪ its
+    reset knots ∪ its ``Z`` clamp-zero roots) over ``[0, horizon]``. Feeds the
+    pool ``_first_crossing_eta`` (trigger/exit-ETA) and the pool
+    ``_required_reduction`` min-ratio; both use ``horizon = H+margin = 240``.
+    Read-only (G0)."""
+    knots = {0.0, float(horizon)}
+    accounts = state.get("accounts", {})
+    for name in _pressure_pool_set(state, window, config):
+        acct = accounts.get(name, {})
+        pinned = partition.pinned_burn_units(name, window)
+        knots |= set(_account_knots(acct, window, config, now, pinned,
+                                    horizon=horizon))
+    return sorted(knots)
+
+
+def _pool_release_suppressed(state: dict, config: dict) -> bool:
+    """True while any ACTIVE (enabled) account is unpolled or its ``capacity_x``
+    is out-of-band / first-seen (Task 9, C1/I4): the pool view is uncertain, so a
+    pool-driven RELEASE (all-clear) must be suppressed and the safety factor
+    widened. The per-account pinned floor is unaffected (ratio-invariant).
+    Read-only (G0)."""
+    disabled = _disabled_accounts(config)
+    accounts = state.get("accounts", {})
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct = accounts.get(name, {})
+        if not acct.get("last_poll_ts"):  # never polled / unknown freshness
+            return True
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is None:  # capacity_x out-of-band / first-seen (unknown tier)
+            return True
+    return False
+
+
+# Enter/exit horizons (minutes). H = horizon_hours*60 is the ENTER/actionable
+# horizon; every trigger ETA is computed to H+margin=240 (round-3 finding 1) so
+# the EXIT test is evaluable in (180,240].
+_PRESSURE_EXIT_MARGIN_MIN = 60.0
+_PRESSURE_WINDOWS = ("5h", "7d")
+
+
+def _pressure_enter_horizon(config: dict) -> float:
+    """H = horizon_hours*60 (default 180) — the ENTER/actionable horizon."""
+    return float(config.get("pressure", {}).get("horizon_hours", 3)) * 60.0
+
+
+def _pressure_trigger_horizon(config: dict) -> float:
+    """H + exit_margin = 240 (default) — the horizon EVERY trigger ETA is computed
+    to, so a breach receding into (180,240] returns a real eta (not None)."""
+    margin = float(config.get("pressure", {}).get("exit_margin_hours", 1)) * 60.0
+    return _pressure_enter_horizon(config) + margin
+
+
+def _pressure_trigger_is_binding(trigger: dict) -> bool:
+    """A trigger is BINDING when its 240-horizon eta is finite (a breach in
+    [0,240], held through the exit-margin band until eta>240 i.e. None), OR it is
+    a Fable-weekly ``level_bound`` trigger, OR it is a pool trigger whose release
+    is suppressed (uncertain pool view). (Task 9, G6.)"""
+    if trigger.get("level_bound"):
+        return True
+    if trigger.get("eta") is not None:
+        return True
+    if trigger.get("view") == "pool" and trigger.get("release_suppressed"):
+        return True
+    return False
+
+
+def _pressure_triggers(state: dict, config: dict, now, partition) -> list[dict]:
+    """The independent breach triggers ``{pool:5h, pool:7d} ∪ {per-acct:5h/7d
+    ∀ active a}`` plus any Fable-weekly level-bound trigger (Task 9, G6, §3).
+
+    Each trigger is ``{view: pool|account, window, eta, binding_constraint,
+    level_bound?, release_suppressed?}``. Every breach ETA is computed at
+    ``horizon = H+margin = 240`` (round-3 finding 1) — NOT 180: passes
+    ``horizon=240`` to ``_pool_remaining_curve`` / ``_pinned_account_eta`` and
+    builds the pool ``_first_crossing_eta`` knots to ``[0, 240]``. Computing to
+    240 leaves ENTER/severity unchanged (a first crossing in [0,180] is identical
+    at either cap) but makes the level's EXIT test evaluable: a trigger breaching
+    in (180,240] gets a real eta (not None). The required-reduction Δ* (also
+    horizon=240) is NOT computed here — it is a separate Task-8 build assembled at
+    Task 20. ``partition`` is the injected Task-11 ``_partition_burn`` (finding 2;
+    tests inject a synthetic double). Read-only (G0): computes over the snapshot,
+    mutates nothing.
+    """
+    H240 = _pressure_trigger_horizon(config)
+    triggers: list[dict] = []
+
+    # --- pool triggers (one per window) ---
+    suppressed = _pool_release_suppressed(state, config)
+    for window in _PRESSURE_WINDOWS:
+        pool = _pressure_pool_set(state, window, config)
+        eta = None
+        if pool:
+            curve = _pool_remaining_curve(state, window, config, now, partition,
+                                          horizon=H240)
+            rotatable = _pool_rotatable_burn(state, window, config, now, partition)
+            knots = _pool_knots(state, window, config, now, partition, horizon=H240)
+            eta = _first_crossing_eta(curve, rotatable, knots, config, now)
+        if eta is not None or suppressed:
+            triggers.append({
+                "view": "pool", "window": window, "eta": eta,
+                "binding_constraint": f"token-pressure:pool:{window}",
+                "release_suppressed": suppressed,
+            })
+
+    # --- per-account pinned triggers (one per active account per window) ---
+    disabled = _disabled_accounts(config)
+    accounts = state.get("accounts", {})
+    pm = config.get("per_model_weekly", {})
+    fable_cap = float(pm.get("cap_pct", 95))
+    fable_margin = float(config.get("pressure", {}).get("weekly_gate_margin_pct", 2))
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts.get(name, {})
+        acct = dict(acct_state, name=name)  # inject name for the partition lookup
+        for window in _PRESSURE_WINDOWS:
+            gate = _pressure_gate(window, config)
+            pct = acct_state.get(f"current_{window}_pct", 0.0) or 0.0
+            if pct >= gate:  # OVER-GATE: skip the root-find -> immediate breach
+                eta = 0.0
+            else:
+                eta = _pinned_account_eta(acct, window, config, now, partition,
+                                          horizon=H240)
+            if eta is not None:
+                triggers.append({
+                    "view": "account", "window": window, "eta": eta,
+                    "binding_constraint": f"token-pressure:account:{name}:{window}",
+                })
+        # --- Fable-weekly level-bound trigger (binds by LEVEL, not ETA) ---
+        fable_pct = acct_state.get("per_model_weekly_pct", {}).get("Fable")
+        if fable_pct is not None and float(fable_pct) >= fable_cap - fable_margin:
+            triggers.append({
+                "view": "account", "window": "7d", "eta": 0.0,
+                "binding_constraint": f"token-pressure:account:{name}:fable",
+                "level_bound": True,
+            })
+    return triggers
+
+
+def _pressure_binding(triggers: list[dict]) -> dict | None:
+    """The single MOST-SEVERE binding trigger (Task 9, G6): earliest breach-ETA
+    across {pool-exhaustion, per-account pinned-burn}; a pool↔per-account TIE goes
+    to the per-account view (it WINS the targeting binding). A level_bound /
+    over-gate trigger has eta 0.0 (earliest). A release-suppressed pool with no
+    breach (eta None) ranks last (least severe). Returns ``None`` when nothing is
+    binding."""
+    binding = [t for t in triggers if _pressure_trigger_is_binding(t)]
+    if not binding:
+        return None
+
+    def sort_key(t: dict):
+        eta = t.get("eta")
+        eta_eff = eta if eta is not None else float("inf")
+        view_rank = 0 if t.get("view") == "account" else 1  # account wins ties
+        return (eta_eff, view_rank)
+
+    return min(binding, key=sort_key)
+
+
+def _pressure_level(triggers: list[dict], config: dict) -> dict:
+    """Fold the independent triggers into one ``ok|elevated|critical`` level
+    (Task 9, G6, committee #6). Returns ``{"level", "binding", "all_binding"}``.
+
+    Each trigger's ``eta`` is the 240-horizon value from ``_pressure_triggers``.
+    A trigger is BINDING iff its eta is finite (≤240 — held through the
+    exit-margin band; it clears only when eta>240 i.e. None), or it is a
+    level_bound trigger, or a release-suppressed pool trigger. ENTER thresholds
+    on the 240-horizon eta (unchanged): ``critical`` iff any binding trigger has
+    ``eta < critical_eta_min`` (60) or is ``level_bound`` (Fable within margin of
+    gate); otherwise ``elevated``. ``level = ok`` only when NOTHING is binding —
+    i.e. EVERY currently-binding trigger's 240-horizon eta exceeds 240 (a level
+    DECREASE requires ALL binding to clear; the ``exit_dwell_min`` is applied
+    downstream in Stage 2). ``binding`` is the most-severe trigger
+    (``_pressure_binding``; pool↔account tie -> account). Read-only.
+    """
+    critical_eta = float(config.get("pressure", {}).get("critical_eta_min", 60))
+    binding = [t for t in triggers if _pressure_trigger_is_binding(t)]
+    if not binding:
+        return {"level": "ok", "binding": None, "all_binding": []}
+
+    def is_critical(t: dict) -> bool:
+        if t.get("level_bound"):
+            return True
+        eta = t.get("eta")
+        return eta is not None and eta < critical_eta
+
+    level = "critical" if any(is_critical(t) for t in binding) else "elevated"
+    return {"level": level, "binding": _pressure_binding(triggers),
+            "all_binding": binding}
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
