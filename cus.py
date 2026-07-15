@@ -5363,6 +5363,80 @@ def _pressure_remaining_curve(acct: dict, window: str, config: dict, now,
     return f
 
 
+def _pool_remaining_curve(state: dict, window: str, config: dict, now,
+                          partition, *, horizon: float = 180):
+    """Staggered-reset pool remaining curve ``f(t)`` (Task 5, G6, §10.12).
+
+    ``pool_remaining(t) = Σ_{a ∈ _pressure_pool_set} clamp(remaining_a(t), 0,
+    C_a)`` where each ``remaining_a`` is Task 4's ``_pressure_remaining_curve``
+    built with account ``a``'s OWN reset knot and its PINNED burn from the
+    injected ``partition``, reusing the SAME decayed-step ramp + constant credit
+    ``R_a = C_a - remaining_a(0)``. Because every per-account term is the exact
+    Task-4 curve, this is provably the pointwise sum of those curves (G6). Each
+    account's cap ``C_a`` is computed with the SAME ``_pressure_acct_ratio`` the
+    per-account curve uses, so the clamp bounds match exactly.
+
+    Pool SUPPLY is drained by projected PINNED burn (subtracted inside each
+    ``remaining_a``) — CONSERVATIVE, moving any exhaustion ETA only earlier
+    (§3 hazard-b). Pool DEMAND (rotatable burn) is NOT here; it is
+    ``_pool_rotatable_burn`` (the ``rotatable_burn·t`` term the first-crossing
+    evaluator subtracts, Task 6).
+
+    ``partition`` is the injected Task 11 ``_partition_burn`` output (finding 2)
+    — Phase F cannot reach the per-session split via ``state``; tests inject a
+    synthetic double, real wiring lands at Task 20. It exposes
+    ``pinned_burn_units(name, window)`` in units/min per pooled account.
+
+    ``horizon`` threads through to each per-account curve (finding 1): BOTH the
+    trigger/exit-ETA caller (Task 9 via Task 6) AND the required-reduction
+    caller (Task 8) pass ``H+margin = 240`` so a 5h reset in ``(180, 240]``
+    contributes its ramp credit out to 240 (else the pool ETA is under-forecast
+    and the level's exit test is blind in that band). Read-only (G0): builds
+    fresh per-account closures over the deep-copied ``state``, mutates nothing.
+    """
+    gate = _pressure_gate(window, config)
+    accounts = state.get("accounts", {})
+    per_acct = []  # (curve, cap) per pooled account
+    for name in _pressure_pool_set(state, window, config):
+        acct = accounts.get(name, {})
+        pinned_units = partition.pinned_burn_units(name, window)
+        curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
+                                          horizon=horizon)
+        cap = _pressure_cap_units(gate, _pressure_acct_ratio(acct, config))
+        per_acct.append((curve, cap))
+
+    def f(t: float) -> float:
+        total = 0.0
+        for curve, cap in per_acct:
+            v = curve(t)
+            if v < 0.0:
+                v = 0.0
+            elif v > cap:
+                v = cap
+            total += v
+        return total
+
+    return f
+
+
+def _pool_rotatable_burn(state: dict, window: str, config: dict, now,
+                         partition) -> float:
+    """Total ROTATABLE burn demand on the pool (Task 5, G6, C1): ``Σ_{a ∈
+    _pressure_pool_set} rotatable_burn_units_a`` from the injected ``partition``
+    (Task 11 ``_partition_burn`` — finding 2).
+
+    Only the rotatable component of each pooled account's burn counts as pool
+    demand; the PINNED component is excluded here (it drains supply inside
+    ``_pool_remaining_curve`` and drives the per-account safety floor, Task 7).
+    Disjoint by construction (C1): the partition guarantees each session's
+    rotatable and pinned components are disjoint and sum to its total. ``now``
+    is accepted for call-shape symmetry (a burn RATE is time-invariant).
+    Read-only (G0).
+    """
+    return sum(partition.rotatable_burn_units(name, window)
+               for name in _pressure_pool_set(state, window, config))
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
