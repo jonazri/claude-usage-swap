@@ -8024,7 +8024,44 @@ def decide_swap(
 
     active_acct = state["accounts"][current]
     cur_usage = usage_by_account.get(current)
+    # Per-model weekly cap is a HARD invariant that poll_account_usage persists
+    # into state.json (`per_model_weekly_pct`) on every poll. Read it from
+    # persisted state here — BEFORE the no-fresh-poll guard — so the force-swap-OFF
+    # side is SYMMETRIC with target selection, which already consults persisted
+    # per-model via `_max_model_weekly_from_acct`. Without this, an account backing
+    # a live lane that is NOT the freshly-polled active mount (inactive cadence
+    # ~600s) has no `usage_by_account` entry, so the guard below used to
+    # `return None` ("no fresh usage poll") BEFORE reaching Trigger 1 — leaving the
+    # lane pinned at e.g. Fable 100% until its next poll landed (found 2026-07-05:
+    # `cus launch auto` on 'default' at Fable 100% never force-swapped because
+    # 'default' polled slow while another account held the mount).
+    model_cap = _model_weekly_cap_for_config(config)
+    persisted_model = _max_model_weekly_from_acct(active_acct, config)
     if cur_usage is None:
+        # No fresh poll this cycle: the aggregate 5h/7d ladder can't be judged (it
+        # needs live window data), but the per-model hard cap CAN — from the last
+        # persisted read. Enforce only that here; everything else still correctly
+        # waits for a fresh poll.
+        if persisted_model > 0 and persisted_model >= model_cap:
+            target = pick_swap_target(state, config)
+            if target is None or (
+                "[DEGRADED:" in target.reason and "no targets below 7d cap" in target.reason
+            ):
+                _note("model_cap_no_target", "hold",
+                      f"{current} model-week {persisted_model:.1f}% >= {model_cap}% "
+                      f"but no eligible swap target")
+                return None
+            reason = (f"per-model weekly cap: {current} model-week {persisted_model:.1f}% "
+                      f">= {model_cap}% (persisted; no fresh poll this cycle); "
+                      f"target: {target.reason}")
+            _note("hard_7d_cap", "swap", reason)
+            return SwapDecision(
+                target=target.name,
+                reason=reason,
+                tier=determine_tier(active_acct, config),
+                gate="hard_7d_cap",
+                deferrable=False,
+            )
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
@@ -8073,8 +8110,10 @@ def decide_swap(
     # The model comparison uses its own threshold (per_model_weekly.cap_pct,
     # falling back to hard_7d_cap) so e.g. "Fable at 90" can coexist with an
     # aggregate ceiling of 80.
-    cur_model = _max_model_weekly_from_usage(cur_usage, config)
-    model_cap = _model_weekly_cap_for_config(config)
+    # Take the max of the fresh-poll reading and the persisted reading (computed
+    # above, next to the no-fresh-poll guard) so a maxed model trips regardless of
+    # whether this cycle repolled the account. model_cap is already set above.
+    cur_model = max(_max_model_weekly_from_usage(cur_usage, config), persisted_model)
     # Fix A: force the hard-cap trips on the burn-EXTRAPOLATED values, not the
     # stale poll. Aggregate 7d extrapolates via estimate_window_pct (same base as
     # cur_usage.seven_day.utilization — they're synced by update_state_with_usage).

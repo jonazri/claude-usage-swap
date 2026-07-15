@@ -181,6 +181,7 @@ EXPECTED: dict[Fingerprint, str] = {
     ("decide_slot_swaps", "pick_swap_target", 1): "ctx",  # L8461 task-5: fan-out re-pick shim2 carries fresh claim-aware stashed ctx
     ("decide_swap", "pick_swap_target", 1): "ctx",  # L7708 task-5: threads ctx via caller's stashed state + picker self-build fallback
     ("decide_swap", "pick_swap_target", 2): "ctx",  # L7986 task-5: threads ctx via caller's stashed state + picker self-build fallback
+    ("decide_swap", "pick_swap_target", 3): "ctx",  # per-model port 2026-07-05: persisted per-model hard-cap force-swap on no-fresh-poll; threads ctx via caller's stashed state + picker self-build fallback
     ("diagnose", "pick_swap_target", 1): "ctx",  # L11159 task-5: SOS Condition 2b shim carries stashed ctx (G8/formula 2)
     ("diagnose", "pick_swap_target", 2): "ctx",  # L11173 task-5: premium-degrade probe reuses same ctx-stashed shim
     ("one_cycle", "decide_swap", 1): "ctx",  # L15844 task-5: decide_state shim carries stashed ctx
