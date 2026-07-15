@@ -5506,6 +5506,101 @@ def _first_crossing_eta(remaining_curve, burn: float, knots, config: dict, now):
     return None
 
 
+def _account_zero_roots(rem_fn, seg_knots, cap: float) -> list[float]:
+    """Clamp-to-zero roots ``Z`` in ``(0, cap]`` of a piecewise-linear
+    per-account remaining curve (Task 6/8 knot support, G6 finding 1).
+
+    ``rem_fn`` is the UNCLAMPED per-account curve (Task 4); ``seg_knots`` are its
+    interior breakpoints (the account's reset knot ``T_w`` and ``T_w+W``), which
+    split it into linear pieces. On each linear segment the curve crosses 0 at
+    most once; the root is found by linear interpolation between straddling
+    endpoints (no per-segment algebra). These roots are exactly where the pool
+    sum's per-account lower clamp at 0 activates — supplying them as knots keeps
+    ``g`` monotone per refined segment for ``_first_crossing_eta`` and makes the
+    ``_required_reduction`` min-ratio exact at interior kinks. Read-only (G0).
+    """
+    pts = sorted({0.0, float(cap)}
+                 | {float(k) for k in seg_knots if 0.0 < float(k) < cap})
+    roots: list[float] = []
+    for i in range(len(pts) - 1):
+        ta, tb = pts[i], pts[i + 1]
+        va, vb = rem_fn(ta), rem_fn(tb)
+        if (va > 0.0 and vb < 0.0) or (va < 0.0 and vb > 0.0):
+            root = ta + (tb - ta) * va / (va - vb)
+            if 0.0 < root <= cap:
+                roots.append(root)
+        elif vb == 0.0 and 0.0 < tb <= cap:
+            roots.append(tb)
+    return roots
+
+
+def _account_knots(acct: dict, window: str, config: dict, now,
+                   pinned_burn_units: float, *, horizon: float) -> list[float]:
+    """Per-account reset+clamp knot set ``sorted({0, horizon} ∪ {T_w} ∪ {T_w+W}
+    ∪ Z) ∩ [0, horizon]`` for the first-crossing / required-reduction evaluators
+    (Task 6/7/8, G6). ``acct`` is the per-account state dict; ``pinned_burn_units``
+    the account's injected pinned burn (units/min). Read-only (G0)."""
+    knots = {0.0, float(horizon)}
+    seg: list[float] = []
+    T = _pressure_reset_knot(acct, window, config, now, horizon=horizon)
+    if T is not None:
+        knots.add(T)
+        seg.append(T)
+        W = 300.0 if window == "5h" else 10080.0
+        tb = T + W
+        if 0.0 < tb <= horizon:
+            knots.add(tb)
+            seg.append(tb)
+    rem = _pressure_remaining_curve(acct, window, config, now, pinned_burn_units,
+                                    horizon=horizon)
+    for root in _account_zero_roots(rem, seg, horizon):
+        knots.add(root)
+    return sorted(knots)
+
+
+def _pinned_burn_rate(acct, window: str, partition) -> float:
+    """The PINNED (non-rotatable) component of an account's burn, in reference
+    units/min, from the injected Task-11 ``_partition_burn`` partition (Task 7,
+    finding 2, C1/M1).
+
+    ``acct`` is the per-account state dict carrying its ``"name"`` (a bare name
+    string is also accepted); the partition is name-keyed per the Task-5 protocol
+    (``pinned_burn_units(name, window)``, units/min). This is the raw observed
+    rate — NEVER discounted "will rotate" (M1). Phase F cannot reach the
+    per-session split via ``state`` (which carries only the account-total
+    ``burn_rate_*_pct_per_min``): the pinned component is a Phase-D product,
+    injected here and wired for real at Task 20. Read-only (G0).
+    """
+    name = acct.get("name") if isinstance(acct, dict) else acct
+    return float(partition.pinned_burn_units(name, window))
+
+
+def _pinned_account_eta(acct: dict, window: str, config: dict, now, partition,
+                        *, horizon: float = 180) -> float | None:
+    """Per-account pinned-burn safety-floor ETA (Task 7, G6 §7, C1/M1): the first
+    ``t`` where account ``acct``'s PINNED burn ALONE drives its own decayed-step
+    remaining curve to 0, independent of pool health.
+
+    Builds Task 4's decayed-step curve with the account's PINNED burn from
+    ``partition`` (``_pinned_burn_rate``), builds the account's OWN reset+clamp
+    knots to ``[0, horizon]`` (``_account_knots``), and crosses via
+    ``_first_crossing_eta`` with ``burn=0`` — the pinned burn is already drained
+    inside the curve, so ``g(t) = remaining_a(t)``. Over gate (``pct >= gate``)
+    ⇒ ``remaining0 = 0`` ⇒ ``g(0) <= 0`` ⇒ ``0.0`` (immediate).
+
+    ``horizon`` DECOUPLES the pinned ETA from a hardcoded 180 (round-3 finding 1):
+    ``_pressure_triggers`` (Task 9) passes ``horizon = H+margin = 240`` so the
+    level's EXIT test can see a pinned breach receding in ``(180, 240]`` (a
+    within-180 breach is identical at either cap). Tests inject a synthetic
+    partition; the real value is wired at Task 20. Read-only (G0).
+    """
+    pinned_units = _pinned_burn_rate(acct, window, partition)
+    curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
+                                      horizon=horizon)
+    knots = _account_knots(acct, window, config, now, pinned_units, horizon=horizon)
+    return _first_crossing_eta(curve, 0.0, knots, config, now)
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
