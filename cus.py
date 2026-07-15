@@ -7237,6 +7237,401 @@ def _nnls(M: list[list[float]], y: list[float], *, max_iter: int) -> tuple[list[
     return x, converged
 
 
+# --- Task 16 (spec-2 token-pressure forecaster, STAGE 1): the full
+# constrained burn-weight fit -- composes Task 15's `_nnls` with a
+# monotone-prior reparam, a scaled seed, Tikhonov regularization anchored on
+# that seed, a condition-number fallback, and a min-windows guard. Pure
+# Python (FACT #8/G4, NO numpy/scipy) and deterministic end to end (every
+# loop below is a fixed ascending `range()` pass, never a dict/set, matching
+# `_nnls`'s own determinism contract).
+
+# Pinned column order -- do NOT reorder; every positional list in this file
+# (Task 14's `_build_weight_windows` output, Task 15/16's reparam) is keyed
+# to this order.
+_PRESSURE_WEIGHT_COLUMNS = ("input", "output", "cache_read", "cache_create_5m", "cache_create_1h")
+
+# Default seed weights (relative units -- scaled by `_scaled_seed` before
+# use), PINNED per G4: output costs ~5x input, cache writes are cheap
+# relative to a cache_read, and the write premium grows with TTL.
+_PRESSURE_DEFAULT_SEEDS_REL = [1.0, 5.0, 0.1, 1.25, 2.0]
+
+# Monotone-prior reparam matrix T (PINNED, G4): w = T @ x, x >= 0 turns
+# EVERY prior into a pure non-negativity constraint on x -- no QP needed.
+# Row k of T is the coefficients of x in w_k:
+#   w[0] = x0                    (input)
+#   w[1] = x0 + x1                (output)          -> output >= input >= 0
+#   w[2] = x2                    (cache_read)
+#   w[3] = x2 + x3                (cache_create_5m)  -> cache_create_5m >= cache_read
+#   w[4] = x2 + x3 + x4           (cache_create_1h)  -> cache_create_1h >= cache_create_5m
+_PRESSURE_WEIGHT_T: list[list[float]] = [
+    [1.0, 0.0, 0.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0, 1.0, 1.0],
+]
+
+# "Populated column" relative tolerance (G4): a column counts as populated
+# when its L2 norm is >= this fraction of the max column's L2 norm. Shared
+# by `_condition_number` (restricts the Gram/kappa computation to populated
+# columns) and `fit_burn_weights` (labels every OTHER column `seed_pinned`).
+_PRESSURE_POPULATED_COL_REL_TOL = 1e-6
+
+# Jacobi eigenvalue routine bounds (G4): a compact, deterministic,
+# stdlib-only symmetric-eigenvalue solver for the (<=5x5) populated-column
+# Gram matrix -- cyclic sweeps over ascending (row, col) pairs, never a
+# "largest off-diagonal" search (which would still be deterministic, but
+# sweeps are simpler and match the G4 "<=50 sweeps" framing).
+_PRESSURE_JACOBI_MAX_SWEEPS = 50
+_PRESSURE_JACOBI_OFFDIAG_TOL = 1e-12
+
+# Condition-number singularity guard (G4): lmin <= this fraction of lmax
+# means the populated-column Gram is numerically singular -- report kappa
+# as infinity rather than a huge-but-finite number that could slip under an
+# operator's `cond_max` by accident.
+_PRESSURE_COND_SINGULAR_REL_TOL = 1e-12
+
+
+def _pressure_populated_columns(A: list[list[float]]) -> list[int]:
+    """Indices of A's columns that carry real signal (Task 16, G4): a
+    column's L2 norm >= ``_PRESSURE_POPULATED_COL_REL_TOL`` times the
+    MAX column's L2 norm. An all-zero (or near-zero) token-type column --
+    e.g. ``cache_create_5m`` before that tier is ever exercised -- is
+    EXCLUDED here, which is what keeps a single unpopulated column from
+    both (a) polluting `_condition_number`'s kappa (it would otherwise
+    contribute a near-zero eigenvalue to the Gram, blowing kappa up for a
+    reason that has nothing to do with the columns that DO have data), and
+    (b) getting reported as anything other than `seed_pinned` -- its weight
+    is determined by the Tikhonov seed anchor alone, never real data.
+
+    Pure (G0): reads A, mutates nothing. Empty/degenerate A (no rows, no
+    columns, or every column exactly zero) returns ``[]``.
+    """
+    n = len(A)
+    k = len(A[0]) if n else 0
+    if k == 0:
+        return []
+    col_l2 = []
+    for j in range(k):
+        s = 0.0
+        for i in range(n):
+            v = A[i][j]
+            s += v * v
+        col_l2.append(math.sqrt(s))
+    max_col_l2 = max(col_l2)
+    if max_col_l2 <= 0.0:
+        return []
+    threshold = _PRESSURE_POPULATED_COL_REL_TOL * max_col_l2
+    return [j for j in range(k) if col_l2[j] >= threshold]
+
+
+def _condition_number(A: list[list[float]]) -> float:
+    """``kappa = sqrt(lmax / lmin)`` of the populated-column Gram of the
+    ORIGINAL token-mix matrix A (Task 16, G4) -- NEVER the reparam ``A @ T``
+    (T's monotone-prior structure would distort the condition read: e.g. a
+    genuinely well-conditioned A can produce a poorly-conditioned ``A @ T``
+    purely from T's chained-sum rows, which says nothing about the DATA).
+
+    Restricted to `_pressure_populated_columns(A)` (G4): an unpopulated
+    column (all-zero token type) must NOT trip the condition fallback --
+    its own near-zero column would otherwise contribute a near-zero
+    eigenvalue and blow kappa up for a reason unrelated to the columns that
+    DO carry data. A single populated column is trivially well-conditioned
+    (``kappa = 1.0`` -- there is nothing for it to be collinear WITH). Zero
+    populated columns (a fully empty/degenerate A) returns infinity, same
+    as a genuinely singular Gram.
+
+    Eigenvalues come from a compact CYCLIC Jacobi eigenvalue routine
+    (Golub & Van Loan / the classic symmetric Jacobi rotation) run directly
+    on the populated-column Gram matrix (<=5x5, so this is cheap): up to
+    `_PRESSURE_JACOBI_MAX_SWEEPS` full sweeps over every ascending
+    ``(row, col)`` pair with ``row < col``, each sweep stopping early once
+    every off-diagonal magnitude is <= `_PRESSURE_JACOBI_OFFDIAG_TOL`. Pure
+    Python (FACT #8/G4, NO numpy/scipy) and deterministic: sweeps iterate
+    ascending indices only, never a dict/set.
+
+    ``lmin <= _PRESSURE_COND_SINGULAR_REL_TOL * lmax`` (G4) is treated as
+    numerically singular -> ``kappa = inf`` rather than a huge-but-finite
+    ratio a caller's `cond_max` threshold could accidentally miss.
+
+    Pure (G0): reads A, mutates nothing, no I/O.
+    """
+    n = len(A)
+    populated = _pressure_populated_columns(A)
+    p = len(populated)
+    if n == 0 or p == 0:
+        return float("inf")
+    if p == 1:
+        return 1.0
+
+    # Populated-column Gram: G[a][b] = dot(col(populated[a]), col(populated[b])).
+    G = [[0.0] * p for _ in range(p)]
+    for a in range(p):
+        ca = populated[a]
+        for b in range(a, p):
+            cb = populated[b]
+            s = 0.0
+            for i in range(n):
+                s += A[i][ca] * A[i][cb]
+            G[a][b] = s
+            G[b][a] = s
+
+    for _sweep in range(_PRESSURE_JACOBI_MAX_SWEEPS):
+        max_off = 0.0
+        for a in range(p):
+            for b in range(a + 1, p):
+                v = abs(G[a][b])
+                if v > max_off:
+                    max_off = v
+        if max_off <= _PRESSURE_JACOBI_OFFDIAG_TOL:
+            break
+        for pi in range(p):
+            for qi in range(pi + 1, p):
+                apq = G[pi][qi]
+                if apq == 0.0:
+                    continue
+                app = G[pi][pi]
+                aqq = G[qi][qi]
+                theta = (aqq - app) / (2.0 * apq)
+                if theta >= 0.0:
+                    t = 1.0 / (theta + math.sqrt(1.0 + theta * theta))
+                else:
+                    t = -1.0 / (-theta + math.sqrt(1.0 + theta * theta))
+                c = 1.0 / math.sqrt(1.0 + t * t)
+                s = t * c
+                G[pi][pi] = app - t * apq
+                G[qi][qi] = aqq + t * apq
+                G[pi][qi] = 0.0
+                G[qi][pi] = 0.0
+                for i in range(p):
+                    if i == pi or i == qi:
+                        continue
+                    aip = G[i][pi]
+                    aiq = G[i][qi]
+                    G[i][pi] = c * aip - s * aiq
+                    G[pi][i] = G[i][pi]
+                    G[i][qi] = s * aip + c * aiq
+                    G[qi][i] = G[i][qi]
+
+    eigenvalues = [G[a][a] for a in range(p)]
+    lmax = max(eigenvalues)
+    lmin = min(eigenvalues)
+    if lmax <= 0.0 or lmin <= _PRESSURE_COND_SINGULAR_REL_TOL * lmax:
+        return float("inf")
+    return math.sqrt(lmax / lmin)
+
+
+def _scaled_seed(
+    A: list[list[float]],
+    b: list[float],
+    w_seed_rel: list[float],
+    *,
+    clamp: tuple[float, float] = (1e-6, 1e6),
+) -> tuple[list[float], float]:
+    """The Task 16 scaled seed (G4): a single scalar ``s`` that puts the
+    RELATIVE seed weights ``w_seed_rel`` at roughly the right absolute
+    scale for THIS fleet's actual burn, found by the closed-form
+    least-squares scale that best explains ``b`` from ``A @ w_seed_rel``::
+
+        s = dot(b, A @ w_seed_rel) / dot(A @ w_seed_rel, A @ w_seed_rel)
+
+    clamped to ``clamp`` (default ``[1e-6, 1e6]``, overridden by the caller
+    from ``pressure.weight_refit.seed_scale_clamp``). Returns
+    ``(w_seed, seed_scale)`` where ``w_seed = s * w_seed_rel`` -- this is
+    BOTH a possible final answer (the `seed-fallback` source) AND the
+    Tikhonov anchor `fit_burn_weights` regularizes the NNLS fit toward.
+
+    INVALID ``s`` (non-finite, <= 0, or a degenerate/zero
+    ``dot(Aw, Aw)`` denominator -- e.g. ``A`` is empty or ``w_seed_rel`` is
+    entirely orthogonal to every row) falls all the way back to the RAW,
+    UNSCALED seed: ``w_seed = w_seed_rel`` (i.e. as if ``s = 1``). The
+    returned ``seed_scale`` in that case is ``math.nan`` -- an unambiguous
+    "invalid" signal to the caller (never colliding with a real clamped
+    scale, which is always finite in ``clamp``); `fit_burn_weights`
+    publishes ``1.0`` in the output for this case, matching the ``s = 1``
+    semantics, while using ``math.isfinite`` on this raw return to decide
+    the SOURCE branch.
+
+    Pure (G0): reads A/b/w_seed_rel, mutates nothing, no I/O.
+    """
+    Aw = _matvec(A, w_seed_rel)
+    denom = _dot(Aw, Aw)
+    if denom == 0.0 or not math.isfinite(denom):
+        return list(w_seed_rel), math.nan
+    s = _dot(b, Aw) / denom
+    if not math.isfinite(s) or s <= 0.0:
+        return list(w_seed_rel), math.nan
+    lo, hi = clamp
+    s = min(max(s, lo), hi)
+    return [s * wi for wi in w_seed_rel], s
+
+
+def _pressure_apply_T(A: list[list[float]]) -> list[list[float]]:
+    """``A @ T`` for the PINNED Task 16 reparam matrix `_PRESSURE_WEIGHT_T`
+    (5x5) -- the x-space design matrix `fit_burn_weights` runs NNLS on,
+    since ``A @ w = A @ (T @ x) = (A @ T) @ x``. Computed via `_dot` on
+    T's columns (T is a small fixed constant, not worth a generic n x 5 x 5
+    matmul primitive). Pure (G0)."""
+    T = _PRESSURE_WEIGHT_T
+    k = len(T[0])
+    cols = [[T[row][j] for row in range(len(T))] for j in range(k)]
+    return [[_dot(row, col) for col in cols] for row in A]
+
+
+def _pressure_residual_fraction(A: list[list[float]], b: list[float], w: list[float]) -> float:
+    """``||A @ w - b|| / ||b||`` (Task 16, G4) -- published on every
+    `fit_burn_weights` result regardless of source, so a caller can see fit
+    quality even when the source is `seed-fallback` or `insufficient-data`
+    (both still have a concrete ``w`` to score against ``(A, b)``).
+    ``b`` all-zero (degenerate) reports 0.0 if the residual is also exactly
+    zero, else infinity -- never a ZeroDivisionError."""
+    Aw = _matvec(A, w)
+    resid = [b[i] - Aw[i] for i in range(len(b))]
+    resid_norm = math.sqrt(_dot(resid, resid))
+    b_norm = math.sqrt(_dot(b, b))
+    if b_norm == 0.0:
+        return 0.0 if resid_norm == 0.0 else float("inf")
+    return resid_norm / b_norm
+
+
+def fit_burn_weights(
+    A: list[list[float]],
+    b: list[float],
+    seeds_rel: list[float] | None,
+    cfg: dict,
+) -> dict:
+    """The full constrained burn-weight fit (Task 16, G4) -- composes
+    Task 15's `_nnls` with the monotone-prior reparam (`_PRESSURE_WEIGHT_T`),
+    a scaled seed (`_scaled_seed`), Tikhonov regularization anchored on that
+    seed, a condition-number fallback (`_condition_number`), and a
+    min-windows guard, to fit the 5 pinned per-token-type burn weights from
+    Task 14's ``(A, b)`` windows.
+
+    INPUTS: ``A``/``b`` as `_build_weight_windows` (Task 14) returns them
+    (``A`` rows in `_PRESSURE_WEIGHT_COLUMNS` order, ``b`` index-aligned,
+    tier-normalized Δburn). ``seeds_rel`` -- the RELATIVE seed weights,
+    defaulting to `_PRESSURE_DEFAULT_SEEDS_REL` when falsy. ``cfg`` -- the
+    FULL top-level config; this reads ``cfg["pressure"]["weight_refit"]``
+    (G4 defaults below), matching every other `_pressure_*` config read in
+    this file. ``weight_refit.enabled``/``refit_every_min`` are config-only
+    here -- the actual refit CADENCE (when to call this at all) is wired
+    later (Task 21+); this function always computes a fit when called.
+
+    REPARAM (G4): solves for ``x >= 0`` via ``w = T @ x``
+    (`_PRESSURE_WEIGHT_T`), which turns EVERY monotone prior
+    (``output >= input >= 0``, ``0 <= cache_read <= cache_create_5m <=
+    cache_create_1h``) into pure non-negativity on ``x`` -- no QP needed,
+    just NNLS.
+
+    OBJECTIVE (G4): ONE Tikhonov-augmented NNLS call on
+    ``M = [A @ T ; sqrt(lambda) @ T]``, ``y = [b ; sqrt(lambda) * w_seed]``,
+    where ``lambda = tikhonov_alpha * mean_j ||col_j(A @ T)||^2``
+    (scale-invariant -- ties the regularization strength to the actual
+    magnitude of the design matrix, not an arbitrary constant). The
+    ``sqrt(lambda) @ T`` block (NOT ``sqrt(lambda) @ I``) means the penalty
+    term is ``lambda * ||T @ x - w_seed||^2 == lambda * ||w - w_seed||^2``
+    -- it regularizes the ACTUAL fitted weight vector ``w`` toward the
+    seed, not the latent ``x`` toward an arbitrary point.
+
+    SOURCE SELECTION (G4, checked in this order):
+
+      1. ``n_windows < weight_refit.min_windows`` -> ``"insufficient-data"``:
+         raw, UNSCALED seeds (``s = 1``, ``w = w_seed_rel``). Too few
+         windows to trust ANY scale/fit estimate.
+      2. Else, if the populated-column condition number exceeds
+         ``weight_refit.cond_max``, OR `_scaled_seed`'s ``s`` was invalid
+         -> ``"seed-fallback"``: ``w = w_seed`` (the SCALED seed when ``s``
+         was valid, else the unscaled seed as if ``s = 1`` -- see
+         `_scaled_seed`). The NNLS call is skipped entirely in this branch
+         -- there is no point running (and no sound Tikhonov anchor to run
+         it with) when the premise (a usable scale, a well-conditioned
+         design) already failed.
+      3. Else, run the Tikhonov-augmented NNLS. If it does NOT converge
+         (`_nnls`'s own ``max_iter`` exhaustion) -> ``"seed-fallback"``
+         again (``w = w_seed``, the scaled seed -- ``s`` WAS valid here).
+      4. Else -> ``"fit"``: ``w = T @ x``.
+
+    ``seed_pinned`` (G4) lists the `_PRESSURE_WEIGHT_COLUMNS` names of
+    every UNPOPULATED original column (`_pressure_populated_columns`),
+    regardless of source -- purely descriptive of which weights have no
+    real data behind them (and are therefore riding the Tikhonov seed
+    anchor alone when the source is `"fit"`, or the seed outright
+    otherwise). An unpopulated column never trips the condition fallback
+    on its own (`_condition_number` already excludes it).
+
+    OUTPUT: ``{weights, source, condition_number, residual_fraction,
+    n_windows, seed_scale, seed_pinned}`` -- ``weights`` a dict keyed by
+    `_PRESSURE_WEIGHT_COLUMNS`; ``residual_fraction`` always
+    `_pressure_residual_fraction(A, b, weights)` for whatever ``w`` was
+    ultimately chosen; ``condition_number``/``seed_pinned`` always computed
+    (cheap, useful observability regardless of source).
+
+    Pure (G0): reads A/b/seeds_rel/cfg, mutates nothing, no I/O, no
+    ``save_state`` -- this is a computation over caller-supplied windows,
+    never a state mutation itself.
+    """
+    weight_refit_cfg = (cfg or {}).get("pressure", {}).get("weight_refit", {}) or {}
+    min_windows = int(weight_refit_cfg.get("min_windows", 200))
+    tikhonov_alpha = float(weight_refit_cfg.get("tikhonov_alpha", 0.01))
+    cond_max = float(weight_refit_cfg.get("cond_max", 1.0e6))
+    nnls_max_iter = int(weight_refit_cfg.get("nnls_max_iter", 15))
+    clamp_cfg = weight_refit_cfg.get("seed_scale_clamp", [1.0e-6, 1.0e6])
+    clamp = (float(clamp_cfg[0]), float(clamp_cfg[1]))
+
+    w_seed_rel = [float(v) for v in seeds_rel] if seeds_rel else list(_PRESSURE_DEFAULT_SEEDS_REL)
+    n = len(A)
+    k = len(_PRESSURE_WEIGHT_COLUMNS)
+
+    kappa = _condition_number(A)
+    populated = _pressure_populated_columns(A)  # ascending list, never a set
+    seed_pinned = [
+        _PRESSURE_WEIGHT_COLUMNS[j] for j in range(k) if j not in populated
+    ]
+
+    w_seed, seed_scale_raw = _scaled_seed(A, b, w_seed_rel, clamp=clamp)
+    s_valid = math.isfinite(seed_scale_raw)
+    seed_scale_out = seed_scale_raw if s_valid else 1.0
+
+    def _result(weights: list[float], source: str, seed_scale: float) -> dict:
+        return {
+            "weights": dict(zip(_PRESSURE_WEIGHT_COLUMNS, weights)),
+            "source": source,
+            "condition_number": kappa,
+            "residual_fraction": _pressure_residual_fraction(A, b, weights),
+            "n_windows": n,
+            "seed_scale": seed_scale,
+            "seed_pinned": seed_pinned,
+        }
+
+    if n < min_windows:
+        return _result(list(w_seed_rel), "insufficient-data", 1.0)
+
+    if not s_valid or kappa > cond_max:
+        return _result(list(w_seed), "seed-fallback", seed_scale_out)
+
+    AT = _pressure_apply_T(A)
+    col_sq_sums = [0.0] * k
+    for row in AT:
+        for j in range(k):
+            col_sq_sums[j] += row[j] * row[j]
+    mean_col_sq = sum(col_sq_sums) / k
+    lam = tikhonov_alpha * mean_col_sq
+    sqrt_lam = math.sqrt(lam) if lam > 0.0 else 0.0
+
+    M = [row[:] for row in AT]
+    for row_idx in range(len(_PRESSURE_WEIGHT_T)):
+        M.append([sqrt_lam * _PRESSURE_WEIGHT_T[row_idx][j] for j in range(k)])
+    y = list(b) + [sqrt_lam * w_seed[j] for j in range(k)]
+
+    x, converged = _nnls(M, y, max_iter=nnls_max_iter * 5)
+
+    if not converged:
+        return _result(list(w_seed), "seed-fallback", seed_scale_out)
+
+    w = _matvec(_PRESSURE_WEIGHT_T, x)
+    return _result(w, "fit", seed_scale_out)
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
