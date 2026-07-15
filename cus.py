@@ -65,6 +65,7 @@ authoritative on this point).
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -5024,6 +5025,84 @@ def _capacity_warnings(state: dict, config: dict) -> list[str]:
                 message = f"INFO: {message} (operator-disabled — informational only)"
             warnings.append(message)
     return warnings
+
+
+# =========================================================================== #
+#  Token-pressure forecaster (spec-2, STAGE 1) — READ-ONLY layer               #
+#                                                                              #
+#  A deterministic, side-effect-free forecast layer that projects burn against #
+#  the tier-normalized rotatable pool and each account's pinned floor, and     #
+#  publishes pressure.json / `cus pressure`. See                               #
+#  docs/superpowers/plans/2026-07-14-token-pressure.md.                        #
+#                                                                              #
+#  G0 — READ-ONLY STATE DISCIPLINE (load-bearing landmine, §10.11 / FACT #3):  #
+#  EVERY helper below loads state through `_pressure_load_state` (a deep copy) #
+#  and NEVER calls `save_state`, `_capacity_warnings`, or the SOS builder, and #
+#  NEVER mutates the live daemon `state`. The forecaster refines cus's coarse  #
+#  per-account signal; it must never be the first caller that freezes a        #
+#  `capacity_reference_snapshot` or fires an operator SOS. Reach capacity ONLY #
+#  through the pure read helpers (`_account_raw_capacity_x` @4716,             #
+#  `_observed_fleet_min_x` @4801, `_remaining_units` @4940, ...) plus the      #
+#  side-effect-free `_pressure_resolve_reference_x` below — NEVER the mutators #
+#  `_resolve_reference_x` @4833 (persists the snapshot + emits the SOS         #
+#  warning), `_account_capacity_x` @4767, or `_capacity_ctx` @4892 over the    #
+#  live state.                                                                 #
+# =========================================================================== #
+
+
+def _pressure_load_state(config: dict) -> dict:
+    """Read-only state snapshot for the token-pressure forecaster (Task 1,
+    G0 / §10.11).
+
+    Returns ``copy.deepcopy(load_state())`` — the ONLY state object the
+    forecaster is permitted to mutate. The live daemon ``state`` (and the
+    on-disk ``state.json``) are never touched: the whole forecaster loads
+    state THROUGH this helper and never calls ``save_state``. Deep-copying
+    (not a shallow copy) is required because the capacity/account sub-dicts
+    are nested and shared by reference; a shallow copy would let a later
+    in-place cache write leak back into the loaded structure.
+
+    ``config`` is accepted for call-shape symmetry with the rest of the
+    ``_pressure_*`` helpers (each takes ``config``); ``load_state`` itself
+    reads the module-global ``STATE_JSON`` and takes no arguments.
+    """
+    return copy.deepcopy(load_state())
+
+
+def _pressure_resolve_reference_x(state: dict, config: dict) -> float:
+    """Side-effect-free ``reference_x`` for the read-only forecaster (Task 1,
+    G0 / §10.11 landmine, FACT #3/#4).
+
+    Same precedence as ``_resolve_reference_x`` @4833 — pinned
+    ``capacity_aware.reference_x`` (numeric and >= 1) → persisted
+    ``state["capacity_reference_snapshot"]`` → observed fleet-min
+    (``_observed_fleet_min_x``, falling back to 1.0 when the enabled fleet has
+    no known tier) — but WITHOUT its two production side effects on the
+    unpinned first-caller path:
+
+      * it NEVER writes ``state["capacity_reference_snapshot"]`` (the in-place
+        mutation @4872 the daemon would later flush to disk), and
+      * it NEVER emits the SOS-instruction warning @4873 that
+        ``_capacity_warnings`` @4964 folds into a real operator
+        ``SOSCondition`` (SOS builder @12108); it never calls
+        ``_capacity_warnings`` at all.
+
+    reference_x is pinned live (=5, FACT #4), so production takes the pin
+    branch; the snapshot/fleet-min branches exist only so an unpinned fleet
+    (or a test) resolves cleanly without persisting or warning. Returns the
+    bare float (no warnings tuple) — the forecaster surfaces its own
+    diagnostics, never cus's operator SOS strings.
+    """
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    if pinned is not None:
+        is_number = isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+        if is_number and pinned >= 1:
+            return float(pinned)
+    snapshot = state.get("capacity_reference_snapshot")
+    if snapshot is not None:
+        return float(snapshot)
+    observed = _observed_fleet_min_x(state, config)
+    return float(observed) if observed is not None else 1.0
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
