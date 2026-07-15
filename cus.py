@@ -7902,6 +7902,234 @@ def _safety_factor(residual_fraction: float, condition_number: float, cfg: dict)
     return _clamp(raw, base, cap)
 
 
+# ---------------------------------------------------------------------------
+# Task 20 (spec-2 token-pressure forecaster, STAGE 1, integration): assemble
+# the single pressure.json artifact from Phase-D products — level, normalized
+# pool/per-account curves+ETAs, binding, required reductions, weight-fit
+# confidence, per-session table — written atomic tmp+rename (NEVER
+# save_state). `_pressure_snapshot` is PURE (state, config, now) PLUS the
+# EXPLICIT injected Phase-D products (partition/session_table/weight_fit/
+# attribution — round-3 finding 2: a pure (state, config, now) builder cannot
+# reach filesystem-backed Phase-D reads itself); `_pressure_write_json` is the
+# only I/O this task performs, and it is a plain atomic write — never
+# `save_state` (this artifact lives outside state.json, G0).
+# ---------------------------------------------------------------------------
+
+PRESSURE_JSON = ACCOUNTS_DIR / "pressure.json"
+
+_PRESSURE_SESSION_ROW_KEYS = (
+    "session_id", "account_shares", "model", "fable_share", "pane", "socket",
+    "cwd", "class", "rate", "trend", "coordinator_of",
+)
+
+
+def _pressure_session_row(row: dict) -> dict:
+    """Normalize one injected `session_table` row to the pinned pressure.json
+    `sessions[]` shape (Task 20 — the brief's schema pins these 11 keys).
+    Missing keys default to `None` (`account_shares` to `{}`) rather than
+    silently dropping/renaming whatever the caller's Phase-D pipeline
+    produced. Pure (G0): reads `row`, mutates nothing.
+    """
+    out = {}
+    for key in _PRESSURE_SESSION_ROW_KEYS:
+        if key == "account_shares":
+            out[key] = dict(row.get(key) or {})
+        else:
+            out[key] = row.get(key)
+    return out
+
+
+def _pressure_binding_view(trigger: dict | None) -> dict | None:
+    """The nested `binding` block (Task 20, finding 7): `{view, name,
+    constraint, window, eta_min}` — NEVER a flat `binding_view`. Derived from
+    the single most-severe trigger `_pressure_level`/`_pressure_binding`
+    (Task 9) already picked, so `eta_min` is always numerically identical to
+    the per-account/pool ETA field that trigger corresponds to (round-3
+    finding 1, `test_binding_eta_consistent_240`).
+
+    `name` is `pool:<window>` for a pool trigger, or the account name parsed
+    out of the trigger's own `binding_constraint` string
+    (`token-pressure:account:<name>:<window|fable>`, Task 9's own
+    convention — a trigger dict carries no separate "name" field, so this is
+    the one place that string is parsed). `constraint` is `fable_weekly` for
+    a level_bound (Fable) trigger, else the trigger's own `window`. `None`
+    when nothing is binding (`level == "ok"`). Pure (G0).
+    """
+    if trigger is None:
+        return None
+    view = trigger.get("view")
+    window = trigger.get("window")
+    constraint = "fable_weekly" if trigger.get("level_bound") else window
+    if view == "pool":
+        name = f"pool:{window}"
+    else:
+        parts = str(trigger.get("binding_constraint", "")).split(":")
+        name = parts[2] if len(parts) > 2 else None
+    return {
+        "view": view,
+        "name": name,
+        "constraint": constraint,
+        "window": window,
+        "eta_min": trigger.get("eta"),
+    }
+
+
+def _pressure_snapshot(state: dict, config: dict, now, *, partition, session_table,
+                       weight_fit: dict, attribution: dict, episode_id=None) -> dict:
+    """Assemble the full pressure.json object (Task 20, PURE — no I/O).
+
+    Delegates the trigger/level computation to the EXISTING Task 9
+    `_pressure_triggers`/`_pressure_level` with the REAL injected
+    `partition` (replacing the synthetic `FakePartition` the Phase-F tests
+    inject) — this function never reimplements the curve/ETA math. The
+    per-window pool/per-account ETA and required-reduction fields reuse the
+    SAME Task 5/6/7/8 building blocks those two functions call internally
+    (`_pool_remaining_curve`/`_pool_rotatable_burn`/`_pool_knots`/
+    `_pinned_account_eta`/`_required_reduction_pool`/
+    `_required_reduction_pinned`), at the SAME `horizon = H+margin = 240`
+    `_pressure_triggers` uses (`_pressure_trigger_horizon`) — so every
+    published ETA is numerically identical to the trigger it corresponds to
+    (round-3 finding 1), and `binding.eta_min` (built from the SAME trigger
+    dict `_pressure_binding` picked) is trivially consistent with them.
+
+    Phase-D products the daemon/CLI caller (Task 21/23) built from
+    filesystem I/O are EXPLICIT injected inputs (round-3 finding 2 — a pure
+    `(state, config, now)` builder cannot reach `_read_active_tails`/
+    `_attribute_burn`/`fit_burn_weights` itself):
+      - `partition`: Task 11 `_partition_burn` output (or a test double) —
+        exposes `pinned_burn_units(name, window)` / `rotatable_burn_units(
+        name, window)` in reference units/min, the Task 5 protocol.
+      - `session_table`: per-session rows (account_shares + class/rate/
+        trend/coordinator_of) from Task 11-13 — copied into `sessions[]`
+        verbatim (shape-normalized by `_pressure_session_row`), NEVER
+        re-derived from `state` (finding 2).
+      - `weight_fit`: Task 16 `fit_burn_weights` output — copied into the
+        `weight_fit` block and used (via `residual_fraction`/
+        `condition_number`) to derive `safety_factor` (Task 17
+        `_safety_factor`).
+      - `attribution`: Task 19 `_attribution_confidence` output, merged by
+        the caller with Task 11's `residual_fraction` — copied into the
+        `attribution` block verbatim.
+
+    `episode_id` (§6): minting on an `ok -> elevated` upward transition
+    needs the PRIOR level, which this pure per-snapshot builder has no way
+    to know (it only ever sees the CURRENT state) — so real minting/
+    persistence is the CALLER's job (Task 21/23 owns the episode ledger).
+    Here it is accepted as a plain injected/optional value and published
+    verbatim, defaulting to `None` when the caller has nothing to report
+    yet.
+
+    Live gates (finding 6): every published `gate` (`accounts.<name>.5h/7d/
+    fable_weekly.gate`) is read from `config` AT SNAPSHOT TIME via the
+    EXISTING `_pressure_gate`/`per_model_weekly.cap_pct` reads (never a
+    hardcoded literal) — `_pressure_gate` itself already falls back to cus's
+    own in-code default ladder top when `thresholds.steps` is empty/absent
+    (G3).
+
+    Read-only (G0): never mutates `state` or any injected product; builds
+    only new dicts/lists. Performs NO filesystem I/O of its own.
+    """
+    triggers = _pressure_triggers(state, config, now, partition)
+    level_out = _pressure_level(triggers, config)
+
+    H240 = _pressure_trigger_horizon(config)
+    accounts_state = state.get("accounts", {})
+    disabled = _disabled_accounts(config)
+    suppressed = _pool_release_suppressed(state, config)
+
+    pool_block: dict = {}
+    for window in _PRESSURE_WINDOWS:
+        gate = _pressure_gate(window, config)
+        pool_set = _pressure_pool_set(state, window, config)
+        pool_curve = _pool_remaining_curve(state, window, config, now, partition,
+                                           horizon=H240)
+        rotatable = _pool_rotatable_burn(state, window, config, now, partition)
+        knots = _pool_knots(state, window, config, now, partition, horizon=H240)
+        eta = _first_crossing_eta(pool_curve, rotatable, knots, config, now)
+        rr = _required_reduction_pool(pool_curve, rotatable, knots, config, now)
+        capacity_units = sum(
+            _pressure_cap_units(gate, _pressure_acct_ratio(accounts_state.get(name, {}), config))
+            for name in pool_set
+        )
+        pool_block[window] = {
+            "capacity_units": capacity_units,
+            "remaining_units": pool_curve(0.0),
+            "burn_units_per_min": rotatable,
+            "exhaustion_eta_min": eta,
+            "required_reduction_units_per_min": rr["delta_units"],
+            "release_suppressed": suppressed,
+        }
+
+    fable_cfg = config.get("per_model_weekly", {}) or {}
+    fable_gate = float(fable_cfg.get("cap_pct", 95))
+
+    accounts_block: dict = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts_state.get(name, {})
+        acct = dict(acct_state, name=name)  # inject name for the partition lookup
+        capacity_x = acct_state.get("capacity_x")
+        capacity_x = float(capacity_x) if capacity_x else 1.0
+        entry: dict = {"capacity_x": capacity_x}
+        for window in _PRESSURE_WINDOWS:
+            gate = _pressure_gate(window, config)
+            ratio = _pressure_acct_ratio(acct_state, config)
+            pct = acct_state.get(f"current_{window}_pct", 0.0) or 0.0
+            remaining_units = _pressure_remaining_units(pct, gate, ratio)
+            pinned_units = _pinned_burn_rate(acct, window, partition)
+            burn_pct_per_min = pinned_units * 100.0 / ratio if ratio else pinned_units * 100.0
+            pinned_eta = _pinned_account_eta(acct, window, config, now, partition,
+                                             horizon=H240)
+            rr = _required_reduction_pinned(acct, window, config, now, partition)
+            entry[window] = {
+                "pct": pct,
+                "gate": gate,
+                "remaining_units": remaining_units,
+                "burn_pct_per_min": burn_pct_per_min,
+                "pinned_eta_min": pinned_eta,
+                "required_reduction_pct_per_min": rr["delta_pct_per_min"],
+            }
+        fable_pct = (acct_state.get("per_model_weekly_pct", {}) or {}).get("Fable")
+        entry["fable_weekly"] = {"pct": fable_pct, "gate": fable_gate, "level_bound": True}
+        accounts_block[name] = entry
+
+    safety_factor = _safety_factor(weight_fit["residual_fraction"],
+                                   weight_fit["condition_number"], config)
+
+    return {
+        "level": level_out["level"],
+        "generated_at": now.isoformat(),
+        "reference_x": _pressure_resolve_reference_x(state, config),
+        "horizon_min": _pressure_enter_horizon(config),
+        "pool": pool_block,
+        "accounts": accounts_block,
+        "binding": _pressure_binding_view(level_out["binding"]),
+        "episode_id": episode_id,
+        "weight_fit": dict(weight_fit),
+        "safety_factor": safety_factor,
+        "attribution": dict(attribution),
+        "sessions": [_pressure_session_row(row) for row in session_table],
+    }
+
+
+def _pressure_write_json(snapshot: dict) -> None:
+    """Atomic tmp+os.replace write of the pressure.json `snapshot` (Task 20)
+    into `PRESSURE_JSON` (`~/claude-accounts/pressure.json`) — NEVER
+    `save_state`: this artifact lives outside state.json entirely (G0, the
+    forecaster never mutates the daemon's own state), so a `save_state`
+    failure elsewhere in the same cycle can never block or corrupt this
+    write. Reuses the existing `write_json`/`atomic_write_bytes` primitive
+    (tempfile in the same directory + `os.replace`, POSIX-atomic) — a
+    concurrent reader always sees the prior file or the fully-written new
+    one, never a partial write.
+    """
+    write_json(PRESSURE_JSON, snapshot)
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
