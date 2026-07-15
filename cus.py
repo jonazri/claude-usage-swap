@@ -20721,6 +20721,81 @@ def _sl_pin_label(pin_account: str | None, active: str, color_on: bool) -> str:
     return click.style(raw, fg="yellow", bold=True) if color_on else raw
 
 
+def _pressure_statusline_glyph(snapshot: dict) -> str:
+    """Compact non-`ok` token-pressure glyph for `cus statusline` (Task 22,
+    spec-2 token-pressure forecaster). PURE formatter over an
+    already-computed pressure.json `snapshot` (Task 20's `_pressure_snapshot`
+    schema) — reads `snapshot["level"]`/`snapshot["binding"]` plus the
+    corresponding `pool`/`accounts` window block for the binding's required
+    reduction. NEVER recomputes the snapshot, never mutates it, never writes
+    anything (G0 — same read-only contract every pressure path holds).
+
+    `""` at `level == "ok"` (nothing to show), and `""` whenever the snapshot
+    is missing/malformed in a way that would make the glyph meaningless (no
+    `binding`, unknown `view`, or no matching window block) — fail-safe, so a
+    partial/stale snapshot degrades to no glyph rather than crashing the
+    statusline the operator relies on every render.
+
+    Pool form: `⚡pool <eta_h>h -<req>%`. Account form: `⚡<acct> <eta_h>h
+    -<req>%`. `<eta_h>` is `binding["eta_min"] / 60`, 1 decimal place (144 ->
+    "2.4h"). `<req>` is the binding's required reduction, as an integer-ish
+    percent:
+      - pool: `pool[window]["required_reduction_units_per_min"]` is in
+        reference UNITS/min (`_pressure_cap_units`: units = gate/100 * ratio,
+        Task 2 §10.10) — the glyph reads a unit as a reference-account-
+        equivalent percent (`units * 100`), the same `*100/ratio` convention
+        `_required_reduction_pinned` @5686 uses for a ratio=1 account.
+      - account: `accounts[name][window]["required_reduction_pct_per_min"]`
+        is already a percent (Task 8 §5.3) — used as-is, no rescale.
+
+    Fable form: `⚡<acct> fable` — a `fable_weekly` binding
+    (`binding["constraint"] == "fable_weekly"`) is LEVEL-bound (G6: a
+    qualitative Fable-cap→Sonnet-throttle ask), not ETA-bound, so it has no
+    real numeric eta/required-reduction of its own. `binding["window"]` is
+    always the literal `"7d"` for this case (Task 9 §5829) and
+    `binding["eta_min"]` is always `0.0` — both are artifacts of how the
+    trigger is built, NOT a real 7-day breach ETA. Reading the account's
+    ordinary 7d `required_reduction_pct_per_min` here would render a
+    misleading `⚡<acct> 0.0h -0%` (looks like "nothing to do") for what is
+    actually a CRITICAL condition, so this case is special-cased BEFORE the
+    numeric formatting below and renders a qualitative glyph instead — no
+    fake eta/percent, never `""` (this must not hide a critical condition).
+    """
+    if snapshot.get("level") == "ok":
+        return ""
+    binding = snapshot.get("binding")
+    if not binding:
+        return ""
+    view = binding.get("view")
+    window = binding.get("window")
+    eta_min = binding.get("eta_min")
+    if window is None or eta_min is None:
+        return ""
+    if binding.get("constraint") == "fable_weekly":
+        acct = binding.get("name")
+        if not acct:
+            return ""
+        return f"⚡{acct} fable"
+    if view == "pool":
+        label = "pool"
+        block = (snapshot.get("pool") or {}).get(window) or {}
+        if "required_reduction_units_per_min" not in block:
+            return ""
+        req_pct = block["required_reduction_units_per_min"] * 100.0
+    elif view == "account":
+        label = binding.get("name")
+        if not label:
+            return ""
+        block = ((snapshot.get("accounts") or {}).get(label) or {}).get(window) or {}
+        if "required_reduction_pct_per_min" not in block:
+            return ""
+        req_pct = block["required_reduction_pct_per_min"]
+    else:
+        return ""
+    eta_h = eta_min / 60.0
+    return f"⚡{label} {eta_h:.1f}h -{round(req_pct)}%"
+
+
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
@@ -20763,6 +20838,22 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     # every output path (SOS / warning / compact / verbose) so the operator
     # can always tell render-time staleness regardless of which branch hit.
     render_stamp = _fmt_render_stamp_eastern()
+
+    # Task 22 (spec-2 token-pressure forecaster): a read-only glyph appended
+    # to every output line below when pressure is non-`ok`. Plain file read
+    # of the daemon/CLI-produced pressure.json (Task 20) — NEVER recomputed
+    # here (that would violate the forecaster's own G0 read-only contract,
+    # and the statusline renders far too often to afford a fresh
+    # sessions.log scan/attribution pass anyway). Absent/unreadable/corrupt
+    # pressure.json (not yet written, mid-write, or a stale schema) degrades
+    # to "" so a missing forecaster artifact never breaks the statusline.
+    pressure_glyph = ""
+    if PRESSURE_JSON.exists():
+        try:
+            pressure_glyph = _pressure_statusline_glyph(read_json(PRESSURE_JSON))
+        except Exception:
+            pressure_glyph = ""
+    pressure_bit = f" {pressure_glyph}" if pressure_glyph else ""
 
     # SOS surfacing (2026-07-03): a human-action-needed condition is emitted as
     # its OWN first line, but we NO LONGER early-return — the normal account /
@@ -20875,7 +20966,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if unknown5 and unknown7:
             pin_bit = f" {pin_lbl}" if pin_lbl else ""
             slot_bit = f" {slot_lbl}" if slot_lbl else ""
-            click.echo(f"cus:{active_lbl}{slot_bit}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
+            click.echo(f"cus:{active_lbl}{slot_bit}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)}{pressure_bit} · {render_stamp}", color=color_on)
             return
         # GH #59: compact mode must flag a rolled-over 5h window live, exactly
         # like verbose mode already does. The reset countdown elapses between
@@ -20942,7 +21033,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         sd_piece = "7d:?" if unknown7 else f"7d:{_sl_pct(sd, nx, color_on)}"
         click.echo(
             f"{prefix} {fh_piece} {sd_piece} "
-            f"{nxt_lbl(nx)}{poll_part} · {render_stamp}",
+            f"{nxt_lbl(nx)}{poll_part}{pressure_bit} · {render_stamp}",
             color=color_on,
         )
         return
@@ -21070,7 +21161,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 poll_piece = f"poll {_fmt_duration(age)}ago·due now"
             pieces.append(click.style(poll_piece, dim=True) if color_on else poll_piece)
 
-    click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}", color=color_on)
+    click.echo(pieces_prefix + " | ".join(pieces) + f"{pressure_bit} · {render_stamp}", color=color_on)
 
 
 @cli.command(name="decisions")
