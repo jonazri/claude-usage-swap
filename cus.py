@@ -24155,6 +24155,293 @@ def shadow_report(shadow_dir, config: dict, now) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Task 30 (spec-2 token-pressure forecaster, STAGE 1): shadow-week BACKTEST
+# scorer. `shadow_report` (Task 27) evaluates the flip GATES; this pairs each
+# forecast record with the realized outcome N cycles later and scores
+# forecast-vs-actual, over/under-throttle, and reset over/under-prediction --
+# feeding Task 27's verdict inputs and the risk-4 tunability review.
+# ---------------------------------------------------------------------------
+
+# Same 240-min ceiling `_pressure_trigger_horizon`'s default (horizon_hours=3
+# + exit_margin_hours=1) already computes every `binding.eta_min` against
+# (Task 9), plus the SAME `_PRESSURE_EXIT_MARGIN_MIN` (60) tolerance used
+# elsewhere in this module for the "+margin" in "horizon+margin". Task 30's
+# own interface takes only `records` (no `config` -- brief), so these mirror
+# the config-absent defaults rather than re-deriving them per call.
+_PRESSURE_BACKTEST_HORIZON_MIN = 240.0
+_PRESSURE_BACKTEST_MARGIN_MIN = _PRESSURE_EXIT_MARGIN_MIN
+
+
+def _pressure_backtest_target(binding) -> tuple[str, str | None, str] | None:
+    """``(view, name, window)`` identifying which per-account/pool
+    ``remaining_units`` series a forecast record's ``binding`` refers to, or
+    ``None`` when there's nothing to join against: no binding, a malformed
+    one, or a level-bound ``fable_weekly`` breach (``dry_run_target``'s own
+    §5.4 branch) -- there's no per-window ``remaining_units`` series for a
+    qualitative Fable->Sonnet downshift ask to confirm against actual data.
+    ``name`` is ``None`` for the pool view (there's no per-account name)."""
+    if not isinstance(binding, dict):
+        return None
+    window = binding.get("window")
+    if not window:
+        return None
+    view = binding.get("view")
+    if view == "account":
+        name = binding.get("name")
+        if not name:
+            return None
+        return ("account", name, window)
+    if view == "pool":
+        return ("pool", None, window)
+    return None
+
+
+def _pressure_backtest_remaining(rec: dict, target: tuple[str, str | None, str]) -> float | None:
+    """The actual ``remaining_units`` reading ``target`` names, straight off
+    a shadow record's already-published ``per_account``/``pool`` blocks
+    (Task 20) -- NEVER recomputed."""
+    view, name, window = target
+    block = (rec.get("per_account") or {}).get(name) or {} if view == "account" else (rec.get("pool") or {})
+    return (block.get(window) or {}).get("remaining_units")
+
+
+def _pressure_backtest_required(rec: dict, target: tuple[str, str | None, str]) -> float:
+    """The required-reduction reading ``target`` names at ``rec`` -- the
+    account view's ``required_reduction_pct_per_min`` or the pool view's
+    ``required_reduction_units_per_min`` (Task 20), i.e. whatever reduction
+    was ACTUALLY needed at that record's own moment in time (as opposed to
+    the earlier forecast-time estimate a plan was built from)."""
+    view, name, window = target
+    if view == "account":
+        block = (rec.get("per_account") or {}).get(name) or {}
+        val = (block.get(window) or {}).get("required_reduction_pct_per_min")
+    else:
+        block = rec.get("pool") or {}
+        val = (block.get(window) or {}).get("required_reduction_units_per_min")
+    return float(val) if val is not None else 0.0
+
+
+def _pressure_backtest_first_materialization(records: list[dict], i: int,
+                                              target: tuple[str, str | None, str]) -> tuple[dict | None, bool]:
+    """``(materialized_record, covered)``: the first record at-or-after
+    ``records[i]`` (including ``records[i]`` itself, for an already-bound
+    breach) whose ``target`` reading has actually crossed into breach
+    (``remaining_units <= 0``) within
+    ``_PRESSURE_BACKTEST_HORIZON_MIN + _PRESSURE_BACKTEST_MARGIN_MIN`` of
+    ``records[i]``'s own ``ts`` -- the realized confirmation that a forecast
+    breach "came true", mirroring `_pressure_shadow_false_clears`'s own
+    later-record scan (Task 27). ``covered`` is ``True`` once either a
+    materialization is found OR the records extend at least to the
+    horizon+margin deadline; ``False`` means the window is still open (not
+    enough logged lookahead yet) -- callers must not read "no breach found"
+    as "never breaches" when ``covered`` is ``False`` (that would falsely
+    score a shadow week that simply hasn't run long enough as an over-
+    throttle). Assumes ``records`` is sorted ascending by ``ts`` (the same
+    assumption every reused Task-27 helper already makes)."""
+    ts_n = _pressure_parse_ts(records[i].get("ts"))
+    if ts_n is None:
+        return None, False
+    deadline = ts_n + timedelta(minutes=_PRESSURE_BACKTEST_HORIZON_MIN + _PRESSURE_BACKTEST_MARGIN_MIN)
+
+    remaining0 = _pressure_backtest_remaining(records[i], target)
+    if remaining0 is not None and float(remaining0) <= 0.0:
+        return records[i], True
+
+    for other in records[i + 1:]:
+        ts_m = _pressure_parse_ts(other.get("ts"))
+        if ts_m is None:
+            continue
+        if ts_m > deadline:
+            return None, True  # lookahead reaches past the deadline w/o a breach -- covered
+        remaining = _pressure_backtest_remaining(other, target)
+        if remaining is not None and float(remaining) <= 0.0:
+            return other, True
+    return None, False  # ran out of records before reaching the deadline -- window still open
+
+
+def _pressure_backtest_materialized_breaches(records: list[dict]) -> list[dict]:
+    """Every forecast record (``binding`` naming a per-window series) whose
+    breach actually materialized within horizon+margin -- "did forecast
+    breaches materialize" (Task 30 brief). Independent of whether the plan's
+    coverage was adequate (that's under/over-throttle's job below); this is
+    the raw materialization signal both of those derive from."""
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        target = _pressure_backtest_target(rec.get("binding"))
+        if target is None:
+            continue
+        mat_rec, _covered = _pressure_backtest_first_materialization(records, i, target)
+        if mat_rec is None:
+            continue
+        view, name, window = target
+        hits.append({
+            "view": view, "name": name, "window": window,
+            "forecast_ts": rec.get("ts"), "materialized_ts": mat_rec.get("ts"),
+        })
+    return hits
+
+
+def _pressure_backtest_under_throttle_events(records: list[dict]) -> list[dict]:
+    """§1 SAFETY (the important metric): a forecast breach whose realized
+    outcome (`_pressure_backtest_first_materialization`) actually crossed
+    into breach, where the dry-run plan's ``planned_shed`` was LESS than the
+    required-reduction logged AT THE MOMENT OF MATERIALIZATION (the REALIZED
+    severity -- not the earlier forecast-time estimate, which
+    ``forecast_err_series`` already scores separately). This is the failure
+    the whole backtest exists to surface: the plan would have under-
+    throttled and the box could have blown the limit."""
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        would_ask = rec.get("would_ask")
+        if not would_ask:
+            continue
+        target = _pressure_backtest_target(rec.get("binding"))
+        if target is None:
+            continue
+        mat_rec, _covered = _pressure_backtest_first_materialization(records, i, target)
+        if mat_rec is None:
+            continue
+        planned_shed = float(would_ask.get("planned_shed") or 0.0)
+        required_realized = _pressure_backtest_required(mat_rec, target)
+        if planned_shed < required_realized:
+            view, name, window = target
+            hits.append({
+                "view": view, "name": name, "window": window,
+                "forecast_ts": rec.get("ts"), "materialized_ts": mat_rec.get("ts"),
+                "planned_shed": planned_shed,
+                "required_at_forecast": float(would_ask.get("required") or 0.0),
+                "required_realized": required_realized,
+                "deficit": required_realized - planned_shed,
+            })
+    return hits
+
+
+def _pressure_backtest_over_throttle_events(records: list[dict]) -> list[dict]:
+    """Advisory fairness cost (NOT a safety failure): a plan that SHED
+    (``would_target`` non-empty -- the plan would have asked sessions to
+    slow) on a forecast that never actually breached within horizon+margin.
+    Only counted when the lookahead `_pressure_backtest_first_
+    materialization` actually COVERS that full window -- a window that is
+    simply still open (not enough logged cycles yet) is not evidence of
+    "never breaches", so it's skipped rather than mis-scored."""
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        targets = rec.get("would_target") or []
+        if not targets:
+            continue
+        target = _pressure_backtest_target(rec.get("binding"))
+        if target is None:
+            continue
+        mat_rec, covered = _pressure_backtest_first_materialization(records, i, target)
+        if mat_rec is not None or not covered:
+            continue
+        would_ask = rec.get("would_ask") or {}
+        view, name, window = target
+        hits.append({
+            "view": view, "name": name, "window": window,
+            "forecast_ts": rec.get("ts"),
+            "planned_shed": float(would_ask.get("planned_shed") or 0.0),
+            "targets": list(targets),
+        })
+    return hits
+
+
+def _pressure_backtest_reset_signed_errors(records: list[dict], model: str) -> list[float]:
+    """Signed forecast error @60-min lead for ``model`` (``decayed_step`` or
+    ``rolling_integral``), one value per joined (predicted, actual) pair,
+    pooled over every account/window (Task 30 -- reuses the SAME temporal
+    join `_pressure_shadow_forecast_errors` (Task 27) already performs for
+    ``decayed_step`` alone, but keeps the SIGN and scores ``rolling_
+    integral`` too, per the brief -- ``rolling_integral`` stays informational
+    only, never gates, Part 3).
+
+    Sign convention: ``predicted - actual``. Positive = the model predicted
+    MORE remaining than there actually was post-reset -- OVER-predicted (too
+    optimistic). Negative = it predicted LESS than there actually was --
+    UNDER-predicted (too pessimistic)."""
+    errors: list[float] = []
+    for i, rec in enumerate(records):
+        model_block = ((rec.get("reset_models") or {}).get(model)) or {}
+        if not model_block:
+            continue
+        ts_n = _pressure_parse_ts(rec.get("ts"))
+        if ts_n is None:
+            continue
+        target_ts = ts_n + timedelta(minutes=_PRESSURE_FORECAST_JOIN_LEAD_MIN)
+
+        best_rec = None
+        best_gap = None
+        for other in records[i + 1:]:
+            ts_m = _pressure_parse_ts(other.get("ts"))
+            if ts_m is None:
+                continue
+            gap_min = (ts_m - target_ts).total_seconds() / 60.0
+            if gap_min > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                break  # records are ascending -- nothing closer remains
+            if abs(gap_min) > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                continue
+            if best_gap is None or abs(gap_min) < best_gap:
+                best_rec, best_gap = other, abs(gap_min)
+        if best_rec is None:
+            continue
+
+        actual_block = best_rec.get("reset_models_actual") or {}
+        for name, win_map in model_block.items():
+            for window, entry in (win_map or {}).items():
+                predicted = (entry or {}).get("remaining_at_plus_60")
+                if predicted is None:
+                    continue
+                actual = (actual_block.get(name) or {}).get(window)
+                if actual is None:
+                    continue
+                errors.append(float(predicted) - float(actual))
+    return errors
+
+
+def score_shadow_window(records: list[dict]) -> dict:
+    """Task 30: the shadow-week BACKTEST scorer -- pairs each forecast
+    record with the realized outcome N cycles later and scores forecast-vs-
+    actual, over/under-throttle, and reset over/under-prediction, feeding
+    Task 27's ``shadow_report`` verdict inputs and the risk-4 tunability
+    review.
+
+    Read-only (G0): operates purely on the passed ``records`` list -- never
+    reads/writes files or state (that's `_pressure_shadow_scan`'s/
+    `shadow_report`'s job, one layer up). ``records`` is assumed pre-sorted
+    ascending by ``ts``, the SAME assumption every reused Task-27 helper
+    already makes.
+
+    Reuses Task 27's own forecast-error/false-clear/vacuous-clear helpers
+    verbatim (`_pressure_shadow_forecast_errors`/`_pressure_shadow_false_
+    clears`/`_pressure_shadow_vacuous_clears`) with an empty ``config={}`` --
+    each already degrades gracefully to the SAME config-absent defaults an
+    unconfigured `shadow_report` would use (`_pressure_shadow_reference_x`:
+    reference_x=1.0; `_pressure_enter_horizon`: horizon_hours=3 -> 180min);
+    Task 30's own interface takes only ``records`` (no ``config``), per the
+    brief.
+    """
+    config: dict = {}
+    forecast_err_series = {
+        window: _pressure_shadow_forecast_errors(records, config, window)
+        for window in _PRESSURE_WINDOWS
+    }
+    reset_over_under = {
+        model: _pressure_median(_pressure_backtest_reset_signed_errors(records, model))
+        for model in ("decayed_step", "rolling_integral")
+    }
+    return {
+        "forecast_err_series": forecast_err_series,
+        "false_clears": _pressure_shadow_false_clears(records, config),
+        "vacuous_clears": _pressure_shadow_vacuous_clears(records),
+        "materialized_breaches": _pressure_backtest_materialized_breaches(records),
+        "over_throttle_events": _pressure_backtest_over_throttle_events(records),
+        "under_throttle_events": _pressure_backtest_under_throttle_events(records),
+        "realized_safety_factor_series": _pressure_shadow_realized_safety_factors(records),
+        "reset_over_under": reset_over_under,
+    }
+
+
 @cli.command(name="sos")
 @click.option("--quiet", is_flag=True, help="No output if all clear (for scripting).")
 def sos_cmd(quiet: bool) -> None:
