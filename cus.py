@@ -6759,6 +6759,36 @@ def _in_worktree_cwd(cwd: str | None) -> bool:
     return "worktrees" in parts or ".worktrees" in parts
 
 
+def _worktree_committee_corroborated(record: dict) -> bool:
+    """Shared corroboration gate (final-review fix-wave, §5.2 SAFETY hole):
+    consumed by `_classify_session` heuristic 4 (worktree-cwd
+    ``committee-loop``) and by heuristic 5's generic-automation rate
+    fallback (Task 24b hardening) -- the SAME gate, not a parallel one, so
+    the two heuristics can never disagree about what counts as
+    "corroborated sustained automation".
+
+    True iff EITHER a structural automation signal is set
+    (``has_subagent_children``/``has_workflow_children`` -- checked here for
+    forward-compat even though `_classify_session`'s own heuristics 2-3
+    already return before either caller is reached today, so this branch is
+    unreachable via the current heuristic ordering) OR the rate is
+    corroborated as sustained rather than a one-off burst: ``trend ==
+    "rising"``, or ``session_age_s >= rate_window_min * 60`` (the rate's own
+    divisor has already matured past `_session_rate`'s 60s age floor).
+
+    A brand-new session's single uncorroborated sample (no rising trend,
+    still younger than its own rate window's maturity floor) does NOT
+    corroborate -- conservative by design (§5.2: an ambiguous/missing
+    signal falls toward the non-elastic class, never toward an elastic
+    one)."""
+    if record.get("has_subagent_children") or record.get("has_workflow_children"):
+        return True
+    trend = record.get("trend")
+    session_age_s = float(record.get("session_age_s", 0.0) or 0.0)
+    rate_window_min = float(record.get("rate_window_min", 10.0) or 10.0)
+    return trend == "rising" or session_age_s >= rate_window_min * 60.0
+
+
 def _classify_session(record: dict) -> str:
     """Task 12 (§3 "Classification", deterministic heuristics; §5.2's
     targeting candidate walk consumes this): ``"committee-loop"``,
@@ -6813,9 +6843,25 @@ def _classify_session(record: dict) -> str:
          this session's own spawned subagents.
       3. ``workflow`` -- ``has_workflow_children`` (no subagents
          specifically): this session is running a workflow of its own.
-      4. ``committee-loop`` -- cwd sits under a ``.worktrees/<child>``
-         layout (``_in_worktree_cwd``): the parallel-worktree-per-agent
-         pattern.
+      4. ``committee-loop`` (final-review fix-wave, §5.2 SAFETY hole closed)
+         -- cwd sits under a ``.worktrees/<child>`` layout (``_in_worktree_cwd``):
+         the parallel-worktree-per-agent pattern -- BUT ONLY when ALSO
+         corroborated as sustained automation, via
+         ``_worktree_committee_corroborated`` (the SAME trend/age gate
+         heuristic 5 below uses, reused here rather than duplicated): either
+         ``trend == "rising"``, or ``session_age_s >= rate_window_min * 60``
+         (the rate's own divisor has already matured past `_session_rate`'s
+         60s floor) -- OR a structural signal (``has_subagent_children``/
+         ``has_workflow_children``, checked again inside the shared helper
+         for forward-compat, though heuristics 2-3 above already return
+         before either this heuristic or heuristic 5 is ever reached, so
+         that branch is unreachable today). A worktree cwd ALONE is never
+         sufficient: this project's own interactive dev sessions run
+         ``claude`` directly with a cwd of ``<repo>/.claude/worktrees/<name>``
+         -- the exact layout this heuristic matches -- so a bare human-paced
+         session there must NOT be classified elastic (§5.2 "never target a
+         human"). An uncorroborated/human-paced worktree session falls
+         through to heuristic 6, ``interactive``.
       5. ``workflow`` (generic-automation fallback, Task 24b HARDENED) --
          none of the structural signals above are set, and the rate itself
          is high (``>= _CLASSIFY_HIGH_RATE_PCT_PER_MIN`` pct/min: design
@@ -6841,14 +6887,10 @@ def _classify_session(record: dict) -> str:
         return "subagent-heavy"
     if record.get("has_workflow_children"):
         return "workflow"
-    if _in_worktree_cwd(record.get("cwd")):
+    if _in_worktree_cwd(record.get("cwd")) and _worktree_committee_corroborated(record):
         return "committee-loop"
     if rate >= _CLASSIFY_HIGH_RATE_PCT_PER_MIN:
-        trend = record.get("trend")
-        session_age_s = float(record.get("session_age_s", 0.0) or 0.0)
-        rate_window_min = float(record.get("rate_window_min", 10.0) or 10.0)
-        corroborated = trend == "rising" or session_age_s >= rate_window_min * 60.0
-        if corroborated:
+        if _worktree_committee_corroborated(record):
             return "workflow"
     return "interactive"
 

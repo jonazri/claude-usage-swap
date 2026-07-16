@@ -147,13 +147,76 @@ def test_classify_workflow_children():
 def test_classify_committee_loop_worktree_cwd():
     """cwd sits under a `.worktrees/<child>` layout (design doc §3
     Coordinator rollup / committee #9's observed convention) -> the
-    parallel-worktree-per-agent pattern, 'committee-loop'."""
+    parallel-worktree-per-agent pattern, 'committee-loop' -- PROVIDED it is
+    also corroborated as sustained automation (final-review fix-wave, §5.2
+    SAFETY hole: a bare worktree cwd is no longer sufficient on its own,
+    see `test_human_paced_worktree_cwd_not_elastic` below). This fixture
+    carries a matured ``session_age_s`` (past the ``rate_window_min * 60``
+    floor) as its corroboration signal -- the SAME gate the generic-rate
+    fallback (heuristic 5) uses -- so it still asserts the intended class
+    for a genuine, sustained automated committee-loop session."""
     record = {
         "rate_pct_per_min": 2.0,
         "sample_count": 8,
         "cwd": "/home/yaz/code/misc/claude-usage-swap/.worktrees/spec2-stage1",
+        "session_age_s": 900.0,
+        "rate_window_min": 10,
     }
     assert cus._classify_session(record) == "committee-loop"
+
+
+def test_human_paced_worktree_cwd_not_elastic():
+    """LOAD-BEARING (final-review fix-wave, §5.2 SAFETY hole): this
+    project's OWN interactive dev sessions run `claude` directly with a cwd
+    of `<repo>/.claude/worktrees/<name>` -- exactly the layout
+    `_in_worktree_cwd` matches. Before this fix, ANY session in such a cwd
+    classified 'committee-loop' (elastic) with no rate/corroboration gate --
+    a HUMAN working interactively in a worktree checkout was misclassified
+    elastic and became a §5.2 targeting candidate. A worktree cwd ALONE
+    must never be sufficient: this record is human-paced (a real,
+    sustained-looking rate below the automation threshold), has no
+    structural child signal, and is uncorroborated (young age, no rising
+    trend) -- so it must classify 'interactive', NEVER 'committee-loop'."""
+    record = {
+        "rate_pct_per_min": 0.8,
+        "sample_count": 12,
+        "cwd": "/home/yaz/code/misc/claude-usage-swap/.claude/worktrees/spec2-stage1",
+        "session_age_s": 30.0,
+        "rate_window_min": 10,
+        "trend": "steady",
+    }
+    assert cus._classify_session(record) == "interactive"
+
+
+def test_corroborated_worktree_is_committee_loop():
+    """The flip side of the SAFETY fix above (final-review fix-wave): a
+    GENUINE automated committee-loop session in a worktree cwd -- one whose
+    rate IS corroborated as sustained automation, via the same trend/age
+    gate heuristic 5 uses -- still classifies 'committee-loop'. Two
+    independent corroboration signals, either sufficient on its own:
+      (a) a genuinely rising rate trend, even while still young; or
+      (b) the session is old enough that its rate reading is no longer
+          riding `_session_rate`'s 60s age floor.
+    """
+    rising_trend_young_age = {
+        "rate_pct_per_min": 2.0,
+        "sample_count": 8,
+        "cwd": "/home/yaz/code/misc/claude-usage-swap/.claude/worktrees/spec2-stage1",
+        "session_age_s": 30.0,
+        "rate_window_min": 10,
+        "trend": "rising",
+    }
+    assert cus._classify_session(rising_trend_young_age) == "committee-loop"
+
+    steady_trend_old_age = {
+        "rate_pct_per_min": 2.0,
+        "sample_count": 8,
+        "cwd": "/home/yaz/code/misc/claude-usage-swap/.claude/worktrees/spec2-stage1",
+        "session_age_s": 601.0,
+        "rate_window_min": 10,
+        "trend": "steady",
+    }
+    assert cus._classify_session(steady_trend_old_age) == "committee-loop"
 
 
 def test_classify_high_rate_without_structure_falls_back_to_workflow():
