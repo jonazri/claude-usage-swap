@@ -350,5 +350,45 @@ def test_fable_weekly_binding_escalates_rather_than_sizing():
     assert isinstance(plan["reason"], str) and plan["reason"]
 
 
+# ================= Task 24b: rate-only fallback corroboration =================
+
+def test_young_burst_session_not_targeted():
+    """Task 24b end-to-end (pre-shadow-flip HARD gate, §5.2 "never target
+    a human"): a young single-burst session's ONE instantaneous rate
+    reading is high (>= `_CLASSIFY_HIGH_RATE_PCT_PER_MIN`) but
+    uncorroborated -- no structural signal, trend not 'rising', and the
+    session is still well under its own rate window's maturity floor
+    (`rate_window_min * 60` = 600s here). Before Task 24b's fix, that rate
+    alone would have classed this session 'workflow' and made it a §5.2
+    targeting candidate; now `_classify_session` conservatively classes it
+    'interactive', so it must NEVER appear in `dry_run_target`'s targets --
+    even alongside a real breach with a genuinely elastic candidate
+    present, proving the corroboration requirement protects targeting
+    end-to-end, not just the classifier in isolation."""
+    burst_record = {
+        "rate_pct_per_min": 9.0,
+        "sample_count": 1,
+        "cwd": "/home/yaz/project",
+        "session_age_s": 25.0,
+        "rate_window_min": 10,
+    }
+    burst_class = cus._classify_session(burst_record)
+    assert burst_class == "interactive"  # NOT "workflow" -- the gate itself
+
+    burst = _session("burst1", burst_class, rate=9.0,
+                      account_shares={"acctX": 1.0}, trend="steady")
+    wf3 = _session("wf3", "workflow", rate=40.0, trend="steady",
+                    account_shares={"acctX": 1.0})
+
+    state = _account_state([burst, wf3], required=20.0, safety_factor=1.2)
+    plan = cus.dry_run_target(state, CFG)
+
+    target_ids = [t["session_id"] for t in plan["targets"]]
+    assert "burst1" not in target_ids
+    assert target_ids == ["wf3"]
+    assert plan["met"] is True
+    assert plan["escalate"] is False
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

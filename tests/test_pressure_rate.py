@@ -160,13 +160,93 @@ def test_classify_high_rate_without_structure_falls_back_to_workflow():
     """No structural signal (no children, no worktree cwd) but a rate no
     human typing could plausibly sustain -- design doc §3 lists 'a high
     sustained rate' as its own elastic signal -- falls back to the generic
-    automation class 'workflow' rather than 'interactive'."""
+    automation class 'workflow' rather than 'interactive', PROVIDED the
+    rate reading is corroborated as sustained (Task 24b hardening): here
+    via ``session_age_s`` already past the rate window's own maturity
+    floor (``rate_window_min * 60`` = 600s), so this is not a fixture that
+    relied on the old, now-unsafe rate-only-no-corroboration behavior."""
     record = {
         "rate_pct_per_min": 9.0,
         "sample_count": 20,
         "cwd": "/home/yaz/project",
+        "session_age_s": 900.0,
+        "rate_window_min": 10,
     }
     assert cus._classify_session(record) == "workflow"
+
+
+def test_young_single_burst_not_elastic():
+    """Task 24b (pre-shadow-flip HARD gate, §5.2 'never target a human'):
+    a brand-new *interactive* session whose first turn is one big
+    paste/tool-result can spike the instantaneous rate
+    (``_session_rate``'s 60s age-floor divisor) over
+    ``_CLASSIFY_HIGH_RATE_PCT_PER_MIN`` without being remotely automated.
+    With NO structural signal and NO corroboration -- trend not
+    'rising' and the session still younger than its own rate window's
+    maturity floor (``rate_window_min * 60``) -- the rate-only fallback
+    must NOT fire; this must classify 'interactive', never 'workflow'
+    (a false 'elastic' label here would make this session a dry-run
+    throttle target -- unsafe)."""
+    uncorroborated_records = [
+        # No trend field at all, young age (well under the 600s floor).
+        {
+            "rate_pct_per_min": 9.0,
+            "sample_count": 1,
+            "cwd": "/home/yaz/project",
+            "session_age_s": 20.0,
+            "rate_window_min": 10,
+        },
+        # Explicit steady trend, young age.
+        {
+            "rate_pct_per_min": 9.0,
+            "sample_count": 1,
+            "cwd": "/home/yaz/project",
+            "session_age_s": 45.0,
+            "rate_window_min": 10,
+            "trend": "steady",
+        },
+        # No age/rate_window_min fields at all (record shape the on-demand
+        # single-sample build path can hand in) -- must default
+        # conservatively, never treat missing age as "old enough".
+        {
+            "rate_pct_per_min": 9.0,
+            "sample_count": 1,
+            "cwd": "/home/yaz/project",
+        },
+    ]
+    for record in uncorroborated_records:
+        assert cus._classify_session(record) == "interactive", record
+
+
+def test_corroborated_high_rate_is_workflow():
+    """Task 24b: the SAME high, structurally-unsupported rate DOES class
+    'workflow' once genuinely corroborated as sustained automation --
+    either signal alone suffices:
+      (a) a genuinely rising multi-window trend (`_trend_class` over ~1h
+          of points), even while the session is still young; or
+      (b) the session is old enough that its rate is no longer riding
+          `_session_rate`'s 60s age floor (``session_age_s >=
+          rate_window_min * 60``), even with a 'steady' trend.
+    """
+    rising_trend_young_age = {
+        "rate_pct_per_min": 9.0,
+        "sample_count": 1,
+        "cwd": "/home/yaz/project",
+        "session_age_s": 30.0,
+        "rate_window_min": 10,
+        "trend": "rising",
+    }
+    assert cus._classify_session(rising_trend_young_age) == "workflow"
+
+    steady_trend_old_age = {
+        "rate_pct_per_min": 9.0,
+        "sample_count": 20,
+        "cwd": "/home/yaz/project",
+        "session_age_s": 601.0,
+        "rate_window_min": 10,
+        "trend": "steady",
+    }
+    assert cus._classify_session(steady_trend_old_age) == "workflow"
 
 
 def test_classify_missing_fields_is_conservative():

@@ -6719,6 +6719,25 @@ def _classify_session(record: dict) -> str:
         layout, never a rollup of the children's burn.)
       - ``has_workflow_children`` (bool, same but ``<session_id>/workflows/
         *.jsonl``)
+      - ``trend`` (str | None, this session's own ``_trend_class()`` output
+        over its trailing-rate history -- ``"rising"``/``"falling"``/
+        ``"steady"``. Only ``"rising"`` corroborates heuristic 5 below; a
+        single-sample history (no persisted rate history yet, Task 21's
+        on-demand build) is honestly ``"steady"`` by `_trend_class`'s own
+        ``len < 3`` rule, i.e. NOT corroborating -- it does not fabricate a
+        trend it can't see.)
+      - ``session_age_s`` (float, seconds since this session's own most
+        recent ``sessions.log`` interval start -- the SAME age
+        `_session_rate()` was called with to compute ``rate_pct_per_min``.
+        Task 24b uses it to tell a rate reading that has matured over its
+        own full trailing window from one still riding `_session_rate`'s
+        60s age-floor divisor.)
+      - ``rate_window_min`` (float, the trailing-rate window (minutes)
+        `_session_rate` was called with for this session -- Task 24b's
+        corroboration-by-age floor is ``rate_window_min * 60`` seconds;
+        defaults to 10 (this module's own ``rate_window_min`` config
+        default) when absent, never to 0 -- a missing value must never
+        make a young session look corroborated.)
 
     Heuristics, most-specific first, CONSERVATIVE by design (§5.2: a false
     elastic label risks wrongly targeting a human, so an ambiguous/missing
@@ -6733,13 +6752,21 @@ def _classify_session(record: dict) -> str:
       4. ``committee-loop`` -- cwd sits under a ``.worktrees/<child>``
          layout (``_in_worktree_cwd``): the parallel-worktree-per-agent
          pattern.
-      5. ``workflow`` (generic-automation fallback) -- none of the
-         structural signals above are set, but the sustained rate itself
-         (``>= _CLASSIFY_HIGH_RATE_PCT_PER_MIN`` pct/min) is higher than a
-         human typing could plausibly sustain (design doc §3 lists "a high
-         sustained rate" itself among the elastic signals).
+      5. ``workflow`` (generic-automation fallback, Task 24b HARDENED) --
+         none of the structural signals above are set, and the rate itself
+         is high (``>= _CLASSIFY_HIGH_RATE_PCT_PER_MIN`` pct/min: design
+         doc §3 lists "a high sustained rate" itself among the elastic
+         signals) -- BUT this fires ONLY when that rate is CORROBORATED as
+         sustained automation, not a one-off burst: either ``trend ==
+         "rising"``, or ``session_age_s >= rate_window_min * 60`` (the
+         rate's own divisor has already matured past `_session_rate`'s 60s
+         floor). Pre-shadow-flip gate (§5.2 "never target a human"): a
+         brand-new *interactive* session's first-turn paste/tool-result can
+         spike the instantaneous rate over the threshold without either
+         signal -- that case falls through to ``interactive``, uncorroborated.
       6. ``interactive`` -- the conservative default: real, sustained
-         activity with none of the above automation signals.
+         activity with none of the above automation signals (structural or
+         corroborated-rate).
     """
     rate = float(record.get("rate_pct_per_min", 0.0) or 0.0)
     sample_count = int(record.get("sample_count", 0) or 0)
@@ -6753,7 +6780,12 @@ def _classify_session(record: dict) -> str:
     if _in_worktree_cwd(record.get("cwd")):
         return "committee-loop"
     if rate >= _CLASSIFY_HIGH_RATE_PCT_PER_MIN:
-        return "workflow"
+        trend = record.get("trend")
+        session_age_s = float(record.get("session_age_s", 0.0) or 0.0)
+        rate_window_min = float(record.get("rate_window_min", 10.0) or 10.0)
+        corroborated = trend == "rising" or session_age_s >= rate_window_min * 60.0
+        if corroborated:
+            return "workflow"
     return "interactive"
 
 
@@ -21376,6 +21408,17 @@ def _pressure_build_session_table(attribution_table, intervals: dict, coord_map:
             "has_subagent_children": has_sub,
             "has_workflow_children": has_wf,
             "cwd": cwd,
+            # Task 24b corroboration signals for `_classify_session`'s
+            # rate-only fallback: this on-demand path's `trend` is
+            # honestly "steady" (single-sample history, see module note
+            # above), so `session_age_s`/`rate_window_min` -- the SAME
+            # values `_session_rate` just used for this session's own
+            # rate -- are what let a genuinely mature/sustained rate
+            # reading corroborate, while a young single-burst session
+            # (still riding `_session_rate`'s 60s age floor) does not.
+            "trend": trend,
+            "session_age_s": session_age_s,
+            "rate_window_min": rate_window_min,
         }
         session_table.append({
             "session_id": sid,
