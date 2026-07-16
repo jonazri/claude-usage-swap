@@ -21408,20 +21408,35 @@ def _pressure_session_child_flags(session_id: str, projects_dir: Path) -> tuple[
 
 
 def _pressure_build_session_table(attribution_table, intervals: dict, coord_map: dict[str, str],
-                                  projects_dir: Path, now: datetime, config: dict) -> list[dict]:
+                                  projects_dir: Path, now: datetime, config: dict,
+                                  persist: bool = False) -> list[dict]:
     """Assemble the ``sessions[]`` rows `_pressure_snapshot` (Task 20) needs
     (Task 21 wiring -- no earlier task pins this exact shape): coordinator
     rollup (`_rollup_children`, Task 13) over the raw per-message
     attribution (`_attribute_burn`, Task 11), then per-(rolled)session
     ``rate``/``class``/``trend`` (Task 12).
 
-    NO ACCUMULATED HISTORY (documented, not a bug): this on-demand path has
-    no persisted per-session rate history (that is daemon-persistence
-    territory, a later task) -- so `_session_rate` is fed a single sample
-    (this batch's total attributed burn for the session) and `_trend_class`
-    is fed a single-point history, which its own ``len(rate_history) < 3``
-    rule already defines as ``"steady"`` -- the correct, honest answer for
-    a caller with no history, not a fabricated trend.
+    ACCUMULATED HISTORY (Task 27b): `_trend_class` now sees this session's
+    own persisted trailing rate history (`_pressure_load_rate_history`,
+    grouped oldest-first per session_id by `_pressure_rate_history_by_
+    session`) with this cycle's freshly-computed `rate` appended, instead
+    of a single-point history -- so a session with >=3 accumulated samples
+    over its trailing window can genuinely read "rising"/"falling", not
+    just `_trend_class`'s own conservative <3-point "steady" default. A
+    session with no prior history (first time seen, or its history has
+    aged out) still gets that same honest "steady" default -- this is not
+    a regression of the old single-sample behavior, only an extension of
+    it.
+
+    ``persist`` (mirrors `_read_active_tails(..., persist=...)`'s own
+    contract, and `_pressure_accumulated_weight_windows`'s new one): the
+    daemon cycle (`_pressure_cycle`, persist=True) appends this cycle's
+    freshly-computed ``(session_id, rate, ts)`` samples to the accumulated
+    store AFTER building the table (so THIS cycle's own trend read is
+    computed from strictly prior history, never self-referential); the
+    on-demand CLI (`pressure_cmd`, persist=False) reads the accumulated
+    store as it stands and never appends -- so it can never race the
+    daemon over the same on-disk store.
 
     ``account_shares``: a session's rolled-up burn split by account (a
     session can be joined to more than one account across its own
@@ -21451,6 +21466,9 @@ def _pressure_build_session_table(attribution_table, intervals: dict, coord_map:
     rate_window_min = float(pressure_cfg.get("rate_window_min", 10))
     accel_thresh = float(pressure_cfg.get("trend_accel_thresh", 0.02))
 
+    rate_history_by_session = _pressure_rate_history_by_session(_pressure_load_rate_history())
+    new_rate_samples: list[dict] = []
+
     session_table: list[dict] = []
     for sid, acct_burns in totals_by_session.items():
         total_burn = sum(acct_burns.values())
@@ -21461,7 +21479,9 @@ def _pressure_build_session_table(attribution_table, intervals: dict, coord_map:
         last_iv = ivs[-1] if ivs else None
         session_age_s = max(0.0, (now - last_iv.start).total_seconds()) if last_iv else 0.0
         rate = _session_rate([total_burn], session_age_s, rate_window_min)
-        trend = _trend_class([rate], accel_thresh)
+        history = rate_history_by_session.get(sid, [])
+        trend = _trend_class(history + [rate], accel_thresh)
+        new_rate_samples.append({"session_id": sid, "rate": rate, "ts": now.isoformat()})
         has_sub, has_wf = _pressure_session_child_flags(sid, projects_dir)
         cwd = last_iv.cwd if last_iv else None
         record = {
@@ -21471,10 +21491,8 @@ def _pressure_build_session_table(attribution_table, intervals: dict, coord_map:
             "has_workflow_children": has_wf,
             "cwd": cwd,
             # Task 24b corroboration signals for `_classify_session`'s
-            # rate-only fallback: this on-demand path's `trend` is
-            # honestly "steady" (single-sample history, see module note
-            # above), so `session_age_s`/`rate_window_min` -- the SAME
-            # values `_session_rate` just used for this session's own
+            # rate-only fallback: `session_age_s`/`rate_window_min` -- the
+            # SAME values `_session_rate` just used for this session's own
             # rate -- are what let a genuinely mature/sustained rate
             # reading corroborate, while a young single-burst session
             # (still riding `_session_rate`'s 60s age floor) does not.
@@ -21495,6 +21513,8 @@ def _pressure_build_session_table(attribution_table, intervals: dict, coord_map:
             "trend": trend,
             "coordinator_of": sorted(coordinated_children.get(sid, [])) or None,
         })
+    if persist and new_rate_samples:
+        _pressure_rate_history_append(new_rate_samples, now)
     return session_table
 
 
@@ -21645,18 +21665,27 @@ def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
     registry (§3) -- there is no on-disk offsets registry in Stage 1 either
     way (Task 10: caller-owned in-memory only).
 
-    NO ACCUMULATED HISTORY (documented, not a bug, matches the on-demand
-    nature of this path): the weight-fit regression windows this command
-    can assemble are empty every call (there is no persisted >=200-window
-    history -- that is daemon-persistence territory, a later task), so
-    `fit_burn_weights` naturally reports ``source="insufficient-data"``
-    (seed weights) rather than a fabricated fit. For the identical reason
-    the ``offsets`` dict is always empty, `_attribution_confidence` (Task
-    19) naturally reports low confidence / ``blindness=True`` whenever
-    sessions are active -- an honest reflection of a stateless snapshot
-    having no persisted read history to compare against, not a targeting
-    bug (`_attribution_confidence`'s own gating already keeps this from
-    ever suppressing §5.4 supply-side escalation).
+    ACCUMULATED HISTORY, READ-ONLY (Task 27b): the weight-fit regression
+    windows and per-session rate history are now read from the daemon's
+    persisted cross-cycle stores under `PRESSURE_ROOT`
+    (`_pressure_accumulated_weight_windows`/`_pressure_build_session_table`,
+    both called with ``persist=False`` below) -- so this command benefits
+    from whatever the daemon has already accumulated (a real fit once
+    >=``weight_refit.min_windows`` windows exist, a real trend once a
+    session has >=3 accumulated rate samples) without ever appending its
+    own observation to either store, so it can never race the daemon over
+    the same on-disk store (same rationale as the ``offsets`` dict below).
+    Immediately after a fresh deploy, before the daemon has accumulated
+    enough history, this still naturally falls out to
+    ``source="insufficient-data"`` (seed weights) / ``trend="steady"`` --
+    an honest reflection of not-yet-enough history, not a targeting bug.
+    For the identical persist=False reason the ``offsets`` dict is always
+    empty, `_attribution_confidence` (Task 19) naturally reports low
+    confidence / ``blindness=True`` whenever sessions are active -- an
+    honest reflection of a stateless snapshot having no persisted read
+    history to compare against, not a targeting bug
+    (`_attribution_confidence`'s own gating already keeps this from ever
+    suppressing §5.4 supply-side escalation).
     """
     config = load_config()
     now = datetime.now(timezone.utc)
@@ -21702,11 +21731,11 @@ def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
     sessions_rows = _parse_sessions_log()
     intervals = _session_account_intervals(sessions_rows)
 
-    # 4. Weight-fit inputs: NO accumulated regression history on this
-    #    on-demand path (see docstring) -- pass the minimal/empty windows
-    #    actually available rather than fabricate history; this naturally
-    #    falls out to source="insufficient-data" (seed weights) below.
-    A, b, _dropped_reason_counts = _build_weight_windows([], [], [])
+    # 4. Weight-fit inputs: read-only over the daemon's accumulated
+    #    cross-cycle history (Task 27b), persist=False -- never appends
+    #    this call's own observation to the store (see docstring).
+    A, b, _dropped_reason_counts = _pressure_accumulated_weight_windows(
+        state, tails, intervals, config, now, persist=False)
     weight_fit = fit_burn_weights(A, b, None, config)
 
     # 5. Per-message attribution (Task 11) -> disjoint pinned/rotatable
@@ -21716,10 +21745,12 @@ def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
     partition = _partition_burn(attribution_table, state, config)
 
     # 6. Per-session rate/class/trend + coordinator rollup (Task 12/13).
+    #    persist=False (Task 27b): reads accumulated rate history, never
+    #    appends this call's own samples to the store.
     projects_dir = CLAUDE_DIR / "projects"
     coord_map = _pressure_coordinator_map(sessions_rows, projects_dir)
     session_table = _pressure_build_session_table(
-        attribution_table, intervals, coord_map, projects_dir, now, config)
+        attribution_table, intervals, coord_map, projects_dir, now, config, persist=False)
 
     # 7. Blindness / cold-start confidence (Task 19). `offsets` is still
     #    exactly the empty dict from step 2 -- persist=False guarantees it
@@ -22748,6 +22779,419 @@ def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now
     }
 
 
+# ---------------------------------------------------------------------------
+# Task 27b (spec-2 token-pressure forecaster, STAGE 1): persisted cross-cycle
+# rolling-history accumulator. Closes a real gap Tasks 14/16 (weight-fit) and
+# 12 (trend) left open: `pressure_cmd`/`_pressure_cycle` have ALWAYS called
+# `_build_weight_windows([], [], [])` literally (Task 21/23's own call --
+# neither task's brief pinned a real producer, see their reports) and
+# `_pressure_build_session_table` has ALWAYS fed `_trend_class` a single-
+# sample history, so `fit_burn_weights` could never see >=
+# `weight_refit.min_windows` (200) real windows (source stuck at
+# "insufficient-data"/seeds forever) and `_trend_class` could never see more
+# than one point (stuck at its own conservative `len < 3` -> "steady"
+# default forever). Two pressure-owned rolling stores under `PRESSURE_ROOT`
+# (NEVER state.json/`save_state`, G0) close this:
+#
+#   1. weight_windows.jsonl -- one row per (account) window observation per
+#      daemon cycle, reconstructable into `_build_weight_windows`'s own
+#      `(pct_history, token_totals_per_window)` inputs. A companion
+#      weight_window_resets.jsonl carries detected reset-crossing rows (its
+#      `resets` input), and a tiny weight_window_cursor.json pointer (last
+#      poll's pct/ts/resets_at per account) is what makes computing a Δpct
+#      window and detecting a crossing possible in the first place -- NOT
+#      itself a rolling history (O(#accounts), never grows unboundedly).
+#      Row growth bounded to `_PRESSURE_WEIGHT_WINDOW_MAX_ROWS` (3000): at a
+#      live ~5 min daemon cadence this is comfortably more than a week even
+#      for several accounts, always >= `weight_refit.min_windows` (200) with
+#      generous headroom for Task 14's own reset-crossing/zero-token/
+#      nonpositive-b exclusions.
+#   2. session_rate_history.jsonl -- one row per (session_id, rate, ts)
+#      sample per daemon cycle, so `_trend_class` sees a real trailing
+#      series instead of one point. Bounded by AGE
+#      (`_PRESSURE_RATE_HISTORY_MAX_AGE_MIN`, 2h, plus a flat row-count
+#      backstop) -- a session with no fresh samples (ended/gone quiet) ages
+#      entirely out of its own trailing window, which is also how a dead
+#      session's history is evicted (no separate liveness check needed).
+#
+# PERSIST GATING mirrors `_read_active_tails(..., persist=...)`'s own
+# contract exactly (Task 10): the daemon cycle (`_pressure_cycle`,
+# persist=True) computes + APPENDS this cycle's own new observations before
+# reading; the on-demand CLI (`pressure_cmd`, persist=False) READS the
+# accumulated stores AS THEY STAND, never appends -- so the CLI benefits
+# from the daemon's accumulated history without ever racing the daemon over
+# the same on-disk store (same G0/§3 rationale Task 10/21 already
+# established for the transcript-offset registry, now applied here too).
+#
+# ATOMICITY: every store is tmp+rename (`atomic_write_bytes`/`write_json`,
+# the SAME mechanism `_pressure_write_json`/`_pressure_save_last_emit`
+# already use), and a JSONL store's read-modify-write append is additionally
+# guarded by a companion `<path>.lock` file's `fcntl.flock` -- a SEPARATE
+# lock file, never the data file itself (flock is tied to an inode, and
+# `os.replace` swaps inodes at rename time, so flock-ing the data file
+# directly would stop protecting the NEW file the instant the rename
+# lands). A reader therefore always sees either the complete prior content
+# or the complete new content, never a torn write -- "a malformed/partial
+# line" can only ever be pre-existing/injected corruption, never a torn
+# append; the tolerant per-line JSONL reader (mirrors `_pressure_shadow_
+# scan`'s own convention exactly) skips such a line without losing any
+# OTHER, already-valid row.
+# ---------------------------------------------------------------------------
+
+_PRESSURE_WEIGHT_WINDOW_MAX_ROWS = 3000
+_PRESSURE_WEIGHT_RESET_MAX_ROWS = 500
+_PRESSURE_RATE_HISTORY_MAX_AGE_MIN = 120.0  # ~2h trailing window per session
+_PRESSURE_RATE_HISTORY_MAX_ROWS = 20000  # hard backstop alongside the age prune
+
+_PRESSURE_RAW_TOKEN_COLUMNS = ("input", "output", "cache_read", "cache_create_5m", "cache_create_1h")
+
+
+def _pressure_weight_window_path() -> Path:
+    """Call-time (not import-time) `PRESSURE_ROOT`-derived path, same
+    convention as `_pressure_last_emit_path` -- a test repointing
+    `cus.PRESSURE_ROOT` at a tmp tree never touches the real store."""
+    return PRESSURE_ROOT / "weight_windows.jsonl"
+
+
+def _pressure_weight_reset_path() -> Path:
+    return PRESSURE_ROOT / "weight_window_resets.jsonl"
+
+
+def _pressure_weight_window_cursor_path() -> Path:
+    return PRESSURE_ROOT / "weight_window_cursor.json"
+
+
+def _pressure_rate_history_path() -> Path:
+    return PRESSURE_ROOT / "session_rate_history.jsonl"
+
+
+def _pressure_read_jsonl(path: Path) -> list[dict]:
+    """Best-effort tolerant JSONL read (Task 27b; mirrors `_pressure_shadow_
+    scan`'s own convention exactly): a missing file yields `[]` (never
+    raises -- the store may not have been written yet), and a malformed/
+    non-dict line is skipped rather than discarding every OTHER,
+    already-valid row."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            rows.append(rec)
+    return rows
+
+
+def _pressure_write_jsonl(path: Path, rows: list[dict]) -> None:
+    """Whole-file tmp+rename JSONL write (Task 27b) -- `atomic_write_bytes`
+    is what makes this safe against a torn read (see the Task 27b banner's
+    ATOMICITY note)."""
+    content = "".join(json.dumps(r, default=str, separators=(",", ":")) + "\n" for r in rows)
+    atomic_write_bytes(path, content.encode())
+
+
+def _pressure_append_jsonl_bounded(path: Path, new_rows: list[dict], *, max_rows: int,
+                                    prune=None) -> None:
+    """Atomically append `new_rows` to the JSONL store at `path`, then prune
+    (Task 27b, bounded-growth requirement): the caller-supplied
+    `prune(rows) -> rows` predicate runs first when given (age-based
+    eviction, the rate-history store), followed by an unconditional
+    ``rows[-max_rows:]`` count-based trim (drop OLDEST first -- the store is
+    append-only chronological, so "keep the last max_rows lines" IS "prune
+    the oldest").
+
+    Concurrency: a companion `<path>.lock` file (never `path` itself, see
+    the Task 27b banner) serializes this read-modify-write under
+    `fcntl.flock`; the actual on-disk write is `_pressure_write_jsonl`'s
+    tmp+rename, so a concurrent reader never observes a torn/partial file.
+    """
+    if not new_rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / (path.name + ".lock")
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            rows = _pressure_read_jsonl(path)
+            rows.extend(new_rows)
+            if prune is not None:
+                rows = prune(rows)
+            if len(rows) > max_rows:
+                rows = rows[-max_rows:]
+            _pressure_write_jsonl(path, rows)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
+def _pressure_load_weight_windows() -> list[dict]:
+    return _pressure_read_jsonl(_pressure_weight_window_path())
+
+
+def _pressure_weight_window_append(rows: list[dict]) -> None:
+    _pressure_append_jsonl_bounded(
+        _pressure_weight_window_path(), rows, max_rows=_PRESSURE_WEIGHT_WINDOW_MAX_ROWS)
+
+
+def _pressure_load_weight_resets() -> list[dict]:
+    return _pressure_read_jsonl(_pressure_weight_reset_path())
+
+
+def _pressure_weight_reset_append(rows: list[dict]) -> None:
+    _pressure_append_jsonl_bounded(
+        _pressure_weight_reset_path(), rows, max_rows=_PRESSURE_WEIGHT_RESET_MAX_ROWS)
+
+
+def _pressure_load_weight_window_cursor() -> dict:
+    """Best-effort read of the tiny per-account last-poll pointer -- `{}` on
+    missing/corrupt, mirroring `_pressure_load_last_emit`'s tolerant style
+    exactly (a lost cursor degrades to "every account looks first-ever-seen
+    next cycle", never a crash -- it costs one cycle's worth of Δpct, not
+    correctness)."""
+    try:
+        return read_json(_pressure_weight_window_cursor_path())
+    except (OSError, ValueError):
+        return {}
+
+
+def _pressure_save_weight_window_cursor(cursor: dict) -> None:
+    """Atomic tmp+rename write (never `save_state` -- this lives outside
+    state.json entirely, G0/G1), mirrors `_pressure_save_last_emit` exactly."""
+    write_json(_pressure_weight_window_cursor_path(), cursor)
+
+
+def _pressure_load_rate_history() -> list[dict]:
+    return _pressure_read_jsonl(_pressure_rate_history_path())
+
+
+def _pressure_rate_history_append(rows: list[dict], now: datetime) -> None:
+    """Append this cycle's new per-session rate samples, pruning any row
+    older than `_PRESSURE_RATE_HISTORY_MAX_AGE_MIN` (Task 27b's age-based
+    bound -- see the module banner: this is also how a dead/ended session's
+    entire history evicts itself, no separate liveness check needed)."""
+    cutoff = now - timedelta(minutes=_PRESSURE_RATE_HISTORY_MAX_AGE_MIN)
+
+    def _prune(all_rows: list[dict]) -> list[dict]:
+        kept = []
+        for r in all_rows:
+            ts = _pressure_parse_ts(r.get("ts"))
+            if ts is not None and ts < cutoff:
+                continue
+            kept.append(r)
+        return kept
+
+    _pressure_append_jsonl_bounded(
+        _pressure_rate_history_path(), rows, max_rows=_PRESSURE_RATE_HISTORY_MAX_ROWS, prune=_prune)
+
+
+def _pressure_rate_history_by_session(rows: list[dict]) -> dict[str, list[float]]:
+    """Group accumulated rate-history rows into a per-session, OLDEST-FIRST
+    list of rates -- `_trend_class`'s own required input shape (Task 12). A
+    row missing/malformed `session_id`/`ts`/`rate` is skipped defensively
+    (a directly-constructed test row, or injected corruption already
+    tolerated by `_pressure_read_jsonl`'s own per-line skip)."""
+    grouped: dict[str, list[tuple[datetime, float]]] = {}
+    for row in rows:
+        sid = row.get("session_id")
+        ts = _pressure_parse_ts(row.get("ts"))
+        rate = row.get("rate")
+        if not sid or ts is None or not isinstance(rate, (int, float)) or isinstance(rate, bool):
+            continue
+        grouped.setdefault(sid, []).append((ts, float(rate)))
+    result: dict[str, list[float]] = {}
+    for sid, pts in grouped.items():
+        pts.sort(key=lambda p: p[0])
+        result[sid] = [r for _, r in pts]
+    return result
+
+
+def _pressure_raw_token_totals_by_account(tails: dict, intervals: dict) -> dict[str, dict[str, float]]:
+    """RAW (unweighted) per-token-type totals per account, summed from this
+    cycle's transcript tails (Task 27b) -- the `token_totals_per_window`
+    ingredient `_build_weight_windows` (Task 14) needs, which nothing
+    before this task ever produced (Task 21/23 always called it with
+    `[]`/`[]`).
+
+    Deliberately a SEPARATE pass from `_attribute_burn` (Task 11), not a
+    refactor of it: `_attribute_burn` sums one WEIGHTED scalar per
+    `(account, session_id)` using the CURRENT fit's weights, which THIS
+    function is an input to (calling `_attribute_burn` here would be
+    circular) -- and it is a load-bearing, golden-replay-covered function
+    this task must not touch. This mirrors its exact flatten -> dedup ->
+    `_join_usage_account` time-join pattern (§10.9's 7-day dedup window,
+    chronological-order first-occurrence-wins) but groups by ACCOUNT ONLY
+    (the weight-fit window is per-account, not per-session) and sums the 4
+    real-usage-field columns `_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN`
+    names -- `cache_create_1h` has no raw source in Stage 1 (the SAME
+    documented 5m/1h collapse `_pressure_message_weights` already
+    codifies) and is always 0.0 here. An unjoinable line (`account is
+    None`) contributes to no account's totals, same as `_attribute_burn`'s
+    residual treatment.
+    """
+    entries: list[tuple[datetime, str, str, dict]] = []
+    for _path, lines in tails.items():
+        for line in lines:
+            if not isinstance(line, dict) or line.get("type") != "assistant":
+                continue
+            message = line.get("message")
+            if not isinstance(message, dict):
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            uid = line.get("uuid")
+            session_id = line.get("sessionId")
+            ts_raw = line.get("timestamp")
+            if not (uid and session_id and ts_raw):
+                continue
+            ts = _pressure_parse_ts(ts_raw)
+            if ts is None:
+                continue
+            entries.append((ts, session_id, uid, usage))
+    entries.sort(key=lambda e: e[0])
+
+    totals: dict[str, dict[str, float]] = {}
+    seen_at: dict[tuple[str, str], datetime] = {}
+    for ts, session_id, uid, usage in entries:
+        key = (session_id, uid)
+        prior = seen_at.get(key)
+        if prior is not None and abs(ts - prior) <= _ATTRIBUTION_DEDUP_WINDOW:
+            continue
+        seen_at[key] = ts
+        session_intervals = intervals.get(session_id, [])
+        account, _confidence = _join_usage_account(ts, session_intervals)
+        if account is None:
+            continue
+        acct_totals = totals.setdefault(account, {c: 0.0 for c in _PRESSURE_RAW_TOKEN_COLUMNS})
+        for col, usage_key in _PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN.items():
+            v = usage.get(usage_key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                acct_totals[col] += v
+    return totals
+
+
+def _pressure_window_observations(state: dict, config: dict, now: datetime,
+                                   raw_totals_by_account: dict[str, dict[str, float]],
+                                   cursor: dict) -> tuple[list[dict], list[dict], dict]:
+    """This cycle's NEW weight-fit window-observation row(s) (Task 27b) --
+    one per account that has a PRIOR cursor entry to diff against (an
+    account seen for the first time ever only seeds the cursor; it cannot
+    yield a Δpct window yet -- the SAME cold-start-is-honest posture Task
+    19 already established elsewhere in this module), any reset-crossing(s)
+    detected since the cursor, and the UPDATED cursor for next cycle.
+
+    Window-type fixed to "5h" (Stage-1 scope pin -- no earlier task pins
+    this): the fastest-moving, ladder-gated window (`_pressure_gate`'s LIVE
+    top step, FACT #1/#7). A "7d" window barely moves at a live ~5 min
+    daemon cadence, contributing near-zero informative Δpct per cycle and
+    diluting the accumulator rather than accelerating it toward
+    `weight_refit.min_windows`.
+
+    `cursor` is `{account: {"ts": iso, "pct": float, "resets_at": iso|None}}`
+    -- a SEPARATE, tiny (O(#accounts), never unboundedly growing) pointer,
+    NOT the row history itself. `five_hour_resets_at` is state's own
+    upcoming-reset-boundary timestamp (the SAME field `_pressure_reset_
+    knot` reads, and the SAME `cur_resets_at != prev_resets_at` crossing
+    test the daemon's own ladder-reset detection already uses elsewhere in
+    this file) -- when it CHANGES between two consecutive cycles, the
+    account crossed that exact boundary sometime in between, and the OLD
+    value IS that boundary's timestamp (Task 14 responsibility 1's
+    `resets` input).
+
+    Pure (G0): reads its inputs, mutates none of them; the caller decides
+    whether/how to persist the returned rows/cursor (persist gating lives
+    at the call site, `_pressure_accumulated_weight_windows`, mirroring
+    `_read_active_tails(..., persist=...)`'s own split).
+    """
+    window_rows: list[dict] = []
+    reset_rows: list[dict] = []
+    new_cursor: dict = {}
+    accounts = state.get("accounts", {}) or {}
+    for account, acct_state in accounts.items():
+        if not isinstance(acct_state, dict):
+            continue
+        cur_pct = acct_state.get("current_5h_pct")
+        if cur_pct is None:
+            continue
+        cur_resets_at = acct_state.get("five_hour_resets_at")
+        prior = cursor.get(account)
+        if isinstance(prior, dict) and prior.get("ts") is not None:
+            prior_resets_at = prior.get("resets_at")
+            if prior_resets_at and cur_resets_at and prior_resets_at != cur_resets_at:
+                reset_rows.append({"account": account, "ts": prior_resets_at})
+            ratio = _pressure_acct_ratio(acct_state, config)
+            totals = raw_totals_by_account.get(account, {})
+            window_rows.append({
+                "account": account,
+                "start_ts": prior.get("ts"),
+                "end_ts": now.isoformat(),
+                "pct_start": float(prior.get("pct", 0.0)),
+                "pct_end": float(cur_pct),
+                "ratio": ratio,
+                "input": float(totals.get("input", 0.0) or 0.0),
+                "output": float(totals.get("output", 0.0) or 0.0),
+                "cache_read": float(totals.get("cache_read", 0.0) or 0.0),
+                "cache_create_5m": float(totals.get("cache_create_5m", 0.0) or 0.0),
+                "cache_create_1h": float(totals.get("cache_create_1h", 0.0) or 0.0),
+            })
+        new_cursor[account] = {
+            "ts": now.isoformat(), "pct": float(cur_pct), "resets_at": cur_resets_at,
+        }
+    return window_rows, reset_rows, new_cursor
+
+
+def _pressure_accumulated_weight_windows(state: dict, tails: dict, intervals: dict,
+                                          config: dict, now: datetime, *,
+                                          persist: bool) -> tuple[list[list[float]], list[float], dict[str, int]]:
+    """The accumulated-history counterpart (Task 27b) to a bare
+    `_build_weight_windows([], [], [])` call -- Task 14's own solver-input
+    builder is UNCHANGED (still pure, still the G4 exclusion boundary);
+    this function only changes WHERE its three inputs come from: the
+    persisted cross-cycle stores instead of an always-empty literal.
+
+    persist=True (daemon, `_pressure_cycle`): builds + appends THIS cycle's
+    own new window/reset rows first (`_pressure_window_observations`),
+    updates the cursor, THEN reads the (now-extended) accumulated stores.
+    persist=False (on-demand CLI, `pressure_cmd`): reads the accumulated
+    stores AS THEY STAND -- never computes or appends its own observation,
+    so the CLI can never race the daemon over the same on-disk store (same
+    G0/§3 rationale as `_read_active_tails`'s own `persist` contract). Both
+    paths benefit from whatever the daemon has already accumulated.
+    """
+    if persist:
+        raw_totals = _pressure_raw_token_totals_by_account(tails, intervals)
+        cursor = _pressure_load_weight_window_cursor()
+        new_windows, new_resets, new_cursor = _pressure_window_observations(
+            state, config, now, raw_totals, cursor)
+        if new_windows:
+            _pressure_weight_window_append(new_windows)
+        if new_resets:
+            _pressure_weight_reset_append(new_resets)
+        _pressure_save_weight_window_cursor(new_cursor)
+
+    all_windows = _pressure_load_weight_windows()
+    all_resets = _pressure_load_weight_resets()
+    pct_history = [
+        {"account": w.get("account"), "start_ts": w.get("start_ts"), "end_ts": w.get("end_ts"),
+         "pct_start": w.get("pct_start"), "pct_end": w.get("pct_end"), "ratio": w.get("ratio")}
+        for w in all_windows
+    ]
+    token_totals_per_window = [
+        {col: w.get(col, 0.0) for col in _PRESSURE_RAW_TOKEN_COLUMNS}
+        for w in all_windows
+    ]
+    return _build_weight_windows(pct_history, token_totals_per_window, all_resets)
+
+
 def _pressure_cycle(state: dict, config: dict, now) -> dict:
     """The daemon's per-cycle Phase-D pipeline + snapshot assembly + shadow/
     emit gate (Task 23) -- the persist=True twin of `pressure_cmd`'s
@@ -22801,7 +23245,12 @@ def _pressure_cycle(state: dict, config: dict, now) -> dict:
     sessions_rows = _parse_sessions_log()
     intervals = _session_account_intervals(sessions_rows)
 
-    A, b, _dropped_reason_counts = _build_weight_windows([], [], [])
+    # Task 27b: persist=True -- appends this cycle's own new weight-window/
+    # reset observation(s) to the accumulated cross-cycle stores (deriving
+    # them from THIS cycle's tails/intervals) before reading them back, so
+    # the fit input is the accumulated history, not an always-empty literal.
+    A, b, _dropped_reason_counts = _pressure_accumulated_weight_windows(
+        state, tails, intervals, config, now, persist=True)
     weight_fit = fit_burn_weights(A, b, None, config)
 
     message_weights = _pressure_message_weights(weight_fit["weights"])
@@ -22810,8 +23259,12 @@ def _pressure_cycle(state: dict, config: dict, now) -> dict:
 
     projects_dir = CLAUDE_DIR / "projects"
     coord_map = _pressure_coordinator_map(sessions_rows, projects_dir)
+    # Task 27b: persist=True -- appends this cycle's freshly-computed
+    # per-session rate sample(s) to the accumulated rate-history store
+    # (after this cycle's own trend read, which is computed from strictly
+    # prior history -- see `_pressure_build_session_table`'s docstring).
     session_table = _pressure_build_session_table(
-        attribution_table, intervals, coord_map, projects_dir, now, config)
+        attribution_table, intervals, coord_map, projects_dir, now, config, persist=True)
 
     attribution = dict(_attribution_confidence(offsets_before_read, list(tails.keys()), now))
     attribution["residual_fraction"] = attribution_table.residual_fraction

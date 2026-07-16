@@ -76,6 +76,16 @@ def _env(tmp_path, monkeypatch, *, state=None, config=None):
     # Nonexistent -> _parse_sessions_log() safely returns [].
     monkeypatch.setattr(cus, "SESSIONS_LOG", tmp_path / "sessions.log")
 
+    # Task 27b: `cmd_pressure` now reads (never writes, persist=False) the
+    # daemon's persisted cross-cycle history stores under `PRESSURE_ROOT` --
+    # isolate that tree too (same pattern `tests/test_pressure_shadow.py`'s
+    # own `_env` uses), otherwise a run here would read the REAL machine's
+    # `~/claude-accounts/pressure/` store instead of a clean, empty one.
+    accounts_dir = tmp_path / "claude-accounts"
+    monkeypatch.setattr(cus, "ACCOUNTS_DIR", accounts_dir)
+    monkeypatch.setattr(cus, "PRESSURE_JSON", accounts_dir / "pressure.json")
+    monkeypatch.setattr(cus, "PRESSURE_ROOT", accounts_dir / "pressure")
+
     return state_path, config_path
 
 
