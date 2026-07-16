@@ -188,8 +188,17 @@ def test_shadow_mode_suppresses_emit_and_logs(tmp_path, monkeypatch):
     )
     assert record["would_target"][0]["session_id"] == "wf-shadow-1"
 
-    assert record["reset_models"]["rolling_integral"] is None
+    # Task 26 wires `rolling_integral` in (no longer the `None` placeholder
+    # Task 23 left it as) -- both models are now populated per account/window.
     assert "decayed_step" in record["reset_models"]
+    assert "rolling_integral" in record["reset_models"]
+    assert "A" in record["reset_models"]["decayed_step"]
+    assert "A" in record["reset_models"]["rolling_integral"]
+    assert "reset_models_actual" in record
+    assert record["reset_models_actual"]["A"] == {
+        "5h": record["per_account"]["A"]["5h"]["remaining_units"],
+        "7d": record["per_account"]["A"]["7d"]["remaining_units"],
+    }
     assert record["pool"] == snapshot["pool"]
     assert record["per_account"] == snapshot["accounts"]
     assert record["weight_fit"] == snapshot["weight_fit"]

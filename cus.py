@@ -5338,9 +5338,29 @@ def _pressure_remaining_curve(acct: dict, window: str, config: dict, now,
     ``_pressure_reset_knot(..., horizon=horizon)``). BOTH the trigger/exit-ETA
     path and the required-reduction path pass ``H+margin = 240`` so a 5h reset
     in ``(180, 240]`` still earns its ramp credit; ``H = 180`` is only the ENTER
-    threshold applied downstream (Task 9). ``model`` is reserved for Task 26's
-    shadow-only ``rolling_integral`` branch; the live path is always
-    ``decayed_step``.
+    threshold applied downstream (Task 9).
+
+    ``model`` (Task 26): ``"decayed_step"`` (default, LIVE) is the ramp above,
+    unchanged. ``"rolling_integral"`` is a SHADOW-ONLY second model (never
+    reached by any live-path caller -- none of ``_pinned_account_eta``/
+    ``_required_reduction_pinned``/``_account_knots``/Task 20's snapshot
+    assembler pass ``model=``, so they stay on ``decayed_step`` regardless of
+    what this branch computes) that assumes a uniform release rate starting
+    at ``t=0`` rather than a step anchored at the reset boundary ``T_w``::
+
+        remaining_w(t) = remaining_w(0) + (R_w/W_w)*min(t, W_w) - pinned_burn_units*t
+
+    -- the closed form of "the same constant credit ``R_w`` released evenly
+    across the whole window ``W_w``, as if the account's burn history were
+    uniform back to the start of the window" (LOW-CONFIDENCE: cus doesn't
+    store a burn-history profile to justify uniformity; Stage-1 shadow-logs
+    this alongside ``decayed_step`` to score which shape fits reality, G5 --
+    never gates). It reuses the EXACT SAME ``R_w``/``W_w``/``remaining_w(0)``
+    ``decayed_step`` computes (not redefined), and is gated on the SAME
+    ``T_w is not None`` (a reset knot inside ``horizon``) as ``decayed_step``
+    -- no reset in horizon means neither model credits anything, so a stale
+    ``five_hour_resets_at`` that rolls forward past ``horizon`` (Task 3) is
+    never credited early by either model.
 
     Read-only (G0): reads ``acct`` + resolves ``reference_x`` side-effect-free;
     mutates nothing. Returns a fresh closure over immutable scalars.
@@ -5358,7 +5378,10 @@ def _pressure_remaining_curve(acct: dict, window: str, config: dict, now,
     def f(t: float) -> float:
         val = remaining0 - pinned_burn_units * t
         if T_w is not None:
-            val += _pressure_reset_ramp(t, T_w, W_w, R_w, k)
+            if model == "rolling_integral":
+                val += (R_w / W_w) * min(t, W_w)
+            else:
+                val += _pressure_reset_ramp(t, T_w, W_w, R_w, k)
         return val
 
     return f
@@ -5554,6 +5577,44 @@ def _account_knots(acct: dict, window: str, config: dict, now,
             seg.append(tb)
     rem = _pressure_remaining_curve(acct, window, config, now, pinned_burn_units,
                                     horizon=horizon)
+    for root in _account_zero_roots(rem, seg, horizon):
+        knots.add(root)
+    return sorted(knots)
+
+
+def _pressure_reset_model_knots(acct: dict, window: str, config: dict, now,
+                                pinned_burn_units: float, *, horizon: float,
+                                model: str) -> list[float]:
+    """Model-aware first-crossing knot set for the shadow ``reset_models``
+    block (Task 26, G5, shadow-only). ``decayed_step`` reuses ``_account_
+    knots`` VERBATIM -- byte-identical to the live per-account pinned-ETA
+    knot set, since ``decayed_step``'s own interior kinks (``T_w``,
+    ``T_w+W_w``) are exactly what ``_account_knots`` already builds.
+
+    ``rolling_integral``'s curve has a DIFFERENT (single) interior kink: the
+    release cap at ``t = W_w`` (release starts at ``t=0`` with no boundary-
+    anchored kink at ``T_w`` itself -- see ``_pressure_remaining_curve``), so
+    it gets its own smaller knot set: ``{0, horizon}`` plus that one cap
+    point when it falls in-horizon, plus that segment's own clamp-to-zero
+    root (``_account_zero_roots``, the same technique ``_account_knots``
+    uses, applied to the rolling_integral curve instead). Gated on the same
+    ``T_w is not None`` reset-in-horizon check as the curve itself -- no
+    reset in horizon means no kink to add either.
+
+    Read-only (G0).
+    """
+    if model != "rolling_integral":
+        return _account_knots(acct, window, config, now, pinned_burn_units,
+                              horizon=horizon)
+    W_w = 300.0 if window == "5h" else 10080.0
+    T_w = _pressure_reset_knot(acct, window, config, now, horizon=horizon)
+    knots = {0.0, float(horizon)}
+    seg: list[float] = []
+    if T_w is not None and 0.0 < W_w <= horizon:
+        knots.add(W_w)
+        seg.append(W_w)
+    rem = _pressure_remaining_curve(acct, window, config, now, pinned_burn_units,
+                                    horizon=horizon, model=model)
     for root in _account_zero_roots(rem, seg, horizon):
         knots.add(root)
     return sorted(knots)
@@ -22060,24 +22121,42 @@ def _shadow_log(record: dict, now) -> None:
         os.close(fd)
 
 
-def _pressure_shadow_decayed_step(state: dict, config: dict, now) -> dict:
-    """The populate-able half of the shadow record's `reset_models` block
-    (per Task 23's own instruction: `decayed_step` CAN be populated -- Task
-    4, already built; `rolling_integral` stays `None`, wired at Task 26).
+def _pressure_shadow_reset_models(state: dict, snapshot: dict, config: dict, now) -> dict:
+    """Both post-reset models' per-account/window forecast, for the shadow
+    record's `reset_models` block (Task 26 -- fills Task 23's own
+    `rolling_integral: None` placeholder; `decayed_step` was already
+    populate-able there, Task 4). Returns
+    `{"decayed_step": {name: {window: {...}}}, "rolling_integral": {...}}`.
 
-    Per account/window, the Task-4 `_pressure_reset_knot` boundary --
-    minutes to the NEXT reset, only when it falls within the same
-    `H+margin=240` horizon the ETA/required-reduction paths use -- the one
-    piece of the decayed-step ramp model's own parameters (`T_w`) not
-    already published elsewhere in pressure.json's `accounts` block (which
-    only publishes the resulting curve VALUES, not the knot timing itself).
-    `None` per window when no reset lands in horizon (nothing to report,
-    not a failure). Read-only (G0).
+    Neither call here is reachable from the live (`shadow_mode: false`)
+    path: `_pressure_snapshot`'s own curve calls (`_pinned_account_eta`/
+    `_required_reduction_pinned`/`_account_knots`) never pass `model=`, so
+    the published ETAs/level/emit decision are unaffected regardless of
+    what this function computes (Part 3, G5 -- shadow never gates).
+
+    `pinned_burn_units` is NOT re-derived from a `partition` object --
+    `_pressure_build_shadow_record`'s own signature (an existing Task-23
+    caller depends on it) carries no `partition`, only `state`/`snapshot`/
+    `config`/`now` -- it is RECOVERED from the snapshot's own already-
+    published `accounts.<name>.<window>.burn_pct_per_min` by inverting Task
+    20's own `burn_pct_per_min = pinned_units*100/ratio` with the SAME
+    `_pressure_acct_ratio`, so the reconstructed value is the real Task-11
+    pinned burn the live snapshot used (mod float round-trip), not a fresh
+    approximation.
+
+    Per model: `eta_min` is that model's own first-crossing-to-zero
+    (`_first_crossing_eta` over `_pressure_reset_model_knots`'s model-aware
+    knot set) and `remaining_at_plus_60` is that model's curve evaluated at
+    `config.pressure.critical_eta_min` (default 60) minutes ahead -- the
+    same lead Task 9's own critical-level classification uses. Read-only
+    (G0): reads `state`/`snapshot`/`config`, mutates nothing.
     """
     horizon = _pressure_trigger_horizon(config)
+    lead = float(config.get("pressure", {}).get("critical_eta_min", 60))
     accounts_state = state.get("accounts", {})
     disabled = _disabled_accounts(config)
-    out: dict = {}
+    snap_accounts = snapshot.get("accounts", {})
+    out: dict = {"decayed_step": {}, "rolling_integral": {}}
     for a in config.get("accounts", []):
         if not isinstance(a, dict):
             continue
@@ -22085,8 +22164,42 @@ def _pressure_shadow_decayed_step(state: dict, config: dict, now) -> dict:
         if not name or name in disabled:
             continue
         acct_state = accounts_state.get(name, {})
+        ratio = _pressure_acct_ratio(acct_state, config)
+        snap_entry = snap_accounts.get(name, {}) or {}
+        for model in ("decayed_step", "rolling_integral"):
+            out[model][name] = {}
+        for window in _PRESSURE_WINDOWS:
+            win_snap = snap_entry.get(window, {}) or {}
+            burn_pct_per_min = float(win_snap.get("burn_pct_per_min", 0.0) or 0.0)
+            pinned_units = (burn_pct_per_min * ratio / 100.0 if ratio
+                           else burn_pct_per_min / 100.0)
+            for model in ("decayed_step", "rolling_integral"):
+                curve = _pressure_remaining_curve(
+                    acct_state, window, config, now, pinned_units,
+                    horizon=horizon, model=model)
+                knots = _pressure_reset_model_knots(
+                    acct_state, window, config, now, pinned_units,
+                    horizon=horizon, model=model)
+                eta = _first_crossing_eta(curve, 0.0, knots, config, now)
+                out[model][name][window] = {
+                    "eta_min": eta,
+                    "remaining_at_plus_60": curve(lead),
+                }
+    return out
+
+
+def _pressure_shadow_actual_remaining(snapshot: dict) -> dict:
+    """Current actual per-account/window remaining units (Task 26, G0),
+    read directly from the snapshot's own already-computed `accounts` block
+    (Task 20's pure `_pressure_remaining_units` result -- never
+    recomputed), so the Task 30 backtest can temporally-join a cycle-N
+    model prediction of `remaining_at_plus_60` to the cycle-~N+60min ACTUAL
+    reading logged here. This function only reads `snapshot`; the temporal
+    join itself is Task 30's job, out of scope here."""
+    out: dict = {}
+    for name, entry in snapshot.get("accounts", {}).items():
         out[name] = {
-            window: _pressure_reset_knot(acct_state, window, config, now, horizon=horizon)
+            window: (entry.get(window, {}) or {}).get("remaining_units")
             for window in _PRESSURE_WINDOWS
         }
     return out
@@ -22558,6 +22671,15 @@ def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now
     the only mutation is the shadow-owned `last_would_emit.json` registry, a
     pressure-owned store outside state.json entirely, same as
     `last_emit.json` itself.
+
+    `reset_models` (Task 26) is `_pressure_shadow_reset_models`'s per-
+    account/window `{"decayed_step": {...}, "rolling_integral": {...}}` --
+    each model's own `eta_min`/`remaining_at_plus_60` forecast, LOG-ONLY
+    (never gates; the live path stays on `decayed_step` regardless, Part
+    3). `reset_models_actual` is the SAME accounts' CURRENT actual
+    remaining (`_pressure_shadow_actual_remaining`, straight off `snapshot`)
+    so the Task 30 backtest can temporally-join a cycle-N prediction to the
+    cycle-~N+60min actual.
     """
     binding = snapshot.get("binding")
     would_emit = None
@@ -22590,10 +22712,8 @@ def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now
         "would_target": would_target,
         "pool": snapshot["pool"],
         "per_account": snapshot["accounts"],
-        "reset_models": {
-            "decayed_step": _pressure_shadow_decayed_step(state, config, now),
-            "rolling_integral": None,   # wired at Task 26 (not built)
-        },
+        "reset_models": _pressure_shadow_reset_models(state, snapshot, config, now),
+        "reset_models_actual": _pressure_shadow_actual_remaining(snapshot),
         "weight_fit": snapshot["weight_fit"],
     }
 
