@@ -106,9 +106,55 @@ def test_shadow_mode_suppresses_emit_and_logs(tmp_path, monkeypatch):
     config key at all, proving the True default) computes a real snapshot,
     writes pressure.json, and appends exactly one shadow-log line -- but
     NEVER calls the emit/marker spies. `would_emit` is the payload that
-    would have fired."""
+    would have fired.
+
+    Follow-up 1, Part 2: `would_ask`/`would_target` are now WIRED to
+    `dry_run_target(snapshot, config)` -- no longer the hardcoded
+    `None`/`[]` placeholder. Over-gate alone (pct 96 > gate 94) already
+    makes `pinned_eta_min` immediate (0.0) regardless of burn rate, so the
+    ORIGINAL fixture already had a binding/critical breach -- but with NO
+    burn-rate signal at all, `required_reduction_pct_per_min` stayed 0.0
+    (nothing to reduce against), which would make `dry_run_target`
+    trivially "already met" with an empty `targets` list even after
+    wiring, for a reason unrelated to the wiring itself. So this fixture
+    ALSO gives account "A" a real coarse burn rate via the same cold-start-
+    blindness scaffold `test_blindness_uses_coarse_supply_rate` uses (one
+    recently-active, empty-content transcript -> blindness=True ->
+    `_pressure_supply_partition` feeds `burn_rate_5h_pct_per_min` into the
+    published pinned burn), so `required_reduction_pct_per_min` is
+    genuinely non-zero. One real elastic candidate session is injected via
+    a monkeypatched `_pressure_build_session_table` (the transcript-
+    attribution machinery that would normally produce a session_table
+    organically is Task 11-13's concern, out of scope for this wiring test
+    -- same "hand-built to the exact schema" approach
+    `tests/test_pressure_dryrun.py` documents for `dry_run_target` itself),
+    so the resulting plan is a real, non-empty targeting plan.
+    """
     accounts_dir = _env(tmp_path, monkeypatch)
     state = {"accounts": {"A": _acct(pct=96.0, pct7d=10.0)}}  # 96 > gate 94
+    state["accounts"]["A"]["burn_rate_5h_pct_per_min"] = 5.0
+    state["accounts"]["A"]["burn_rate_7d_pct_per_min"] = 0.5
+
+    # Cold-start blindness scaffold (same technique as
+    # `test_blindness_uses_coarse_supply_rate` below): one recently-active,
+    # empty-content transcript is enough for `_read_active_tails` to see an
+    # ACTIVE session against the empty pre-cycle offsets registry, which is
+    # what drives the coarse burn-rate fallback above.
+    slug_dir = cus.CLAUDE_DIR / "projects" / "proj"
+    slug_dir.mkdir(parents=True)
+    transcript = slug_dir / "sess1.jsonl"
+    transcript.write_text("")
+    _set_mtime(transcript, NOW)
+
+    # share%/min = rate(40.0) * account_shares["A"](1.0) = 40.0, well above
+    # share_floor_pct's default 15.0 -- a real §5.2 candidate for the
+    # account:A:5h breach even though trend is "steady" (not "rising").
+    wf_row = {
+        "session_id": "wf-shadow-1", "account_shares": {"A": 1.0}, "model": None,
+        "fable_share": None, "pane": "%1", "socket": "s0", "cwd": "/x",
+        "class": "workflow", "rate": 40.0, "trend": "steady", "coordinator_of": None,
+    }
+    monkeypatch.setattr(cus, "_pressure_build_session_table", lambda *a, **k: [wf_row])
 
     emit_calls = []
     marker_calls = []
@@ -133,13 +179,43 @@ def test_shadow_mode_suppresses_emit_and_logs(tmp_path, monkeypatch):
     assert record["would_emit"] is not None
     assert record["would_emit"]["severity"] == snapshot["level"]
     assert record["would_emit"]["episode_id"] is None
-    assert record["would_ask"] is None
-    assert record["would_target"] == []
+
+    expected_plan = cus.dry_run_target(snapshot, BASE_CFG)
+    assert record["would_ask"] == expected_plan
+    assert record["would_target"] == expected_plan["targets"]
+    assert record["would_target"] != [], (
+        "a real elastic candidate must produce a non-empty would_target plan"
+    )
+    assert record["would_target"][0]["session_id"] == "wf-shadow-1"
+
     assert record["reset_models"]["rolling_integral"] is None
     assert "decayed_step" in record["reset_models"]
     assert record["pool"] == snapshot["pool"]
     assert record["per_account"] == snapshot["accounts"]
     assert record["weight_fit"] == snapshot["weight_fit"]
+
+
+def test_would_ask_and_would_target_stay_none_when_no_breach():
+    """Follow-up 1, Part 2: when there is no binding (`level == "ok"`),
+    `would_ask`/`would_target` must stay `None`/`[]` -- `dry_run_target` is
+    not even consulted for a no-breach snapshot (its OWN `binding is None`
+    branch returns a "trivially met" dict, which is a different thing from
+    "there was no ask to log")."""
+    state = {"accounts": {}}
+    snapshot = {
+        "level": "ok", "reference_x": 5.0, "safety_factor": 1.0,
+        "binding": None,
+        "pool": {
+            "5h": {"exhaustion_eta_min": None, "required_reduction_units_per_min": 0.0,
+                   "release_suppressed": False},
+            "7d": {"exhaustion_eta_min": None, "required_reduction_units_per_min": 0.0,
+                   "release_suppressed": False},
+        },
+        "accounts": {}, "sessions": [], "weight_fit": {"weights": {}},
+    }
+    record = cus._pressure_build_shadow_record(state, snapshot, {"accounts": []}, NOW)
+    assert record["would_ask"] is None
+    assert record["would_target"] == []
 
 
 def test_shadow_false_still_emits(tmp_path, monkeypatch):

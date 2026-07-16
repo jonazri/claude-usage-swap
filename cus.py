@@ -22384,15 +22384,31 @@ def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now
     leaves no trace that would perturb the live path's hysteresis the
     moment `shadow_mode` is flipped off.
 
-    `would_ask`/`would_target` are `None`/`[]`: Task 24's `dry_run_target`
-    (§5 targeting plan) is not built by any prior task. Read-only w.r.t.
-    `state`/`config`/`snapshot` and the live `last_emit.json` (G0); the only
-    mutation is the shadow-owned `last_would_emit.json` registry, a
+    `would_ask`/`would_target` are wired to Task 24's `dry_run_target`
+    (Follow-up 1, Part 2): whenever there IS a binding/breach, `would_ask`
+    is the full plan `dry_run_target(snapshot, config)` returns (targets,
+    planned_shed, required, safety_factor, met, escalate, reason) and
+    `would_target` is that plan's own `targets` list -- the "would-have-
+    asked" data Task 27's calibration reads. `dry_run_target` consumes an
+    already-published Task-20 `_pressure_snapshot`-shaped dict (the exact
+    shape `snapshot` already is here), so no adaptation is needed. This is
+    independent of `would_emit`'s hysteresis-gated admit decision above --
+    the plan is computed whenever a breach exists, not only on a cycle that
+    would actually emit, since the shadow log's whole purpose is recording
+    what WOULD have been asked every cycle. When there is no breach
+    (`binding is None`, `level == "ok"`), `would_ask`/`would_target` stay
+    `None`/`[]` -- `dry_run_target`'s own `binding is None` branch returns a
+    "trivially met" dict, which is a different thing from "there was no ask
+    to log", so it is deliberately never called in that case. Read-only
+    w.r.t. `state`/`config`/`snapshot` and the live `last_emit.json` (G0);
+    the only mutation is the shadow-owned `last_would_emit.json` registry, a
     pressure-owned store outside state.json entirely, same as
     `last_emit.json` itself.
     """
     binding = snapshot.get("binding")
     would_emit = None
+    would_ask = None
+    would_target: list = []
     if binding is not None:
         key = _pressure_binding_key(binding)
         registry = _pressure_load_last_would_emit()
@@ -22408,13 +22424,16 @@ def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now
             }
             _pressure_save_last_would_emit(registry)
 
+        would_ask = dry_run_target(snapshot, config)
+        would_target = would_ask["targets"]
+
     return {
         "ts": now.isoformat(),
         "level": snapshot["level"],
         "binding": binding,
         "would_emit": would_emit,
-        "would_ask": None,      # wired at Task 24 (dry_run_target, not built)
-        "would_target": [],     # wired at Task 24 (dry_run_target, not built)
+        "would_ask": would_ask,
+        "would_target": would_target,
         "pool": snapshot["pool"],
         "per_account": snapshot["accounts"],
         "reset_models": {
