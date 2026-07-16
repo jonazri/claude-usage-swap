@@ -74,6 +74,7 @@ import os
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -21622,7 +21623,10 @@ def _render_pressure_table(snapshot: dict) -> None:
 
 @cli.command(name="pressure")
 @click.option("--json", "as_json", is_flag=True, help="Emit the pressure snapshot as JSON instead of a table.")
-def pressure_cmd(as_json: bool) -> None:
+@click.option("--shadow-report", "shadow_report_flag", is_flag=True,
+              help="Score the shadow jsonl week against the G7 flip-gate constants "
+                   "and print the verdict (Task 27) instead of a live snapshot.")
+def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
     """Token-pressure forecaster snapshot (spec-2 §3/§10.11) -- level,
     normalized pool/per-account curves + exhaustion ETAs, binding
     constraint, required reduction, weight-fit confidence, per-session
@@ -21656,6 +21660,32 @@ def pressure_cmd(as_json: bool) -> None:
     """
     config = load_config()
     now = datetime.now(timezone.utc)
+
+    if shadow_report_flag:
+        # Task 27: score the shadow jsonl week against the G7 flip-gate
+        # constants -- entirely read-only over `_pressure_shadow_dir()`,
+        # never touches state.json/pressure.json/the live snapshot pipeline
+        # below. Short-circuits the rest of this command.
+        report = shadow_report(_pressure_shadow_dir(), config, now)
+        if as_json:
+            click.echo(json.dumps(report, indent=2, default=str))
+        else:
+            click.echo(f"verdict: {report['verdict']}")
+            if report["blocking_metrics"]:
+                click.echo(f"blocking_metrics: {', '.join(report['blocking_metrics'])}")
+            eg = report["exercise_gate"]
+            click.echo(
+                f"exercise_gate: episodes={eg['episodes']} "
+                f"reset_crossings={eg['reset_crossings']} met={eg['met']}"
+            )
+            click.echo(
+                f"elapsed_days: {report['elapsed_days']:.2f} "
+                f"days_remaining: {report['days_remaining']:.2f}"
+            )
+            for name, metric in report["per_metric"].items():
+                mark = "PASS" if metric["pass"] else "FAIL"
+                click.echo(f"  [{mark}] {name}: {metric['value']} (threshold {metric['threshold']})")
+        return
 
     # 1. Read-only deep-copied state (Task 1, G0) -- the ONLY state object
     #    this command may touch; the daemon's live state is never reached.
@@ -22843,6 +22873,582 @@ def _pressure_cycle(state: dict, config: dict, now) -> dict:
         _pressure_save_last_emit(registry)
 
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Task 27 (spec-2 token-pressure forecaster, STAGE 1, Phase S final task):
+# `cus pressure --shadow-report` -- the G7 flip-gate scorer. Reads the
+# shadow jsonl week (Task 23's `_shadow_log` records, enriched by Task 24's
+# `would_ask`/`would_target` and Task 26's `reset_models`/
+# `reset_models_actual`) and emits a PASS/FAIL verdict against every named
+# flip-gate constant, PLUS the minimum-exercise gate (quiet week -> EXTEND)
+# and the elapsed-days gate (a compressed busy window must never certify
+# FLIP-READY). This is the ONLY artifact the operator's `shadow_mode:false`
+# flip is gated on. Read-only (G0): scans `*.jsonl` files and one
+# `.clock-started` marker under `shadow_dir`; never writes config, never
+# `save_state`, never mutates a shadow file -- the sentinel may produce/
+# journal this report but never edits config itself (that is the operator's
+# manual flip, per the operating contract).
+# ---------------------------------------------------------------------------
+
+# G7 flip-gate constants (task brief). Every threshold below is read ONLY
+# from these module constants -- never a hardcoded literal at the call
+# site -- so a future retune is a one-line change.
+FORECAST_ERR_MEDIAN_MAX = 0.10
+FORECAST_ERR_P90_MAX = 0.20
+WEIGHT_CV_MAX = 0.25
+WEIGHT_MASS_MIN_FRACTION = 0.10  # a column below this share of total weighted mass is excluded from WEIGHT_CV
+MIN_CLEAN_WINDOWS = 200
+FIT_R2_MEDIAN_MIN = 0.80
+COND_MEDIAN_MAX = 30.0
+COND_P90_MAX = 100.0
+RESIDUAL_MEDIAN_MAX = 0.15
+RESIDUAL_P90_MAX = 0.30
+SAFETY_FACTOR_ABSORB_MEDIAN_MAX = 1.5
+SAFETY_FACTOR_ABSORB_CAP = 3.0  # `safety_factor_max` default (Task 17) -- "never hit 3.0" during a materialized breach
+MIN_EPISODES = 5
+MIN_RESET_CROSSINGS = 10
+FLIP_GATE_ELAPSED_DAYS = 7.0
+_PRESSURE_FORECAST_JOIN_LEAD_MIN = 60.0  # Task 26's fixed `remaining_at_plus_60` lookahead
+_PRESSURE_FORECAST_JOIN_TOLERANCE_MIN = 15.0  # how far a candidate cycle-M record may drift from N.ts+60min and still join
+
+# Monotone-ordering priors `fit_burn_weights`'s `_PRESSURE_WEIGHT_T` reparam
+# is built to hold (Task 16, G4 docstring): output >= input >= 0, and
+# 0 <= cache_read <= cache_create_5m <= cache_create_1h.
+_PRESSURE_WEIGHT_ORDER_CHAIN = ("cache_read", "cache_create_5m", "cache_create_1h")
+
+
+def _pressure_shadow_scan(shadow_dir) -> list[dict]:
+    """Load every record from every ``<shadow_dir>/*.jsonl`` file (Task 23's
+    per-day shadow log), sorted ascending by ``ts``. Best-effort/read-only:
+    a missing directory yields ``[]`` (never raises -- the Task 31 deploy
+    smoke may call ``--shadow-report`` before the shadow dir has ever been
+    written), and a malformed line is skipped rather than crashing the whole
+    report over one corrupt append (the shadow log's own writer is
+    best-effort append-only, Task 23)."""
+    shadow_dir = Path(shadow_dir)
+    records: list[dict] = []
+    if not shadow_dir.is_dir():
+        return records
+    for path in sorted(shadow_dir.glob("*.jsonl")):
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                records.append(rec)
+    records.sort(key=lambda r: r.get("ts") or "")
+    return records
+
+
+def _pressure_median(values: list[float]) -> float:
+    """Hand-rolled median (stdlib `statistics`, no numpy dep) -- ``0.0`` for
+    an empty/all-non-finite input (never raises)."""
+    vals = [float(v) for v in values if v is not None and not math.isnan(v)]
+    if not vals:
+        return 0.0
+    return statistics.median(vals)
+
+
+def _pressure_p90(values: list[float]) -> float:
+    """Hand-rolled 90th percentile, nearest-rank convention: the
+    ``ceil(0.9*n)``-th smallest of ``n`` sorted samples (1-indexed) -- no
+    numpy/statistics.quantiles dep, ``0.0`` for an empty input."""
+    vals = sorted(float(v) for v in values if v is not None and not math.isnan(v))
+    if not vals:
+        return 0.0
+    n = len(vals)
+    rank = max(1, min(n, math.ceil(0.9 * n)))
+    return vals[rank - 1]
+
+
+def _pressure_shadow_reference_x(config: dict) -> float:
+    """Side-effect-free ``reference_x`` for the shadow-report path, which has
+    no ``state`` to consult (``shadow_report``'s signature is
+    ``(shadow_dir, config, now)`` -- Task 1's `_pressure_resolve_reference_x`
+    needs a state dict this path was never given). Reuses ONLY the
+    config-pin branch (production runs pinned, FACT #4: ``reference_x: 5``);
+    an unpinned fleet falls back to the neutral 1.0 rather than guess at a
+    fleet-min this path cannot observe."""
+    pinned = (config or {}).get("capacity_aware", {}).get("reference_x")
+    if isinstance(pinned, (int, float)) and not isinstance(pinned, bool) and pinned >= 1:
+        return float(pinned)
+    return 1.0
+
+
+def _pressure_shadow_forecast_errors(records: list[dict], config: dict, window: str) -> list[float]:
+    """Forecast error @60-min lead for the `decayed_step` model (the
+    production one), one window at a time (Task 27).
+
+    Temporally-joins each cycle-N record's
+    ``reset_models.decayed_step.<name>.<window>.remaining_at_plus_60``
+    prediction to the ACTUAL remaining ``reset_models_actual`` of the
+    nearest later record within `_PRESSURE_FORECAST_JOIN_TOLERANCE_MIN` of
+    N.ts + 60min (`_PRESSURE_FORECAST_JOIN_LEAD_MIN`, Task 26's fixed
+    lookahead) -- a candidate outside that tolerance is skipped (no data
+    close enough to N+60min to compare against) rather than joined to a
+    stale/premature sample. ``error = |predicted - actual| / denom``, where
+    ``denom = Σ_accounts capacity_x/reference_x`` (CAPACITY per the fleet at
+    N, per the brief -- never the remaining amount, which would blow up
+    toward zero at exactly the moments accuracy matters most)."""
+    reference_x = _pressure_shadow_reference_x(config)
+    errors: list[float] = []
+    for i, rec in enumerate(records):
+        decayed = ((rec.get("reset_models") or {}).get("decayed_step")) or {}
+        per_account = rec.get("per_account") or {}
+        if not decayed or not per_account:
+            continue
+        denom = sum(
+            float(acct.get("capacity_x") or 0.0) / reference_x
+            for acct in per_account.values()
+            if isinstance(acct, dict)
+        )
+        if denom <= 0.0:
+            continue
+        ts_n = _pressure_parse_ts(rec.get("ts"))
+        if ts_n is None:
+            continue
+        target_ts = ts_n + timedelta(minutes=_PRESSURE_FORECAST_JOIN_LEAD_MIN)
+
+        best_rec = None
+        best_gap = None
+        for other in records[i + 1:]:
+            ts_m = _pressure_parse_ts(other.get("ts"))
+            if ts_m is None:
+                continue
+            gap_min = (ts_m - target_ts).total_seconds() / 60.0
+            if gap_min > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                break  # records are ascending -- nothing closer remains
+            if abs(gap_min) > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                continue
+            if best_gap is None or abs(gap_min) < best_gap:
+                best_rec, best_gap = other, abs(gap_min)
+        if best_rec is None:
+            continue
+
+        actual_block = best_rec.get("reset_models_actual") or {}
+        for name, win_map in decayed.items():
+            predicted = (win_map or {}).get(window, {}).get("remaining_at_plus_60")
+            if predicted is None:
+                continue
+            actual = (actual_block.get(name) or {}).get(window)
+            if actual is None:
+                continue
+            errors.append(abs(float(predicted) - float(actual)) / denom)
+    return errors
+
+
+def _pressure_shadow_false_clears(records: list[dict], config: dict) -> list[dict]:
+    """FALSE_CLEAR detections (Task 27, HARD-ZERO, G7): a cycle-N
+    `decayed_step` forecast declares an account/window CLEAR by the logged
+    +60-min lookahead (``remaining_at_plus_60 > 0`` -- Task 26's fixed
+    forecast horizon is the closest available proxy to "a post-reset release
+    within exit_margin_hours", since Task 26 logs no configurable-horizon
+    forecast) while that account/window is ACTUALLY breached right now
+    (``remaining_units <= 0`` at N) -- and the ACTUAL series crosses back
+    into breach again at some later record within ``horizon_hours``
+    (`_pressure_enter_horizon`, ``config.pressure.horizon_hours``) of N.
+    Returns every detection (empty list -> the HARD-ZERO gate passes) so the
+    report can name the offending metric per the brief."""
+    horizon_min = _pressure_enter_horizon(config)
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        ts_n = _pressure_parse_ts(rec.get("ts"))
+        if ts_n is None:
+            continue
+        decayed = ((rec.get("reset_models") or {}).get("decayed_step")) or {}
+        per_account = rec.get("per_account") or {}
+        deadline = ts_n + timedelta(minutes=horizon_min)
+        for name, win_map in decayed.items():
+            cur_acct = per_account.get(name) or {}
+            for window in _PRESSURE_WINDOWS:
+                predicted = (win_map or {}).get(window, {}).get("remaining_at_plus_60")
+                if predicted is None or float(predicted) <= 0.0:
+                    continue  # not a "declared clear"
+                cur_remaining = (cur_acct.get(window) or {}).get("remaining_units")
+                if cur_remaining is None or float(cur_remaining) > 0.0:
+                    continue  # not currently in breach -- nothing to falsely clear
+                for other in records[i + 1:]:
+                    ts_m = _pressure_parse_ts(other.get("ts"))
+                    if ts_m is None or ts_m > deadline:
+                        break
+                    later_acct = (other.get("per_account") or {}).get(name) or {}
+                    later_remaining = (later_acct.get(window) or {}).get("remaining_units")
+                    if later_remaining is not None and float(later_remaining) <= 0.0:
+                        hits.append({
+                            "account": name, "window": window,
+                            "declared_clear_ts": rec.get("ts"),
+                            "recontradicted_ts": other.get("ts"),
+                        })
+                        break
+    return hits
+
+
+def _pressure_shadow_vacuous_clears(records: list[dict]) -> list[dict]:
+    """VACUOUS_CLEAR detections (Task 27, HARD-ZERO, G7): a real breach
+    (``binding`` not None) whose Task-24 dry-run plan needed a genuine
+    reduction (``would_ask.required > 0``) but emitted an EMPTY plan
+    (``would_target == []``) without escalating (``would_ask.escalate`` is
+    falsy) -- §5.4 says an unmeetable/insufficient candidate set must
+    escalate, never silently "clear" a real breach with nothing asked."""
+    hits: list[dict] = []
+    for rec in records:
+        binding = rec.get("binding")
+        would_ask = rec.get("would_ask")
+        if binding is None or not would_ask:
+            continue
+        required = float(would_ask.get("required") or 0.0)
+        targets = rec.get("would_target") or []
+        escalate = bool(would_ask.get("escalate"))
+        if required > 0.0 and not targets and not escalate:
+            hits.append({"ts": rec.get("ts"), "binding": binding, "required": required})
+    return hits
+
+
+def _pressure_shadow_weight_cv(records: list[dict]) -> dict[str, float]:
+    """Per-column coefficient of variation (population stdev / mean) of the
+    week's logged ``weight_fit.weights``, restricted to columns whose
+    AVERAGE share of total weighted mass is >= `WEIGHT_MASS_MIN_FRACTION`
+    (a column that never carries meaningful mass is excluded per the brief,
+    rather than penalized for looking "unstable" on noise alone)."""
+    mass_totals = {col: 0.0 for col in _PRESSURE_WEIGHT_COLUMNS}
+    series: dict[str, list[float]] = {col: [] for col in _PRESSURE_WEIGHT_COLUMNS}
+    mass_n = 0
+    for rec in records:
+        weights = ((rec.get("weight_fit") or {}).get("weights")) or {}
+        if not weights:
+            continue
+        total = sum(float(v) for v in weights.values() if v is not None)
+        if total > 0.0:
+            mass_n += 1
+            for col in _PRESSURE_WEIGHT_COLUMNS:
+                val = weights.get(col)
+                if val is not None:
+                    mass_totals[col] += float(val) / total
+        for col in _PRESSURE_WEIGHT_COLUMNS:
+            val = weights.get(col)
+            if val is not None:
+                series[col].append(float(val))
+
+    cvs: dict[str, float] = {}
+    for col in _PRESSURE_WEIGHT_COLUMNS:
+        avg_mass = (mass_totals[col] / mass_n) if mass_n else 0.0
+        if avg_mass < WEIGHT_MASS_MIN_FRACTION:
+            continue
+        vals = series[col]
+        if len(vals) < 2:
+            cvs[col] = 0.0
+            continue
+        mean = statistics.mean(vals)
+        if mean == 0.0:
+            cvs[col] = 0.0 if statistics.pstdev(vals) == 0.0 else math.inf
+            continue
+        cvs[col] = statistics.pstdev(vals) / abs(mean)
+    return cvs
+
+
+def _pressure_shadow_ordering_held_fraction(records: list[dict]) -> float:
+    """Fraction of refits (records carrying a ``weight_fit.weights`` block)
+    that held the monotone-ordering priors `fit_burn_weights`'s reparam is
+    built to guarantee (Task 16 docstring): ``output >= input >= 0`` and
+    ``0 <= cache_read <= cache_create_5m <= cache_create_1h``. ``1.0``
+    (vacuously "held") when no refit is present -- there is nothing to
+    violate."""
+    checked = 0
+    held = 0
+    for rec in records:
+        weights = ((rec.get("weight_fit") or {}).get("weights")) or {}
+        if not weights:
+            continue
+        checked += 1
+        output = float(weights.get("output", 0.0))
+        input_ = float(weights.get("input", 0.0))
+        ok = output >= input_ >= 0.0
+        prev = 0.0
+        for col in _PRESSURE_WEIGHT_ORDER_CHAIN:
+            val = float(weights.get(col, 0.0))
+            ok = ok and (prev <= val)
+            prev = val
+        if ok:
+            held += 1
+    return (held / checked) if checked else 1.0
+
+
+def _pressure_shadow_fit_stats(records: list[dict]) -> tuple[list[float], list[float], list[float]]:
+    """Per-record derived R², published condition_number, and n_windows
+    from every logged ``weight_fit`` block (Task 27).
+
+    `fit_burn_weights` (Task 16) never publishes an ``r2`` field directly
+    (only ``residual_fraction = ||Aw-b|| / ||b||``); this derives
+    ``r2 = 1 - residual_fraction**2`` -- the standard relation between a
+    normalized-residual-norm fraction and R² when the design has no
+    intercept (``SStot = ||b||**2``, matching `_pressure_residual_fraction`'s
+    own un-centered normalization, Task 16). A degenerate all-zero-``b``
+    fit (Stage 1's real ``_pressure_cycle`` calls `fit_burn_weights` with
+    empty windows every cycle today -- a known, separately-tracked gap, see
+    ``progress.md``) yields ``residual_fraction = 0.0`` -> ``r2 = 1.0``
+    (vacuously "perfect", since there was no real data to fit against) --
+    this is why `fit_r2_median` and `min_clean_windows` are deliberately
+    SEPARATE gates: R² alone cannot detect "there was no data".
+    """
+    r2s: list[float] = []
+    conds: list[float] = []
+    n_windows: list[float] = []
+    for rec in records:
+        wf = rec.get("weight_fit") or {}
+        residual = wf.get("residual_fraction")
+        if residual is not None:
+            residual = float(residual)
+            r2 = 1.0 - residual * residual
+            if not math.isnan(r2):
+                r2s.append(r2)
+        cond = wf.get("condition_number")
+        if cond is not None:
+            conds.append(float(cond))
+        nw = wf.get("n_windows")
+        if nw is not None:
+            n_windows.append(float(nw))
+    return r2s, conds, n_windows
+
+
+def _pressure_shadow_realized_safety_factors(records: list[dict]) -> list[float]:
+    """Realized ``safety_factor`` (Task 17) from every record with a
+    materialized breach (``binding`` not None and a logged ``would_ask``) --
+    the SOFT residual gate's absorption check reads these."""
+    out: list[float] = []
+    for rec in records:
+        if rec.get("binding") is None:
+            continue
+        would_ask = rec.get("would_ask")
+        if not would_ask:
+            continue
+        sf = would_ask.get("safety_factor")
+        if sf is not None:
+            out.append(float(sf))
+    return out
+
+
+def _pressure_shadow_exercise(records: list[dict]) -> tuple[int, int]:
+    """Minimum-exercise counts (Task 27): ``episodes`` = number of
+    ok -> bound transitions (a maximal run of consecutive bound cycles
+    counts once); ``reset_crossings`` = number of ACTUAL
+    (account, window) sign changes of ``remaining_units`` across the gate
+    (breached <-> clear) over the week, summed over every account/window."""
+    episodes = 0
+    in_episode = False
+    for rec in records:
+        bound = rec.get("binding") is not None or (rec.get("level") not in (None, "ok"))
+        if bound and not in_episode:
+            episodes += 1
+        in_episode = bound
+
+    crossings = 0
+    last_state: dict[tuple[str, str], bool] = {}
+    for rec in records:
+        per_account = rec.get("per_account") or {}
+        for name, acct in per_account.items():
+            if not isinstance(acct, dict):
+                continue
+            for window in _PRESSURE_WINDOWS:
+                remaining = (acct.get(window) or {}).get("remaining_units")
+                if remaining is None:
+                    continue
+                breached = float(remaining) <= 0.0
+                key = (name, window)
+                prev = last_state.get(key)
+                if prev is not None and prev != breached:
+                    crossings += 1
+                last_state[key] = breached
+    return episodes, crossings
+
+
+def _pressure_shadow_clock(shadow_dir, now) -> tuple[float, bool]:
+    """``(elapsed_days, marker_exists)`` from ``<shadow_dir>/.clock-started``
+    (the Task 31 marker, findings 4 & 9). Absent/unparseable marker ->
+    ``(0.0, False)`` -- NEVER raises ``FileNotFoundError``, NEVER treated as
+    a started clock (the Task 31 deploy smoke may call ``--shadow-report``
+    before this file has ever been written)."""
+    marker = Path(shadow_dir) / ".clock-started"
+    try:
+        text = marker.read_text().strip()
+    except OSError:
+        return 0.0, False
+    started = _pressure_parse_ts(text)
+    if started is None:
+        return 0.0, False
+    elapsed = (now - started).total_seconds() / 86400.0
+    return max(0.0, elapsed), True
+
+
+def _pressure_shadow_spotcheck(shadow_dir) -> tuple[bool, "bool | None", str]:
+    """Task 40's spot-check artifact -- NOT built until a later (H2/stage-2)
+    task, so in Stage 1 it never exists. Returns ``(pending, agree_3of3,
+    display)``: absent/unreadable/malformed -> ``(True, None, "pending")``
+    -- a PENDING gate (prevents FLIP-READY, contributes to EXTEND) that
+    NEVER raises and NEVER counts as a hard BLOCK by itself. Present ->
+    ``(False, agree == total == 3, "agree/total")`` -- a real HARD gate
+    result once Task 40 starts publishing it."""
+    path = Path(shadow_dir) / "spotcheck.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True, None, "pending"
+    try:
+        agree = int(data.get("agree"))
+        total = int(data.get("total"))
+    except (TypeError, ValueError, AttributeError):
+        return True, None, "pending"
+    return False, (agree == 3 and total == 3), f"{agree}/{total}"
+
+
+def shadow_report(shadow_dir, config: dict, now) -> dict:
+    """The G7 flip-gate scorer (Task 27): scans ``<shadow_dir>/*.jsonl``
+    (default ``~/claude-accounts/pressure/shadow/``, Task 23's per-day
+    shadow log) and evaluates every named flip-gate metric, the minimum-
+    exercise gate, and the elapsed-days gate. Read-only (G0): never writes
+    ``config``, never ``save_state``, never mutates a shadow file -- the
+    RETURNED artifact enforces every gate as data (``per_metric``), never
+    prose-only.
+
+    VERDICT PRECEDENCE (derived to satisfy the brief's named tests):
+      1. Any HARD-ZERO safety violation (``false_clear_count`` or
+         ``vacuous_clear_count`` > 0) -> ``BLOCKED``, naming the metric --
+         a safety violation blocks even a short/quiet window.
+      2. Else if elapsed days < `FLIP_GATE_ELAPSED_DAYS` (including an
+         absent ``.clock-started`` marker), OR the minimum-exercise gate is
+         unmet, OR the spot-check gate is still pending (no Task 40
+         artifact yet) -> ``EXTEND`` -- regardless of how fast the exercise
+         + hard gates were otherwise met (a compressed busy window must
+         never certify FLIP-READY).
+      3. Else if any other HARD gate fails -> ``BLOCKED``, naming every
+         failing metric.
+      4. Else -> ``FLIP-READY``.
+    """
+    shadow_dir = Path(shadow_dir)
+    config = config or {}
+    records = _pressure_shadow_scan(shadow_dir)
+
+    per_metric: dict[str, dict] = {}
+
+    def _add(name: str, value, threshold, passed: bool, **extra) -> None:
+        entry = {"pass": bool(passed), "value": value, "threshold": threshold}
+        entry.update(extra)
+        per_metric[name] = entry
+
+    # --- forecast error @60-min lead, decayed_step, per window (HARD) ---
+    for window in _PRESSURE_WINDOWS:
+        errs = _pressure_shadow_forecast_errors(records, config, window)
+        med = _pressure_median(errs)
+        p90 = _pressure_p90(errs)
+        _add(f"forecast_err_median_{window}", med, FORECAST_ERR_MEDIAN_MAX, med <= FORECAST_ERR_MEDIAN_MAX)
+        _add(f"forecast_err_p90_{window}", p90, FORECAST_ERR_P90_MAX, p90 <= FORECAST_ERR_P90_MAX)
+
+    # --- false-clear / vacuous-clear (HARD-ZERO) ---
+    false_clears = _pressure_shadow_false_clears(records, config)
+    vacuous_clears = _pressure_shadow_vacuous_clears(records)
+    _add("false_clear_count", len(false_clears), 0, len(false_clears) == 0, detections=false_clears)
+    _add("vacuous_clear_count", len(vacuous_clears), 0, len(vacuous_clears) == 0, detections=vacuous_clears)
+
+    # --- weight stability (HARD) ---
+    cvs = _pressure_shadow_weight_cv(records)
+    worst_cv = max(cvs.values()) if cvs else 0.0
+    _add("weight_cv", worst_cv, WEIGHT_CV_MAX, worst_cv <= WEIGHT_CV_MAX, per_column=cvs)
+
+    ordering_frac = _pressure_shadow_ordering_held_fraction(records)
+    _add("ordering_priors_held", ordering_frac, 1.0, ordering_frac >= 1.0)
+
+    r2s, conds, n_windows = _pressure_shadow_fit_stats(records)
+    min_clean = max(n_windows) if n_windows else 0.0
+    _add("min_clean_windows", min_clean, MIN_CLEAN_WINDOWS, min_clean >= MIN_CLEAN_WINDOWS)
+
+    r2_median = _pressure_median(r2s)
+    _add("fit_r2_median", r2_median, FIT_R2_MEDIAN_MIN, r2_median >= FIT_R2_MEDIAN_MIN)
+
+    cond_median = _pressure_median(conds)
+    cond_p90 = _pressure_p90(conds)
+    _add("cond_median", cond_median, COND_MEDIAN_MAX, cond_median <= COND_MEDIAN_MAX)
+    _add("cond_p90", cond_p90, COND_P90_MAX, cond_p90 <= COND_P90_MAX)
+
+    # --- SOFT residual, absorbable by a conservative realized safety factor ---
+    residuals = [
+        float((rec.get("weight_fit") or {}).get("residual_fraction"))
+        for rec in records
+        if (rec.get("weight_fit") or {}).get("residual_fraction") is not None
+    ]
+    residual_median = _pressure_median(residuals)
+    residual_p90 = _pressure_p90(residuals)
+    residual_within = residual_median <= RESIDUAL_MEDIAN_MAX and residual_p90 <= RESIDUAL_P90_MAX
+
+    safety_factors = _pressure_shadow_realized_safety_factors(records)
+    sf_median = _pressure_median(safety_factors)
+    sf_saturated = any(sf >= SAFETY_FACTOR_ABSORB_CAP for sf in safety_factors)
+    absorbed = sf_median <= SAFETY_FACTOR_ABSORB_MEDIAN_MAX and not sf_saturated
+    residual_pass = residual_within or absorbed
+    _add("residual_median", residual_median, RESIDUAL_MEDIAN_MAX, residual_pass,
+         soft=True, absorbed=(not residual_within) and absorbed)
+    _add("residual_p90", residual_p90, RESIDUAL_P90_MAX, residual_pass,
+         soft=True, absorbed=(not residual_within) and absorbed)
+
+    # --- spot-check (Task 40 -- not built in Stage 1; handled gracefully) ---
+    spotcheck_pending, spotcheck_pass, spotcheck_display = _pressure_shadow_spotcheck(shadow_dir)
+    _add("spotcheck_agree", spotcheck_display, "3/3",
+         (spotcheck_pass is True), pending=spotcheck_pending)
+
+    # --- minimum-exercise gate ---
+    episodes, reset_crossings = _pressure_shadow_exercise(records)
+    exercise_met = episodes >= MIN_EPISODES and reset_crossings >= MIN_RESET_CROSSINGS
+    exercise_gate = {
+        "episodes": episodes, "reset_crossings": reset_crossings, "met": exercise_met,
+    }
+
+    # --- elapsed-days gate ---
+    elapsed_days, marker_exists = _pressure_shadow_clock(shadow_dir, now)
+    days_remaining = max(0.0, FLIP_GATE_ELAPSED_DAYS - elapsed_days)
+    days_met = marker_exists and elapsed_days >= FLIP_GATE_ELAPSED_DAYS
+
+    # --- verdict precedence ---
+    blocking_metrics: list[str] = []
+    if not per_metric["false_clear_count"]["pass"]:
+        blocking_metrics.append("false_clear_count")
+    if not per_metric["vacuous_clear_count"]["pass"]:
+        blocking_metrics.append("vacuous_clear_count")
+
+    if blocking_metrics:
+        verdict = "BLOCKED"
+    elif not days_met or not exercise_met or spotcheck_pending:
+        verdict = "EXTEND"
+    else:
+        hard_metric_names = (
+            "forecast_err_median_5h", "forecast_err_p90_5h",
+            "forecast_err_median_7d", "forecast_err_p90_7d",
+            "weight_cv", "ordering_priors_held", "min_clean_windows",
+            "fit_r2_median", "cond_median", "cond_p90",
+        )
+        for name in hard_metric_names:
+            if not per_metric[name]["pass"]:
+                blocking_metrics.append(name)
+        if not residual_pass:
+            blocking_metrics.append("residual_median")
+        if spotcheck_pass is False:
+            blocking_metrics.append("spotcheck_agree")
+        verdict = "BLOCKED" if blocking_metrics else "FLIP-READY"
+
+    return {
+        "per_metric": per_metric,
+        "exercise_gate": exercise_gate,
+        "elapsed_days": elapsed_days,
+        "days_remaining": days_remaining,
+        "verdict": verdict,
+        "blocking_metrics": blocking_metrics,
+    }
 
 
 @cli.command(name="sos")
