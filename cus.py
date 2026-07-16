@@ -21643,42 +21643,38 @@ def _render_pressure_table(snapshot: dict) -> None:
         console.print("No attributed sessions this cycle.")
 
 
-@cli.command(name="pressure")
-@click.option("--json", "as_json", is_flag=True, help="Emit the pressure snapshot as JSON instead of a table.")
-@click.option("--shadow-report", "shadow_report_flag", is_flag=True,
-              help="Score the shadow jsonl week against the G7 flip-gate constants "
-                   "and print the verdict (Task 27) instead of a live snapshot.")
-def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
-    """Token-pressure forecaster snapshot (spec-2 §3/§10.11) -- level,
-    normalized pool/per-account curves + exhaustion ETAs, binding
-    constraint, required reduction, weight-fit confidence, per-session
-    rows.
+def _pressure_compute_snapshot(config: dict, now: datetime) -> dict:
+    """Task 21/29 (spec-2 token-pressure forecaster, STAGE 1): the shared
+    read-only Phase-D pipeline both `cus pressure` (Task 21) and
+    `replay_forecast` (Task 29, golden-file replay) drive -- state load ->
+    transcript tails -> sessions.log intervals -> weight fit -> per-message
+    attribution/partition -> per-session rate/class/trend -> blindness/
+    cold-start confidence -> the pure `_pressure_snapshot` (Task 20).
 
-    READ-ONLY, on-demand (Task 21, round-3 finding 2): this command PERFORMS
+    READ-ONLY, on-demand (G0/§3, round-3 finding 2): this function PERFORMS
     the Phase-D I/O the pure `_pressure_snapshot` (Task 20) cannot reach
     itself -- state load, transcript tails, sessions.log intervals, a
     weight fit, per-message attribution/partition, per-session rate/class/
     trend -- and hands the results to `_pressure_snapshot` as explicit
-    products, then only PRINTS. It never `save_state`s, never
-    `_pressure_write_json`s (writing pressure.json to disk is a future
-    daemon-cycle concern, not this on-demand path), and reads transcript
-    tails with ``persist=False`` (a fresh, empty ``offsets`` dict every
-    invocation) so the CLI can never race the daemon over a shared offset
-    registry (§3) -- there is no on-disk offsets registry in Stage 1 either
-    way (Task 10: caller-owned in-memory only).
+    products. It never `save_state`s, never `_pressure_write_json`s
+    (writing pressure.json to disk is a future daemon-cycle concern, not
+    this on-demand path), and reads transcript tails with ``persist=False``
+    (a fresh, empty ``offsets`` dict every invocation) so a caller can
+    never race the daemon over a shared offset registry (§3) -- there is
+    no on-disk offsets registry in Stage 1 either way (Task 10:
+    caller-owned in-memory only).
 
     ACCUMULATED HISTORY, READ-ONLY (Task 27b): the weight-fit regression
-    windows and per-session rate history are now read from the daemon's
+    windows and per-session rate history are read from the daemon's
     persisted cross-cycle stores under `PRESSURE_ROOT`
     (`_pressure_accumulated_weight_windows`/`_pressure_build_session_table`,
-    both called with ``persist=False`` below) -- so this command benefits
-    from whatever the daemon has already accumulated (a real fit once
+    both called with ``persist=False`` below) -- so this benefits from
+    whatever the daemon has already accumulated (a real fit once
     >=``weight_refit.min_windows`` windows exist, a real trend once a
     session has >=3 accumulated rate samples) without ever appending its
-    own observation to either store, so it can never race the daemon over
-    the same on-disk store (same rationale as the ``offsets`` dict below).
-    Immediately after a fresh deploy, before the daemon has accumulated
-    enough history, this still naturally falls out to
+    own observation to either store. Immediately after a fresh deploy, or
+    against an isolated fixture tree (Task 29) that never populates
+    `PRESSURE_ROOT`, this naturally falls out to
     ``source="insufficient-data"`` (seed weights) / ``trend="steady"`` --
     an honest reflection of not-yet-enough history, not a targeting bug.
     For the identical persist=False reason the ``offsets`` dict is always
@@ -21688,44 +21684,21 @@ def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
     history to compare against, not a targeting bug
     (`_attribution_confidence`'s own gating already keeps this from ever
     suppressing §5.4 supply-side escalation).
+
+    Reads module-global paths (`STATE_JSON`/`CONFIG_YAML`/`CLAUDE_DIR`/
+    `SESSIONS_LOG`/`ACCOUNTS_DIR`/`PRESSURE_ROOT`/...) at CALL TIME via the
+    helpers below -- a caller wanting an isolated/replayed run (Task 29)
+    points those globals at a fixture tree before calling this function,
+    exactly what `replay_forecast` does.
     """
-    config = load_config()
-    now = datetime.now(timezone.utc)
-
-    if shadow_report_flag:
-        # Task 27: score the shadow jsonl week against the G7 flip-gate
-        # constants -- entirely read-only over `_pressure_shadow_dir()`,
-        # never touches state.json/pressure.json/the live snapshot pipeline
-        # below. Short-circuits the rest of this command.
-        report = shadow_report(_pressure_shadow_dir(), config, now)
-        if as_json:
-            click.echo(json.dumps(report, indent=2, default=str))
-        else:
-            click.echo(f"verdict: {report['verdict']}")
-            if report["blocking_metrics"]:
-                click.echo(f"blocking_metrics: {', '.join(report['blocking_metrics'])}")
-            eg = report["exercise_gate"]
-            click.echo(
-                f"exercise_gate: episodes={eg['episodes']} "
-                f"reset_crossings={eg['reset_crossings']} met={eg['met']}"
-            )
-            click.echo(
-                f"elapsed_days: {report['elapsed_days']:.2f} "
-                f"days_remaining: {report['days_remaining']:.2f}"
-            )
-            for name, metric in report["per_metric"].items():
-                mark = "PASS" if metric["pass"] else "FAIL"
-                click.echo(f"  [{mark}] {name}: {metric['value']} (threshold {metric['threshold']})")
-        return
-
     # 1. Read-only deep-copied state (Task 1, G0) -- the ONLY state object
-    #    this command may touch; the daemon's live state is never reached.
+    #    this call may touch; the daemon's own live state is never reached.
     state = _pressure_load_state(config)
 
-    # 2. Bounded transcript tails (Task 10), persist=False -- on-demand must
-    #    never advance the offset registry (G0/§3). A fresh, empty `offsets`
-    #    dict every call; `_read_active_tails` guarantees it is left
-    #    untouched when persist=False.
+    # 2. Bounded transcript tails (Task 10), on-demand persist=False --
+    #    must never advance the offset registry (G0/§3). A fresh, empty
+    #    `offsets` dict every call; `_read_active_tails` guarantees it is
+    #    left untouched when persist=False.
     offsets: dict[Path, int] = {}
     tails = _read_active_tails(now, config, offsets, persist=False)
 
@@ -21763,13 +21736,133 @@ def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
     # 8. Assemble the pure snapshot (Task 20) -- NEVER (state, config, now)
     #    alone; every Phase-D product above is an explicit injected input
     #    (round-3 finding 2).
-    snapshot = _pressure_snapshot(
+    return _pressure_snapshot(
         state, config, now,
         partition=partition,
         session_table=session_table,
         weight_fit=weight_fit,
         attribution=attribution,
     )
+
+
+_REPLAY_PATCHED_GLOBALS = (
+    "STATE_JSON", "CONFIG_YAML", "SESSIONS_LOG", "CLAUDE_DIR",
+    "ACCOUNTS_DIR", "PRESSURE_JSON", "PRESSURE_ROOT",
+)
+
+
+def replay_forecast(fixture_dir) -> dict:
+    """Task 29 (spec-2 token-pressure forecaster, STAGE 1): deterministic
+    golden-file replay.
+
+    Loads a scrubbed fixture's ``state.json`` (+ ``sessions.log`` +
+    transcript jsonl under ``claude_home/projects/``) and ``config.yaml``
+    from ``fixture_dir``, runs the FULL forecaster pipeline
+    (`_pressure_compute_snapshot`, Task 21's `pressure_cmd` pipeline
+    factored out for exactly this reuse) off a FROZEN ``now`` read from the
+    fixture's ``fixture.json`` manifest (key ``"now"``, an ISO-8601
+    timestamp), and returns the resulting `pressure_state` snapshot dict.
+
+    Fixture directory layout (``fixture_dir``)::
+
+        fixture.json        -- {"now": "<ISO-8601 UTC timestamp>"}
+        state.json           -- accounts/slots (same shape load_state() reads)
+        config.yaml           -- same shape load_config() merges onto DEFAULT_CONFIG
+        sessions.log           -- _parse_sessions_log() CSV rows (optional)
+        claude_home/projects/  -- transcript jsonl tree (optional)
+
+    READ-ONLY/deterministic (G0): identical read path to ``cus pressure
+    --json``, just sourced from ``fixture_dir`` instead of the live
+    ``~/.claude`` / ``~/claude-accounts`` trees. The fixture's own state.json
+    is never mutated (`_pressure_compute_snapshot` -> `_pressure_load_state`
+    deep-copies before this function ever sees it), and `ACCOUNTS_DIR`
+    (hence `PRESSURE_ROOT`) is pointed at a path under `fixture_dir` that
+    the fixture never populates, so the weight-fit accumulated-history read
+    (Task 27b, `persist=False`) always finds nothing on disk and
+    deterministically falls back to the fixed seed weights
+    (``source="insufficient-data"``) -- the same isolation
+    `tests/test_pressure_cli.py`'s `_env()` fixture uses, done here by hand
+    (manual save/restore in a `try`/`finally`) since this function lives
+    inside cus.py itself and has no pytest `monkeypatch` fixture available.
+
+    Two `replay_forecast` calls on the same fixture are byte-identical:
+    every module-global path is restored in `finally` (no leaked state
+    between calls), `now` is the fixture's own frozen value (never wall
+    clock), and the pipeline underneath (fixed-iteration NNLS + stdlib
+    bracket-then-bisect root-find) has no other source of nondeterminism.
+    """
+    fixture_dir = Path(fixture_dir)
+    manifest = read_json(fixture_dir / "fixture.json")
+    now = datetime.fromisoformat(str(manifest["now"]).replace("Z", "+00:00"))
+
+    accounts_dir = fixture_dir / "claude-accounts"
+    patched = {
+        "STATE_JSON": fixture_dir / "state.json",
+        "CONFIG_YAML": fixture_dir / "config.yaml",
+        "SESSIONS_LOG": fixture_dir / "sessions.log",
+        "CLAUDE_DIR": fixture_dir / "claude_home",
+        "ACCOUNTS_DIR": accounts_dir,
+        "PRESSURE_JSON": accounts_dir / "pressure.json",
+        "PRESSURE_ROOT": accounts_dir / "pressure",
+    }
+    saved = {name: globals()[name] for name in _REPLAY_PATCHED_GLOBALS}
+    try:
+        for name, value in patched.items():
+            globals()[name] = value
+        config = load_config()
+        return _pressure_compute_snapshot(config, now)
+    finally:
+        for name, value in saved.items():
+            globals()[name] = value
+
+
+@cli.command(name="pressure")
+@click.option("--json", "as_json", is_flag=True, help="Emit the pressure snapshot as JSON instead of a table.")
+@click.option("--shadow-report", "shadow_report_flag", is_flag=True,
+              help="Score the shadow jsonl week against the G7 flip-gate constants "
+                   "and print the verdict (Task 27) instead of a live snapshot.")
+def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
+    """Token-pressure forecaster snapshot (spec-2 §3/§10.11) -- level,
+    normalized pool/per-account curves + exhaustion ETAs, binding
+    constraint, required reduction, weight-fit confidence, per-session
+    rows.
+
+    READ-ONLY, on-demand (Task 21, round-3 finding 2): this command PRINTS
+    the result of `_pressure_compute_snapshot` (the actual Phase-D pipeline
+    -- see that function's docstring for the full G0/persist=False
+    contract) and otherwise only handles CLI concerns (the shadow-report
+    short-circuit, JSON vs. table rendering).
+    """
+    config = load_config()
+    now = datetime.now(timezone.utc)
+
+    if shadow_report_flag:
+        # Task 27: score the shadow jsonl week against the G7 flip-gate
+        # constants -- entirely read-only over `_pressure_shadow_dir()`,
+        # never touches state.json/pressure.json/the live snapshot pipeline
+        # below. Short-circuits the rest of this command.
+        report = shadow_report(_pressure_shadow_dir(), config, now)
+        if as_json:
+            click.echo(json.dumps(report, indent=2, default=str))
+        else:
+            click.echo(f"verdict: {report['verdict']}")
+            if report["blocking_metrics"]:
+                click.echo(f"blocking_metrics: {', '.join(report['blocking_metrics'])}")
+            eg = report["exercise_gate"]
+            click.echo(
+                f"exercise_gate: episodes={eg['episodes']} "
+                f"reset_crossings={eg['reset_crossings']} met={eg['met']}"
+            )
+            click.echo(
+                f"elapsed_days: {report['elapsed_days']:.2f} "
+                f"days_remaining: {report['days_remaining']:.2f}"
+            )
+            for name, metric in report["per_metric"].items():
+                mark = "PASS" if metric["pass"] else "FAIL"
+                click.echo(f"  [{mark}] {name}: {metric['value']} (threshold {metric['threshold']})")
+        return
+
+    snapshot = _pressure_compute_snapshot(config, now)
 
     if as_json:
         click.echo(json.dumps(snapshot, indent=2, default=str))

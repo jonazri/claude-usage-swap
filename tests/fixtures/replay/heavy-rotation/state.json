@@ -1,0 +1,41 @@
+{
+  "accounts": {
+    "A1": {
+      "capacity_x": 20000,
+      "current_5h_pct": 50.0,
+      "current_7d_pct": 10.0,
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    },
+    "A2": {
+      "capacity_x": 20000,
+      "current_5h_pct": 50.0,
+      "current_7d_pct": 10.0,
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    },
+    "A3": {
+      "capacity_x": 20000,
+      "current_5h_pct": 50.0,
+      "current_7d_pct": 10.0,
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    },
+    "A4": {
+      "capacity_x": 20000,
+      "current_5h_pct": 50.0,
+      "current_7d_pct": 10.0,
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    },
+    "A5": {
+      "capacity_x": 20000,
+      "current_5h_pct": 50.0,
+      "current_7d_pct": 10.0,
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    },
+    "A6": {
+      "capacity_x": 20000,
+      "current_5h_pct": 50.0,
+      "current_7d_pct": 10.0,
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    }
+  },
+  "swap_history": []
+}

@@ -1,0 +1,231 @@
+{
+  "accounts": {
+    "A1": {
+      "5h": {
+        "burn_pct_per_min": 0.25,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": 175.828125,
+        "remaining_units": 1760.0,
+        "required_reduction_pct_per_min": 0.25
+      },
+      "7d": {
+        "burn_pct_per_min": 0.25,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": null,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 0.20833333333333334
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "A2": {
+      "5h": {
+        "burn_pct_per_min": 0.5,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": 87.828125,
+        "remaining_units": 1760.0,
+        "required_reduction_pct_per_min": 0.5
+      },
+      "7d": {
+        "burn_pct_per_min": 0.5,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 139.86328125,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 0.5
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "A3": {
+      "5h": {
+        "burn_pct_per_min": 0.75,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": 58.4375,
+        "remaining_units": 1760.0,
+        "required_reduction_pct_per_min": 0.75
+      },
+      "7d": {
+        "burn_pct_per_min": 0.75,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 93.15104166666666,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 0.75
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "A4": {
+      "5h": {
+        "burn_pct_per_min": 1.0,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": 43.828125,
+        "remaining_units": 1760.0,
+        "required_reduction_pct_per_min": 1.0
+      },
+      "7d": {
+        "burn_pct_per_min": 1.0,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 69.86328125,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 1.0
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "A5": {
+      "5h": {
+        "burn_pct_per_min": 1.25,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": 35.0625,
+        "remaining_units": 1760.0,
+        "required_reduction_pct_per_min": 1.25
+      },
+      "7d": {
+        "burn_pct_per_min": 1.25,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 55.78125,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 1.25
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "A6": {
+      "5h": {
+        "burn_pct_per_min": 1.5,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": 29.104166666666664,
+        "remaining_units": 1760.0,
+        "required_reduction_pct_per_min": 1.5
+      },
+      "7d": {
+        "burn_pct_per_min": 1.5,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 46.484375,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 1.5
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    }
+  },
+  "attribution": {
+    "allow_supply_escalation": true,
+    "blindness": true,
+    "confidence": 0.0,
+    "reason": "cold-start: 1/1 sessions unread",
+    "residual_fraction": 0.0,
+    "suppress_residual_widening": true,
+    "suppress_targeting": true
+  },
+  "binding": {
+    "constraint": "5h",
+    "eta_min": 29.104166666666664,
+    "name": "A6",
+    "view": "account",
+    "window": "5h"
+  },
+  "episode_id": null,
+  "generated_at": "2026-07-15T12:00:00+00:00",
+  "horizon_min": 180.0,
+  "level": "critical",
+  "pool": {
+    "5h": {
+      "burn_units_per_min": 0.0,
+      "capacity_units": 22560.0,
+      "exhaustion_eta_min": 175.828125,
+      "release_suppressed": false,
+      "remaining_units": 10560.0,
+      "required_reduction_units_per_min": 0.0
+    },
+    "7d": {
+      "burn_units_per_min": 0.0,
+      "capacity_units": 19200.0,
+      "exhaustion_eta_min": null,
+      "release_suppressed": false,
+      "remaining_units": 16800.0,
+      "required_reduction_units_per_min": 0.0
+    }
+  },
+  "reference_x": 5.0,
+  "safety_factor": 1.7999999999999998,
+  "sessions": [
+    {
+      "account_shares": {
+        "A1": 0.047619047619047616,
+        "A2": 0.09523809523809523,
+        "A3": 0.14285714285714285,
+        "A4": 0.19047619047619047,
+        "A5": 0.23809523809523808,
+        "A6": 0.2857142857142857
+      },
+      "class": "interactive",
+      "coordinator_of": null,
+      "cwd": "/home/fixture/project",
+      "fable_share": null,
+      "model": null,
+      "pane": null,
+      "rate": 52.5,
+      "session_id": "sess-rotation",
+      "socket": null,
+      "trend": "steady"
+    }
+  ],
+  "weight_fit": {
+    "condition_number": Infinity,
+    "n_windows": 0,
+    "residual_fraction": 0.0,
+    "seed_pinned": [
+      "input",
+      "output",
+      "cache_read",
+      "cache_create_5m",
+      "cache_create_1h"
+    ],
+    "seed_scale": 1.0,
+    "source": "insufficient-data",
+    "weights": {
+      "cache_create_1h": 2.0,
+      "cache_create_5m": 1.25,
+      "cache_read": 0.1,
+      "input": 1.0,
+      "output": 5.0
+    }
+  }
+}

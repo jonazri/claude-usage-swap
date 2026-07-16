@@ -1,0 +1,15 @@
+accounts:
+- capacity_x: 20000
+  name: R
+- capacity_x: 20000
+  name: L
+capacity_aware:
+  enabled: true
+  reference_x: 5
+per_model_weekly:
+  cap_pct: 95
+thresholds:
+  steps:
+  - 70
+  - 85
+  - 94

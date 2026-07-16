@@ -1,0 +1,23 @@
+accounts:
+- capacity_x: 20000
+  name: A1
+- capacity_x: 20000
+  name: A2
+- capacity_x: 20000
+  name: A3
+- capacity_x: 20000
+  name: A4
+- capacity_x: 20000
+  name: A5
+- capacity_x: 20000
+  name: A6
+capacity_aware:
+  enabled: true
+  reference_x: 5
+per_model_weekly:
+  cap_pct: 95
+thresholds:
+  steps:
+  - 70
+  - 85
+  - 94
