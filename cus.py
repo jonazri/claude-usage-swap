@@ -24183,6 +24183,8 @@ def _pressure_backtest_target(binding) -> tuple[str, str | None, str] | None:
     ``name`` is ``None`` for the pool view (there's no per-account name)."""
     if not isinstance(binding, dict):
         return None
+    if binding.get("constraint") == "fable_weekly":
+        return None
     window = binding.get("window")
     if not window:
         return None

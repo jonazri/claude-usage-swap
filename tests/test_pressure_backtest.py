@@ -159,6 +159,40 @@ def test_under_throttle_immediate_breach_uses_own_record():
     assert hits[0]["required_realized"] == pytest.approx(20.0)
 
 
+def test_fable_weekly_binding_produces_no_throttle_events():
+    """A `fable_weekly` level-bound critical binding
+    (`binding["constraint"] == "fable_weekly"`, but `binding["window"] ==
+    "7d"` -- a REAL key; `_pressure_binding_view` sets `window` even for a
+    fable binding) must NOT resolve to a throttle target via
+    `_pressure_backtest_target`. `dry_run_target`'s own fable branch
+    (cus.py ~22871) never attempts §5.2/§5.3 sizing for a qualitative
+    Fable->Sonnet downshift ask -- it always returns
+    `planned_shed=0.0, required=0.0, escalate=True` -- so there is no
+    numeric plan to join against the account's REAL 7d `remaining_units`
+    series. Even though the account's real 7d window later breaches (for an
+    unrelated, ordinary reason), that must NOT surface as a spurious
+    `under_throttle_events`/`materialized_breaches` hit misattributed to
+    the fable record."""
+    rec0 = _rec(
+        NOW.isoformat(),
+        per_account={"A": _acct(r7d=5.0)},
+        binding={"view": "account", "name": "A", "constraint": "fable_weekly",
+                 "window": "7d", "eta_min": 30.0},
+        level="critical",
+        would_ask=_would_ask(required=0.0, planned_shed=0.0, met=False, escalate=True),
+        would_target=[],
+    )
+    rec1 = _rec(
+        (NOW + timedelta(minutes=30)).isoformat(),
+        per_account={"A": _acct(r7d=-3.0, req7d=12.0)},
+    )
+    metrics = cus.score_shadow_window([rec0, rec1])
+
+    assert metrics["under_throttle_events"] == []
+    assert metrics["materialized_breaches"] == []
+    assert metrics["over_throttle_events"] == []
+
+
 # --------------------------------------------------------------------------
 # over-throttle: advisory fairness cost
 # --------------------------------------------------------------------------
