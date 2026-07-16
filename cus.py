@@ -69,11 +69,13 @@ import copy
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import re
 import shlex
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -22052,14 +22054,143 @@ def _pressure_build_emit_payload(key: str, snapshot: dict, cur: dict, now) -> di
     }
 
 
-def _pressure_emit_socket(payload: dict) -> None:
-    """Stage-1 stub for the cus -> sentineld authenticated §4 emit-socket
-    client. Task 32's real `EmitSocket` and Task 28's `_sentinel_available`
-    gate are not built yet, so the live (`shadow_mode: false`) emit path is
-    exercised via this single, monkeypatchable choke-point (a test spy
-    wraps/replaces it) rather than a hand-rolled socket call here. No-op
-    until Task 32/28 land.
+def _sentinel_emit_socket_path() -> Path:
+    """The well-known filesystem path of sentineld's authenticated §4 emit
+    socket (Task 32, Stage 2 -- binds `SENTINEL_ROOT/run/emit.sock`). cus
+    does NOT import the `sentineld` package -- the two repos/daemons stay
+    independent, so a missing/uninstalled sentinel install must never
+    become an import-time crash here -- so this mirrors sentineld's OWN
+    `SENTINEL_ROOT` env-var resolution (`sentineld/__init__.py`: a set-but-
+    empty/whitespace-only `SENTINEL_ROOT` falls back to the same default)
+    rather than importing it, letting both sides agree on the path by
+    CONVENTION, not code sharing.
     """
+    env_root = os.environ.get("SENTINEL_ROOT", "")
+    root = Path(env_root) if env_root.strip() else HOME / "claude-accounts" / "sentinel-runtime"
+    return root / "run" / "emit.sock"
+
+
+def _sentinel_available() -> bool:
+    """Task 28 install/ordering gate (§10.5): True iff BOTH (1) the
+    `sentinel` CLI is on PATH (`shutil.which`), AND (2) sentineld's
+    authenticated §4 emit socket (`_sentinel_emit_socket_path`) exists AND
+    accepts a connection. Normally False in Stage 1: Task 32's socket
+    server (Stage 2) is not built yet, so on a real Stage-1 box this always
+    reads as unavailable -- the correct, safe default. `_pressure_cycle`'s
+    live emit path (see there) degrades every admitted emit to log-only
+    whenever this is False, rather than crashing or silently dropping it.
+
+    Never raises: the PATH lookup and the connect probe are both wrapped so
+    ANY failure (missing binary, missing/stale socket file, connection
+    refused, permission denied, timeout, or `SOCK_SEQPACKET`/`AF_UNIX`
+    simply not being defined on this platform's `socket` module) reads as
+    "unavailable" -- an availability probe must never itself break the
+    daemon's forecasting loop (G0).
+    """
+    if shutil.which("sentinel") is None:
+        return False
+    sock_path = _sentinel_emit_socket_path()
+    if not sock_path.exists():
+        return False
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    except (OSError, AttributeError):
+        return False
+    try:
+        probe.settimeout(0.25)
+        probe.connect(str(sock_path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def _pressure_degrade_to_log_only(payload: dict, reason: str) -> None:
+    """Task 28 install/ordering gate's shared degrade path -- used by BOTH
+    `_pressure_cycle` (sentinel absent/unreachable BEFORE any connection is
+    attempted) and `_pressure_emit_to_sentinel` (connection attempted but
+    failed). Logs the would-emit at WARN (stdlib `logging` -- no handler
+    configured here; Python's own last-resort handler prints WARNING+ to
+    stderr with zero setup, and a test can capture it via `caplog`) and
+    appends the SAME payload to the cus-side shadow log
+    (`_pressure_shadow_log_path`/`_shadow_log`), so a degraded live cycle
+    leaves the same calibration trail a `shadow_mode: true` cycle would.
+
+    `now` is recovered from `payload["generated_at"]`
+    (`_pressure_build_emit_payload` always sets it to the cycle's own `now`)
+    rather than accepted as a parameter, so this one function shape serves
+    both call sites regardless of what each has in local scope. Best-effort
+    (`_shadow_log`'s atomic append can itself raise `OSError` on a broken
+    filesystem) -- swallowed, matching `_pressure_load_last_emit`/
+    `_log_decision`'s tolerant style: a lost log line must never be why the
+    daemon's forecasting loop crashes.
+    """
+    logging.warning("token-pressure emit degraded to log-only (%s): %s",
+                     reason, payload.get("summary") or payload.get("dedupe_key"))
+    now = _pressure_parse_ts(payload.get("generated_at")) or datetime.now(timezone.utc)
+    record = {"ts": now.isoformat(), "would_emit": payload, "degraded_reason": reason}
+    try:
+        _shadow_log(record, now)
+    except OSError:
+        pass
+
+
+def _pressure_emit_socket(payload: dict) -> None:
+    """Task 28: the raw connect+send over sentineld's authenticated §4 emit
+    socket (`_sentinel_emit_socket_path`, Task 32's real `EmitSocket`
+    server, Stage 2). A single UNIX `SOCK_SEQPACKET` connect+send -- no
+    retry, no error handling of its own (that's `_pressure_emit_to_
+    sentinel`'s job, its only caller). Kept as its own function/choke-point
+    (the SAME name pre-Task-28 code already spied on in
+    `tests/test_pressure_shadow.py`) so a test can replace just the
+    wire-level send without also restubbing the degrade-on-error handling
+    around it. Raises `OSError` on any connect/send failure -- the caller
+    catches it.
+    """
+    sock_path = _sentinel_emit_socket_path()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+        client.settimeout(1.0)
+        client.connect(str(sock_path))
+        client.send(json.dumps(payload, default=str, separators=(",", ":")).encode())
+
+
+def _pressure_emit_to_sentinel(payload: dict, config: dict) -> bool:
+    """Task 28 cus -> socket emit CLIENT. `_pressure_cycle`'s LIVE
+    (`shadow_mode: false`) branch calls this, and only this, to hand an
+    admitted emit off to sentineld -- called ONLY after `_sentinel_
+    available()` has already read True for this cycle (the install/
+    ordering gate above). Still wraps the actual connect+send
+    (`_pressure_emit_socket`) in its OWN try/except: the availability probe
+    and this call are two SEPARATE connections, so a same-cycle TOCTOU
+    (sentineld exits/hangs between the two) is possible and must degrade
+    exactly like "never available" would have -- `_pressure_cycle` must
+    NEVER see a raised exception out of the emit path (G0: a dependency
+    going away mid-cycle must never crash the daemon's forecasting loop).
+
+    Returns True iff the send completed without an `OSError` (a delivery
+    guarantee to the local socket, NOT an ack from sentineld -- there is no
+    reply channel here); on False, `_pressure_cycle` must NOT advance the
+    live `last_emit.json` hysteresis for this key (nothing was actually
+    emitted -- advancing it on a phantom success would silently suppress a
+    legitimate re-emit once sentinel comes back). On False this function
+    has ALREADY performed the log-only degrade itself
+    (`_pressure_degrade_to_log_only`) -- the caller only needs to skip its
+    own marker/registry bookkeeping, not degrade a second time.
+
+    `config` is accepted for call-shape symmetry with the rest of the §4
+    emit path (a future auth-secret/timeout override belongs here) --
+    unused today; Task 32's HMAC shared secret is sentineld-side only.
+    Argv/payload-safe: `payload` is sent as a single JSON-encoded datagram
+    body, never interpolated into a shell command or file path (mirrors the
+    §7b.3 wrapper discipline for the socket path).
+    """
+    try:
+        _pressure_emit_socket(payload)
+        return True
+    except OSError:
+        _pressure_degrade_to_log_only(payload, "connect_error")
+        return False
 
 
 def _pressure_write_emit_marker(key: str, payload: dict, now) -> None:
@@ -23230,11 +23361,16 @@ def _pressure_cycle(state: dict, config: dict, now) -> dict:
     published snapshot, so this is the one clean way to recover every
     currently-binding key without modifying `_pressure_snapshot`, which is
     out of this task's scope) to get every currently-binding key, consults
-    `_pressure_emit_decision` per key, emits (via the Stage-1
-    `_pressure_emit_socket` spy point -- Task 32's real EmitSocket / Task
-    28's `_sentinel_available` gate are not built) only when admitted, and
-    persists the resulting last-emit registry so the hysteresis means
-    something across daemon cycles.
+    `_pressure_emit_decision` per key, and for each ADMITTED key gates on
+    Task 28's `_sentinel_available()` install/ordering check: available ->
+    emit via `_pressure_emit_to_sentinel` (Task 32's real `EmitSocket`
+    server is Stage 2, so in Stage 1 this is exercised only through test
+    spies) and persist that key into the last-emit registry; unavailable
+    (the Stage-1 default) -> `_pressure_degrade_to_log_only` instead (WARN
+    + shadow-log append, the live registry left untouched for that key --
+    nothing was actually emitted). Never raises either way, and always
+    persists whatever last-emit registry entries a real emit did add so the
+    hysteresis means something across daemon cycles.
     """
     state = copy.deepcopy(state)
 
@@ -23314,7 +23450,20 @@ def _pressure_cycle(state: dict, config: dict, now) -> dict:
             continue
         cur = _pressure_key_state(key, snapshot, config)
         payload = _pressure_build_emit_payload(key, snapshot, cur, now)
-        _pressure_emit_socket(payload)
+
+        # Task 28 install/ordering gate (§10.5): a missing/unreachable
+        # sentinel degrades THIS admitted emit to log-only -- independent
+        # of shadow_mode (a missing dependency is always log-only, even
+        # here in the live shadow_mode:false path). Never raises either
+        # way; on a degrade the live last_emit.json registry is left
+        # untouched for this key (nothing was actually emitted), so a real
+        # emit is not silently suppressed once sentinel becomes available.
+        if not _sentinel_available():
+            _pressure_degrade_to_log_only(payload, "sentinel_unavailable")
+            continue
+        if not _pressure_emit_to_sentinel(payload, config):
+            continue
+
         _pressure_write_emit_marker(key, payload, now)
         registry[key] = {
             "level": cur["level"],

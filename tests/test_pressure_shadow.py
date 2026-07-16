@@ -229,11 +229,18 @@ def test_would_ask_and_would_target_stay_none_when_no_breach():
 
 def test_shadow_false_still_emits(tmp_path, monkeypatch):
     """`shadow_mode: false` -> the emit spy fires once for the one binding
-    key, and NO shadow-log line is written this cycle."""
+    key, and NO shadow-log line is written this cycle.
+
+    Task 28's `_sentinel_available` install/ordering gate now stands
+    between the emit decision and the wire-level send -- monkeypatched True
+    here so this test keeps exercising the LIVE emit-reaches-the-socket
+    path unchanged; the log-only degrade when sentinel is absent/
+    unreachable is covered by tests/test_pressure_install_gate.py."""
     accounts_dir = _env(tmp_path, monkeypatch)
     state = {"accounts": {"A": _acct(pct=96.0, pct7d=10.0)}}
     config = dict(BASE_CFG, pressure={"shadow_mode": False})
 
+    monkeypatch.setattr(cus, "_sentinel_available", lambda: True)
     emit_calls = []
     monkeypatch.setattr(cus, "_pressure_emit_socket", lambda payload: emit_calls.append(payload))
     monkeypatch.setattr(cus, "_pressure_write_emit_marker", lambda key, payload, now: None)
