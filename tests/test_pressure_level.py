@@ -5,11 +5,17 @@ Fold the independent triggers ``{pool:5h, pool:7d} ∪ {per-acct:5h/7d ∀a}`` i
 one ``ok/elevated/critical`` level. Each trigger's breach ETA is computed to
 ``horizon = H+margin = 240`` (round-3 finding 1) so the EXIT test is evaluable in
 ``(180, 240]``: a trigger breaching there keeps a REAL eta (not None) and is held
-binding. ENTER thresholds are applied to that 240-horizon eta unchanged: critical
-at ``eta < 60``, elevated at ``eta <= 180``; a trigger clears only when its
-240-horizon eta exceeds 240 (i.e. eta is None). Fable-weekly binds by LEVEL.
-pool↔per-account tie -> per-account WINS. Pool release is suppressed while any
-active account is unpolled / capacity_x out-of-band.
+binding. ``_pressure_level`` is STATELESS (no memory of the prior cycle's level),
+so eta<=240 -- NOT the plan's 180 -- is the only threshold it ever applies, for
+BOTH entering and holding binding: critical at ``eta < 60`` or ``level_bound``;
+elevated for ANY OTHER binding trigger, i.e. up to ``eta == 240``. A trigger
+clears only when its 240-horizon eta exceeds 240 (i.e. eta is None). The plan's
+true hysteresis -- ENTER at the tighter ``H = 180``, EXIT only at 240 after an
+``exit_dwell_min`` dwell -- needs prior-cycle level STATE this stateless fold does
+not have, and is DEFERRED to the Stage-2 acting path (pre-shadow-flip gate); see
+`cus._pressure_level`'s docstring. Fable-weekly binds by LEVEL. pool↔per-account
+tie -> per-account WINS. Pool release is suppressed while any active account is
+unpolled / capacity_x out-of-band.
 
 HARNESS: ``python3 -m pytest tests/ -q``.
 """

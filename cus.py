@@ -5815,7 +5815,18 @@ def _pressure_trigger_is_binding(trigger: dict) -> bool:
     """A trigger is BINDING when its 240-horizon eta is finite (a breach in
     [0,240], held through the exit-margin band until eta>240 i.e. None), OR it is
     a Fable-weekly ``level_bound`` trigger, OR it is a pool trigger whose release
-    is suppressed (uncertain pool view). (Task 9, G6.)"""
+    is suppressed (uncertain pool view). (Task 9, G6.)
+
+    Docs correction (final-review fix-wave, code UNCHANGED): this function is
+    STATELESS -- it has no memory of the prior cycle's level -- so 240 (H +
+    exit_margin) is the ONLY horizon it ever tests, for both a fresh breach
+    and an already-binding one alike. The plan's true hysteresis (breach
+    ENTERS binding at the tighter H=180, but only EXITS at 240 after an
+    ``exit_dwell_min`` dwell) needs prior-cycle level STATE to tell "just
+    entered" from "still holding" apart, which this stateless helper (and
+    Stage-1 shadow generally) does not have -- that hysteresis is DEFERRED to
+    the Stage-2 acting path (pre-shadow-flip gate). Until then, every binding
+    trigger effectively enters (and holds) at eta<=240, not the plan's 180."""
     if trigger.get("level_bound"):
         return True
     if trigger.get("eta") is not None:
@@ -5928,14 +5939,25 @@ def _pressure_level(triggers: list[dict], config: dict) -> dict:
     Each trigger's ``eta`` is the 240-horizon value from ``_pressure_triggers``.
     A trigger is BINDING iff its eta is finite (≤240 — held through the
     exit-margin band; it clears only when eta>240 i.e. None), or it is a
-    level_bound trigger, or a release-suppressed pool trigger. ENTER thresholds
-    on the 240-horizon eta (unchanged): ``critical`` iff any binding trigger has
-    ``eta < critical_eta_min`` (60) or is ``level_bound`` (Fable within margin of
-    gate); otherwise ``elevated``. ``level = ok`` only when NOTHING is binding —
-    i.e. EVERY currently-binding trigger's 240-horizon eta exceeds 240 (a level
-    DECREASE requires ALL binding to clear; the ``exit_dwell_min`` is applied
-    downstream in Stage 2). ``binding`` is the most-severe trigger
-    (``_pressure_binding``; pool↔account tie -> account). Read-only.
+    level_bound trigger, or a release-suppressed pool trigger. ``critical`` iff
+    any binding trigger has ``eta < critical_eta_min`` (60) or is ``level_bound``
+    (Fable within margin of gate); otherwise ``elevated``. ``level = ok`` only
+    when NOTHING is binding — i.e. EVERY currently-binding trigger's 240-horizon
+    eta exceeds 240 (a level DECREASE requires ALL binding to clear; the
+    ``exit_dwell_min`` is applied downstream in Stage 2). ``binding`` is the
+    most-severe trigger (``_pressure_binding``; pool↔account tie -> account).
+    Read-only.
+
+    Docs correction (final-review fix-wave, code UNCHANGED): this fold is
+    STATELESS (no memory of the prior cycle's level), so eta≤240 (H +
+    exit_margin, NOT the plan's 180) is the ONLY ENTER/HOLD threshold applied
+    here — ``elevated`` fires for ANY binding, non-critical trigger up to
+    eta=240, not just eta<=180. The plan's true hysteresis (ENTER at the
+    tighter H=180, EXIT only at 240 after an ``exit_dwell_min`` dwell) needs
+    prior-cycle level state this stateless helper does not have, and is
+    DEFERRED to the Stage-2 acting path (pre-shadow-flip gate) — intentional
+    and conservative for Stage-1 shadow (it only ever widens the binding
+    window, never narrows it, so it cannot under-count pressure).
     """
     critical_eta = float(config.get("pressure", {}).get("critical_eta_min", 60))
     binding = [t for t in triggers if _pressure_trigger_is_binding(t)]
