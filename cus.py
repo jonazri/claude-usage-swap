@@ -22080,17 +22080,26 @@ def _sentinel_available() -> bool:
     live emit path (see there) degrades every admitted emit to log-only
     whenever this is False, rather than crashing or silently dropping it.
 
-    Never raises: the PATH lookup and the connect probe are both wrapped so
-    ANY failure (missing binary, missing/stale socket file, connection
-    refused, permission denied, timeout, or `SOCK_SEQPACKET`/`AF_UNIX`
-    simply not being defined on this platform's `socket` module) reads as
-    "unavailable" -- an availability probe must never itself break the
-    daemon's forecasting loop (G0).
+    Never raises: the PATH lookup, the socket-path existence check, and the
+    connect probe are ALL wrapped so ANY failure (missing binary,
+    missing/stale socket file, an unreadable/untraversable ancestor
+    directory, connection refused, permission denied, timeout, or
+    `SOCK_SEQPACKET`/`AF_UNIX` simply not being defined on this platform's
+    `socket` module) reads as "unavailable" -- an availability probe must
+    never itself break the daemon's forecasting loop (G0). Note in
+    particular that `pathlib.Path.exists()` on its own only swallows
+    ENOENT/ENOTDIR/EBADF/ELOOP -- it does NOT swallow `PermissionError` (or
+    any other `OSError`) raised when an ancestor directory isn't
+    traversable by the current user, which is why that check is wrapped
+    explicitly below rather than trusted to be exception-safe by itself.
     """
     if shutil.which("sentinel") is None:
         return False
     sock_path = _sentinel_emit_socket_path()
-    if not sock_path.exists():
+    try:
+        if not sock_path.exists():
+            return False
+    except OSError:
         return False
     try:
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)

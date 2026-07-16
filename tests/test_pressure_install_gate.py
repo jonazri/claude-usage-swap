@@ -36,6 +36,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cus  # noqa: E402
@@ -228,6 +230,71 @@ def test_sentinel_available_true_reaches_client(tmp_path, monkeypatch):
     assert "token-pressure:account:A:5h" in registry
 
 
+def test_sentinel_available_inaccessible_path_returns_false(tmp_path, monkeypatch):
+    """Fix-wave-1 (Critical): `pathlib.Path.exists()` only swallows
+    ENOENT/ENOTDIR/EBADF/ELOOP -- it does NOT swallow `PermissionError` (or
+    any other `OSError`). When an ancestor directory of the emit-socket path
+    (e.g. `SENTINEL_ROOT` itself) isn't traversable by the current user -- a
+    realistic partial/misconfigured/other-user install -- `sock_path.exists()`
+    raises `PermissionError` straight out of `_sentinel_available()` unless
+    that call is itself inside an `OSError` guard. This is a direct unit
+    test of that guard: `shutil.which` is mocked present (so we reach the
+    socket-path check), and `Path.exists` is mocked to raise
+    `PermissionError` for ANY path -- `_sentinel_available()` must still
+    return `False`, never propagate."""
+    _env(tmp_path, monkeypatch)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sentinel")
+
+    def _raise_permission_error(self):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "exists", _raise_permission_error)
+
+    assert cus._sentinel_available() is False   # must not raise
+
+
+def test_permission_denied_ancestor_degrades_to_log_only(tmp_path, monkeypatch, caplog):
+    """Fix-wave-1 (Critical), cycle-level reproduction: a REAL `chmod 000`
+    ancestor directory under `SENTINEL_ROOT` (not a mock) makes
+    `sock_path.exists()` raise a genuine `PermissionError` when the kernel
+    can't traverse it -- exactly the reviewer's empirical repro. Under
+    `shadow_mode: false`, `_pressure_cycle` must still degrade this to
+    log-only and return a clean snapshot; it must NEVER crash the
+    forecasting loop (Task 28's core guarantee)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits; cannot exercise PermissionError")
+
+    sentinel_root = tmp_path / "sentinel-runtime"
+    (sentinel_root / "run").mkdir(parents=True)
+    os.chmod(sentinel_root, 0o000)
+    try:
+        accounts_dir = _env(tmp_path, monkeypatch, sentinel_root=sentinel_root)
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sentinel")
+
+        client_calls = []
+        monkeypatch.setattr(cus, "_pressure_emit_to_sentinel",
+                             lambda payload, config: client_calls.append(payload) or True)
+
+        state, config = _breaching_cycle_args()
+
+        caplog.set_level(logging.WARNING)
+        snapshot = cus._pressure_cycle(state, config, NOW)   # must not raise
+    finally:
+        os.chmod(sentinel_root, 0o755)
+
+    assert snapshot["level"] != "ok"
+    assert client_calls == [], "the emit client must never be reached when the socket path is inaccessible"
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    log_path = _shadow_log_path(accounts_dir, NOW)
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["would_emit"] is not None
+    assert record["degraded_reason"] == "sentinel_unavailable"
+
+    assert not (accounts_dir / "pressure" / "last_emit.json").exists()
+
+
 if __name__ == "__main__":
-    import pytest
     sys.exit(pytest.main([__file__, "-q"]))
