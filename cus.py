@@ -22186,7 +22186,8 @@ def _pressure_session_share_pct_per_min(session: dict) -> float:
 
 
 def _pressure_dry_run_candidates(
-    sessions: list[dict], binding: dict, accounts_block: dict, reference_x: float, config: dict
+    sessions: list[dict], binding: dict, accounts_block: dict, reference_x: float, config: dict,
+    floor: float | None = None,
 ) -> list[dict]:
     """§5.2 candidate filter + contribution/rank annotation, sorted
     descending by ``contribution * elasticity_weight`` with the
@@ -22198,13 +22199,26 @@ def _pressure_dry_run_candidates(
 
     Filter (§5.2): class in {workflow, committee-loop, subagent-heavy} AND
     (share_pct_per_min >= share_floor_pct OR trend == "rising"). NEVER
-    `interactive`, never `idle`. The floor gates on the %-scale
+    `interactive`, never `idle` -- the class gate always applies first,
+    regardless of ``floor``. The floor gates on the %-scale
     `_pressure_session_share_pct_per_min` (Follow-up 1 fix) -- NOT on the
     reference-unit `contribution`, which remains the §5.3 ranking/sizing
     quantity below, unchanged.
+
+    ``floor``, when given, OVERRIDES ``config.pressure.share_floor_pct`` for
+    this one call (Task 25): `dry_run_target` passes ``floor=0.0`` for a
+    `level == "critical"` breach so this returns the FULL class-gated
+    elastic pool (every session admitted regardless of its %-share, since
+    `share_pct_per_min` is never negative) each annotated with its own
+    `share_pct_per_min` -- the pool the critical descent then re-filters at
+    each successively lower step (`_pressure_filter_candidates_by_floor`)
+    without ever re-deriving anything from the raw `sessions` again.
+    ``floor=None`` (every other caller) keeps today's behavior: filter at
+    the single configured `share_floor_pct`.
     """
     share_floor_pct = float(
-        (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
+        floor if floor is not None
+        else (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
     )
     out = []
     for session in sorted(sessions, key=lambda s: s.get("session_id", "")):
@@ -22226,6 +22240,7 @@ def _pressure_dry_run_candidates(
                 "trend": trend,
                 "contribution": contribution,
                 "elasticity_weight": elasticity_weight,
+                "share_pct_per_min": share_pct_per_min,
             }
         )
     return _pressure_rank_candidates(out)
@@ -22245,6 +22260,25 @@ def _pressure_rank_candidates(candidates: list[dict]) -> list[dict]:
             c["session_id"],
         ),
     )
+
+
+def _pressure_filter_candidates_by_floor(candidates: list[dict], floor: float) -> list[dict]:
+    """Task 25: re-apply the §5.2 OR-filter (``share_pct_per_min >= floor OR
+    trend == "rising"``) to an ALREADY-ANNOTATED candidate pool at one
+    descent step's ``floor`` -- the companion to `_pressure_dry_run_candidates`'s
+    own filter, but operating on each candidate's pre-computed
+    `share_pct_per_min` (added to that function's output for exactly this
+    purpose) rather than re-deriving anything from raw session dicts. The
+    critical descent in `_size_reduction_walk` calls this once per step
+    against the SAME full pool (built once, at the lowest floor ever used,
+    by `dry_run_target`) -- a session excluded at a higher floor is still in
+    that pool and becomes eligible the instant a lower step's threshold
+    admits it.
+    """
+    return [
+        c for c in candidates
+        if c["share_pct_per_min"] >= floor or c.get("trend") == "rising"
+    ]
 
 
 def _size_reduction_walk_pass(
@@ -22282,26 +22316,84 @@ def _size_reduction_walk_pass(
 
 
 def _size_reduction_walk(
-    candidates: list[dict], required: float, safety_factor: float, config: dict
+    candidates: list[dict], required: float, safety_factor: float, config: dict,
+    level: str = "elevated",
 ) -> dict:
-    """Task 24's base single-floor sizing walk (Task 25 extends this same
-    helper with the critical `[15,10,5,2.5]` descent per finding 12 --
-    `_size_reduction_walk_pass` above is already factored out so that
-    extension re-runs the pass at successive floors without a rewrite).
+    """Task 24's base single-floor sizing walk, extended by Task 25 with the
+    critical `[15,10,5,2.5]` descent per finding 12 (`_size_reduction_walk_pass`
+    above is factored out so this extension re-runs the pass at successive
+    floors without a rewrite).
 
-    ``candidates`` must already be filtered/ranked (§5.2) -- this function
-    only performs the §5.3 accumulate-and-stop walk plus the §5.4
-    met/escalate framing. Meetable: ``met=True, escalate=False``.
-    Unmeetable (candidates exhausted before reaching the threshold, or an
-    empty candidate set on a real ``required > 0``): ``met=False,
-    escalate=True`` with a non-empty ``reason`` -- never a vacuous empty
-    plan that silently "clears" a real breach (§5.4).
+    ``level == "elevated"`` (the default -- unchanged Task 24 behavior):
+    ``candidates`` must already be filtered/ranked (§5.2) at the base
+    `share_floor_pct` -- this branch only performs the §5.3
+    accumulate-and-stop walk plus the §5.4 met/escalate framing. NEVER
+    descends, even if a deeper floor would meet.
+
+    ``level == "critical"``: ``candidates`` must instead be the FULL
+    class-gated elastic pool, each annotated with `share_pct_per_min`
+    (`_pressure_dry_run_candidates(..., floor=0.0)` -- see `dry_run_target`).
+    Descends `config.pressure.critical_share_floor_steps` (default
+    `[15, 10, 5, 2.5]`), RE-FILTERING that SAME pool at each step
+    (`_pressure_filter_candidates_by_floor`) and re-running the §5.3 walk,
+    STOPPING the instant a step meets -- so a session excluded at 15% but
+    with `share_pct_per_min >= 5` becomes eligible the moment the descent
+    reaches 5%, without ever re-deriving anything from raw sessions. The
+    floor actually used is recorded on the plan (`floor`). Stateless/
+    per-episode: every call starts fresh at the first step (15) -- there is
+    no module/global ratchet, so two sequential episodes each redo the full
+    descent from scratch.
+
+    Both branches: meetable -> ``met=True, escalate=False``. Unmeetable
+    (candidates exhausted before reaching the threshold at the last floor
+    tried -- `share_floor_pct` for elevated, `share_floor_min_pct` for a
+    fully-descended critical -- or an empty candidate set on a real
+    ``required > 0``): ``met=False, escalate=True`` with a non-empty
+    ``reason`` -- never a vacuous empty plan that silently "clears" a real
+    breach (§5.4).
     """
-    share_floor_pct = float(
-        (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
-    )
-    result = _size_reduction_walk_pass(candidates, required, safety_factor, share_floor_pct)
+    pressure_cfg = (config or {}).get("pressure", {})
+    share_floor_pct = float(pressure_cfg.get("share_floor_pct", 15.0))
     threshold = required * safety_factor
+
+    if level == "critical":
+        steps = [
+            float(step)
+            for step in pressure_cfg.get(
+                "critical_share_floor_steps", [15.0, 10.0, 5.0, 2.5]
+            )
+        ]
+        share_floor_min_pct = float(pressure_cfg.get("share_floor_min_pct", 2.5))
+        floor = share_floor_pct
+        result = _size_reduction_walk_pass([], required, safety_factor, floor)
+        for floor in steps:
+            filtered = _pressure_filter_candidates_by_floor(candidates, floor)
+            result = _size_reduction_walk_pass(filtered, required, safety_factor, floor)
+            if result["met"]:
+                return {
+                    "targets": result["targets"],
+                    "planned_shed": result["planned_shed"],
+                    "met": True,
+                    "escalate": False,
+                    "reason": None,
+                    "floor": floor,
+                }
+        reason = (
+            f"unmeetable even at floor={floor:.4g}% (min {share_floor_min_pct:.4g}%): "
+            f"{len(result['targets'])} elastic candidate(s) shed "
+            f"{result['planned_shed']:.4g} of required {threshold:.4g} "
+            f"(required={required:.4g} x safety_factor={safety_factor:.4g})"
+        )
+        return {
+            "targets": result["targets"],
+            "planned_shed": result["planned_shed"],
+            "met": False,
+            "escalate": True,
+            "reason": reason,
+            "floor": floor,
+        }
+
+    result = _size_reduction_walk_pass(candidates, required, safety_factor, share_floor_pct)
     if result["met"]:
         return {
             "targets": result["targets"],
@@ -22309,6 +22401,7 @@ def _size_reduction_walk(
             "met": True,
             "escalate": False,
             "reason": None,
+            "floor": share_floor_pct,
         }
     reason = (
         f"unmeetable: {len(candidates)} elastic candidate(s) shed "
@@ -22321,6 +22414,7 @@ def _size_reduction_walk(
         "met": False,
         "escalate": True,
         "reason": reason,
+        "floor": share_floor_pct,
     }
 
 
@@ -22341,6 +22435,18 @@ def dry_run_target(pressure_state: dict, config: dict) -> dict:
     Fable->Sonnet downshift ask a later task builds -- NOT built here, so
     this always escalates rather than defaulting `required` to 0 and
     vacuously clearing a real breach.
+
+    Task 25: for a ``level == "critical"`` breach, the candidate pool is
+    built with ``floor=0.0`` -- the FULL class-gated elastic pool (every
+    session admitted regardless of %-share, since `share_pct_per_min` is
+    never negative), each annotated with its own `share_pct_per_min` -- so
+    `_size_reduction_walk`'s critical descent can re-filter that SAME pool
+    at each successively lower `critical_share_floor_steps` step without
+    ever re-deriving anything from `pressure_state["sessions"]` again (a
+    session excluded at 15% but with `share_pct_per_min >= 5` becomes
+    eligible once the descent reaches 5%). Any other level (``"elevated"``
+    or unset/malformed, fail-closed to the non-descending base floor) keeps
+    the single-floor pool `_pressure_dry_run_candidates` has always built.
     """
     safety_factor = float(pressure_state.get("safety_factor", 1.0))
     binding = pressure_state.get("binding")
@@ -22387,10 +22493,15 @@ def dry_run_target(pressure_state: dict, config: dict) -> dict:
     else:
         required = 0.0
 
+    level = pressure_state.get("level")
+    pool_floor = 0.0 if level == "critical" else None
     candidates = _pressure_dry_run_candidates(
-        pressure_state.get("sessions", []), binding, accounts_block, reference_x, config
+        pressure_state.get("sessions", []), binding, accounts_block, reference_x, config,
+        floor=pool_floor,
     )
-    walk = _size_reduction_walk(candidates, required, safety_factor, config)
+    walk = _size_reduction_walk(
+        candidates, required, safety_factor, config, level=level or "elevated"
+    )
     return {
         "targets": walk["targets"],
         "planned_shed": walk["planned_shed"],
