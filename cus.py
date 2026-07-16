@@ -23390,7 +23390,7 @@ def shadow_report(shadow_dir, config: dict, now) -> dict:
     safety_factors = _pressure_shadow_realized_safety_factors(records)
     sf_median = _pressure_median(safety_factors)
     sf_saturated = any(sf >= SAFETY_FACTOR_ABSORB_CAP for sf in safety_factors)
-    absorbed = sf_median <= SAFETY_FACTOR_ABSORB_MEDIAN_MAX and not sf_saturated
+    absorbed = bool(safety_factors) and sf_median <= SAFETY_FACTOR_ABSORB_MEDIAN_MAX and not sf_saturated
     residual_pass = residual_within or absorbed
     _add("residual_median", residual_median, RESIDUAL_MEDIAN_MAX, residual_pass,
          soft=True, absorbed=(not residual_within) and absorbed)

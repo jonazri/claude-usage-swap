@@ -367,6 +367,30 @@ def test_residual_exceeded_not_absorbed_fails(tmp_path):
     assert report["per_metric"]["residual_p90"]["pass"] is False
 
 
+def test_residual_exceeded_empty_safety_factors_not_absorbed(tmp_path):
+    """residual_fraction=0.25 exceeds RESIDUAL_MEDIAN_MAX (0.15) but still
+    passes fit_r2_median (r2 = 1-0.25**2 = 0.9375 >= 0.80); the week's
+    breach records carry NO `would_ask.safety_factor` at all (Task 27
+    finding: absence of evidence must not read as evidence of absorption).
+    Regression for the vacuous-True bug: `_pressure_median([]) == 0.0`
+    used to satisfy `0.0 <= SAFETY_FACTOR_ABSORB_MEDIAN_MAX` and
+    `not any([])` unconditionally, certifying "absorbed" with zero
+    logged safety factors."""
+    shadow_dir = tmp_path / "shadow"
+    records = _full_week_records(residual_fraction=0.25)  # no safety_factors -> realized list is empty
+    _write_shadow(shadow_dir, "d.jsonl", records)
+    _clock(shadow_dir, NOW - timedelta(days=8))
+    _spotcheck(shadow_dir)
+
+    report = cus.shadow_report(shadow_dir, BASE_CFG, NOW)
+    m = report["per_metric"]["residual_median"]
+    assert m["value"] == pytest.approx(0.25)
+    assert m["pass"] is False
+    assert m["absorbed"] is False
+    assert report["verdict"] == "BLOCKED"
+    assert "residual_median" in report["blocking_metrics"]
+
+
 # --------------------------------------------------------------------------
 # HARD-ZERO safety gates: single injected false-clear / vacuous-clear
 # --------------------------------------------------------------------------
