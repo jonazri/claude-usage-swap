@@ -385,5 +385,218 @@ def test_cycle_appends_and_fit_uses_history(tmp_path, monkeypatch):
     assert snapshot["weight_fit"]["n_windows"] == 4
 
 
+# ---------------------------------------------------------------------------
+# Fix wave 1: direct coverage for `_pressure_raw_token_totals_by_account`
+# (review finding -- every test above monkeypatches this away, so a bug in
+# its field-mapping/dedup/time-join would silently corrupt every downstream
+# weight-fit window with nothing catching it). Fixture style mirrors
+# `tests/test_pressure_attribution.py`'s own `_row`/`_usage`/`_assistant_line`
+# helpers for `_attribute_burn` (Task 11), which this function's dedup ->
+# time-join pattern deliberately mirrors (see its docstring, @cus.py:23017).
+# ---------------------------------------------------------------------------
+
+def _row(ts: datetime, session_id: str, account: str, pane: str = "%1",
+         tmux_socket: str = "/tmp/tmux-1000/default", cwd: str = "/home/yaz/project") -> dict:
+    """`_parse_sessions_log()`-shaped row -- already-normalized 6-col."""
+    return {
+        "ts": ts.isoformat().replace("+00:00", "Z"),
+        "session_id": session_id,
+        "account": account,
+        "pane": pane,
+        "tmux_socket": tmux_socket,
+        "cwd": cwd,
+    }
+
+
+def _usage(input_tokens=0, output_tokens=0, cache_read=0, cache_create=0) -> dict:
+    """Real-transcript-shaped usage dict -- one flat `cache_creation_input_
+    tokens` field, no per-message 5m/1h split (§ `_PRESSURE_USAGE_FIELD_BY_
+    WEIGHT_COLUMN`'s documented Stage-1 collapse)."""
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_create,
+    }
+
+
+def _assistant_line(session_id: str, uid: str, ts: datetime, usage: dict) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uid,
+        "sessionId": session_id,
+        "timestamp": ts.isoformat().replace("+00:00", "Z"),
+        "message": {"usage": usage, "model": "claude-opus-4-8"},
+    }
+
+
+def test_raw_token_totals_field_mapping():
+    """One usage line with known `input_tokens`/`output_tokens`/
+    `cache_read_input_tokens`/`cache_creation_input_tokens` maps to the
+    correct 5 column totals for its joined account, including the
+    documented `cache_create_1h` collapse: Stage 1 has no raw source for
+    it (no field in `_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN` maps to it),
+    so it must stay exactly 0.0, never dropped from the row entirely."""
+    rows = [_row(NOW, "s1", "acctA")]
+    intervals = cus._session_account_intervals(rows)
+
+    usage = _usage(input_tokens=100, output_tokens=20, cache_read=7, cache_create=3)
+    tails = {
+        Path("/tmp/a.jsonl"): [
+            _assistant_line("s1", "u1", NOW + timedelta(minutes=1), usage),
+        ],
+    }
+
+    totals = cus._pressure_raw_token_totals_by_account(tails, intervals)
+
+    assert totals == {
+        "acctA": {
+            "input": 100.0, "output": 20.0, "cache_read": 7.0,
+            "cache_create_5m": 3.0, "cache_create_1h": 0.0,
+        },
+    }
+
+
+def test_raw_token_totals_dedup():
+    """A duplicated `(session_id, uuid)` line -- the same message re-read
+    by an overlapping tail window, landing in a SECOND `tails` path entry
+    -- within the 7d dedup window is counted ONCE: chronological-order
+    first-occurrence-wins, same as `_attribute_burn` (§10.9)."""
+    rows = [_row(NOW, "s1", "acctA")]
+    intervals = cus._session_account_intervals(rows)
+
+    first_ts = NOW + timedelta(minutes=1)
+    dup_ts = NOW + timedelta(minutes=2)  # re-read a minute later, same uuid
+    tails = {
+        Path("/tmp/a.jsonl"): [
+            _assistant_line("s1", "dup-1", first_ts, _usage(input_tokens=100)),
+            _assistant_line("s1", "u2", first_ts, _usage(output_tokens=50)),
+        ],
+        Path("/tmp/b.jsonl"): [
+            # overlapping tail re-read of the SAME message -- must NOT double-count,
+            # and if it wrongly won, the mismatched value below would prove it.
+            _assistant_line("s1", "dup-1", dup_ts, _usage(input_tokens=999)),
+        ],
+    }
+
+    totals = cus._pressure_raw_token_totals_by_account(tails, intervals)
+
+    assert totals == {
+        "acctA": {
+            "input": 100.0, "output": 50.0, "cache_read": 0.0,
+            "cache_create_5m": 0.0, "cache_create_1h": 0.0,
+        },
+    }
+
+
+def test_raw_token_totals_time_join():
+    """A usage line joins to the account active AT ITS OWN timestamp (per
+    the covering interval, rotation-row-driven -- same as
+    `test_rotation_rows_would_join_midwindow`), and a line that fails to
+    join -- either before the earliest known interval, or for a session
+    with NO sessions.log history at all -- contributes to NO account's
+    totals (kept out entirely, never guessed onto the wrong one; this
+    function has no residual bucket to fall into, unlike
+    `AttributionTable`)."""
+    t0 = NOW
+    t_rotate = NOW + timedelta(minutes=10)
+    rows = [_row(t0, "s1", "acctX"), _row(t_rotate, "s1", "acctY")]
+    intervals = cus._session_account_intervals(rows)
+    assert len(intervals["s1"]) == 2  # sanity: rotation produced 2 intervals
+
+    tails = {
+        Path("/tmp/a.jsonl"): [
+            # before the earliest interval start -- fails to join
+            _assistant_line("s1", "u-before", t0 - timedelta(minutes=5),
+                             _usage(input_tokens=99999)),
+            # mid-window, before rotation -> acctX
+            _assistant_line("s1", "u-x", t0 + timedelta(minutes=5),
+                             _usage(input_tokens=100)),
+            # after rotation -> acctY
+            _assistant_line("s1", "u-y", t_rotate + timedelta(minutes=5),
+                             _usage(input_tokens=200)),
+            # session with zero sessions.log history at all -- fails to join
+            _assistant_line("s-none", "u-orphan", t0 + timedelta(minutes=1),
+                             _usage(input_tokens=77777)),
+        ],
+    }
+
+    totals = cus._pressure_raw_token_totals_by_account(tails, intervals)
+
+    assert set(totals.keys()) == {"acctX", "acctY"}
+    assert totals["acctX"]["input"] == 100.0
+    assert totals["acctY"]["input"] == 200.0
+    # the two join-failures (99999, 77777) must appear NOWHERE
+    assert sum(t["input"] for t in totals.values()) == 300.0
+
+
+def test_raw_token_totals_multi_account():
+    """Lines across TWO real accounts aggregate to the correct per-account
+    totals, INCLUDING two different sessions bound to the SAME account
+    combining into one bucket -- this function groups by ACCOUNT ONLY, not
+    `(account, session_id)` like `_attribute_burn` (the weight-fit window
+    is per-account, per the docstring)."""
+    rows = [
+        _row(NOW, "s1", "acctA"),
+        _row(NOW, "s3", "acctA"),  # second, distinct session -- SAME account
+        _row(NOW, "s2", "acctB"),
+    ]
+    intervals = cus._session_account_intervals(rows)
+
+    tails = {
+        Path("/tmp/a.jsonl"): [
+            _assistant_line("s1", "u1", NOW + timedelta(minutes=1),
+                             _usage(input_tokens=10, output_tokens=2, cache_read=1, cache_create=0.5)),
+            _assistant_line("s3", "u3", NOW + timedelta(minutes=1),
+                             _usage(input_tokens=20, output_tokens=3)),
+            _assistant_line("s2", "u2", NOW + timedelta(minutes=1),
+                             _usage(input_tokens=1000, output_tokens=1)),
+        ],
+    }
+
+    totals = cus._pressure_raw_token_totals_by_account(tails, intervals)
+
+    assert totals == {
+        "acctA": {
+            "input": 30.0, "output": 5.0, "cache_read": 1.0,
+            "cache_create_5m": 0.5, "cache_create_1h": 0.0,
+        },
+        "acctB": {
+            "input": 1000.0, "output": 1.0, "cache_read": 0.0,
+            "cache_create_5m": 0.0, "cache_create_1h": 0.0,
+        },
+    }
+
+
+def test_window_observation_reset_crossing_producer():
+    """The self-disclosed untested branch (@cus.py:23129): a cycle where
+    `prior_resets_at != cur_resets_at` emits a reset-crossing row stamped
+    with the OLD (pre-crossing) boundary timestamp -- the exact boundary
+    the account crossed sometime between the two cycles -- ALONGSIDE the
+    normal Δpct window-observation row, and rolls the cursor forward to
+    the NEW boundary for next cycle."""
+    prior_resets_at = (NOW - timedelta(hours=1)).isoformat()
+    cur_resets_at = (NOW + timedelta(hours=4)).isoformat()
+
+    acct_state = _acct(pct=60.0)
+    acct_state["five_hour_resets_at"] = cur_resets_at
+    state = {"accounts": {"A": acct_state}}
+
+    cursor = {"A": {"ts": (NOW - timedelta(minutes=5)).isoformat(), "pct": 50.0,
+                     "resets_at": prior_resets_at}}
+    raw_totals = {"A": {"input": 1.0, "output": 2.0, "cache_read": 0.0,
+                         "cache_create_5m": 0.0, "cache_create_1h": 0.0}}
+
+    window_rows, reset_rows, new_cursor = cus._pressure_window_observations(
+        state, BASE_CFG, NOW, raw_totals, cursor)
+
+    assert reset_rows == [{"account": "A", "ts": prior_resets_at}]
+    assert len(window_rows) == 1
+    assert window_rows[0]["account"] == "A"
+    assert window_rows[0]["pct_start"] == 50.0
+    assert window_rows[0]["pct_end"] == 60.0
+    assert new_cursor["A"] == {"ts": NOW.isoformat(), "pct": 60.0, "resets_at": cur_resets_at}
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
