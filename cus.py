@@ -22116,6 +22116,32 @@ def _pressure_session_contribution(
     return 0.0
 
 
+def _pressure_session_share_pct_per_min(session: dict) -> float:
+    """A session's total PERCENT-scale burn-share rate -- ``Σ_acct (rate *
+    account_shares[acct])`` summed over EVERY account it rotated across --
+    independent of the binding view. This is the §5.2 CANDIDACY-FLOOR
+    quantity (``share_pct_per_min >= share_floor_pct``), always %-scale
+    regardless of whether the binding is account- or pool-bound.
+
+    Deliberately NOT the same quantity as `_pressure_session_contribution`
+    (§5.3 SIZING): for a pool view, that function reference-x normalizes
+    each account's term (``.../100 * capacity_x/reference_x``), which is
+    routinely 12-100x SMALLER than this %-scale sum. Follow-up 1 (Important
+    bug fix): comparing that reference-unit ``contribution`` against the
+    %-scale ``share_floor_pct`` (the pre-fix code) silently degenerated the
+    §5.2 OR-filter to "only rising sessions qualify" for pool bindings,
+    pushing genuinely-meetable pool breaches toward avoidable
+    ``escalate=True``. For an account view, ``share_pct_per_min`` and the
+    bound-account slice of `_pressure_session_contribution` coincide
+    whenever the session's entire share is on the bound account (the common
+    case) -- the account-view floor was already %-scale and is unaffected
+    by this fix.
+    """
+    rate = float(session.get("rate") or 0.0)
+    shares = session.get("account_shares") or {}
+    return sum(rate * float(share) for share in shares.values())
+
+
 def _pressure_dry_run_candidates(
     sessions: list[dict], binding: dict, accounts_block: dict, reference_x: float, config: dict
 ) -> list[dict]:
@@ -22128,8 +22154,11 @@ def _pressure_dry_run_candidates(
     input, so ties resolve identically across repeated calls).
 
     Filter (§5.2): class in {workflow, committee-loop, subagent-heavy} AND
-    (contribution >= share_floor_pct OR trend == "rising"). NEVER
-    `interactive`, never `idle`.
+    (share_pct_per_min >= share_floor_pct OR trend == "rising"). NEVER
+    `interactive`, never `idle`. The floor gates on the %-scale
+    `_pressure_session_share_pct_per_min` (Follow-up 1 fix) -- NOT on the
+    reference-unit `contribution`, which remains the §5.3 ranking/sizing
+    quantity below, unchanged.
     """
     share_floor_pct = float(
         (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
@@ -22142,8 +22171,9 @@ def _pressure_dry_run_candidates(
         contribution = _pressure_session_contribution(
             session, binding, accounts_block, reference_x
         )
+        share_pct_per_min = _pressure_session_share_pct_per_min(session)
         trend = session.get("trend")
-        if contribution < share_floor_pct and trend != "rising":
+        if share_pct_per_min < share_floor_pct and trend != "rising":
             continue
         elasticity_weight = _pressure_elasticity_weight(cls, config)
         out.append(

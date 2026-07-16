@@ -169,6 +169,47 @@ def test_pool_breach_no_elastic_candidates_at_all_escalates():
     assert isinstance(plan["reason"], str) and plan["reason"]
 
 
+def test_pool_breach_floor_gates_on_pct_share_not_reference_unit_contribution():
+    """Follow-up 1, Part 1 (Important bug fix): the §5.2 candidacy floor
+    must gate on a PERCENT-scale share%/min quantity, NOT the reference-
+    unit `contribution` that §5.3 sizing uses -- for a POOL binding the two
+    are on wildly different scales (contribution is `capacity_x/reference_x`
+    normalized, routinely 12-100x smaller than a %-scale share).
+
+    `steady1` (workflow, elastic) rotates 100% of its burn onto a single
+    5x-tier account (ratio 1.0) at rate=30.0, trend="steady" (NOT rising,
+    and no other rising sibling in this fixture): its share%/min = rate *
+    account_shares["acc3"] = 30.0 * 1.0 = 30.0 (>= share_floor_pct=15 ->
+    clears the floor), while its POOL-view reference-unit contribution =
+    `_pressure_burn_units(30.0, ratio=1.0)` = 30.0/100*1.0 = 0.3 (far below
+    15). Pre-fix, comparing 0.3 against the 15.0 floor wrongly excluded
+    this session -- it would only ever have been included by accident, if
+    it happened to be "rising". This proves the floor now uses share%/min:
+    the session is a candidate purely because 30.0 >= 15.0, not because of
+    `trend`.
+    """
+    steady1 = _session("steady1", "workflow", rate=30.0, trend="steady",
+                        account_shares={"acc3": 1.0})
+    state = _pool_state([steady1], required=4.0, safety_factor=1.2)
+
+    candidates = cus._pressure_dry_run_candidates(
+        state["sessions"], state["binding"], state["accounts"],
+        state["reference_x"], CFG,
+    )
+
+    ids = [c["session_id"] for c in candidates]
+    assert "steady1" in ids, (
+        "a non-rising session with share%/min=30.0 (>= floor 15.0) must "
+        "clear the §5.2 floor even though its pool-view reference-unit "
+        "contribution (0.3) is far below share_floor_pct=15 -- the floor "
+        "must compare against %-scale share, not reference-unit contribution"
+    )
+    steady1_candidate = next(c for c in candidates if c["session_id"] == "steady1")
+    # §5.3 sizing/ranking still uses the reference-unit contribution
+    # (unchanged) -- only the §5.2 floor GATE itself switched quantities.
+    assert steady1_candidate["contribution"] == pytest.approx(0.3, abs=1e-9)
+
+
 # ========================== (a)+(b) per-account breach =======================
 
 def test_account_breach_meetable_floor_filters_low_share_non_rising():
