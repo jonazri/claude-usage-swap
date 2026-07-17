@@ -138,18 +138,53 @@ def test_launch_fallback_is_logged():
     """G8: the launch-time degrade is a KNOWN, LOGGED limitation, never
     silent -- a structured `pressure.attribution.launch_time_fallback` line
     naming the session is emitted every time the single-interval fallback
-    fires."""
+    fires. Post-deploy fix: this line moved from stdout to STDERR (it was
+    corrupting every stdout-JSON caller, e.g. `cus pressure --json`), so
+    this test now asserts on stderr, not stdout -- the G8 not-silent
+    guarantee itself is unchanged."""
     rows = [_row(NOW, "sLog", "acctLog")]
     intervals = cus._session_account_intervals(rows)["sLog"]
 
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stderr(buf):
         cus._join_usage_account(NOW + timedelta(minutes=1), intervals)
     out = buf.getvalue()
 
     assert "pressure.attribution.launch_time_fallback" in out
     assert "session_id=sLog" in out
     assert "account=acctLog" in out
+
+
+def test_launch_fallback_logged_once_per_session():
+    """Post-deploy fix: launch-time is the UNIVERSAL case today (FACT #5 --
+    no rotation rows in sessions.log), so `_join_usage_account` fires the
+    fallback for EVERY message of EVERY session. Logging it once per
+    message flooded daemon.log; `_attribute_burn` must throttle it to AT
+    MOST ONCE per `session_id` for the whole attribution pass, not once per
+    message -- proven here with FIVE messages on the same single-interval
+    session yielding exactly ONE fallback line."""
+    rows = [_row(NOW, "sMulti", "acctMulti")]
+    intervals = cus._session_account_intervals(rows)
+
+    tails = {
+        Path("/tmp/multi.jsonl"): [
+            _assistant_line("sMulti", f"uid{i}", NOW + timedelta(minutes=i),
+                             _usage(input_tokens=10, output_tokens=1))
+            for i in range(1, 6)
+        ],
+    }
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        table = cus._attribute_burn(tails, intervals, WEIGHTS)
+    out = buf.getvalue()
+
+    # Attribution results are unaffected by the logging-cadence change --
+    # all 5 messages still join and sum normally.
+    assert table.burn_for("acctMulti", "sMulti") > 0
+
+    assert out.count("pressure.attribution.launch_time_fallback") == 1
+    assert "session_id=sMulti" in out
 
 
 def test_legacy_5col_and_6col_parse():
