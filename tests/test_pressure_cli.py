@@ -326,7 +326,13 @@ def test_pressure_json_stdout_is_clean_json(tmp_path, monkeypatch):
     }
     transcript.write_text(json.dumps(line) + "\n")
 
-    result = CliRunner(mix_stderr=False).invoke(cus.cli, ["pressure", "--json"])
+    # Click < 8.2 needs mix_stderr=False to split stdout/stderr; Click >= 8.2
+    # removed the kwarg and splits them by default. Support both.
+    try:
+        runner = CliRunner(mix_stderr=False)
+    except TypeError:
+        runner = CliRunner()
+    result = runner.invoke(cus.cli, ["pressure", "--json"])
     assert result.exit_code == 0, result.output
 
     # stdout must be ONLY the JSON snapshot -- parseable, and no fallback
