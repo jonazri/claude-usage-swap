@@ -1,0 +1,19 @@
+{
+  "accounts": {
+    "L": {
+      "capacity_x": 20000,
+      "current_5h_pct": 70.0,
+      "current_7d_pct": 10.0,
+      "five_hour_resets_at": "2026-07-15T12:08:00Z",
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    },
+    "R": {
+      "capacity_x": 20000,
+      "current_5h_pct": 70.0,
+      "current_7d_pct": 10.0,
+      "five_hour_resets_at": "2026-07-15T12:05:00Z",
+      "last_poll_ts": "2026-07-15T11:59:00Z"
+    }
+  },
+  "swap_history": []
+}

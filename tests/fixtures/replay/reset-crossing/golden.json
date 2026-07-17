@@ -1,0 +1,145 @@
+{
+  "accounts": {
+    "L": {
+      "5h": {
+        "burn_pct_per_min": 0.5,
+        "gate": 94.0,
+        "pct": 70.0,
+        "pinned_eta_min": 82.853515625,
+        "remaining_units": 960.0,
+        "required_reduction_pct_per_min": 0.5
+      },
+      "7d": {
+        "burn_pct_per_min": 0.5,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 139.86328125,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 0.5
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "R": {
+      "5h": {
+        "burn_pct_per_min": 0.5,
+        "gate": 94.0,
+        "pct": 70.0,
+        "pinned_eta_min": 85.467529296875,
+        "remaining_units": 960.0,
+        "required_reduction_pct_per_min": 0.5
+      },
+      "7d": {
+        "burn_pct_per_min": 0.5,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": 139.86328125,
+        "remaining_units": 2800.0,
+        "required_reduction_pct_per_min": 0.5
+      },
+      "capacity_x": 20000.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    }
+  },
+  "attribution": {
+    "allow_supply_escalation": true,
+    "blindness": true,
+    "confidence": 0.0,
+    "reason": "cold-start: 2/2 sessions unread",
+    "residual_fraction": 0.0,
+    "suppress_residual_widening": true,
+    "suppress_targeting": true
+  },
+  "binding": {
+    "constraint": "5h",
+    "eta_min": 82.853515625,
+    "name": "L",
+    "view": "account",
+    "window": "5h"
+  },
+  "episode_id": null,
+  "generated_at": "2026-07-15T12:00:00+00:00",
+  "horizon_min": 180.0,
+  "level": "elevated",
+  "pool": {
+    "5h": {
+      "burn_units_per_min": 0.0,
+      "capacity_units": 7520.0,
+      "exhaustion_eta_min": 85.4609375,
+      "release_suppressed": false,
+      "remaining_units": 1920.0,
+      "required_reduction_units_per_min": 0.0
+    },
+    "7d": {
+      "burn_units_per_min": 0.0,
+      "capacity_units": 6400.0,
+      "exhaustion_eta_min": 139.86328125,
+      "release_suppressed": false,
+      "remaining_units": 5600.0,
+      "required_reduction_units_per_min": 0.0
+    }
+  },
+  "reference_x": 5.0,
+  "safety_factor": 1.7999999999999998,
+  "sessions": [
+    {
+      "account_shares": {
+        "L": 1.0
+      },
+      "class": "interactive",
+      "coordinator_of": null,
+      "cwd": "/home/fixture/project",
+      "fable_share": null,
+      "model": null,
+      "pane": null,
+      "rate": 4.0,
+      "session_id": "sess-l",
+      "socket": null,
+      "trend": "steady"
+    },
+    {
+      "account_shares": {
+        "R": 1.0
+      },
+      "class": "interactive",
+      "coordinator_of": null,
+      "cwd": "/home/fixture/project",
+      "fable_share": null,
+      "model": null,
+      "pane": null,
+      "rate": 4.0,
+      "session_id": "sess-r",
+      "socket": null,
+      "trend": "steady"
+    }
+  ],
+  "weight_fit": {
+    "condition_number": Infinity,
+    "n_windows": 0,
+    "residual_fraction": 0.0,
+    "seed_pinned": [
+      "input",
+      "output",
+      "cache_read",
+      "cache_create_5m",
+      "cache_create_1h"
+    ],
+    "seed_scale": 1.0,
+    "source": "insufficient-data",
+    "weights": {
+      "cache_create_1h": 2.0,
+      "cache_create_5m": 1.25,
+      "cache_read": 0.1,
+      "input": 1.0,
+      "output": 5.0
+    }
+  }
+}

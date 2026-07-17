@@ -65,13 +65,18 @@ authoritative on this point).
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 import shlex
 import shutil
+import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -5297,6 +5302,3307 @@ def _capacity_warnings(state: dict, config: dict) -> list[str]:
                 message = f"INFO: {message} (operator-disabled — informational only)"
             warnings.append(message)
     return warnings
+
+
+# =========================================================================== #
+#  Token-pressure forecaster (spec-2, STAGE 1) — READ-ONLY layer               #
+#                                                                              #
+#  A deterministic, side-effect-free forecast layer that projects burn against #
+#  the tier-normalized rotatable pool and each account's pinned floor, and     #
+#  publishes pressure.json / `cus pressure`. See                               #
+#  docs/superpowers/plans/2026-07-14-token-pressure.md.                        #
+#                                                                              #
+#  G0 — READ-ONLY STATE DISCIPLINE (load-bearing landmine, §10.11 / FACT #3):  #
+#  EVERY helper below loads state through `_pressure_load_state` (a deep copy) #
+#  and NEVER calls `save_state`, `_capacity_warnings`, or the SOS builder, and #
+#  NEVER mutates the live daemon `state`. The forecaster refines cus's coarse  #
+#  per-account signal; it must never be the first caller that freezes a        #
+#  `capacity_reference_snapshot` or fires an operator SOS. Reach capacity ONLY #
+#  through the pure read helpers (`_account_raw_capacity_x` @4716,             #
+#  `_observed_fleet_min_x` @4801, `_remaining_units` @4940, ...) plus the      #
+#  side-effect-free `_pressure_resolve_reference_x` below — NEVER the mutators #
+#  `_resolve_reference_x` @4833 (persists the snapshot + emits the SOS         #
+#  warning), `_account_capacity_x` @4767, or `_capacity_ctx` @4892 over the    #
+#  live state.                                                                 #
+# =========================================================================== #
+
+
+def _pressure_load_state(config: dict) -> dict:
+    """Read-only state snapshot for the token-pressure forecaster (Task 1,
+    G0 / §10.11).
+
+    Returns ``copy.deepcopy(load_state())`` — the ONLY state object the
+    forecaster is permitted to mutate. The live daemon ``state`` (and the
+    on-disk ``state.json``) are never touched: the whole forecaster loads
+    state THROUGH this helper and never calls ``save_state``. Deep-copying
+    (not a shallow copy) is required because the capacity/account sub-dicts
+    are nested and shared by reference; a shallow copy would let a later
+    in-place cache write leak back into the loaded structure.
+
+    ``config`` is accepted for call-shape symmetry with the rest of the
+    ``_pressure_*`` helpers (each takes ``config``); ``load_state`` itself
+    reads the module-global ``STATE_JSON`` and takes no arguments.
+    """
+    return copy.deepcopy(load_state())
+
+
+def _pressure_resolve_reference_x(state: dict, config: dict) -> float:
+    """Side-effect-free ``reference_x`` for the read-only forecaster (Task 1,
+    G0 / §10.11 landmine, FACT #3/#4).
+
+    Same precedence as ``_resolve_reference_x`` @4833 — pinned
+    ``capacity_aware.reference_x`` (numeric and >= 1) → persisted
+    ``state["capacity_reference_snapshot"]`` → observed fleet-min
+    (``_observed_fleet_min_x``, falling back to 1.0 when the enabled fleet has
+    no known tier) — but WITHOUT its two production side effects on the
+    unpinned first-caller path:
+
+      * it NEVER writes ``state["capacity_reference_snapshot"]`` (the in-place
+        mutation @4872 the daemon would later flush to disk), and
+      * it NEVER emits the SOS-instruction warning @4873 that
+        ``_capacity_warnings`` @4964 folds into a real operator
+        ``SOSCondition`` (SOS builder @12108); it never calls
+        ``_capacity_warnings`` at all.
+
+    reference_x is pinned live (=5, FACT #4), so production takes the pin
+    branch; the snapshot/fleet-min branches exist only so an unpinned fleet
+    (or a test) resolves cleanly without persisting or warning. Returns the
+    bare float (no warnings tuple) — the forecaster surfaces its own
+    diagnostics, never cus's operator SOS strings.
+    """
+    pinned = config.get("capacity_aware", {}).get("reference_x")
+    if pinned is not None:
+        is_number = isinstance(pinned, (int, float)) and not isinstance(pinned, bool)
+        if is_number and pinned >= 1:
+            return float(pinned)
+    snapshot = state.get("capacity_reference_snapshot")
+    if snapshot is not None:
+        return float(snapshot)
+    observed = _observed_fleet_min_x(state, config)
+    return float(observed) if observed is not None else 1.0
+
+
+def _pressure_gate(window: str, config: dict) -> float:
+    """The effective breach gate (in raw %) for one window (Task 2, G3, FACT
+    #1/#7).
+
+    * ``5h`` → the LIVE top ladder step ``config['thresholds']['steps'][-1]``
+      (currently 94), read at RUNTIME — NEVER a hardcoded literal. A retuned or
+      defaulted ladder must not mis-forecast: an empty/absent ``steps`` falls
+      back to cus's own in-code default ``[50, 75, 90]`` top = 90 (hardcoding
+      94 would project a breach 4 points too late → under-throttle). There is
+      no distinct 5h hard cap.
+    * ``7d`` → ``hard_7d_cap_pct`` (``_hard_7d_cap_for_config``, default 80),
+      NOT the level-bound weekly 95 (which never enters the units path, FACT
+      #7).
+    """
+    if window == "5h":
+        steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+        return float(steps[-1])
+    if window == "7d":
+        return float(_hard_7d_cap_for_config(config))
+    raise ValueError(f"_pressure_gate: unknown window {window!r} (expected '5h'|'7d')")
+
+
+def _pressure_ratio(acct: str, acct_ctx: dict, config: dict) -> float:
+    """Capacity ratio ``capacity_x / reference_x`` for account ``acct`` (Task 2,
+    G0/G3, FACT #3/#4).
+
+    Built from the PURE ``_account_raw_capacity_x`` @4716 (config override →
+    credentials-parsed tier, never a state-cache write) + Task 1's
+    side-effect-free ``_pressure_resolve_reference_x`` — deliberately BYPASSING
+    the G0 mutators ``_capacity_ctx`` @4892 / ``_account_capacity_x`` @4767
+    (both freeze the snapshot / write the ``capacity_x`` cache in place; only
+    pin-dependently side-effect-free).
+
+    ``acct`` is the account NAME; ``acct_ctx`` is the deep-copied state snapshot
+    (``_pressure_load_state``) — its per-account views live under
+    ``acct_ctx['accounts'][name]``, hence "per-account view of the deep-copied
+    state" (finding 3). It is NOT a ``_capacity_ctx`` result. Reading it is
+    read-only: ``_account_raw_capacity_x`` and ``_pressure_resolve_reference_x``
+    never mutate it.
+
+    An account with no genuinely-known tier resolves to the neutral ratio 1.0
+    (exactly what ``_account_capacity_x``'s neutral fallback yields) — such an
+    account is excluded from the rotatable pool by ``_pressure_pool_set`` (C1),
+    but a defined ratio keeps every downstream unit computation divide-safe.
+    """
+    reference_x = _pressure_resolve_reference_x(acct_ctx, config)
+    raw_x, _warnings = _account_raw_capacity_x(acct, acct_ctx, config)
+    if raw_x is None:
+        return 1.0  # neutral tier -> ratio exactly 1 (never inflates/starves)
+    return float(raw_x) / float(reference_x)
+
+
+def _pressure_acct_ratio(acct_state: dict, config: dict) -> float:
+    """Capacity ratio for an account from its per-account STATE dict alone
+    (Task 4/5 internal), ``capacity_x / reference_x``.
+
+    The curve helpers (``_pressure_remaining_curve``, ``_pool_remaining_curve``)
+    receive the per-account state dict (as cus's ``projected_seven_day_reset``
+    does), not the fleet name+state pair ``_pressure_ratio`` takes — so they
+    source the tier from the account's cached ``capacity_x`` (populated at poll
+    time from the same ``_account_raw_capacity_x`` source) and resolve
+    ``reference_x`` via the side-effect-free Task 1 resolver. Using ONE ratio
+    source for both an account's own curve AND its pool-cap ``C_a`` is what
+    makes the pool the exact pointwise sum of the per-account curves (G6). A
+    missing/None ``capacity_x`` yields the neutral ratio 1.0 (such accounts are
+    excluded from the pool by ``_pressure_pool_set``).
+    """
+    reference_x = _pressure_resolve_reference_x(acct_state, config)
+    capacity_x = acct_state.get("capacity_x")
+    if not capacity_x:
+        return 1.0
+    return float(capacity_x) / float(reference_x)
+
+
+def _pressure_remaining_units(pct: float, gate: float, ratio: float) -> float:
+    """Remaining reference units measured **to the gate** (Task 2, §10.10,
+    committee I2/M1): ``((gate - pct) / 100) * ratio``, clamped ≥ 0.
+
+    This is a BUILDING BLOCK, NOT a drop-in for cus's ``_remaining_units``
+    @4940, which measures ``(100 - pct)`` (headroom to 100). The forecaster
+    measures headroom to the *effective gate* — a 20x account (ratio 4.0) at
+    90% for the 5h window (gate 94) has ``((94-90)/100)*4.0 = 0.16`` units left,
+    not the ``0.40`` a to-100 measure would report.
+    """
+    return max(0.0, (gate - pct) / 100.0 * ratio)
+
+
+def _pressure_cap_units(gate: float, ratio: float) -> float:
+    """Fresh-window capacity ``C_w = (gate / 100) * ratio`` (Task 2, G5) — the
+    upper clamp for a published remaining curve."""
+    return gate / 100.0 * ratio
+
+
+def _pressure_burn_units(burn_pct_per_min: float, ratio: float) -> float:
+    """Burn rate in reference units/min (Task 2): ``(burn%/min / 100) * ratio``.
+    0.5 %/min on a 20x account (ratio 4.0) = 0.02 units/min."""
+    return burn_pct_per_min / 100.0 * ratio
+
+
+def _pressure_pool_set(state: dict, window: str, config: dict) -> list[str]:
+    """Accounts eligible for the tier-normalized rotatable pool for ``window``
+    (Task 2, C1/M2, G3/G6).
+
+    Include an account iff it is ACTIVE (enabled — not operator-disabled) AND
+    its ``capacity_x`` is genuinely POPULATED (``_account_raw_capacity_x``
+    returns a known tier, NEVER the ratio-1 neutral fallback — C1) AND its
+    current usage ``pct < gate``. A gated (``pct >= gate``), a ratio-1
+    unknown-tier, and a disabled account are all excluded — a fixed
+    fleet-min-tier account is fine (it is genuinely known), only a ratio-1
+    fallback is not. Iterates the declared fleet (``config['accounts']``);
+    read-only over ``state``.
+    """
+    gate = _pressure_gate(window, config)
+    disabled = _disabled_accounts(config)
+    accounts = state.get("accounts", {})
+    eligible: list[str] = []
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is None:  # unknown tier -> ratio-1 neutral fallback -> exclude (C1)
+            continue
+        pct = accounts.get(name, {}).get(f"current_{window}_pct", 0.0) or 0.0
+        if pct >= gate:
+            continue
+        eligible.append(name)
+    return eligible
+
+
+def _pressure_reset_knot(acct: dict, window: str, config: dict, now,
+                         *, horizon) -> float | None:
+    """Minutes ``T_w`` to the NEXT reset boundary for ``window`` (Task 3, G5,
+    reset-decay risk #2). ``acct`` is the per-account state dict; ``now`` a
+    timezone-aware ``datetime``.
+
+    * ``5h`` — minutes to ``acct['five_hour_resets_at']``. If that boundary is
+      STALE (at/before ``now``), roll it forward by whole ``W5 = 300`` min
+      periods until it is in the future, so ``T_w`` is never ≤ 0 (never a false
+      immediate post-reset credit — risk #2). A missing/unparseable timestamp
+      returns ``None``.
+    * ``7d`` — minutes to ``projected_seven_day_reset`` @4587 (already
+      self-rolled to the next upcoming ~72h refresh).
+
+    Returns the offset ONLY when ``0 < T_w <= horizon``; else ``None``. The
+    ``horizon`` argument DECOUPLES the knot from a hardcoded 180 (finding 1):
+    BOTH the trigger/exit-ETA path (Task 6 via Task 9) AND the
+    required-reduction path (Task 4/5 curves + Task 8) pass
+    ``horizon = H+margin = 240`` so a 5h reset in ``(180, 240]`` is retained;
+    ``H = 180`` is the ENTER threshold applied to the resulting ETA (Task 9),
+    never the knot horizon. Pure/read-only (G0): reads ``acct``, mutates
+    nothing.
+    """
+    W5 = 300.0
+    if window == "5h":
+        reset_at = acct.get("five_hour_resets_at")
+        if not reset_at:
+            return None
+        try:
+            reset_dt = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        t = (reset_dt - now).total_seconds() / 60.0
+        # Stale boundary -> roll forward whole W5 periods so T_w > 0 (risk #2).
+        while t <= 0:
+            t += W5
+    elif window == "7d":
+        projected = projected_seven_day_reset(acct, config, now)
+        if not projected:
+            return None
+        try:
+            reset_dt = datetime.fromisoformat(str(projected).replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        t = (reset_dt - now).total_seconds() / 60.0
+    else:
+        raise ValueError(f"_pressure_reset_knot: unknown window {window!r}")
+    if 0 < t <= horizon:
+        return t
+    return None
+
+
+def _pressure_reset_ramp(t: float, T_w: float, W_w: float, R_w: float, k: float) -> float:
+    """Decayed-step reset ramp (Task 4, G5, committee #8): the fraction of the
+    constant reset credit ``R_w`` restored by minute ``t``.
+
+    ``R_w * clamp((t - T_w) / W_w, 0, 1) ** k`` — a LINEAR ramp (``k = 1.0``
+    shipped) anchored AT the reset boundary ``T_w`` and restored over the full
+    window ``W_w``. ramp is 0 for ``t <= T_w`` (no false pre-boundary headroom —
+    an in-window tail keeps burning), rises linearly to exactly ``R_w`` at
+    ``t = T_w + W_w`` (a full fresh window), and holds ``R_w`` thereafter.
+
+    ``R_w = C_w - remaining_w(0)`` is the CANONICAL constant credit (NOT a
+    boundary-anchored ``cap - remaining(t_r⁻)``); Task 5's pool curve reuses
+    this exact ramp + credit so the pool is the pointwise sum of per-account
+    curves (G6).
+    """
+    frac = (t - T_w) / W_w
+    frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
+    return R_w * (frac ** k)
+
+
+def _pressure_remaining_curve(acct: dict, window: str, config: dict, now,
+                              pinned_burn_units: float, *, horizon: float = 180,
+                              model: str = "decayed_step"):
+    """Per-account decayed-step remaining curve ``f(t)`` (Task 4, G5). ``acct``
+    is the per-account state dict; ``now`` a timezone-aware ``datetime``.
+
+    Returns the UNCLAMPED remaining as a callable of minutes-ahead ``t``::
+
+        remaining_w(t) = remaining_w(0) - pinned_burn_units*t + reset_ramp(t; k)
+
+    with ``remaining_w(0) = _pressure_remaining_units(pct, gate, ratio)``,
+    ``C_w = _pressure_cap_units(gate, ratio)``, and the constant credit
+    ``R_w = C_w - remaining_w(0) = (min(pct, gate)/100)*ratio``. The published
+    curve is ``clamp(f(t), 0, C_w)``; the UNCLAMPED callable is returned because
+    the pool sum (Task 5) applies its own per-account clamp and the pinned-ETA
+    first-crossing (Task 6/7) crosses on the unclamped expression (G5).
+
+    ``pinned_burn_units`` is INJECTED (finding 2) — the account's PINNED burn
+    component (units/min) from the Task 11 ``_partition_burn`` partition, NOT the
+    account-total ``state.burn_rate`` (which would double-count the rotatable
+    portion: subtracted here in supply AND counted as pool demand in Task 5).
+    Phase-F callers pass a synthetic value; the real value is wired at Task 20.
+
+    ``horizon`` reconciles the reset ramp with the two forecast paths (finding
+    1): the ramp is applied for any reset knot ``T_w in (0, horizon]`` (via
+    ``_pressure_reset_knot(..., horizon=horizon)``). BOTH the trigger/exit-ETA
+    path and the required-reduction path pass ``H+margin = 240`` so a 5h reset
+    in ``(180, 240]`` still earns its ramp credit; ``H = 180`` is only the ENTER
+    threshold applied downstream (Task 9).
+
+    ``model`` (Task 26): ``"decayed_step"`` (default, LIVE) is the ramp above,
+    unchanged. ``"rolling_integral"`` is a SHADOW-ONLY second model (never
+    reached by any live-path caller -- none of ``_pinned_account_eta``/
+    ``_required_reduction_pinned``/``_account_knots``/Task 20's snapshot
+    assembler pass ``model=``, so they stay on ``decayed_step`` regardless of
+    what this branch computes) that assumes a uniform release rate starting
+    at ``t=0`` rather than a step anchored at the reset boundary ``T_w``::
+
+        remaining_w(t) = remaining_w(0) + (R_w/W_w)*min(t, W_w) - pinned_burn_units*t
+
+    -- the closed form of "the same constant credit ``R_w`` released evenly
+    across the whole window ``W_w``, as if the account's burn history were
+    uniform back to the start of the window" (LOW-CONFIDENCE: cus doesn't
+    store a burn-history profile to justify uniformity; Stage-1 shadow-logs
+    this alongside ``decayed_step`` to score which shape fits reality, G5 --
+    never gates). It reuses the EXACT SAME ``R_w``/``W_w``/``remaining_w(0)``
+    ``decayed_step`` computes (not redefined), and is gated on the SAME
+    ``T_w is not None`` (a reset knot inside ``horizon``) as ``decayed_step``
+    -- no reset in horizon means neither model credits anything, so a stale
+    ``five_hour_resets_at`` that rolls forward past ``horizon`` (Task 3) is
+    never credited early by either model.
+
+    Read-only (G0): reads ``acct`` + resolves ``reference_x`` side-effect-free;
+    mutates nothing. Returns a fresh closure over immutable scalars.
+    """
+    gate = _pressure_gate(window, config)
+    ratio = _pressure_acct_ratio(acct, config)
+    pct = acct.get(f"current_{window}_pct", 0.0) or 0.0
+    remaining0 = _pressure_remaining_units(pct, gate, ratio)
+    cap = _pressure_cap_units(gate, ratio)
+    R_w = cap - remaining0  # == (min(pct, gate)/100)*ratio, the canonical credit
+    W_w = 300.0 if window == "5h" else 10080.0
+    k = float(config.get("pressure", {}).get("reset_decay", {}).get("ramp_k", 1.0))
+    T_w = _pressure_reset_knot(acct, window, config, now, horizon=horizon)
+
+    def f(t: float) -> float:
+        val = remaining0 - pinned_burn_units * t
+        if T_w is not None:
+            if model == "rolling_integral":
+                val += (R_w / W_w) * min(t, W_w)
+            else:
+                val += _pressure_reset_ramp(t, T_w, W_w, R_w, k)
+        return val
+
+    return f
+
+
+def _pool_remaining_curve(state: dict, window: str, config: dict, now,
+                          partition, *, horizon: float = 180):
+    """Staggered-reset pool remaining curve ``f(t)`` (Task 5, G6, §10.12).
+
+    ``pool_remaining(t) = Σ_{a ∈ _pressure_pool_set} clamp(remaining_a(t), 0,
+    C_a)`` where each ``remaining_a`` is Task 4's ``_pressure_remaining_curve``
+    built with account ``a``'s OWN reset knot and its PINNED burn from the
+    injected ``partition``, reusing the SAME decayed-step ramp + constant credit
+    ``R_a = C_a - remaining_a(0)``. Because every per-account term is the exact
+    Task-4 curve, this is provably the pointwise sum of those curves (G6). Each
+    account's cap ``C_a`` is computed with the SAME ``_pressure_acct_ratio`` the
+    per-account curve uses, so the clamp bounds match exactly.
+
+    Pool SUPPLY is drained by projected PINNED burn (subtracted inside each
+    ``remaining_a``) — CONSERVATIVE, moving any exhaustion ETA only earlier
+    (§3 hazard-b). Pool DEMAND (rotatable burn) is NOT here; it is
+    ``_pool_rotatable_burn`` (the ``rotatable_burn·t`` term the first-crossing
+    evaluator subtracts, Task 6).
+
+    ``partition`` is the injected Task 11 ``_partition_burn`` output (finding 2)
+    — Phase F cannot reach the per-session split via ``state``; tests inject a
+    synthetic double, real wiring lands at Task 20. It exposes
+    ``pinned_burn_units(name, window)`` in units/min per pooled account.
+
+    ``horizon`` threads through to each per-account curve (finding 1): BOTH the
+    trigger/exit-ETA caller (Task 9 via Task 6) AND the required-reduction
+    caller (Task 8) pass ``H+margin = 240`` so a 5h reset in ``(180, 240]``
+    contributes its ramp credit out to 240 (else the pool ETA is under-forecast
+    and the level's exit test is blind in that band). Read-only (G0): builds
+    fresh per-account closures over the deep-copied ``state``, mutates nothing.
+    """
+    gate = _pressure_gate(window, config)
+    accounts = state.get("accounts", {})
+    per_acct = []  # (curve, cap) per pooled account
+    for name in _pressure_pool_set(state, window, config):
+        acct = accounts.get(name, {})
+        pinned_units = partition.pinned_burn_units(name, window)
+        curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
+                                          horizon=horizon)
+        cap = _pressure_cap_units(gate, _pressure_acct_ratio(acct, config))
+        per_acct.append((curve, cap))
+
+    def f(t: float) -> float:
+        total = 0.0
+        for curve, cap in per_acct:
+            v = curve(t)
+            if v < 0.0:
+                v = 0.0
+            elif v > cap:
+                v = cap
+            total += v
+        return total
+
+    return f
+
+
+def _pool_rotatable_burn(state: dict, window: str, config: dict, now,
+                         partition) -> float:
+    """Total ROTATABLE burn demand on the pool (Task 5, G6, C1): ``Σ_{a ∈
+    _pressure_pool_set} rotatable_burn_units_a`` from the injected ``partition``
+    (Task 11 ``_partition_burn`` — finding 2).
+
+    Only the rotatable component of each pooled account's burn counts as pool
+    demand; the PINNED component is excluded here (it drains supply inside
+    ``_pool_remaining_curve`` and drives the per-account safety floor, Task 7).
+    Disjoint by construction (C1): the partition guarantees each session's
+    rotatable and pinned components are disjoint and sum to its total. ``now``
+    is accepted for call-shape symmetry (a burn RATE is time-invariant).
+    Read-only (G0).
+    """
+    return sum(partition.rotatable_burn_units(name, window)
+               for name in _pressure_pool_set(state, window, config))
+
+
+def _first_crossing_eta(remaining_curve, burn: float, knots, config: dict, now):
+    """Earliest ``t`` where pool slack ``g(t) = remaining_curve(t) - burn*t``
+    reaches 0, via a stdlib segmented bracket-then-bisect (Task 6, G6, §10.12,
+    committee C2 — NOT ``Σremaining/Σburn``, NOT scipy; FACT #8 pure stdlib).
+
+    ``remaining_curve`` is the (possibly-clamped) supply callable ``f(t)`` —
+    Task 5's ``_pool_remaining_curve`` for the pool ETA, Task 4's per-account
+    curve for the pinned ETA. ``burn`` is the DEMAND rate the evaluator subtracts
+    (``rotatable_burn`` for the pool; 0 for a pinned account whose own burn is
+    already drained inside its curve).
+
+    ``knots`` is the per-account reset+clamp knot list the CALLER builds from
+    ``state`` (a bare callable cannot expose its own breakpoints — §8)::
+
+        K = sorted({0, cap} ∪ {t_r,a} ∪ {t_r,a+W} ∪ Z) ∩ [0, cap]
+
+    where ``Z`` = each account's closed-form ``remaining_a(t)=0`` clamp-to-zero
+    root (finding 1) — WITHOUT which the lower clamp at 0 activates at an
+    interior point ∉ K and ``g``'s slope can jump upward mid-segment (one account
+    floors while another's reset ramp lifts it), so ``g`` dips ≤0 then recovers
+    >0 UNSEEN by an endpoint-only bracket — an unsafe under-forecast. With ``Z``
+    every clamp term is fully linear or fully floored per refined segment, so
+    ``g`` is truly monotone per segment and endpoint evaluation is sufficient.
+
+    This helper is HORIZON-AGNOSTIC — it just walks the knots it is given and
+    returns the first crossing anywhere in the supplied ``[0, cap]``. BOTH the
+    trigger/exit-ETA path (Task 9) AND the required-reduction path (Task 8) pass
+    knots capped at ``H+margin = 240`` (round-3 finding 1) so a breach/reset in
+    ``(180, 240]`` is never dropped.
+
+    Rule: ``g(0) <= 0`` → ``0.0`` (already drained); else walk consecutive
+    ``(t_i, t_{i+1})`` and at the FIRST segment with ``g(t_i) > 0`` and
+    ``g(t_{i+1}) <= 0`` bisect to ``g(t*) = 0``; if ``g > 0`` over all segments →
+    ``None``. Constants pinned: ``TTE_TOL = 0.5`` min, ``BISECT_MAX_ITERS = 64``,
+    ``EPS = 0`` (breach predicate ``g(t) <= 0``). ``config``/``now`` are accepted
+    for call-shape symmetry (the constants are pinned literals, not config).
+    Read-only (G0): evaluates the supplied closures, mutates nothing.
+    """
+    TTE_TOL = 0.5
+    BISECT_MAX_ITERS = 64
+    EPS = 0.0
+
+    def g(t: float) -> float:
+        return remaining_curve(t) - burn * t
+
+    if g(0.0) <= EPS:
+        return 0.0
+    # sorted, de-duplicated knots; 0.0 is always a segment origin (caller
+    # includes it, but guarantee it so the [0, K[0]] gap is never skipped).
+    K = sorted({0.0} | {float(k) for k in knots})
+    for i in range(len(K) - 1):
+        lo, hi = K[i], K[i + 1]
+        if hi <= lo:
+            continue
+        g_lo = g(lo)
+        g_hi = g(hi)
+        if g_lo > EPS and g_hi <= EPS:
+            for _ in range(BISECT_MAX_ITERS):
+                if (hi - lo) <= TTE_TOL:
+                    break
+                mid = 0.5 * (lo + hi)
+                if g(mid) > EPS:
+                    lo = mid
+                else:
+                    hi = mid
+            return 0.5 * (lo + hi)
+    return None
+
+
+def _account_zero_roots(rem_fn, seg_knots, cap: float) -> list[float]:
+    """Clamp-to-zero roots ``Z`` in ``(0, cap]`` of a piecewise-linear
+    per-account remaining curve (Task 6/8 knot support, G6 finding 1).
+
+    ``rem_fn`` is the UNCLAMPED per-account curve (Task 4); ``seg_knots`` are its
+    interior breakpoints (the account's reset knot ``T_w`` and ``T_w+W``), which
+    split it into linear pieces. On each linear segment the curve crosses 0 at
+    most once; the root is found by linear interpolation between straddling
+    endpoints (no per-segment algebra). These roots are exactly where the pool
+    sum's per-account lower clamp at 0 activates — supplying them as knots keeps
+    ``g`` monotone per refined segment for ``_first_crossing_eta`` and makes the
+    ``_required_reduction`` min-ratio exact at interior kinks. Read-only (G0).
+    """
+    pts = sorted({0.0, float(cap)}
+                 | {float(k) for k in seg_knots if 0.0 < float(k) < cap})
+    roots: list[float] = []
+    for i in range(len(pts) - 1):
+        ta, tb = pts[i], pts[i + 1]
+        va, vb = rem_fn(ta), rem_fn(tb)
+        if (va > 0.0 and vb < 0.0) or (va < 0.0 and vb > 0.0):
+            root = ta + (tb - ta) * va / (va - vb)
+            if 0.0 < root <= cap:
+                roots.append(root)
+        elif vb == 0.0 and 0.0 < tb <= cap:
+            roots.append(tb)
+    return roots
+
+
+def _account_knots(acct: dict, window: str, config: dict, now,
+                   pinned_burn_units: float, *, horizon: float) -> list[float]:
+    """Per-account reset+clamp knot set ``sorted({0, horizon} ∪ {T_w} ∪ {T_w+W}
+    ∪ Z) ∩ [0, horizon]`` for the first-crossing / required-reduction evaluators
+    (Task 6/7/8, G6). ``acct`` is the per-account state dict; ``pinned_burn_units``
+    the account's injected pinned burn (units/min). Read-only (G0)."""
+    knots = {0.0, float(horizon)}
+    seg: list[float] = []
+    T = _pressure_reset_knot(acct, window, config, now, horizon=horizon)
+    if T is not None:
+        knots.add(T)
+        seg.append(T)
+        W = 300.0 if window == "5h" else 10080.0
+        tb = T + W
+        if 0.0 < tb <= horizon:
+            knots.add(tb)
+            seg.append(tb)
+    rem = _pressure_remaining_curve(acct, window, config, now, pinned_burn_units,
+                                    horizon=horizon)
+    for root in _account_zero_roots(rem, seg, horizon):
+        knots.add(root)
+    return sorted(knots)
+
+
+def _pressure_reset_model_knots(acct: dict, window: str, config: dict, now,
+                                pinned_burn_units: float, *, horizon: float,
+                                model: str) -> list[float]:
+    """Model-aware first-crossing knot set for the shadow ``reset_models``
+    block (Task 26, G5, shadow-only). ``decayed_step`` reuses ``_account_
+    knots`` VERBATIM -- byte-identical to the live per-account pinned-ETA
+    knot set, since ``decayed_step``'s own interior kinks (``T_w``,
+    ``T_w+W_w``) are exactly what ``_account_knots`` already builds.
+
+    ``rolling_integral``'s curve has a DIFFERENT (single) interior kink: the
+    release cap at ``t = W_w`` (release starts at ``t=0`` with no boundary-
+    anchored kink at ``T_w`` itself -- see ``_pressure_remaining_curve``), so
+    it gets its own smaller knot set: ``{0, horizon}`` plus that one cap
+    point when it falls in-horizon, plus that segment's own clamp-to-zero
+    root (``_account_zero_roots``, the same technique ``_account_knots``
+    uses, applied to the rolling_integral curve instead). Gated on the same
+    ``T_w is not None`` reset-in-horizon check as the curve itself -- no
+    reset in horizon means no kink to add either.
+
+    Read-only (G0).
+    """
+    if model != "rolling_integral":
+        return _account_knots(acct, window, config, now, pinned_burn_units,
+                              horizon=horizon)
+    W_w = 300.0 if window == "5h" else 10080.0
+    T_w = _pressure_reset_knot(acct, window, config, now, horizon=horizon)
+    knots = {0.0, float(horizon)}
+    seg: list[float] = []
+    if T_w is not None and 0.0 < W_w <= horizon:
+        knots.add(W_w)
+        seg.append(W_w)
+    rem = _pressure_remaining_curve(acct, window, config, now, pinned_burn_units,
+                                    horizon=horizon, model=model)
+    for root in _account_zero_roots(rem, seg, horizon):
+        knots.add(root)
+    return sorted(knots)
+
+
+def _pinned_burn_rate(acct, window: str, partition) -> float:
+    """The PINNED (non-rotatable) component of an account's burn, in reference
+    units/min, from the injected Task-11 ``_partition_burn`` partition (Task 7,
+    finding 2, C1/M1).
+
+    ``acct`` is the per-account state dict carrying its ``"name"`` (a bare name
+    string is also accepted); the partition is name-keyed per the Task-5 protocol
+    (``pinned_burn_units(name, window)``, units/min). This is the raw observed
+    rate — NEVER discounted "will rotate" (M1). Phase F cannot reach the
+    per-session split via ``state`` (which carries only the account-total
+    ``burn_rate_*_pct_per_min``): the pinned component is a Phase-D product,
+    injected here and wired for real at Task 20. Read-only (G0).
+    """
+    name = acct.get("name") if isinstance(acct, dict) else acct
+    return float(partition.pinned_burn_units(name, window))
+
+
+def _pinned_account_eta(acct: dict, window: str, config: dict, now, partition,
+                        *, horizon: float = 180) -> float | None:
+    """Per-account pinned-burn safety-floor ETA (Task 7, G6 §7, C1/M1): the first
+    ``t`` where account ``acct``'s PINNED burn ALONE drives its own decayed-step
+    remaining curve to 0, independent of pool health.
+
+    Builds Task 4's decayed-step curve with the account's PINNED burn from
+    ``partition`` (``_pinned_burn_rate``), builds the account's OWN reset+clamp
+    knots to ``[0, horizon]`` (``_account_knots``), and crosses via
+    ``_first_crossing_eta`` with ``burn=0`` — the pinned burn is already drained
+    inside the curve, so ``g(t) = remaining_a(t)``. Over gate (``pct >= gate``)
+    ⇒ ``remaining0 = 0`` ⇒ ``g(0) <= 0`` ⇒ ``0.0`` (immediate).
+
+    ``horizon`` DECOUPLES the pinned ETA from a hardcoded 180 (round-3 finding 1):
+    ``_pressure_triggers`` (Task 9) passes ``horizon = H+margin = 240`` so the
+    level's EXIT test can see a pinned breach receding in ``(180, 240]`` (a
+    within-180 breach is identical at either cap). Tests inject a synthetic
+    partition; the real value is wired at Task 20. Read-only (G0).
+    """
+    pinned_units = _pinned_burn_rate(acct, window, partition)
+    curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
+                                      horizon=horizon)
+    knots = _account_knots(acct, window, config, now, pinned_units, horizon=horizon)
+    return _first_crossing_eta(curve, 0.0, knots, config, now)
+
+
+def _required_reduction_pool(pool_curve, rotatable_burn: float, knots_rr, config: dict,
+                             now) -> dict:
+    """Smallest pool cut (reference units/min) that clears the breach to
+    ``H + exit_margin = 240`` min, as an EXACT closed-form min-ratio (Task 8, G6,
+    §5.4). Returns ``{"delta_units": float, "unmeetable": bool}``.
+
+    ``Δ* = clamp(rotatable_burn − min_{t_k ∈ K_rr, 0<t_k<=240}[pool_remaining(t_k)
+    / t_k], 0, rotatable_burn)``. The extremum of ``remaining(t)/t`` on a linear
+    segment is at a knot, so the min over ``K_rr`` is exact (no bisection).
+
+    ``knots_rr`` = ``K_rr = sorted({0, H+margin} ∪ {t_r,a} ∪ {t_r,a+W} ∪ Z_rr) ∩
+    [0, H+margin]`` — built by the CALLER from ``state`` at ``horizon=240``,
+    INCLUDING ``t=240`` itself (the final-segment min lands there — round-1
+    finding) and the ``Z_rr`` clamp-zero roots (interior kinks — round-1
+    finding). The caller MUST build ``pool_curve`` via ``_pool_remaining_curve(
+    ..., horizon=240)`` and the reset knots via ``_pressure_reset_knot(...,
+    horizon=240)`` — the SAME 240 horizon the ETA/trigger path uses (round-2/3
+    finding 1); a 180-cap on either would drop a 5h reset in ``(180, 240]`` and
+    understate the min-ratio (Δ* over-throttles).
+
+    ``unmeetable = min-ratio <= 0 at any knot`` — pool supply itself breaches
+    (pinned drain alone gates) even at zero rotatable demand → §5.4
+    escalate-before-gate. ``now`` accepted for call-shape symmetry. Read-only
+    (G0): evaluates the supplied curve, mutates nothing.
+    """
+    ratios = [pool_curve(t) / t for t in knots_rr if float(t) > 0.0]
+    if not ratios:
+        return {"delta_units": 0.0, "unmeetable": False}
+    min_ratio = min(ratios)
+    unmeetable = min_ratio <= 0.0
+    delta = rotatable_burn - min_ratio
+    delta = max(0.0, min(rotatable_burn, delta))
+    return {"delta_units": delta, "unmeetable": unmeetable}
+
+
+def _required_reduction_pinned(acct: dict, window: str, config: dict, now,
+                               partition, *, horizon: float = 240) -> dict:
+    """Smallest per-account cut (%/min) that clears the account's PINNED-burn
+    breach to ``horizon`` min (Task 8, G6, §5.3/§5.4). Returns
+    ``{"delta_pct_per_min": float, "unmeetable": bool}``.
+
+    ``Δ*_a = clamp(pinned_burn%/min − min_{t_k ∈ K_rr}[h_a(t_k)/t_k], 0,
+    pinned_burn)`` with ``h_a = (gate − pct)`` headroom on the account's
+    decayed-step curve. Computed on the account's reference-UNITS curve (the exact
+    Task-4 ``_pressure_remaining_curve`` the ETA path uses, at ``horizon``) and
+    converted to %/min at the end: for a single account
+    ``h_a%(t) = remaining_units(t)·100/ratio`` exactly (the ``ratio/100`` factor
+    cancels in ``remaining0``, ``burn`` and the reset credit alike), so
+    ``Δ*_pct = Δ*_units · 100/ratio`` — identical to the raw-% formulation but
+    reusing one curve for both paths. The %/min form is ratio-invariant
+    (rotation-blind, M1) and compares to §5.2 candidate share%/min directly.
+
+    ``K_rr`` is built here for the single account via ``_account_knots(...,
+    horizon=horizon)`` — ``{0, horizon}`` (horizon included), its reset knots
+    ``T_w``/``T_w+W``, and the ``Z_rr`` clamp-zero roots. A reset landing in
+    ``(H, horizon]`` earns its ramp credit (finding 1), so Δ* is not
+    over-stated by a dropped reset.
+
+    ``horizon`` DECOUPLES this from an internally hardcoded 240 (fix-wave-1
+    finding 1 — mirrors ``_pinned_account_eta``'s own ``horizon`` param): it
+    defaults to 240 (``H + exit_margin`` under the DEFAULT config) so
+    existing callers/tests are unaffected, but the assembler (Task 20) passes
+    the SAME dynamic ``H240 = _pressure_trigger_horizon(config)`` it already
+    uses for ``pinned_eta_min`` and the pool required-reduction — so under a
+    non-default ``horizon_hours``/``exit_margin_hours`` the pinned
+    required-reduction's knot set stays consistent with the co-published
+    ``pinned_eta_min``'s (instead of silently diverging on a mismatched knot
+    set). ``pinned_burn`` comes from ``_pinned_burn_rate`` (injected
+    partition — finding 2). ``unmeetable = min-ratio <= 0`` (pinned drain
+    alone breaches the supply) → §5.4. Read-only (G0).
+    """
+    ratio = _pressure_acct_ratio(acct, config)
+    pinned_units = _pinned_burn_rate(acct, window, partition)
+    curve = _pressure_remaining_curve(acct, window, config, now, pinned_units,
+                                      horizon=horizon)
+    knots = _account_knots(acct, window, config, now, pinned_units, horizon=horizon)
+    ratios = [curve(t) / t for t in knots if float(t) > 0.0]
+    min_ratio = min(ratios) if ratios else 0.0
+    unmeetable = min_ratio <= 0.0
+    delta_units = pinned_units - min_ratio
+    delta_units = max(0.0, min(pinned_units, delta_units))
+    delta_pct = delta_units * 100.0 / ratio if ratio else delta_units * 100.0
+    return {"delta_pct_per_min": delta_pct, "unmeetable": unmeetable}
+
+
+def _pool_knots(state: dict, window: str, config: dict, now, partition,
+                *, horizon: float) -> list[float]:
+    """The pool's reset+clamp knot set for ``window`` (Task 9/6/8 support, G6):
+    the union of every pooled account's ``_account_knots`` (``{0, horizon}`` ∪ its
+    reset knots ∪ its ``Z`` clamp-zero roots) over ``[0, horizon]``. Feeds the
+    pool ``_first_crossing_eta`` (trigger/exit-ETA) and the pool
+    ``_required_reduction`` min-ratio; both use ``horizon = H+margin = 240``.
+    Read-only (G0)."""
+    knots = {0.0, float(horizon)}
+    accounts = state.get("accounts", {})
+    for name in _pressure_pool_set(state, window, config):
+        acct = accounts.get(name, {})
+        pinned = partition.pinned_burn_units(name, window)
+        knots |= set(_account_knots(acct, window, config, now, pinned,
+                                    horizon=horizon))
+    return sorted(knots)
+
+
+def _pool_release_suppressed(state: dict, config: dict) -> bool:
+    """True while any ACTIVE (enabled) account is unpolled or its ``capacity_x``
+    is out-of-band / first-seen (Task 9, C1/I4): the pool view is uncertain, so a
+    pool-driven RELEASE (all-clear) must be suppressed and the safety factor
+    widened. The per-account pinned floor is unaffected (ratio-invariant).
+    Read-only (G0)."""
+    disabled = _disabled_accounts(config)
+    accounts = state.get("accounts", {})
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct = accounts.get(name, {})
+        if not acct.get("last_poll_ts"):  # never polled / unknown freshness
+            return True
+        raw_x, _warnings = _account_raw_capacity_x(name, state, config)
+        if raw_x is None:  # capacity_x out-of-band / first-seen (unknown tier)
+            return True
+    return False
+
+
+# Enter/exit horizons (minutes). H = horizon_hours*60 is the ENTER/actionable
+# horizon; every trigger ETA is computed to H+margin=240 (round-3 finding 1) so
+# the EXIT test is evaluable in (180,240].
+_PRESSURE_EXIT_MARGIN_MIN = 60.0
+_PRESSURE_WINDOWS = ("5h", "7d")
+
+
+def _pressure_enter_horizon(config: dict) -> float:
+    """H = horizon_hours*60 (default 180) — the ENTER/actionable horizon."""
+    return float(config.get("pressure", {}).get("horizon_hours", 3)) * 60.0
+
+
+def _pressure_trigger_horizon(config: dict) -> float:
+    """H + exit_margin = 240 (default) — the horizon EVERY trigger ETA is computed
+    to, so a breach receding into (180,240] returns a real eta (not None)."""
+    margin = float(config.get("pressure", {}).get("exit_margin_hours", 1)) * 60.0
+    return _pressure_enter_horizon(config) + margin
+
+
+def _pressure_trigger_is_binding(trigger: dict) -> bool:
+    """A trigger is BINDING when its 240-horizon eta is finite (a breach in
+    [0,240], held through the exit-margin band until eta>240 i.e. None), OR it is
+    a Fable-weekly ``level_bound`` trigger, OR it is a pool trigger whose release
+    is suppressed (uncertain pool view). (Task 9, G6.)
+
+    Docs correction (final-review fix-wave, code UNCHANGED): this function is
+    STATELESS -- it has no memory of the prior cycle's level -- so 240 (H +
+    exit_margin) is the ONLY horizon it ever tests, for both a fresh breach
+    and an already-binding one alike. The plan's true hysteresis (breach
+    ENTERS binding at the tighter H=180, but only EXITS at 240 after an
+    ``exit_dwell_min`` dwell) needs prior-cycle level STATE to tell "just
+    entered" from "still holding" apart, which this stateless helper (and
+    Stage-1 shadow generally) does not have -- that hysteresis is DEFERRED to
+    the Stage-2 acting path (pre-shadow-flip gate). Until then, every binding
+    trigger effectively enters (and holds) at eta<=240, not the plan's 180."""
+    if trigger.get("level_bound"):
+        return True
+    if trigger.get("eta") is not None:
+        return True
+    if trigger.get("view") == "pool" and trigger.get("release_suppressed"):
+        return True
+    return False
+
+
+def _pressure_triggers(state: dict, config: dict, now, partition) -> list[dict]:
+    """The independent breach triggers ``{pool:5h, pool:7d} ∪ {per-acct:5h/7d
+    ∀ active a}`` plus any Fable-weekly level-bound trigger (Task 9, G6, §3).
+
+    Each trigger is ``{view: pool|account, window, eta, binding_constraint,
+    level_bound?, release_suppressed?}``. Every breach ETA is computed at
+    ``horizon = H+margin = 240`` (round-3 finding 1) — NOT 180: passes
+    ``horizon=240`` to ``_pool_remaining_curve`` / ``_pinned_account_eta`` and
+    builds the pool ``_first_crossing_eta`` knots to ``[0, 240]``. Computing to
+    240 leaves ENTER/severity unchanged (a first crossing in [0,180] is identical
+    at either cap) but makes the level's EXIT test evaluable: a trigger breaching
+    in (180,240] gets a real eta (not None). The required-reduction Δ* (also
+    horizon=240) is NOT computed here — it is a separate Task-8 build assembled at
+    Task 20. ``partition`` is the injected Task-11 ``_partition_burn`` (finding 2;
+    tests inject a synthetic double). Read-only (G0): computes over the snapshot,
+    mutates nothing.
+    """
+    H240 = _pressure_trigger_horizon(config)
+    triggers: list[dict] = []
+
+    # --- pool triggers (one per window) ---
+    suppressed = _pool_release_suppressed(state, config)
+    for window in _PRESSURE_WINDOWS:
+        pool = _pressure_pool_set(state, window, config)
+        eta = None
+        if pool:
+            curve = _pool_remaining_curve(state, window, config, now, partition,
+                                          horizon=H240)
+            rotatable = _pool_rotatable_burn(state, window, config, now, partition)
+            knots = _pool_knots(state, window, config, now, partition, horizon=H240)
+            eta = _first_crossing_eta(curve, rotatable, knots, config, now)
+        if eta is not None or suppressed:
+            triggers.append({
+                "view": "pool", "window": window, "eta": eta,
+                "binding_constraint": f"token-pressure:pool:{window}",
+                "release_suppressed": suppressed,
+            })
+
+    # --- per-account pinned triggers (one per active account per window) ---
+    disabled = _disabled_accounts(config)
+    accounts = state.get("accounts", {})
+    pm = config.get("per_model_weekly", {})
+    fable_cap = float(pm.get("cap_pct", 95))
+    fable_margin = float(config.get("pressure", {}).get("weekly_gate_margin_pct", 2))
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts.get(name, {})
+        acct = dict(acct_state, name=name)  # inject name for the partition lookup
+        for window in _PRESSURE_WINDOWS:
+            gate = _pressure_gate(window, config)
+            pct = acct_state.get(f"current_{window}_pct", 0.0) or 0.0
+            if pct >= gate:  # OVER-GATE: skip the root-find -> immediate breach
+                eta = 0.0
+            else:
+                eta = _pinned_account_eta(acct, window, config, now, partition,
+                                          horizon=H240)
+            if eta is not None:
+                triggers.append({
+                    "view": "account", "window": window, "eta": eta,
+                    "binding_constraint": f"token-pressure:account:{name}:{window}",
+                })
+        # --- Fable-weekly level-bound trigger (binds by LEVEL, not ETA) ---
+        fable_pct = acct_state.get("per_model_weekly_pct", {}).get("Fable")
+        if fable_pct is not None and float(fable_pct) >= fable_cap - fable_margin:
+            triggers.append({
+                "view": "account", "window": "7d", "eta": 0.0,
+                "binding_constraint": f"token-pressure:account:{name}:fable",
+                "level_bound": True,
+            })
+    return triggers
+
+
+def _pressure_binding(triggers: list[dict]) -> dict | None:
+    """The single MOST-SEVERE binding trigger (Task 9, G6): earliest breach-ETA
+    across {pool-exhaustion, per-account pinned-burn}; a pool↔per-account TIE goes
+    to the per-account view (it WINS the targeting binding). A level_bound /
+    over-gate trigger has eta 0.0 (earliest). A release-suppressed pool with no
+    breach (eta None) ranks last (least severe). Returns ``None`` when nothing is
+    binding."""
+    binding = [t for t in triggers if _pressure_trigger_is_binding(t)]
+    if not binding:
+        return None
+
+    def sort_key(t: dict):
+        eta = t.get("eta")
+        eta_eff = eta if eta is not None else float("inf")
+        view_rank = 0 if t.get("view") == "account" else 1  # account wins ties
+        return (eta_eff, view_rank)
+
+    return min(binding, key=sort_key)
+
+
+def _pressure_level(triggers: list[dict], config: dict) -> dict:
+    """Fold the independent triggers into one ``ok|elevated|critical`` level
+    (Task 9, G6, committee #6). Returns ``{"level", "binding", "all_binding"}``.
+
+    Each trigger's ``eta`` is the 240-horizon value from ``_pressure_triggers``.
+    A trigger is BINDING iff its eta is finite (≤240 — held through the
+    exit-margin band; it clears only when eta>240 i.e. None), or it is a
+    level_bound trigger, or a release-suppressed pool trigger. ``critical`` iff
+    any binding trigger has ``eta < critical_eta_min`` (60) or is ``level_bound``
+    (Fable within margin of gate); otherwise ``elevated``. ``level = ok`` only
+    when NOTHING is binding — i.e. EVERY currently-binding trigger's 240-horizon
+    eta exceeds 240 (a level DECREASE requires ALL binding to clear; the
+    ``exit_dwell_min`` is applied downstream in Stage 2). ``binding`` is the
+    most-severe trigger (``_pressure_binding``; pool↔account tie -> account).
+    Read-only.
+
+    Docs correction (final-review fix-wave, code UNCHANGED): this fold is
+    STATELESS (no memory of the prior cycle's level), so eta≤240 (H +
+    exit_margin, NOT the plan's 180) is the ONLY ENTER/HOLD threshold applied
+    here — ``elevated`` fires for ANY binding, non-critical trigger up to
+    eta=240, not just eta<=180. The plan's true hysteresis (ENTER at the
+    tighter H=180, EXIT only at 240 after an ``exit_dwell_min`` dwell) needs
+    prior-cycle level state this stateless helper does not have, and is
+    DEFERRED to the Stage-2 acting path (pre-shadow-flip gate) — intentional
+    and conservative for Stage-1 shadow (it only ever widens the binding
+    window, never narrows it, so it cannot under-count pressure).
+    """
+    critical_eta = float(config.get("pressure", {}).get("critical_eta_min", 60))
+    binding = [t for t in triggers if _pressure_trigger_is_binding(t)]
+    if not binding:
+        return {"level": "ok", "binding": None, "all_binding": []}
+
+    def is_critical(t: dict) -> bool:
+        if t.get("level_bound"):
+            return True
+        eta = t.get("eta")
+        return eta is not None and eta < critical_eta
+
+    level = "critical" if any(is_critical(t) for t in binding) else "elevated"
+    return {"level": level, "binding": _pressure_binding(triggers),
+            "all_binding": binding}
+
+
+def _fable_rate(pct_snapshots: list[tuple[str, float]]) -> float:
+    """Fable-weekly %/min burn rate DERIVED from consecutive % snapshots (Task
+    18, G8/FACT #7): the Fable per-model weekly cap exposes ONLY a % level via
+    ``accounts[name].per_model_weekly_pct["Fable"]`` (the literal string key --
+    matching the read at cus.py:5819 and the `per_model_weekly` field comment
+    at cus.py:1242) -- no per-model burn rate and no per-model reset timestamp
+    are available, unlike the 5h/7d windows which ship a real
+    ``burn_rate_*_pct_per_min``. So the rate has to be RE-DERIVED here from
+    whatever consecutive polls the caller has on hand.
+
+    ``pct_snapshots`` is a list of ``(ts, pct)`` pairs (ISO-8601 ``ts``,
+    oldest first) taken from successive polls of one account's Fable %.
+    Reuses `_compute_burn_rate` (unchanged) over the LATEST consecutive pair
+    -- same upward-only semantics as every other burn-rate estimator in this
+    file: a % that DROPS between polls means the weekly window reset between
+    them, and the clamp returns 0.0 (never negative) rather than a bogus
+    negative "rate". Fewer than two snapshots -> 0.0 (nothing to derive a
+    slope from yet).
+
+    Pure (G0): no I/O, no state mutation. The derived rate is SHADOW-ONLY in
+    v1 (see `_fable_binding`) -- it is computed (for logging/future use) but
+    never turned into an ETA that drives the binding: `_fable_binding` takes
+    no rate argument at all, so this value cannot reach it (G8's known
+    limitation -- Fable binds by LEVEL, not ETA).
+    """
+    if len(pct_snapshots) < 2:
+        return 0.0
+    old_ts, old_pct = pct_snapshots[-2]
+    new_ts, new_pct = pct_snapshots[-1]
+    return _compute_burn_rate(old_pct, new_pct, old_ts, new_ts)
+
+
+def _fable_binding(fable_pct: float | None, cfg: dict, *, reset=None) -> dict:
+    """LEVEL-bound Fable-weekly binding (Task 18, G8/FACT #7) -- a standalone,
+    directly-testable counterpart to the inline Fable trigger
+    `_pressure_triggers` builds at cus.py:5819-5825 (same cap/margin config
+    reads, same literal ``"Fable"`` key convention upstream).
+
+    Unlike every ETA-bound trigger in this file, Fable has no per-model rate
+    or reset ts to root-find a breach time from (see `_fable_rate`), so this
+    binds purely on the raw LEVEL: ``critical`` iff
+    ``fable_pct >= cap_pct - weekly_gate_margin_pct`` (defaults 95 - 2 = 93 --
+    `per_model_weekly.cap_pct` / `pressure.weekly_gate_margin_pct`, the SAME
+    two config reads `_pressure_triggers` uses for its inline Fable trigger).
+    ``eta`` and ``required_reduction`` are ALWAYS ``None`` -- there is no
+    numeric cut to compute here, only a QUALITATIVE Fable->Sonnet ask ("stop
+    routing this account's Fable-model lane, move it to Sonnet") once
+    critical. `_fable_rate`'s derived rate is deliberately NOT a parameter of
+    this function: the shadow-only rate can never feed this binding in v1,
+    by construction (there is no argument for it to arrive through).
+
+    ``reset`` is an optional caller-supplied weekly-reset PROXY -- Fable has
+    no reset timestamp of its own, so a caller that wants one passes
+    ``projected_seven_day_reset(acct, cfg, now)`` (the account's real 7d
+    reset, reused as the best available proxy for when the Fable % will next
+    drop) through this kwarg; it is carried straight into the returned dict
+    for display and otherwise plays no role in the level computation.
+
+    Pure (G0): no I/O, no state mutation.
+    """
+    pm_cfg = (cfg or {}).get("per_model_weekly", {}) or {}
+    cap_pct = float(pm_cfg.get("cap_pct", 95))
+    margin = float((cfg or {}).get("pressure", {}).get("weekly_gate_margin_pct", 2))
+    threshold = cap_pct - margin
+
+    critical = fable_pct is not None and float(fable_pct) >= threshold
+    if fable_pct is None:
+        level = "ok"
+    elif critical:
+        level = "critical"
+    else:
+        level = "elevated"
+
+    return {
+        "level": level,
+        "critical": critical,
+        "level_bound": True,
+        "eta": None,
+        "required_reduction": None,
+        "cap_pct": cap_pct,
+        "threshold_pct": threshold,
+        "fable_pct": fable_pct,
+        "reset": reset,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 10 (spec-2 STAGE 1, Phase D burn-unit attribution): bounded
+# reverse-tail transcript reader (§8, FACT #6). Reads ONLY the trailing tail
+# of each *recently-active* transcript JSONL under ~/.claude/projects — never
+# the full 2.6 GB corpus. Timestamp-bounded, truncation/inode-safe,
+# READ-ONLY offsets (G0-analogous: `persist` gates whether the caller's
+# offset registry is mutated at all).
+#
+# Pinned constants (verbatim): RATE_WINDOW_S = rate_window_min*60;
+# TAIL_LOOKBACK_MIN = 3*rate_window_min (30 min at the G2 default
+# rate_window_min=10) bounds both the mtime "recently-active" filter and the
+# `since_ts` cutoff passed to `_reverse_tail_since`; PER_SESSION_TAIL_BYTES
+# (below) is the per-file cold-start/reset reverse-seek cap;
+# PER_CYCLE_TAIL_BYTES is `config['pressure']['tail_bytes_per_cycle']`
+# (default 64 MiB, G2) — the aggregate cap across all files read in one
+# `_read_active_tails` call. Truncation predicate: `recorded_offset >
+# current_size` => reset (`_detect_truncation`).
+# ---------------------------------------------------------------------------
+
+PER_SESSION_TAIL_BYTES = 4 * 1024 * 1024  # 4 MiB per-file cold-start/reset cap
+
+_PRESSURE_TAIL_CHUNK_BYTES = 65536  # backward-read chunk size for the reverse scan
+
+TAIL_LOOKBACK_WINDOW_MULT = 3  # TAIL_LOOKBACK_MIN = TAIL_LOOKBACK_WINDOW_MULT * rate_window_min
+
+
+def _tail_lookback_minutes(rate_window_min: float) -> float:
+    """Single source of truth for ``TAIL_LOOKBACK_MIN = 3*rate_window_min``
+    (§8). ``rate_window_min`` is config-derived -- NOT a compile-time
+    constant -- so only the multiplier is fixed (``TAIL_LOOKBACK_WINDOW_MULT``);
+    this is the one place the `3` and the resulting minutes value are
+    computed, so both call sites below stay in sync."""
+    return TAIL_LOOKBACK_WINDOW_MULT * float(rate_window_min)
+
+
+def _pressure_transcript_paths(projects_dir: Path, now: datetime,
+                                rate_window_min: float) -> list[Path]:
+    """Task 10 (§8, FACT #6): every *recently-active* transcript JSONL under
+    ``projects_dir`` — top-level ``<slug>/*.jsonl`` PLUS the nested child
+    transcripts ``<slug>/<parent-sessionId>/subagents/agent-*.jsonl`` and
+    ``<slug>/<parent-sessionId>/workflows/*.jsonl`` (FACT #6) — filtered to
+    mtime >= ``now - TAIL_LOOKBACK_MIN*60`` where
+    ``TAIL_LOOKBACK_MIN = 3*rate_window_min``. Read-only: globs + ``stat()``
+    only, never opens a file. Missing ``projects_dir`` -> ``[]``.
+    """
+    if not projects_dir.is_dir():
+        return []
+    lookback_min = _tail_lookback_minutes(rate_window_min)
+    cutoff = now - timedelta(minutes=lookback_min)
+    patterns = ("*.jsonl", "*/subagents/agent-*.jsonl", "*/workflows/*.jsonl")
+    paths: list[Path] = []
+    for slug_dir in sorted(p for p in projects_dir.iterdir() if p.is_dir()):
+        for pattern in patterns:
+            for candidate in sorted(slug_dir.glob(pattern)):
+                if not candidate.is_file():
+                    continue
+                try:
+                    mtime = datetime.fromtimestamp(candidate.stat().st_mtime,
+                                                    tz=timezone.utc)
+                except OSError:
+                    continue
+                if mtime >= cutoff:
+                    paths.append(candidate)
+    return paths
+
+
+def _detect_truncation(recorded_offset: int, current_size: int) -> bool:
+    """Task 10: pure truncation predicate — a transcript was truncated
+    (rotated/replaced) under our recorded offset iff that offset now points
+    PAST the file's current size (`recorded_offset > current_size`).
+    Equal is NOT a truncation (the file simply has no new data yet)."""
+    return recorded_offset > current_size
+
+
+def _reverse_tail_since(path: Path, since_ts: datetime, *, start_offset: int | None,
+                         byte_cap: int) -> tuple[list[dict], int, bool]:
+    """Task 10 (§8, FACT #6): bounded reverse-tail read of ONE transcript
+    JSONL. Never ``read()``s the whole file — chunked backward reads
+    (``os.SEEK_END``-anchored, ``_PRESSURE_TAIL_CHUNK_BYTES`` at a time),
+    splitting on ``\\n`` and parsing each line's ISO-ms ``timestamp``,
+    walking back only until EITHER the resume floor is reached OR the first
+    (chronologically-ordered, FACT #6) line older than ``since_ts`` is found
+    — whichever comes first scanning backward from EOF.
+
+    Steady state (``start_offset`` given, no truncation) never re-reads
+    before ``start_offset``. Cold start (``start_offset is None``) — or a
+    detected truncation (``_detect_truncation``) — seeks to
+    ``EOF - byte_cap`` (NEVER byte 0) instead.
+
+    Returns ``(lines, new_offset, reset)``: ``lines`` are the parsed JSON
+    dicts (``json.loads``) with ``timestamp >= since_ts``, oldest-first;
+    ``new_offset`` is the file's CURRENT EOF byte offset — what a caller
+    persists for next cycle's steady-state resume; ``reset`` is True iff
+    truncation was detected on this call.
+    """
+    try:
+        fh = path.open("rb")
+    except OSError:
+        return [], (start_offset if start_offset is not None else 0), False
+
+    # Accumulate complete lines scanning backward (newest-first); `carry`
+    # holds the not-yet-newline-terminated leftmost fragment of the chunks
+    # read so far. It is only a genuine (complete) line once the walk stops
+    # exactly at `resume_floor` -- true start-of-file (0), or a prior
+    # steady-state `start_offset`, which (being a previously-recorded EOF) is
+    # always itself a line boundary. If instead the walk stops because
+    # `byte_cap` bound it short of `resume_floor`, that cut is NOT guaranteed
+    # line-aligned and the leftover fragment is safely dropped.
+    with fh:
+        current_size = fh.seek(0, os.SEEK_END)  # single consistent EOF view for this call
+
+        reset = False
+        resume_floor = 0
+        if start_offset is not None:
+            if _detect_truncation(start_offset, current_size):
+                reset = True
+            else:
+                resume_floor = start_offset
+
+        floor = max(resume_floor, current_size - max(byte_cap, 0), 0)
+
+        raw_lines: list[bytes] = []
+        boundary_hit = False
+        pos = current_size
+        carry = b""
+        while pos > floor and not boundary_hit:
+            read_size = min(_PRESSURE_TAIL_CHUNK_BYTES, pos - floor)
+            pos -= read_size
+            fh.seek(pos)
+            chunk = fh.read(read_size) + carry
+            parts = chunk.split(b"\n")
+            carry = parts[0]
+            for raw in reversed(parts[1:]):
+                if not raw.strip():
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                    ts = datetime.fromisoformat(
+                        str(parsed["timestamp"]).replace("Z", "+00:00"))
+                    older = ts < since_ts
+                except (ValueError, KeyError, TypeError):
+                    # A malformed line OR a syntactically-valid-but-NAIVE (no
+                    # Z/offset) timestamp -- comparing a naive ts against the
+                    # tz-aware since_ts raises TypeError. Either way, skip
+                    # this one line rather than crashing the whole read (a
+                    # torn/partial final line is exactly the truncation-
+                    # safety case this task is about).
+                    continue
+                if older:
+                    boundary_hit = True
+                    break
+                raw_lines.append(raw)
+
+        if not boundary_hit and pos == resume_floor and carry.strip():
+            try:
+                parsed = json.loads(carry)
+                ts = datetime.fromisoformat(
+                    str(parsed["timestamp"]).replace("Z", "+00:00"))
+                if ts >= since_ts:
+                    raw_lines.append(carry)
+            except (ValueError, KeyError, TypeError):
+                pass
+
+    lines: list[dict] = []
+    for raw in reversed(raw_lines):  # restore chronological (oldest-first) order
+        try:
+            lines.append(json.loads(raw))
+        except ValueError:
+            continue
+
+    return lines, current_size, reset
+
+
+def _read_active_tails(now: datetime, cfg: dict, offsets: dict, *,
+                        persist: bool) -> dict[Path, list[dict]]:
+    """Task 10 (§8, FACT #6, G0): read this cycle's recently-active
+    transcript tails, aggregate-bounded to
+    ``config['pressure']['tail_bytes_per_cycle']`` (default 64 MiB, G2) —
+    never the full corpus. Each file is additionally capped at
+    ``PER_SESSION_TAIL_BYTES`` per read.
+
+    ``offsets`` is the caller-owned in-memory ``path -> recorded byte
+    offset`` registry (Task 10 does not define an on-disk registry).
+    ``persist=False`` (on-demand ``--json``/CLI, G0/§3) leaves ``offsets``
+    byte-identical, so the CLI path can never race the daemon over the same
+    registry; ``persist=True`` (daemon cycle only) advances it to each
+    file's new EOF offset for next cycle's steady-state resume.
+
+    Returns ``{path: [parsed line dicts]}``. A path whose per-cycle budget
+    is exhausted before its turn still keys into the result (with whatever
+    partial/empty list it got) — low-confidence, never dropped — so a
+    caller never mistakes a merely-unread-this-cycle transcript for one
+    with zero activity. Correspondingly, when ``persist=True``: a file
+    whose ``byte_cap`` this cycle was reduced below ``PER_SESSION_TAIL_BYTES``
+    by the aggregate budget is NOT guaranteed fully read, so its
+    ``offsets[path]`` entry is left UNCHANGED (never advanced to the file's
+    new EOF) — advancing it on an incomplete read would silently and
+    permanently skip whatever wasn't actually read this cycle. The next
+    cycle (with hopefully more budget) resumes from that same,
+    still-accurate offset instead of losing data.
+    """
+    pressure_cfg = cfg.get("pressure", {})
+    rate_window_min = float(pressure_cfg.get("rate_window_min", 10))
+    lookback_min = _tail_lookback_minutes(rate_window_min)
+    since_ts = now - timedelta(minutes=lookback_min)
+    per_cycle_cap = int(pressure_cfg.get("tail_bytes_per_cycle", 64 * 1024 * 1024))
+
+    projects_dir = CLAUDE_DIR / "projects"
+    paths = _pressure_transcript_paths(projects_dir, now, rate_window_min)
+
+    result: dict[Path, list[dict]] = {}
+    budget = per_cycle_cap
+    for path in paths:
+        byte_cap = max(0, min(PER_SESSION_TAIL_BYTES, budget))
+        # The aggregate per-cycle budget cut this file's allotment below its
+        # normal per-session cap -- its read this cycle isn't guaranteed
+        # complete, so its offset must not be advanced (C1 fix).
+        starved = byte_cap < PER_SESSION_TAIL_BYTES
+        start_offset = offsets.get(path)
+        lines, new_offset, _reset = _reverse_tail_since(
+            path, since_ts, start_offset=start_offset, byte_cap=byte_cap)
+        result[path] = lines
+        budget -= byte_cap
+        if persist and not starved:
+            offsets[path] = new_offset
+    return result
+
+
+# --------------------------------------------------------------------------
+# Task 11 (spec-2 token-pressure forecaster, STAGE 1, Phase D linchpin):
+# per-message account time-join + launch-time degradation + unattributed
+# residual + disjoint rotatable/pinned burn partition (§3, FACT #5, G8).
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Interval:
+    """One (account, pane, tmux_socket, cwd) binding window for a session,
+    built from a single `sessions.log` row (launch/resume/rotation alike).
+    `end=None` means open-ended -- this is the session's MOST RECENT known
+    binding, covering every usage timestamp from `start` onward. FACT #5:
+    today's sessions.log carries only launch/resume rows (no rotation
+    rows), so a session normally has exactly ONE interval -- see
+    `_session_account_intervals` / `_join_usage_account`."""
+
+    start: datetime
+    end: datetime | None
+    account: str | None
+    session_id: str
+    pane: str | None
+    tmux_socket: str | None
+    cwd: str | None
+
+
+def _session_account_intervals(rows: list[dict]) -> dict[str, list[Interval]]:
+    """Task 11: build each session's chronologically-ordered account-binding
+    intervals from `sessions.log` rows.
+
+    `rows` is `_parse_sessions_log()`'s (@13326) ALREADY-NORMALIZED output --
+    that function owns the two on-disk CSV shapes (6-col
+    `ts,session_id,account,pane,tmux_socket,cwd` vs legacy 5-col
+    `ts,session_id,account,pane,cwd` via `split(",", 4)`, cwd last so it may
+    embed commas; 5-col rows normalize to `tmux_socket=None`) -- so this
+    function only groups already-parsed rows by `session_id` and turns each
+    session's sorted rows into a covering-interval list, one interval
+    boundary per row. A row with a missing/unparseable `session_id`/`ts` is
+    skipped defensively (should not happen for a real
+    `_parse_sessions_log()` row, but a directly-constructed test row
+    could be malformed).
+
+    FACT #5 / committee #10: `sessions.log` today emits only launch/resume
+    rows, never a rotation row on an account swap mid-session -- so a real
+    session normally yields exactly ONE interval here (the degraded,
+    launch-time case `_join_usage_account` falls back to). This function
+    itself is time-join-agnostic: feed it synthetic multi-row sessions (as
+    `test_rotation_rows_would_join_midwindow` does) and it builds the SAME
+    multi-interval structure a rotation-aware `sessions.log` would.
+    """
+    grouped: dict[str, list[tuple[datetime, dict]]] = {}
+    for row in rows:
+        session_id = row.get("session_id")
+        ts_raw = row.get("ts")
+        if not session_id or not ts_raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        grouped.setdefault(session_id, []).append((ts, row))
+
+    result: dict[str, list[Interval]] = {}
+    for session_id, entries in grouped.items():
+        entries.sort(key=lambda e: e[0])
+        intervals: list[Interval] = []
+        for i, (ts, row) in enumerate(entries):
+            end = entries[i + 1][0] if i + 1 < len(entries) else None
+            intervals.append(Interval(
+                start=ts,
+                end=end,
+                account=row.get("account") or None,
+                session_id=session_id,
+                pane=row.get("pane") or None,
+                tmux_socket=row.get("tmux_socket") or None,
+                cwd=row.get("cwd") or None,
+            ))
+        result[session_id] = intervals
+    return result
+
+
+def _log_launch_time_fallback(session_id: str, account: str | None) -> None:
+    """G8 / committee #10: launch-time degradation is a KNOWN, LOGGED
+    limitation, never silent. One structured, greppable line per fallback
+    join -- same `click.echo`-to-stdout convention as CRED-AUDIT (@7116),
+    not a new log file. Never raises into its caller (observability must
+    never break attribution)."""
+    try:
+        click.echo(
+            "pressure.attribution.launch_time_fallback "
+            f"session_id={session_id} account={account} "
+            'reason="no rotation rows in sessions.log; single launch-time interval"'
+        )
+    except Exception:  # noqa: BLE001 -- observability must never break attribution
+        pass
+
+
+def _join_usage_account(usage_ts: datetime,
+                         intervals: list[Interval]) -> tuple[str | None, str]:
+    """Task 11: time-join one usage-line timestamp to the account active
+    then, via the covering interval `start <= usage_ts < end` (`end=None`
+    treated as +inf -- the session's current/most-recent binding).
+
+    FACT #5: a single-interval session (today's only real shape -- no
+    rotation rows) can never fail the join once it exists, so its
+    confidence is unconditionally downgraded to `"launch-time"` (a KNOWN
+    degrade, logged via `_log_launch_time_fallback` -- G8) rather than
+    reported as a genuine multi-candidate join. A multi-interval session
+    (synthetic rotation rows today; real ones if committee #10's pin is
+    later confirmed) is time-join-DRIVEN: `test_rotation_rows_would_join_
+    midwindow` proves a mid-window usage line lands on the account active
+    at ITS timestamp, not the launch account -- i.e. today's single-interval
+    behavior is the *degraded* case, not a hardcoded assumption.
+
+    No covering interval (usage_ts before the earliest known binding, or no
+    sessions.log history for this session at all -- `intervals=[]`) returns
+    `(None, "unattributed")`: the caller (`_attribute_burn`) keeps this as
+    residual, never guessing an account.
+    """
+    if not intervals:
+        return None, "unattributed"
+    if len(intervals) == 1:
+        iv = intervals[0]
+        _log_launch_time_fallback(iv.session_id, iv.account)
+        return iv.account, "launch-time"
+    for iv in sorted(intervals, key=lambda i: i.start):
+        if iv.start <= usage_ts and (iv.end is None or usage_ts < iv.end):
+            return iv.account, "joined"
+    return None, "unattributed"
+
+
+def _message_burn_units(usage: dict, weights: dict) -> float:
+    """Task 11: one usage line's weighted burn -- Σ usage[k] × weights[k]
+    over the keys BOTH dicts share. Deliberately schema-agnostic: a real
+    transcript `usage` carries `input_tokens`/`output_tokens`/
+    `cache_read_input_tokens`/`cache_creation_input_tokens` (verified from a
+    live transcript) and MAY carry a nested `cache_creation` 5m/1h
+    breakdown; whether `weights` is flat or split that finely is the
+    caller's choice -- weight FITTING (Task 14, NNLS) owns picking the
+    actual values, this is just the dot product."""
+    total = 0.0
+    for key, w in weights.items():
+        v = usage.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            total += v * w
+    return total
+
+
+class AttributionTable:
+    """Task 11 output of `_attribute_burn`: per-`(account, session_id)`
+    weighted burn, plus an explicit, NEVER-rescaled unattributed residual
+    for burn whose account could not be time-joined at all (§3, G8).
+
+    SCOPE NOTE: this is the narrower "join failed" residual only --
+    `_attribute_burn` does not take `state`, so it cannot compute the
+    broader §3 residual (an account's OWN observed `burn_rate` minus the
+    summed session shares read from a byte-capped/truncated transcript,
+    §10.9 (a)/(b)); that comparison needs `state.json`'s per-account rate
+    and is deferred to whichever later task combines this table with
+    `state`. Keyed `"unattributed"` rather than per real account name,
+    because a join failure inherently means no account is known for that
+    burn (see `_join_usage_account`) -- there is nothing else to key it by.
+    """
+
+    def __init__(self) -> None:
+        self.per_session: dict[tuple[str, str], float] = {}
+        self.session_pane: dict[str, str | None] = {}
+        self.unattributed_residual: dict[str, float] = {}
+        self.residual_fraction: float = 0.0
+
+    def burn_for(self, account: str, session_id: str) -> float:
+        return self.per_session.get((account, session_id), 0.0)
+
+    def residual_for(self, key: str = "unattributed") -> float:
+        return self.unattributed_residual.get(key, 0.0)
+
+
+_ATTRIBUTION_DEDUP_WINDOW = timedelta(days=7)  # §10.9: dedup set width
+
+
+def _attribute_burn(tails: dict, intervals: dict, weights: dict) -> AttributionTable:
+    """Task 11: attribute transcript burn to (account, session), per §3's
+    "Demand & attribution" model.
+
+    - Flattens every line across all `tails` (Task 10's `_read_active_tails`
+      output, `dict[Path, list[dict]]`), keeping only `type == "assistant"`
+      lines with a `message.usage` dict, `uuid`, `sessionId`, and a
+      parseable `timestamp` -- anything else (user/tool/system lines,
+      malformed timestamps) is silently skipped, not counted as residual
+      (it carries no burn to attribute in the first place).
+    - Dedups on `(session_id, uuid)` (§10.9): lines are processed in
+      chronological-timestamp order so the FIRST occurrence of a given
+      message wins; an exact repeat (the same message re-read by an
+      overlapping tail window) within `_ATTRIBUTION_DEDUP_WINDOW` (7d, the
+      widest attribution window) of its first occurrence is dropped. This
+      pure function scopes the dedup set to the batch it's given -- a
+      caller persisting it across daemon cycles (Task 20, §10.9(a)) is a
+      separate, later concern.
+    - Time-joins each line via `_join_usage_account` and sums weighted burn
+      (`_message_burn_units`) per `(account, session_id)`.
+    - A line whose join fails (`account is None`) is NEVER rescaled onto a
+      joined session -- it accumulates into `unattributed_residual` instead
+      (see `AttributionTable`'s scope note), and `residual_fraction` is
+      published as `residual / (residual + attributed)` (0.0 when both are
+      zero, never a divide-by-zero).
+    """
+    entries: list[tuple[datetime, str, str, dict]] = []
+    for _path, lines in tails.items():
+        for line in lines:
+            if not isinstance(line, dict) or line.get("type") != "assistant":
+                continue
+            message = line.get("message")
+            if not isinstance(message, dict):
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            uid = line.get("uuid")
+            session_id = line.get("sessionId")
+            ts_raw = line.get("timestamp")
+            if not (uid and session_id and ts_raw):
+                continue
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            entries.append((ts, session_id, uid, usage))
+
+    entries.sort(key=lambda e: e[0])  # chronological -> deterministic dedup
+
+    table = AttributionTable()
+    seen_at: dict[tuple[str, str], datetime] = {}
+
+    for ts, session_id, uid, usage in entries:
+        key = (session_id, uid)
+        prior = seen_at.get(key)
+        if prior is not None and abs(ts - prior) <= _ATTRIBUTION_DEDUP_WINDOW:
+            continue  # duplicate re-read of the same message -- drop
+        seen_at[key] = ts
+
+        burn = _message_burn_units(usage, weights)
+        session_intervals = intervals.get(session_id, [])
+        account, _confidence = _join_usage_account(ts, session_intervals)
+
+        if account is None:
+            table.unattributed_residual["unattributed"] = (
+                table.unattributed_residual.get("unattributed", 0.0) + burn)
+            continue
+
+        table.per_session[(account, session_id)] = (
+            table.per_session.get((account, session_id), 0.0) + burn)
+        if session_id not in table.session_pane and session_intervals:
+            table.session_pane[session_id] = session_intervals[0].pane
+
+    attributed_total = sum(table.per_session.values())
+    residual_total = sum(table.unattributed_residual.values())
+    denom = attributed_total + residual_total
+    table.residual_fraction = (residual_total / denom) if denom > 0 else 0.0
+    return table
+
+
+class PartitionedTable:
+    """Task 11 output of `_partition_burn`: disjoint rotatable vs pinned
+    burn, keyed by `(account_name, window)` to match the `FakePartition`
+    double Tasks 5/7/9 already consume (`pinned_burn_units`/
+    `rotatable_burn_units`, see `tests/test_pressure_{pool_curve,pinned,
+    reqreduction,level}.py`).
+
+    UNITS NOTE (documented, not silently diverged): a value here is the RAW
+    weighted burn `_attribute_burn` summed for that account's bucket over
+    the batch it was given -- NOT yet a true units/min RATE. Converting to
+    a rate is Task 12's job ("per-session trend/accel"), which does not
+    exist yet as of Task 11 (see `.superpowers/sdd/progress.md`); `window`
+    is therefore accepted (for FakePartition signature-parity -- Tasks 5/7
+    call `pinned_burn_units(name, "5h")` positionally) but does not change
+    the returned value -- burn itself has no window dimension, only each
+    window's own cap/reset does (which Tasks 5/7's OWN logic already
+    handles). Task 20's real wiring should revisit this once Task 12 lands.
+    """
+
+    def __init__(self, pinned_by_account: dict[str, float],
+                 rotatable_by_account: dict[str, float],
+                 per_session: dict[tuple[str, str], tuple[float, float]]) -> None:
+        self._pinned = dict(pinned_by_account)
+        self._rotatable = dict(rotatable_by_account)
+        self.per_session = dict(per_session)  # (account, session_id) -> (pinned, rotatable)
+
+    def pinned_burn_units(self, name: str, window: str) -> float:
+        return self._pinned.get(name, 0.0)
+
+    def rotatable_burn_units(self, name: str, window: str) -> float:
+        return self._rotatable.get(name, 0.0)
+
+
+def _partition_burn(attribution_table: AttributionTable, state: dict,
+                     config: dict) -> PartitionedTable:
+    """Task 11 (the Phase-D LINCHPIN, §3 disjoint-population model): split
+    each `(account, session_id)` attributed burn into DISJOINT rotatable vs
+    pinned components, from cus's per-SESSION binding/lane/pool state.
+
+    SIGNATURE NOTE: the brief pins `_partition_burn(attribution_table,
+    state)`; this extends it with `config` because the pinned/lock
+    predicate below (`session_locks.pinned`, `_locked_slots`) and the
+    slot's pool-account resolution both need it, and neither is reachable
+    from `attribution_table`/`state` alone (documented per the brief's
+    "extend the signature minimally and document why" allowance).
+
+    PREDICATE (per-SLOT, not per-account -- a slot's BACKING ACCOUNT can
+    rotate but a session's SLOT binding is for life; verbatim from the
+    investigated task instructions, not re-derived here):
+      1. `slot = session_current_slot(session_id)` -- pane/tmux_socket ->
+         mount -> slot join (module-level, monkeypatchable, so tests
+         control slot resolution without a live sessions.log/mount, the
+         same pattern `tests/test_per_session_cycle.py` already uses).
+      2. `slot is None` (bare/global-mode, no `slot-` mount, Gap A): a
+         non-lane session can never rotate through the pool, so it is
+         PINNED to its own (attributed) account either way. `session_locks
+         .pinned` (pane or session_id, same two-key lookup
+         `session_is_pinned` @14050 uses) is still consulted below for the
+         SAME reason `session_is_pinned` checks it -- but it does NOT
+         change the bucket here: both "explicitly pinned" and "no lane at
+         all" land in PINNED, credited to the burn's own attributed
+         account (there is no pool-backing account to defer to for a
+         session that was never on a slot). This is the brief's own
+         decision, restated: "a non-lane session is never a pool
+         rotatable, so its burn is PINNED to its account."
+      3. `slot in _locked_slots(config)` -> PINNED (the slot's account is
+         frozen -- ladder/hard-cap/reactive-429/idle-gc all skip it),
+         credited to the burn's attributed account (== the locked slot's
+         current account, by construction).
+      4. Else -> ROTATABLE, credited to the account CURRENTLY backing that
+         slot: `state["slots"][slot]["account"]` (the same field
+         `occupied_slot_accounts` @9310 reads).
+
+    MISMATCH REPORTED (per the brief's "if you find a mismatch... report
+    it" instruction): the investigated instructions said step 4 credits
+    "the pool `_slot_pool(state, slot, config)`" -- but `_slot_pool`
+    (cus.py ~9381) returns a rotation-set POOL NAME (`"premium"`/
+    `"standard"`, GH #99), not an account, and the `FakePartition`/
+    `PartitionedTable` contract keys `rotatable_burn_units(name, window)`
+    by ACCOUNT NAME (matching `_pressure_pool_set`/`_pool_rotatable_burn`,
+    Task 5, which iterate account names, not pool names). So step 4
+    instead resolves the slot's CURRENT BACKING ACCOUNT and credits that --
+    the only value that type-checks against the accessor contract;
+    `_slot_pool` plays no role in this predicate.
+
+    KEYS ON SLOT, NOT ACCOUNT: two live slots can share one account name
+    via independent-login families (Gap C), so an account-keyed rollup
+    would conflate a pinned and a rotatable slot. Because each session maps
+    to exactly one slot -> exactly one bucket, the disjoint-and-sums-to-
+    total invariant holds trivially -- asserted below, not just hoped for.
+
+    Gap B (accepted v1 limitation, NOT fixed here): `_locked_slots` freezes
+    a slot's CURRENT account; `state` is a live snapshot, so burn history
+    that straddles a lock/unlock toggle mid-window is attributed by the
+    session's CURRENT slot-lock state, not the state at burn-time.
+    """
+    pinned_by_account: dict[str, float] = {}
+    rotatable_by_account: dict[str, float] = {}
+    per_session: dict[tuple[str, str], tuple[float, float]] = {}
+
+    pinned_map = config.get("session_locks", {}).get("pinned", {}) or {}
+    locked_slots = _locked_slots(config)
+
+    for (account, session_id), burn in attribution_table.per_session.items():
+        slot = session_current_slot(session_id)
+
+        if slot is None:
+            pane = attribution_table.session_pane.get(session_id)
+            # Consulted per step 2 (mirrors session_is_pinned's two-key
+            # lookup) -- intentionally not branched on, see docstring.
+            _is_config_pinned = (pane is not None and pane in pinned_map) or (
+                session_id in pinned_map)
+            pinned_by_account[account] = pinned_by_account.get(account, 0.0) + burn
+            per_session[(account, session_id)] = (burn, 0.0)
+            continue
+
+        if slot in locked_slots:
+            pinned_by_account[account] = pinned_by_account.get(account, 0.0) + burn
+            per_session[(account, session_id)] = (burn, 0.0)
+            continue
+
+        slot_account = (state.get("slots", {}).get(slot, {}) or {}).get("account") or account
+        rotatable_by_account[slot_account] = rotatable_by_account.get(slot_account, 0.0) + burn
+        per_session[(account, session_id)] = (0.0, burn)
+
+    # INVARIANT (asserted, not just tested): rotatable + pinned are disjoint
+    # and sum to each session's total attributed burn -- never both, never
+    # neither. A wrong partition here silently corrupts every downstream
+    # trigger (Tasks 5/7), so this is a hard `assert`, not a soft check.
+    for (account, session_id), (p, r) in per_session.items():
+        total = attribution_table.per_session[(account, session_id)]
+        assert p == 0.0 or r == 0.0, (
+            f"session {session_id} ({account}) split across BOTH pinned and "
+            f"rotatable -- partition must be disjoint")
+        assert abs((p + r) - total) < 1e-9, (
+            f"session {session_id} ({account}) partition {p + r} != total {total}")
+
+    return PartitionedTable(pinned_by_account, rotatable_by_account, per_session)
+
+
+# --------------------------------------------------------------------------
+# Task 12 (spec-2 token-pressure forecaster, STAGE 1, Phase D): per-session
+# trailing burn RATE + trend/acceleration + deterministic session class
+# (§3 "Per-session trailing rate" / "Classification", §5.2 targeting walk).
+# --------------------------------------------------------------------------
+
+_CLASSIFY_IDLE_RATE_EPS = 0.01  # pct_per_min; at/below this reads as idle
+_CLASSIFY_HIGH_RATE_PCT_PER_MIN = 5.0  # sustained rate a human typing could not plausibly produce
+
+
+def _session_rate(weighted_samples: list[float], session_age_s: float,
+                   rate_window_min: float) -> float:
+    """Task 12 (§3 "Per-session trailing rate"): one session's trailing burn
+    rate in pct_per_min, over a window that ADAPTS to the session's own age
+    so a brand-new session isn't divided by a window it hasn't lived through
+    yet, and a long-lived session isn't averaged over its entire history
+    (which would hide a recent throttle's effect for hours -- the design
+    doc's rationale: the compliance check, ~2 daemon cycles / 20 min later,
+    must actually *see* a throttle take effect).
+
+    ``window_s = max(60, min(session_age_s, rate_window_min*60))``:
+      - floored at 60s so a seconds-old session never extrapolates a tiny
+        sample to an absurd %/min;
+      - capped at ``rate_window_min*60`` (default 10 min = 600s) so a
+        long-lived session's rate stays a TRAILING window, not a
+        since-launch average;
+      - between the two, a mid-age session (e.g. 5 min old) is divided by
+        its own actual age -- a 5-min-old workflow at 80% of true burn
+        isn't divided by 30 min and hidden (design doc §3).
+
+    ``weighted_samples`` are this window's already-burn-weighted values
+    (same scale ``_message_burn_units``/``_attribute_burn`` produce, Task
+    11) -- this function only sums and normalizes to a per-minute rate; it
+    does not itself weight or attribute anything.
+
+    ATTRIBUTION-SHARE ONLY (design doc §3 parenthetical): this rate feeds
+    per-session attribution shares and targeting candidacy (§5.2) ONLY --
+    the forecast itself stays on cus's own coarse per-account
+    ``current_%``/``burn_rate_*_pct_per_min`` from ``state.json``, never
+    this.
+    """
+    window_s = max(60.0, min(float(session_age_s), float(rate_window_min) * 60.0))
+    return sum(weighted_samples) / (window_s / 60.0)
+
+
+def _trend_class(rate_history: list[float], accel_thresh: float) -> str:
+    """Task 12 (§3 "trend/acceleration signal"): classify a session's
+    trailing-rate history (oldest-first, ~1h of ``_session_rate`` points at
+    the caller's own recompute cadence -- this function is spacing-agnostic,
+    it only looks at successive samples) as ``"rising"``, ``"falling"``, or
+    ``"steady"``.
+
+    Design doc §3: a *fast-ramping* session is the MOST worth an early
+    "cap fan-out" ask, not the least -- so this looks at ACCELERATION (the
+    second derivative), not just the sign of the rate's slope: a session
+    steadily burning at a high but constant rate is "steady", not "rising".
+
+    Acceleration is the discrete second difference
+    ``rate[i+1] - 2*rate[i] + rate[i-1]``, averaged over every consecutive
+    triplet in ``rate_history``. Mean acceleration ``> +accel_thresh`` ->
+    ``"rising"``; ``< -accel_thresh`` -> ``"falling"``; otherwise
+    ``"steady"``. Fewer than 3 points can't exhibit a second derivative at
+    all -> ``"steady"`` (conservative default, not enough data to flag
+    either way).
+    """
+    if len(rate_history) < 3:
+        return "steady"
+    accels = [
+        rate_history[i + 1] - 2 * rate_history[i] + rate_history[i - 1]
+        for i in range(1, len(rate_history) - 1)
+    ]
+    mean_accel = sum(accels) / len(accels)
+    if mean_accel > accel_thresh:
+        return "rising"
+    if mean_accel < -accel_thresh:
+        return "falling"
+    return "steady"
+
+
+def _in_worktree_cwd(cwd: str | None) -> bool:
+    """Task 12: whether ``cwd`` sits under a ``.worktrees/<child>`` (or bare
+    ``worktrees/<child>``) directory -- the parallel-worktree-per-agent
+    convention the design doc's Coordinator rollup section (§3, committee
+    #9) observed: a child agent's cwd is nested under the parent's own
+    worktree fan-out dir. ``None``/empty -> False (never guess)."""
+    if not cwd:
+        return False
+    parts = Path(cwd).parts
+    return "worktrees" in parts or ".worktrees" in parts
+
+
+def _worktree_committee_corroborated(record: dict) -> bool:
+    """Shared corroboration gate (final-review fix-wave, §5.2 SAFETY hole):
+    consumed by `_classify_session` heuristic 4 (worktree-cwd
+    ``committee-loop``) and by heuristic 5's generic-automation rate
+    fallback (Task 24b hardening) -- the SAME gate, not a parallel one, so
+    the two heuristics can never disagree about what counts as
+    "corroborated sustained automation".
+
+    True iff EITHER a structural automation signal is set
+    (``has_subagent_children``/``has_workflow_children`` -- checked here for
+    forward-compat even though `_classify_session`'s own heuristics 2-3
+    already return before either caller is reached today, so this branch is
+    unreachable via the current heuristic ordering) OR the rate is
+    corroborated as sustained rather than a one-off burst: ``trend ==
+    "rising"``, or ``session_age_s >= rate_window_min * 60`` (the rate's own
+    divisor has already matured past `_session_rate`'s 60s age floor).
+
+    A brand-new session's single uncorroborated sample (no rising trend,
+    still younger than its own rate window's maturity floor) does NOT
+    corroborate -- conservative by design (§5.2: an ambiguous/missing
+    signal falls toward the non-elastic class, never toward an elastic
+    one)."""
+    if record.get("has_subagent_children") or record.get("has_workflow_children"):
+        return True
+    trend = record.get("trend")
+    session_age_s = float(record.get("session_age_s", 0.0) or 0.0)
+    rate_window_min = float(record.get("rate_window_min", 10.0) or 10.0)
+    return trend == "rising" or session_age_s >= rate_window_min * 60.0
+
+
+def _classify_session(record: dict) -> str:
+    """Task 12 (§3 "Classification", deterministic heuristics; §5.2's
+    targeting candidate walk consumes this): ``"committee-loop"``,
+    ``"workflow"``, ``"subagent-heavy"`` (the ELASTIC/throttleable classes),
+    ``"interactive"`` (human-paced, NEVER a targeting candidate -- §5.2:
+    "Never interactive human-paced sessions"), or ``"idle"``.
+
+    ``record`` fields consumed (all optional; a session dict the caller
+    assembles from ``sessions.log`` (``cwd``, matching ``Interval.cwd`` /
+    ``build_session_rows``'s ``"cwd"``) plus this task's own rate output
+    plus Task 10's transcript-path layout (``_pressure_transcript_paths``,
+    FACT #6) -- deliberately NOT a coordinator-burn rollup, that's Task 13):
+      - ``rate_pct_per_min`` (float, this session's ``_session_rate()``
+        output)
+      - ``sample_count`` (int, # weighted burn samples seen in the rate
+        window -- distinct from a merely-stale-but-nonzero rate)
+      - ``cwd`` (str | None, ``sessions.log``'s ``cwd`` for this session)
+      - ``has_subagent_children`` (bool, this session's OWN project-slug dir
+        has nested ``<session_id>/subagents/agent-*.jsonl`` transcripts --
+        Task 10 FACT #6's path convention -- i.e. THIS session is itself
+        spawning subagents. A PRESENCE signal read off its own directory
+        layout, never a rollup of the children's burn.)
+      - ``has_workflow_children`` (bool, same but ``<session_id>/workflows/
+        *.jsonl``)
+      - ``trend`` (str | None, this session's own ``_trend_class()`` output
+        over its trailing-rate history -- ``"rising"``/``"falling"``/
+        ``"steady"``. Only ``"rising"`` corroborates heuristic 5 below; a
+        single-sample history (no persisted rate history yet, Task 21's
+        on-demand build) is honestly ``"steady"`` by `_trend_class`'s own
+        ``len < 3`` rule, i.e. NOT corroborating -- it does not fabricate a
+        trend it can't see.)
+      - ``session_age_s`` (float, seconds since this session's own most
+        recent ``sessions.log`` interval start -- the SAME age
+        `_session_rate()` was called with to compute ``rate_pct_per_min``.
+        Task 24b uses it to tell a rate reading that has matured over its
+        own full trailing window from one still riding `_session_rate`'s
+        60s age-floor divisor.)
+      - ``rate_window_min`` (float, the trailing-rate window (minutes)
+        `_session_rate` was called with for this session -- Task 24b's
+        corroboration-by-age floor is ``rate_window_min * 60`` seconds;
+        defaults to 10 (this module's own ``rate_window_min`` config
+        default) when absent, never to 0 -- a missing value must never
+        make a young session look corroborated.)
+
+    Heuristics, most-specific first, CONSERVATIVE by design (§5.2: a false
+    elastic label risks wrongly targeting a human, so an ambiguous/missing
+    signal falls back toward ``interactive``/``idle``, never toward an
+    elastic class):
+      1. ``idle`` -- no samples, or an (effectively) zero rate: nothing to
+         classify as either machine- or human-paced.
+      2. ``subagent-heavy`` -- ``has_subagent_children``: activity backed by
+         this session's own spawned subagents.
+      3. ``workflow`` -- ``has_workflow_children`` (no subagents
+         specifically): this session is running a workflow of its own.
+      4. ``committee-loop`` (final-review fix-wave, §5.2 SAFETY hole closed)
+         -- cwd sits under a ``.worktrees/<child>`` layout (``_in_worktree_cwd``):
+         the parallel-worktree-per-agent pattern -- BUT ONLY when ALSO
+         corroborated as sustained automation, via
+         ``_worktree_committee_corroborated`` (the SAME trend/age gate
+         heuristic 5 below uses, reused here rather than duplicated): either
+         ``trend == "rising"``, or ``session_age_s >= rate_window_min * 60``
+         (the rate's own divisor has already matured past `_session_rate`'s
+         60s floor) -- OR a structural signal (``has_subagent_children``/
+         ``has_workflow_children``, checked again inside the shared helper
+         for forward-compat, though heuristics 2-3 above already return
+         before either this heuristic or heuristic 5 is ever reached, so
+         that branch is unreachable today). A worktree cwd ALONE is never
+         sufficient: this project's own interactive dev sessions run
+         ``claude`` directly with a cwd of ``<repo>/.claude/worktrees/<name>``
+         -- the exact layout this heuristic matches -- so a bare human-paced
+         session there must NOT be classified elastic (§5.2 "never target a
+         human"). An uncorroborated/human-paced worktree session falls
+         through to heuristic 6, ``interactive``.
+      5. ``workflow`` (generic-automation fallback, Task 24b HARDENED) --
+         none of the structural signals above are set, and the rate itself
+         is high (``>= _CLASSIFY_HIGH_RATE_PCT_PER_MIN`` pct/min: design
+         doc §3 lists "a high sustained rate" itself among the elastic
+         signals) -- BUT this fires ONLY when that rate is CORROBORATED as
+         sustained automation, not a one-off burst: either ``trend ==
+         "rising"``, or ``session_age_s >= rate_window_min * 60`` (the
+         rate's own divisor has already matured past `_session_rate`'s 60s
+         floor). Pre-shadow-flip gate (§5.2 "never target a human"): a
+         brand-new *interactive* session's first-turn paste/tool-result can
+         spike the instantaneous rate over the threshold without either
+         signal -- that case falls through to ``interactive``, uncorroborated.
+      6. ``interactive`` -- the conservative default: real, sustained
+         activity with none of the above automation signals (structural or
+         corroborated-rate).
+    """
+    rate = float(record.get("rate_pct_per_min", 0.0) or 0.0)
+    sample_count = int(record.get("sample_count", 0) or 0)
+
+    if sample_count <= 0 or rate <= _CLASSIFY_IDLE_RATE_EPS:
+        return "idle"
+    if record.get("has_subagent_children"):
+        return "subagent-heavy"
+    if record.get("has_workflow_children"):
+        return "workflow"
+    if _in_worktree_cwd(record.get("cwd")) and _worktree_committee_corroborated(record):
+        return "committee-loop"
+    if rate >= _CLASSIFY_HIGH_RATE_PCT_PER_MIN:
+        if _worktree_committee_corroborated(record):
+            return "workflow"
+    return "interactive"
+
+
+# --------------------------------------------------------------------------
+# Task 13 (spec-2 token-pressure forecaster, STAGE 1, Phase D): coordinator
+# cwd-prefix rollup (§3 "Coordinator rollup", committee #9, FACT #10) --
+# rolls a child session's burn up to its coordinator for §5.2
+# classification + targeting ONLY; Task 11's per-(account, session)
+# attribution is never altered by any function here.
+# --------------------------------------------------------------------------
+
+def _matches_coordinator_layout(cwd: str) -> bool:
+    """FACT #10 (pinned, verbatim): a cwd sits under a coordinator worktree
+    layout iff it matches ONE of exactly two pinned layouts -- ``<repo>/
+    .claude/worktrees/<name>`` (a ``worktrees`` segment immediately
+    preceded by a ``.claude`` segment) or ``<repo>/.worktrees/<name>`` (a
+    single dotted ``.worktrees`` segment) -- each followed by a FURTHER
+    ``<name>`` segment: the registered coordinator IS that ``<name>`` dir,
+    not the ``worktrees``/``.worktrees`` container itself.
+
+    A BARE ``worktrees`` segment with no ``.claude`` immediately preceding
+    it (a plain `git worktree` convention, ``<repo>/worktrees/<name>``) is
+    deliberately NOT a Claude coordinator layout and must NOT match here --
+    matching it would fold a genuine burner session nesting under such a
+    cwd into a false "coordinator" and drop it from the §5.2 targeting
+    candidate set (wrong-session targeting). Segment-wise match throughout
+    (``Path(...).parts``), never a substring/raw-string check."""
+    parts = Path(cwd).parts
+    for i, part in enumerate(parts):
+        if i + 1 >= len(parts):
+            continue
+        if part == ".worktrees":
+            return True
+        if part == "worktrees" and i > 0 and parts[i - 1] == ".claude":
+            return True
+    return False
+
+
+def _has_nested_children(session_id: str, projects_dir: Path) -> bool:
+    """FACT #10's alternate registration condition: a child transcript
+    nests under THIS session's own project-slug dir --
+    ``<slug>/<session_id>/subagents/agent-*.jsonl`` or ``<slug>/
+    <session_id>/workflows/*.jsonl`` -- the same FACT #6 layout
+    `_pressure_transcript_paths` (Task 10) already globs, here checked for
+    one specific ``session_id`` across every slug dir (cwd->slug has no
+    cheap inverse, so this scans, same read-only glob-only cost class as
+    Task 10's own directory walk). Missing ``projects_dir`` -> False."""
+    if not projects_dir.is_dir():
+        return False
+    for slug_dir in projects_dir.iterdir():
+        if not slug_dir.is_dir():
+            continue
+        if any(slug_dir.glob(f"{session_id}/subagents/agent-*.jsonl")):
+            return True
+        if any(slug_dir.glob(f"{session_id}/workflows/*.jsonl")):
+            return True
+    return False
+
+
+def _registered_coordinators(sessions_rows: list[dict], projects_dir: Path) -> set[str]:
+    """Task 13 -- PRODUCER of the coordinator-cwd set (finding 14,
+    previously undefined): a cwd is a coordinator iff (a) it appears as a
+    session launch ``cwd`` in sessions.log (FACT #5, ``sessions_rows`` is
+    the already-parsed ``_parse_sessions_log()``-shaped list of dicts) AND
+    (b) it matches a pinned FACT #10 coordinator layout
+    (`_matches_coordinator_layout`) OR a child transcript nests under THIS
+    session's own dir (`_has_nested_children`). Pattern-detected from the
+    pinned layouts -- NOT an external registry: a launch-row cwd with
+    neither signal is NOT a coordinator."""
+    registered: set[str] = set()
+    for row in sessions_rows:
+        cwd = row.get("cwd")
+        session_id = row.get("session_id")
+        if not cwd:
+            continue
+        if _matches_coordinator_layout(cwd) or (
+                session_id and _has_nested_children(session_id, projects_dir)):
+            registered.add(cwd)
+    return registered
+
+
+def _coordinator_of(child_cwd: str | None,
+                     registered_coordinator_cwds: set[str]) -> str | None:
+    """Task 13: the LONGEST registered-coordinator cwd (the set
+    `_registered_coordinators` produces) that prefixes ``child_cwd``,
+    matched on path SEGMENT boundaries -- never a raw string prefix, which
+    would wrongly match a partial-segment sibling (``/repo/.worktrees/foo``
+    must NOT match ``/repo/.worktrees/foobar``). Ties can't occur (two
+    distinct cwds of equal segment-length are never both a prefix of the
+    same child). Unrecognized (no registered coordinator prefixes it,
+    including a falsy ``child_cwd``) -> ``None`` -- the caller attaches
+    low_confidence downstream, this function only resolves the prefix."""
+    if not child_cwd:
+        return None
+    child_parts = Path(child_cwd).parts
+    best: str | None = None
+    best_len = -1
+    for coord_cwd in registered_coordinator_cwds:
+        coord_parts = Path(coord_cwd).parts
+        if len(coord_parts) > len(child_parts):
+            continue
+        if child_parts[:len(coord_parts)] == coord_parts and len(coord_parts) > best_len:
+            best_len = len(coord_parts)
+            best = coord_cwd
+    return best
+
+
+def _rollup_children(table: AttributionTable, coord_map: dict[str, str]) -> AttributionTable:
+    """Task 13: sum child burn up to the coordinator for §5.2
+    classification + targeting, returning a NEW `AttributionTable`-shaped
+    VIEW -- the input ``table`` (Task 11's per-(account, session)
+    attribution) is NEVER mutated, so per-account attribution stays exactly
+    as Task 11 produced it.
+
+    ``coord_map`` is ``{child_session_id: coordinator_session_id}`` (built
+    by the caller by joining each session's ``cwd`` through
+    `_coordinator_of` against the set `_registered_coordinators` produces,
+    then resolving that coordinator cwd back to ITS OWN session_id via the
+    same sessions_rows -- outside this function's scope, which only sums
+    burn given an already-resolved map). A session_id absent from
+    ``coord_map`` (no registered coordinator, or IS a coordinator itself)
+    passes through unchanged as its own candidate.
+
+    COUNTED ONCE (§1, load-bearing): every entry is re-keyed to
+    ``(account, coord_map.get(session_id, session_id))`` and summed -- a
+    child session_id that maps to a coordinator NEVER also survives as its
+    own key, so the same unit of burn is never double-counted (once as
+    itself, once inside its coordinator) once fed to §5.2's targeting
+    candidate walk.
+
+    NOT a re-attribution: the burn's account key is untouched by the
+    regroup -- a child rolled into a coordinator backed by a DIFFERENT
+    account still lands under its OWN account, just grouped under the
+    coordinator's session_id (rollup groups for targeting; it does not
+    move burn across accounts).
+
+    ``session_pane`` is PRUNED (not copied wholesale) to only the
+    session_ids still present in the rolled-up ``per_session`` -- a
+    dropped child's own ``session_pane`` entry must not survive on this
+    view once its burn has been folded into its coordinator, or the
+    returned table would carry a stale entry for a session_id that no
+    longer appears anywhere in it.
+    """
+    rolled = AttributionTable()
+    rolled.unattributed_residual = dict(table.unattributed_residual)
+    rolled.residual_fraction = table.residual_fraction
+
+    for (account, session_id), burn in table.per_session.items():
+        target_session_id = coord_map.get(session_id, session_id)
+        key = (account, target_session_id)
+        rolled.per_session[key] = rolled.per_session.get(key, 0.0) + burn
+
+    surviving_session_ids = {sid for _account, sid in rolled.per_session}
+    rolled.session_pane = {sid: pane for sid, pane in table.session_pane.items() if sid in surviving_session_ids}
+
+    return rolled
+
+
+# --------------------------------------------------------------------------
+# Task 19 (spec-2 token-pressure forecaster, STAGE 1, Phase D closer): the
+# blindness / cold-start guard (§3 "Blindness guard", §1 rule 1) -- holds
+# the attribution-DEPENDENT acting paths (§5.2 targeting, the residual-
+# driven safety-factor widening, Task 17) while Task 10's tail reader is
+# still catching up right after a daemon start/restart, WITHOUT holding the
+# SUPPLY-derived §5.4 escalate-before-gate (Tasks 5/7/9's
+# `_pressure_triggers`/`_pressure_binding`/`_required_reduction`), which is
+# computed from `state.json` burn rates alone and needs no per-session
+# attribution at all.
+# --------------------------------------------------------------------------
+
+# blindness fires once MORE than this fraction of active sessions have no
+# `offsets` entry yet -- distinguishes a genuine cold-start/restart backlog
+# (most or all active sessions unread) from routine steady-state churn (a
+# single freshly-launched session normally has no offsets entry either,
+# until the reader's NEXT cycle picks it up; that alone must not blind the
+# whole fleet's targeting/widening).
+_ATTRIBUTION_BLINDNESS_UNREAD_FRACTION = 0.5
+
+
+def _attribution_confidence(offsets: dict, active_sessions, now) -> dict:
+    """Task 19 (§3 "Blindness guard", §1 rule 1): tell a high residual
+    caused by Task 10's tail reader (`_read_active_tails` @6140) still
+    CATCHING UP after a daemon start/restart -- benign, transient -- apart
+    from a genuine steady-state attribution gap.
+
+    ``offsets`` is Task 10's caller-owned in-memory ``path -> recorded byte
+    offset`` registry: a path absent from it has never been read by this
+    reader's lifetime (cold start), so no burn from it has been attributed
+    yet. ``active_sessions`` is the set of sessions currently believed
+    alive; each element may be EITHER a plain session_id string -- matched
+    against ``offsets`` by ``Path.stem``, the established top-level
+    transcript-naming convention ``<slug>/<session_id>.jsonl``
+    (`_pressure_transcript_paths` @6002, `_resolve_transcript` @15199's
+    ``f"{session_id}.jsonl"``) -- OR a transcript ``Path`` itself, matched
+    by direct membership in ``offsets``. Accepting both means a caller
+    holding either representation on hand (Task 10's own paths, or a
+    session_id-keyed view like Task 12/13's per-session records) gets a
+    correct match without being forced into a lookup it may not have.
+    ``now`` is accepted for call-shape symmetry with the rest of the
+    Phase-D read paths (Task 10/11/13 all take ``now``, e.g.
+    `_read_active_tails`/`_pressure_transcript_paths`); unused by this
+    cut's pure fraction-of-active-sessions-read computation.
+
+    blindness = True once MORE than
+    ``_ATTRIBUTION_BLINDNESS_UNREAD_FRACTION`` of active sessions are
+    unread -- the high residual this cycle is explained by cold-start
+    backlog, NOT a real attribution failure. blindness = False once the
+    reader has caught up (at most that fraction of active sessions are
+    still unread) -- ANY residual remaining at that point is genuine
+    steady-state residual (a real fit-quality signal), never blindness, no
+    matter how large.
+
+    Returns a dict shaped to compose directly into the pressure.json
+    ``attribution`` block (Task 20: ``{confidence, blindness,
+    residual_fraction, reason}`` -- ``residual_fraction`` comes from Task
+    11's `_attribute_burn`/``AttributionTable.residual_fraction``, merged
+    in by the CALLER, never computed here) PLUS the three gating decisions
+    the downstream acting paths consume directly:
+
+      - ``suppress_targeting`` = ``blindness`` -- §5.2 targeting must not
+        run on incomplete attribution.
+      - ``suppress_residual_widening`` = ``blindness`` -- the confidence-
+        widened safety factor (Task 17, `_safety_factor`) must not widen on
+        a residual that is just cold-start backlog, not a real fit-quality
+        signal.
+      - ``allow_supply_escalation`` = ALWAYS ``True`` -- §5.4
+        escalate-before-gate (`_pressure_triggers`/`_pressure_binding`/
+        `_required_reduction`) is computed from ``state.json`` burn rates
+        alone and needs NO per-session attribution, so blindness must NEVER
+        suppress it.
+
+    ``confidence`` = fraction of active sessions WITH an ``offsets`` entry
+    (``1.0`` when there are no active sessions -- nothing to be blind
+    about, so targeting/widening are NOT suppressed either). Pure (G0):
+    reads ``offsets``/``active_sessions``, mutates nothing.
+    """
+    offset_paths = {p if isinstance(p, Path) else Path(str(p)) for p in offsets}
+    read_stems = {p.stem for p in offset_paths}
+    sessions = list(active_sessions)
+    total = len(sessions)
+
+    def _is_read(item) -> bool:
+        if isinstance(item, Path):
+            return item in offset_paths
+        return str(item) in read_stems
+
+    read_count = sum(1 for item in sessions if _is_read(item))
+
+    if total == 0:
+        confidence = 1.0
+        blindness = False
+        reason = "no active sessions"
+    else:
+        confidence = read_count / total
+        unread = total - read_count
+        blindness = (1.0 - confidence) > _ATTRIBUTION_BLINDNESS_UNREAD_FRACTION
+        reason = (
+            f"cold-start: {unread}/{total} sessions unread"
+            if blindness
+            else f"steady-state: {read_count}/{total} sessions read"
+        )
+
+    return {
+        "blindness": blindness,
+        "confidence": confidence,
+        "reason": reason,
+        "suppress_targeting": blindness,
+        "suppress_residual_widening": blindness,
+        "allow_supply_escalation": True,
+    }
+
+
+def _pressure_parse_ts(ts) -> datetime | None:
+    """Parse an ISO8601 timestamp (``Z`` or offset form) to a tz-aware
+    ``datetime``, or ``None`` if missing/unparseable (Task 14 internal --
+    same tolerant pattern used throughout the pressure module, e.g.
+    ``_pressure_reset_knot``/``_compute_burn_rate``)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+# Cache-create TTLs in minutes (Anthropic prompt-caching tiers: a 5-minute
+# default TTL and a 1-hour extended TTL), keyed by the pinned column name.
+_PRESSURE_CACHE_TTL_MINUTES = {"cache_create_5m": 5.0, "cache_create_1h": 60.0}
+
+
+def _build_weight_windows(pct_history: list[dict], token_totals_per_window: list[dict],
+                          resets: list[dict]) -> tuple[list[list[float]], list[float], dict[str, int]]:
+    """Task 14 (spec-2 token-pressure forecaster, STAGE 1, G4 attribution
+    boundary): assemble the regression inputs ``(A, b)`` for the burn-weight
+    NNLS fit (Task 15/16) -- ONE row per candidate attribution window. This
+    function IS the G4 boundary: every exclusion/correction/normalization
+    happens HERE so the solver receives a clean ``(A, b)`` and does no
+    filtering of its own.
+
+    INPUTS (``pct_history`` and ``token_totals_per_window`` are INDEX-ALIGNED
+    -- entry ``i`` of each describes the same candidate window; no earlier
+    task pins these shapes, the real producer is wired at Task 20):
+
+    * ``pct_history[i]`` -- one candidate attribution window: the interval
+      between two consecutive usage polls for ONE account::
+
+          {"account": str, "start_ts": iso8601, "end_ts": iso8601,
+           "pct_start": float, "pct_end": float, "ratio": float}
+
+      ``pct_start``/``pct_end`` are the SAME window-type's (e.g. both 5h)
+      polled usage percent at the interval boundaries. ``ratio`` is the
+      PRE-RESOLVED ``capacity_x / reference_x`` tier factor (Task 2
+      ``_pressure_ratio``/``_pressure_acct_ratio``) -- this function takes no
+      ``config``, so the caller resolves ratio upstream, once, before
+      building the window list.
+
+    * ``token_totals_per_window[i]`` -- the raw token totals accumulated
+      during that window's interval, keyed by the 5 pinned columns::
+
+          {"input": num, "output": num, "cache_read": num,
+           "cache_create_5m": num, "cache_create_1h": num}
+
+    * ``resets`` -- observed reset-boundary crossings, NOT index-aligned (an
+      account may have 0+ crossings inside any given window's interval)::
+
+          [{"account": str, "ts": iso8601}, ...]
+
+      Not type-tagged (5h vs 7d) deliberately: the brief's "a window whose
+      interval crosses a 5h/7d reset boundary" excludes on EITHER, since
+      either reset means the polled ``pct_end`` reflects a post-reset value
+      not comparable to ``pct_start`` for Δburn purposes.
+
+    OUTPUT:
+
+    * ``A`` -- list of 5-element rows, PINNED column order
+      ``[input, output, cache_read, cache_create_5m, cache_create_1h]`` (do
+      not reorder -- Task 15/16's monotone priors are keyed positionally).
+    * ``b`` -- tier-normalized Δburn, index-aligned with ``A`` (dropped rows
+      are absent from both, never a placeholder)::
+
+          b_i = (pct_end - pct_start) / 100 * ratio
+
+      so equal ABSOLUTE burn (reference units) on a 20x account (ratio 4.0)
+      and a 5x account (ratio 1.0) yields EQUAL ``b`` -- matches Task 2's
+      ``_pressure_burn_units`` normalization.
+    * ``dropped_reason_counts`` -- observability dict, keys present only for
+      reasons actually seen: ``"reset_crossing"`` (responsibility 1),
+      ``"zero_tokens"`` / ``"nonpositive_b"`` (responsibility 3). Every
+      dropped row is counted under exactly one reason (checked in this
+      order: reset_crossing, zero_tokens, nonpositive_b) -- never silently
+      discarded.
+
+    RESPONSIBILITY 2 -- within-window cache-create expiry correction: a
+    cache-create token's TTL (5 min / 1h) can expire partway through a
+    window whose duration exceeds the TTL, so only a fraction of the window
+    actually benefited from that cache entry. v1 correction (deliberately
+    simple -- shadow-calibrated later, NOT a simulation of individual token
+    creation instants, which ``token_totals_per_window`` doesn't carry):
+
+        factor = min(1.0, ttl_minutes / window_duration_minutes)
+        effective_count = raw_count * factor
+
+    applied independently to ``cache_create_5m`` (ttl=5) and
+    ``cache_create_1h`` (ttl=60); ``input``/``output``/``cache_read`` pass
+    through uncorrected (they don't expire). A window whose duration is <=
+    the TTL gets factor 1.0 (the cache entry was live for the entire
+    window -- no correction). A missing/zero/degenerate duration also
+    yields 1.0 (never divide by zero; a genuinely-degenerate window is
+    independently caught by the zero-token/nonpositive-b drops).
+
+    Pure (G0): reads its inputs, mutates nothing, no I/O.
+    """
+    resets_by_account: dict[str, list[datetime]] = {}
+    for r in resets:
+        account = r.get("account")
+        ts = _pressure_parse_ts(r.get("ts"))
+        if account is None or ts is None:
+            continue
+        resets_by_account.setdefault(account, []).append(ts)
+
+    A: list[list[float]] = []
+    b: list[float] = []
+    dropped_reason_counts: dict[str, int] = {}
+
+    def _drop(reason: str) -> None:
+        dropped_reason_counts[reason] = dropped_reason_counts.get(reason, 0) + 1
+
+    for window, totals in zip(pct_history, token_totals_per_window):
+        start_ts = _pressure_parse_ts(window.get("start_ts"))
+        end_ts = _pressure_parse_ts(window.get("end_ts"))
+        account = window.get("account")
+
+        # Responsibility 1: drop reset-crossing windows. A crossing is any
+        # reset for THIS account with start_ts < ts <= end_ts (half-open on
+        # the left so a reset exactly AT the window's start -- already
+        # reflected in pct_start -- doesn't spuriously exclude it).
+        crossed = False
+        if start_ts is not None and end_ts is not None:
+            crossed = any(
+                start_ts < reset_ts <= end_ts
+                for reset_ts in resets_by_account.get(account, ())
+            )
+        if crossed:
+            _drop("reset_crossing")
+            continue
+
+        raw = {
+            "input": float(totals.get("input", 0.0) or 0.0),
+            "output": float(totals.get("output", 0.0) or 0.0),
+            "cache_read": float(totals.get("cache_read", 0.0) or 0.0),
+            "cache_create_5m": float(totals.get("cache_create_5m", 0.0) or 0.0),
+            "cache_create_1h": float(totals.get("cache_create_1h", 0.0) or 0.0),
+        }
+        # Responsibility 3a: drop all-zero-token windows (checked on the RAW
+        # totals -- the expiry correction below only ever scales down, so it
+        # can never turn a non-zero row zero or vice versa).
+        if all(v == 0.0 for v in raw.values()):
+            _drop("zero_tokens")
+            continue
+
+        # Responsibility 4: tier-normalize b BEFORE the nonpositive-b check.
+        pct_start = float(window.get("pct_start", 0.0) or 0.0)
+        pct_end = float(window.get("pct_end", 0.0) or 0.0)
+        ratio = float(window.get("ratio", 1.0) or 1.0)
+        b_i = (pct_end - pct_start) / 100.0 * ratio
+
+        # Responsibility 3b: drop no-measurable-burn windows.
+        if b_i <= 0.0:
+            _drop("nonpositive_b")
+            continue
+
+        # Responsibility 2: within-window cache-create expiry correction.
+        duration_min = None
+        if start_ts is not None and end_ts is not None:
+            duration_min = (end_ts - start_ts).total_seconds() / 60.0
+        corrected = dict(raw)
+        for col, ttl in _PRESSURE_CACHE_TTL_MINUTES.items():
+            factor = 1.0 if not duration_min or duration_min <= 0 else min(1.0, ttl / duration_min)
+            corrected[col] = raw[col] * factor
+
+        A.append([
+            corrected["input"], corrected["output"], corrected["cache_read"],
+            corrected["cache_create_5m"], corrected["cache_create_1h"],
+        ])
+        b.append(b_i)
+
+    return A, b, dropped_reason_counts
+
+
+# --- Task 15 (spec-2 token-pressure forecaster, STAGE 1): vendored
+# pure-Python NNLS core -- the burn-weight fit's (Task 16) constrained
+# least-squares solver. NO numpy/scipy anywhere (FACT #8/G4) -- lists and
+# the `math` module only. See `_nnls` below for the determinism contract
+# (§9.2 golden-replay backtest needs byte-identical output for the same
+# input, every run, every machine).
+
+_NNLS_ZERO_TOL = 1e-10  # absolute -- primal x_i treated as "hit the boundary"
+
+
+def _dot(a: list[float], b: list[float]) -> float:
+    """Pure-Python dot product (Task 15, NNLS primitive). Single ascending
+    index pass -- fixed summation order regardless of caller, never a
+    dict/set involved."""
+    total = 0.0
+    for i in range(len(a)):
+        total += a[i] * b[i]
+    return total
+
+
+def _matvec(A: list[list[float]], v: list[float]) -> list[float]:
+    """``A @ v`` for ``A`` a list of rows (Task 15, NNLS primitive)."""
+    return [_dot(row, v) for row in A]
+
+
+def _matvec_t(A: list[list[float]], v: list[float]) -> list[float]:
+    """``A^T @ v`` for ``A`` a list of rows (Task 15, NNLS primitive) --
+    computes the transpose-multiply without ever materializing ``A^T``."""
+    m = len(A)
+    n = len(A[0]) if m else 0
+    out = [0.0] * n
+    for i in range(m):
+        row = A[i]
+        vi = v[i]
+        for j in range(n):
+            out[j] += row[j] * vi
+    return out
+
+
+def _householder_qr_lstsq(A: list[list[float]], b: list[float]) -> list[float]:
+    """Unconstrained least squares ``argmin ||A x - b||^2`` via Householder
+    QR (Task 15) -- NEVER via the normal equations (``A^T A``), which would
+    square ``A``'s condition number; this is the inner solve `_nnls` calls
+    on the passive-set columns every active-set step.
+
+    ``A`` is a list of rows (m x n, full column rank, m >= n expected for
+    the overdetermined case `_nnls` calls this with). Reduces a WORKING
+    COPY of ``A`` to upper-triangular ``R`` via n Householder reflections,
+    applying each reflection to ``b`` in lockstep, then back-substitutes
+    ``R x = c[:n]`` for ``x``. Deterministic: every loop is a fixed
+    ascending index range, never a dict/set.
+    """
+    m = len(A)
+    n = len(A[0]) if m else 0
+    R = [row[:] for row in A]
+    c = list(b)
+
+    for k in range(n):
+        # Householder vector for column k, rows k..m-1.
+        norm_sq = 0.0
+        for i in range(k, m):
+            norm_sq += R[i][k] * R[i][k]
+        alpha = math.sqrt(norm_sq)
+        if alpha == 0.0:
+            continue  # degenerate column (rank-deficient) -- skip, handled at back-substitution
+        if R[k][k] > 0.0:
+            alpha = -alpha  # choose sign to avoid cancellation
+
+        v = [0.0] * m
+        v[k] = R[k][k] - alpha
+        for i in range(k + 1, m):
+            v[i] = R[i][k]
+
+        v_norm_sq = 0.0
+        for i in range(k, m):
+            v_norm_sq += v[i] * v[i]
+        if v_norm_sq == 0.0:
+            continue
+
+        # Apply the reflection H = I - 2 v v^T / (v^T v) to R's remaining
+        # columns and to c, in ascending column/row order.
+        for j in range(k, n):
+            s = 0.0
+            for i in range(k, m):
+                s += v[i] * R[i][j]
+            s = 2.0 * s / v_norm_sq
+            for i in range(k, m):
+                R[i][j] -= s * v[i]
+
+        s = 0.0
+        for i in range(k, m):
+            s += v[i] * c[i]
+        s = 2.0 * s / v_norm_sq
+        for i in range(k, m):
+            c[i] -= s * v[i]
+
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        s = c[i]
+        for j in range(i + 1, n):
+            s -= R[i][j] * x[j]
+        x[i] = 0.0 if R[i][i] == 0.0 else s / R[i][i]
+    return x
+
+
+def _nnls(M: list[list[float]], y: list[float], *, max_iter: int) -> tuple[list[float], bool]:
+    """Lawson-Hanson (1974) active-set NNLS (Task 15): ``min ||M x - y||^2
+    s.t. x >= 0`` -- the burn-weight fit's (Task 16) constrained solver.
+    Pure Python (FACT #8/G4, NO numpy/scipy), and DETERMINISTIC end to end:
+    the §9.2 golden-replay backtest needs byte-identical ``x`` for the same
+    ``(M, y)``, every run, every machine.
+
+    DETERMINISM (load-bearing, see `_dot`/`_matvec`/`_matvec_t`
+    above): every choice that could otherwise depend on dict/set iteration
+    order -- which variable enters the passive set, which variable(s) leave
+    it -- is made by scanning ``range(n)`` in strict ascending order and
+    keeping the FIRST (lowest-index) value on an exact tie (a strict ``>``
+    comparison naturally does this: a later, equal candidate never
+    displaces an earlier one). The passive-set column order is always
+    ``[j for j in range(n) if passive[j]]`` -- an ascending list, never a
+    ``set`` -- so the submatrix handed to `_householder_qr_lstsq` has a
+    fixed column order every call.
+
+    ALGORITHM: outer loop picks the inactive (non-passive) variable with
+    the largest dual/gradient ``w_j = (M^T (y - M x))_j`` (KKT-optimal once
+    every inactive ``w_j <= dual_tol``, a tolerance relative to the initial
+    dual's magnitude -- 1e-10 relative, per G4), adds it to the passive
+    set, then re-solves the unconstrained LS problem restricted to the
+    passive columns via Householder QR. If that solution has any
+    non-positive component, back off toward it by the largest ``alpha`` in
+    ``[0, 1]`` that keeps every passive ``x_i >= 0`` (the standard
+    Lawson-Hanson interpolation step), drop every passive index that hit
+    the zero boundary, and re-solve -- repeating until the passive-set
+    solution is all-positive, then returning to the outer loop.
+
+    ``max_iter`` bounds the TOTAL number of passive-set QR solves (outer
+    additions + inner backoff re-solves combined). Returns
+    ``converged=False`` on exhaustion rather than fabricate a partial
+    answer as final -- Task 16 owns the seed-fallback retry on that case,
+    this function never falls back on its own.
+    """
+    m = len(M)
+    n = len(M[0]) if m else 0
+    x = [0.0] * n
+    if n == 0:
+        return x, True
+
+    passive = [False] * n
+
+    # `Aty` (== the dual `w` at x=0, since the residual is `y - M@0 == y`)
+    # sets the KKT tolerance's scale only -- it is NOT reused as a Gram-form
+    # shortcut for the outer loop's own dual recompute below. That recompute
+    # is always done in RESIDUAL form (`r = y - M x`, `w = M^T r`, via
+    # `_matvec`/`_matvec_t`), never via the Gram matrix `M^T M`: forming
+    # `M^T M` would square `M`'s condition number for the variable-selection
+    # and termination decision (G4) -- the same condition-squaring
+    # Householder QR is pinned to avoid for the passive-set solve below.
+    Aty = _matvec_t(M, y)
+
+    dual_scale = max((abs(v) for v in Aty), default=0.0) or 1.0
+    dual_tol = 1e-10 * dual_scale
+
+    converged = False
+    iterations = 0
+    need_new_var = True
+
+    while iterations < max_iter:
+        if need_new_var:
+            Mx = _matvec(M, x)
+            w = _matvec_t(M, [y[i] - Mx[i] for i in range(m)])
+
+            best_j = -1
+            best_w = dual_tol
+            for j in range(n):
+                if passive[j]:
+                    continue
+                if w[j] > best_w:
+                    best_w = w[j]
+                    best_j = j
+
+            if best_j == -1:
+                converged = True
+                break
+
+            passive[best_j] = True
+            need_new_var = False
+
+        idxs = [j for j in range(n) if passive[j]]
+        if not idxs:
+            # Pathological floating-point edge case only: a just-selected
+            # variable's Householder-QR passive solve disagreed in sign
+            # with the residual-form dual test that selected it and dropped
+            # right back out, leaving the passive set empty without ever
+            # accepting. Retry variable selection rather than solving a
+            # zero-column system -- still bounded by max_iter like any
+            # other step, never a crash.
+            iterations += 1
+            need_new_var = True
+            continue
+
+        sub = [[row[j] for j in idxs] for row in M]
+        z_local = _householder_qr_lstsq(sub, y)
+        iterations += 1
+
+        min_z = min(z_local)
+        if min_z > 0.0:
+            new_x = [0.0] * n
+            for local_i, j in enumerate(idxs):
+                new_x[j] = z_local[local_i]
+            x = new_x
+            need_new_var = True
+            continue
+
+        # Interpolation step: largest alpha in [0, 1] keeping every passive
+        # x_i >= 0 -- ascending scan over idxs, numeric min (a tie in the
+        # minimizing ratio doesn't change the resulting alpha VALUE, so no
+        # index tie-break is needed here).
+        alpha = 1.0
+        for local_i, j in enumerate(idxs):
+            zi = z_local[local_i]
+            if zi <= 0.0:
+                xi = x[j]
+                denom = xi - zi
+                step = xi / denom if denom != 0.0 else 0.0
+                if step < alpha:
+                    alpha = step
+        alpha = max(0.0, alpha)
+
+        new_x = list(x)
+        for local_i, j in enumerate(idxs):
+            new_x[j] = x[j] + alpha * (z_local[local_i] - x[j])
+        x = new_x
+
+        # Drop every passive index that hit (or numerically crossed) zero --
+        # ascending scan over idxs, never a set.
+        for j in idxs:
+            if x[j] <= _NNLS_ZERO_TOL:
+                passive[j] = False
+                x[j] = 0.0
+
+        need_new_var = False  # re-solve on the shrunk passive set next
+
+    return x, converged
+
+
+# --- Task 16 (spec-2 token-pressure forecaster, STAGE 1): the full
+# constrained burn-weight fit -- composes Task 15's `_nnls` with a
+# monotone-prior reparam, a scaled seed, Tikhonov regularization anchored on
+# that seed, a condition-number fallback, and a min-windows guard. Pure
+# Python (FACT #8/G4, NO numpy/scipy) and deterministic end to end (every
+# loop below is a fixed ascending `range()` pass, never a dict/set, matching
+# `_nnls`'s own determinism contract).
+
+# Pinned column order -- do NOT reorder; every positional list in this file
+# (Task 14's `_build_weight_windows` output, Task 15/16's reparam) is keyed
+# to this order.
+_PRESSURE_WEIGHT_COLUMNS = ("input", "output", "cache_read", "cache_create_5m", "cache_create_1h")
+
+# Default seed weights (relative units -- scaled by `_scaled_seed` before
+# use), PINNED per G4: output costs ~5x input, cache writes are cheap
+# relative to a cache_read, and the write premium grows with TTL.
+_PRESSURE_DEFAULT_SEEDS_REL = [1.0, 5.0, 0.1, 1.25, 2.0]
+
+# Monotone-prior reparam matrix T (PINNED, G4): w = T @ x, x >= 0 turns
+# EVERY prior into a pure non-negativity constraint on x -- no QP needed.
+# Row k of T is the coefficients of x in w_k:
+#   w[0] = x0                    (input)
+#   w[1] = x0 + x1                (output)          -> output >= input >= 0
+#   w[2] = x2                    (cache_read)
+#   w[3] = x2 + x3                (cache_create_5m)  -> cache_create_5m >= cache_read
+#   w[4] = x2 + x3 + x4           (cache_create_1h)  -> cache_create_1h >= cache_create_5m
+_PRESSURE_WEIGHT_T: list[list[float]] = [
+    [1.0, 0.0, 0.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0, 1.0, 1.0],
+]
+
+# "Populated column" relative tolerance (G4): a column counts as populated
+# when its L2 norm is >= this fraction of the max column's L2 norm. Shared
+# by `_condition_number` (restricts the Gram/kappa computation to populated
+# columns) and `fit_burn_weights` (labels every OTHER column `seed_pinned`).
+_PRESSURE_POPULATED_COL_REL_TOL = 1e-6
+
+# Jacobi eigenvalue routine bounds (G4): a compact, deterministic,
+# stdlib-only symmetric-eigenvalue solver for the (<=5x5) populated-column
+# Gram matrix -- cyclic sweeps over ascending (row, col) pairs, never a
+# "largest off-diagonal" search (which would still be deterministic, but
+# sweeps are simpler and match the G4 "<=50 sweeps" framing).
+_PRESSURE_JACOBI_MAX_SWEEPS = 50
+_PRESSURE_JACOBI_OFFDIAG_TOL = 1e-12
+
+# Condition-number singularity guard (G4): lmin <= this fraction of lmax
+# means the populated-column Gram is numerically singular -- report kappa
+# as infinity rather than a huge-but-finite number that could slip under an
+# operator's `cond_max` by accident.
+_PRESSURE_COND_SINGULAR_REL_TOL = 1e-12
+
+
+def _pressure_populated_columns(A: list[list[float]]) -> list[int]:
+    """Indices of A's columns that carry real signal (Task 16, G4): a
+    column's L2 norm >= ``_PRESSURE_POPULATED_COL_REL_TOL`` times the
+    MAX column's L2 norm. An all-zero (or near-zero) token-type column --
+    e.g. ``cache_create_5m`` before that tier is ever exercised -- is
+    EXCLUDED here, which is what keeps a single unpopulated column from
+    both (a) polluting `_condition_number`'s kappa (it would otherwise
+    contribute a near-zero eigenvalue to the Gram, blowing kappa up for a
+    reason that has nothing to do with the columns that DO have data), and
+    (b) getting reported as anything other than `seed_pinned` -- its weight
+    is determined by the Tikhonov seed anchor alone, never real data.
+
+    Pure (G0): reads A, mutates nothing. Empty/degenerate A (no rows, no
+    columns, or every column exactly zero) returns ``[]``.
+    """
+    n = len(A)
+    k = len(A[0]) if n else 0
+    if k == 0:
+        return []
+    col_l2 = []
+    for j in range(k):
+        s = 0.0
+        for i in range(n):
+            v = A[i][j]
+            s += v * v
+        col_l2.append(math.sqrt(s))
+    max_col_l2 = max(col_l2)
+    if max_col_l2 <= 0.0:
+        return []
+    threshold = _PRESSURE_POPULATED_COL_REL_TOL * max_col_l2
+    return [j for j in range(k) if col_l2[j] >= threshold]
+
+
+def _condition_number(A: list[list[float]]) -> float:
+    """``kappa = sqrt(lmax / lmin)`` of the populated-column Gram of the
+    ORIGINAL token-mix matrix A (Task 16, G4) -- NEVER the reparam ``A @ T``
+    (T's monotone-prior structure would distort the condition read: e.g. a
+    genuinely well-conditioned A can produce a poorly-conditioned ``A @ T``
+    purely from T's chained-sum rows, which says nothing about the DATA).
+
+    Restricted to `_pressure_populated_columns(A)` (G4): an unpopulated
+    column (all-zero token type) must NOT trip the condition fallback --
+    its own near-zero column would otherwise contribute a near-zero
+    eigenvalue and blow kappa up for a reason unrelated to the columns that
+    DO carry data. A single populated column is trivially well-conditioned
+    (``kappa = 1.0`` -- there is nothing for it to be collinear WITH). Zero
+    populated columns (a fully empty/degenerate A) returns infinity, same
+    as a genuinely singular Gram.
+
+    Eigenvalues come from a compact CYCLIC Jacobi eigenvalue routine
+    (Golub & Van Loan / the classic symmetric Jacobi rotation) run directly
+    on the populated-column Gram matrix (<=5x5, so this is cheap): up to
+    `_PRESSURE_JACOBI_MAX_SWEEPS` full sweeps over every ascending
+    ``(row, col)`` pair with ``row < col``, each sweep stopping early once
+    every off-diagonal magnitude is <= `_PRESSURE_JACOBI_OFFDIAG_TOL`. Pure
+    Python (FACT #8/G4, NO numpy/scipy) and deterministic: sweeps iterate
+    ascending indices only, never a dict/set.
+
+    ``lmin <= _PRESSURE_COND_SINGULAR_REL_TOL * lmax`` (G4) is treated as
+    numerically singular -> ``kappa = inf`` rather than a huge-but-finite
+    ratio a caller's `cond_max` threshold could accidentally miss.
+
+    Pure (G0): reads A, mutates nothing, no I/O.
+    """
+    n = len(A)
+    populated = _pressure_populated_columns(A)
+    p = len(populated)
+    if n == 0 or p == 0:
+        return float("inf")
+    if p == 1:
+        return 1.0
+
+    # Populated-column Gram: G[a][b] = dot(col(populated[a]), col(populated[b])).
+    G = [[0.0] * p for _ in range(p)]
+    for a in range(p):
+        ca = populated[a]
+        for b in range(a, p):
+            cb = populated[b]
+            s = 0.0
+            for i in range(n):
+                s += A[i][ca] * A[i][cb]
+            G[a][b] = s
+            G[b][a] = s
+
+    for _sweep in range(_PRESSURE_JACOBI_MAX_SWEEPS):
+        max_off = 0.0
+        for a in range(p):
+            for b in range(a + 1, p):
+                v = abs(G[a][b])
+                if v > max_off:
+                    max_off = v
+        if max_off <= _PRESSURE_JACOBI_OFFDIAG_TOL:
+            break
+        for pi in range(p):
+            for qi in range(pi + 1, p):
+                apq = G[pi][qi]
+                if apq == 0.0:
+                    continue
+                app = G[pi][pi]
+                aqq = G[qi][qi]
+                theta = (aqq - app) / (2.0 * apq)
+                if theta >= 0.0:
+                    t = 1.0 / (theta + math.sqrt(1.0 + theta * theta))
+                else:
+                    t = -1.0 / (-theta + math.sqrt(1.0 + theta * theta))
+                c = 1.0 / math.sqrt(1.0 + t * t)
+                s = t * c
+                G[pi][pi] = app - t * apq
+                G[qi][qi] = aqq + t * apq
+                G[pi][qi] = 0.0
+                G[qi][pi] = 0.0
+                for i in range(p):
+                    if i == pi or i == qi:
+                        continue
+                    aip = G[i][pi]
+                    aiq = G[i][qi]
+                    G[i][pi] = c * aip - s * aiq
+                    G[pi][i] = G[i][pi]
+                    G[i][qi] = s * aip + c * aiq
+                    G[qi][i] = G[i][qi]
+
+    eigenvalues = [G[a][a] for a in range(p)]
+    lmax = max(eigenvalues)
+    lmin = min(eigenvalues)
+    if lmax <= 0.0 or lmin <= _PRESSURE_COND_SINGULAR_REL_TOL * lmax:
+        return float("inf")
+    return math.sqrt(lmax / lmin)
+
+
+def _scaled_seed(
+    A: list[list[float]],
+    b: list[float],
+    w_seed_rel: list[float],
+    *,
+    clamp: tuple[float, float] = (1e-6, 1e6),
+) -> tuple[list[float], float]:
+    """The Task 16 scaled seed (G4): a single scalar ``s`` that puts the
+    RELATIVE seed weights ``w_seed_rel`` at roughly the right absolute
+    scale for THIS fleet's actual burn, found by the closed-form
+    least-squares scale that best explains ``b`` from ``A @ w_seed_rel``::
+
+        s = dot(b, A @ w_seed_rel) / dot(A @ w_seed_rel, A @ w_seed_rel)
+
+    clamped to ``clamp`` (default ``[1e-6, 1e6]``, overridden by the caller
+    from ``pressure.weight_refit.seed_scale_clamp``). Returns
+    ``(w_seed, seed_scale)`` where ``w_seed = s * w_seed_rel`` -- this is
+    BOTH a possible final answer (the `seed-fallback` source) AND the
+    Tikhonov anchor `fit_burn_weights` regularizes the NNLS fit toward.
+
+    INVALID ``s`` (non-finite, <= 0, or a degenerate/zero
+    ``dot(Aw, Aw)`` denominator -- e.g. ``A`` is empty or ``w_seed_rel`` is
+    entirely orthogonal to every row) falls all the way back to the RAW,
+    UNSCALED seed: ``w_seed = w_seed_rel`` (i.e. as if ``s = 1``). The
+    returned ``seed_scale`` in that case is ``math.nan`` -- an unambiguous
+    "invalid" signal to the caller (never colliding with a real clamped
+    scale, which is always finite in ``clamp``); `fit_burn_weights`
+    publishes ``1.0`` in the output for this case, matching the ``s = 1``
+    semantics, while using ``math.isfinite`` on this raw return to decide
+    the SOURCE branch.
+
+    Pure (G0): reads A/b/w_seed_rel, mutates nothing, no I/O.
+    """
+    Aw = _matvec(A, w_seed_rel)
+    denom = _dot(Aw, Aw)
+    if denom == 0.0 or not math.isfinite(denom):
+        return list(w_seed_rel), math.nan
+    s = _dot(b, Aw) / denom
+    if not math.isfinite(s) or s <= 0.0:
+        return list(w_seed_rel), math.nan
+    lo, hi = clamp
+    s = min(max(s, lo), hi)
+    return [s * wi for wi in w_seed_rel], s
+
+
+def _pressure_apply_T(A: list[list[float]]) -> list[list[float]]:
+    """``A @ T`` for the PINNED Task 16 reparam matrix `_PRESSURE_WEIGHT_T`
+    (5x5) -- the x-space design matrix `fit_burn_weights` runs NNLS on,
+    since ``A @ w = A @ (T @ x) = (A @ T) @ x``. Computed via `_dot` on
+    T's columns (T is a small fixed constant, not worth a generic n x 5 x 5
+    matmul primitive). Pure (G0)."""
+    T = _PRESSURE_WEIGHT_T
+    k = len(T[0])
+    cols = [[T[row][j] for row in range(len(T))] for j in range(k)]
+    return [[_dot(row, col) for col in cols] for row in A]
+
+
+def _pressure_residual_fraction(A: list[list[float]], b: list[float], w: list[float]) -> float:
+    """``||A @ w - b|| / ||b||`` (Task 16, G4) -- published on every
+    `fit_burn_weights` result regardless of source, so a caller can see fit
+    quality even when the source is `seed-fallback` or `insufficient-data`
+    (both still have a concrete ``w`` to score against ``(A, b)``).
+    ``b`` all-zero (degenerate) reports 0.0 if the residual is also exactly
+    zero, else infinity -- never a ZeroDivisionError."""
+    Aw = _matvec(A, w)
+    resid = [b[i] - Aw[i] for i in range(len(b))]
+    resid_norm = math.sqrt(_dot(resid, resid))
+    b_norm = math.sqrt(_dot(b, b))
+    if b_norm == 0.0:
+        return 0.0 if resid_norm == 0.0 else float("inf")
+    return resid_norm / b_norm
+
+
+def fit_burn_weights(
+    A: list[list[float]],
+    b: list[float],
+    seeds_rel: list[float] | None,
+    cfg: dict,
+) -> dict:
+    """The full constrained burn-weight fit (Task 16, G4) -- composes
+    Task 15's `_nnls` with the monotone-prior reparam (`_PRESSURE_WEIGHT_T`),
+    a scaled seed (`_scaled_seed`), Tikhonov regularization anchored on that
+    seed, a condition-number fallback (`_condition_number`), and a
+    min-windows guard, to fit the 5 pinned per-token-type burn weights from
+    Task 14's ``(A, b)`` windows.
+
+    INPUTS: ``A``/``b`` as `_build_weight_windows` (Task 14) returns them
+    (``A`` rows in `_PRESSURE_WEIGHT_COLUMNS` order, ``b`` index-aligned,
+    tier-normalized Δburn). ``seeds_rel`` -- the RELATIVE seed weights,
+    defaulting to `_PRESSURE_DEFAULT_SEEDS_REL` when falsy. ``cfg`` -- the
+    FULL top-level config; this reads ``cfg["pressure"]["weight_refit"]``
+    (G4 defaults below), matching every other `_pressure_*` config read in
+    this file. ``weight_refit.enabled``/``refit_every_min`` are config-only
+    here -- the actual refit CADENCE (when to call this at all) is wired
+    later (Task 21+); this function always computes a fit when called.
+
+    REPARAM (G4): solves for ``x >= 0`` via ``w = T @ x``
+    (`_PRESSURE_WEIGHT_T`), which turns EVERY monotone prior
+    (``output >= input >= 0``, ``0 <= cache_read <= cache_create_5m <=
+    cache_create_1h``) into pure non-negativity on ``x`` -- no QP needed,
+    just NNLS.
+
+    OBJECTIVE (G4): ONE Tikhonov-augmented NNLS call on
+    ``M = [A @ T ; sqrt(lambda) @ T]``, ``y = [b ; sqrt(lambda) * w_seed]``,
+    where ``lambda = tikhonov_alpha * mean_j ||col_j(A @ T)||^2``
+    (scale-invariant -- ties the regularization strength to the actual
+    magnitude of the design matrix, not an arbitrary constant). The
+    ``sqrt(lambda) @ T`` block (NOT ``sqrt(lambda) @ I``) means the penalty
+    term is ``lambda * ||T @ x - w_seed||^2 == lambda * ||w - w_seed||^2``
+    -- it regularizes the ACTUAL fitted weight vector ``w`` toward the
+    seed, not the latent ``x`` toward an arbitrary point.
+
+    SOURCE SELECTION (G4, checked in this order):
+
+      1. ``n_windows < weight_refit.min_windows`` -> ``"insufficient-data"``:
+         raw, UNSCALED seeds (``s = 1``, ``w = w_seed_rel``). Too few
+         windows to trust ANY scale/fit estimate.
+      2. Else, if the populated-column condition number exceeds
+         ``weight_refit.cond_max``, OR `_scaled_seed`'s ``s`` was invalid
+         -> ``"seed-fallback"``: ``w = w_seed`` (the SCALED seed when ``s``
+         was valid, else the unscaled seed as if ``s = 1`` -- see
+         `_scaled_seed`). The NNLS call is skipped entirely in this branch
+         -- there is no point running (and no sound Tikhonov anchor to run
+         it with) when the premise (a usable scale, a well-conditioned
+         design) already failed.
+      3. Else, run the Tikhonov-augmented NNLS. If it does NOT converge
+         (`_nnls`'s own ``max_iter`` exhaustion) -> ``"seed-fallback"``
+         again (``w = w_seed``, the scaled seed -- ``s`` WAS valid here).
+      4. Else -> ``"fit"``: ``w = T @ x``.
+
+    ``seed_pinned`` (G4) lists the `_PRESSURE_WEIGHT_COLUMNS` names of
+    every UNPOPULATED original column (`_pressure_populated_columns`),
+    regardless of source -- purely descriptive of which weights have no
+    real data behind them (and are therefore riding the Tikhonov seed
+    anchor alone when the source is `"fit"`, or the seed outright
+    otherwise). An unpopulated column never trips the condition fallback
+    on its own (`_condition_number` already excludes it).
+
+    OUTPUT: ``{weights, source, condition_number, residual_fraction,
+    n_windows, seed_scale, seed_pinned}`` -- ``weights`` a dict keyed by
+    `_PRESSURE_WEIGHT_COLUMNS`; ``residual_fraction`` always
+    `_pressure_residual_fraction(A, b, weights)` for whatever ``w`` was
+    ultimately chosen; ``condition_number``/``seed_pinned`` always computed
+    (cheap, useful observability regardless of source).
+
+    Pure (G0): reads A/b/seeds_rel/cfg, mutates nothing, no I/O, no
+    ``save_state`` -- this is a computation over caller-supplied windows,
+    never a state mutation itself.
+    """
+    weight_refit_cfg = (cfg or {}).get("pressure", {}).get("weight_refit", {}) or {}
+    min_windows = int(weight_refit_cfg.get("min_windows", 200))
+    tikhonov_alpha = float(weight_refit_cfg.get("tikhonov_alpha", 0.01))
+    cond_max = float(weight_refit_cfg.get("cond_max", 1.0e6))
+    nnls_max_iter = int(weight_refit_cfg.get("nnls_max_iter", 15))
+    clamp_cfg = weight_refit_cfg.get("seed_scale_clamp", [1.0e-6, 1.0e6])
+    clamp = (float(clamp_cfg[0]), float(clamp_cfg[1]))
+
+    w_seed_rel = [float(v) for v in seeds_rel] if seeds_rel else list(_PRESSURE_DEFAULT_SEEDS_REL)
+    n = len(A)
+    k = len(_PRESSURE_WEIGHT_COLUMNS)
+
+    kappa = _condition_number(A)
+    populated = _pressure_populated_columns(A)  # ascending list, never a set
+    seed_pinned = [
+        _PRESSURE_WEIGHT_COLUMNS[j] for j in range(k) if j not in populated
+    ]
+
+    w_seed, seed_scale_raw = _scaled_seed(A, b, w_seed_rel, clamp=clamp)
+    s_valid = math.isfinite(seed_scale_raw)
+    seed_scale_out = seed_scale_raw if s_valid else 1.0
+
+    def _result(weights: list[float], source: str, seed_scale: float) -> dict:
+        return {
+            "weights": dict(zip(_PRESSURE_WEIGHT_COLUMNS, weights)),
+            "source": source,
+            "condition_number": kappa,
+            "residual_fraction": _pressure_residual_fraction(A, b, weights),
+            "n_windows": n,
+            "seed_scale": seed_scale,
+            "seed_pinned": seed_pinned,
+        }
+
+    if n < min_windows:
+        return _result(list(w_seed_rel), "insufficient-data", 1.0)
+
+    if not s_valid or kappa > cond_max:
+        return _result(list(w_seed), "seed-fallback", seed_scale_out)
+
+    AT = _pressure_apply_T(A)
+    col_sq_sums = [0.0] * k
+    for row in AT:
+        for j in range(k):
+            col_sq_sums[j] += row[j] * row[j]
+    mean_col_sq = sum(col_sq_sums) / k
+    lam = tikhonov_alpha * mean_col_sq
+    sqrt_lam = math.sqrt(lam) if lam > 0.0 else 0.0
+
+    M = [row[:] for row in AT]
+    for row_idx in range(len(_PRESSURE_WEIGHT_T)):
+        M.append([sqrt_lam * _PRESSURE_WEIGHT_T[row_idx][j] for j in range(k)])
+    y = list(b) + [sqrt_lam * w_seed[j] for j in range(k)]
+
+    x, converged = _nnls(M, y, max_iter=nnls_max_iter * 5)
+
+    if not converged:
+        return _result(list(w_seed), "seed-fallback", seed_scale_out)
+
+    w = _matvec(_PRESSURE_WEIGHT_T, x)
+    return _result(w, "fit", seed_scale_out)
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    """``min(max(x, lo), hi)`` -- non-decreasing in ``x`` for any fixed
+    ``lo <= hi``, and returns ``hi`` (never ``inf``/``nan``) for ``x = inf``,
+    which is what lets `_safety_factor` absorb Task 16's ``math.inf``
+    condition-number/residual-fraction outputs without ever propagating a
+    non-finite value out."""
+    return min(max(x, lo), hi)
+
+
+def _safety_factor(residual_fraction: float, condition_number: float, cfg: dict) -> float:
+    """Confidence-widened safety factor (Task 17, G4) -- the load-bearing
+    "never blow the limit" defense (§3; gains shadow-tuned): a low-confidence
+    `fit_burn_weights` result (Task 16's ``"seed-fallback"``/
+    ``"insufficient-data"`` sources, which carry high/inf
+    ``condition_number`` and ``residual_fraction``) makes the forecaster
+    throttle MORE conservatively -- a wider multiplicative safety factor.
+
+        raw = base
+            + residual_gain * residual_fraction
+            + cond_gain * clamp(log10(max(condition_number, 1)) / log10(cond_max), 0, 1)
+        return clamp(raw, safety_factor_base, safety_factor_max)
+
+    Monotone non-decreasing in BOTH ``residual_fraction`` and
+    ``condition_number`` (every term above is non-decreasing in its input,
+    and `_clamp` is non-decreasing in its input) -- the final clamp only
+    ever flattens the curve at the floor/cap, never reverses it.
+
+    Handles ``inf`` in either input without ever returning non-finite:
+    ``condition_number = inf`` -> ``log10(inf) = inf`` -> the inner
+    `_clamp` saturates at its hi bound (1.0, `_clamp`'s ``min(max(x, lo),
+    hi)`` form returns ``hi`` for ``x = inf``), so the condition term
+    saturates at exactly ``cond_gain``. ``residual_fraction = inf`` makes
+    ``raw`` itself ``inf``, but the outer `_clamp` on ``raw`` then caps it
+    at ``safety_factor_max`` the same way -- the return is always a finite
+    float in ``[safety_factor_base, safety_factor_max]``.
+
+    ``cfg`` -- the FULL top-level config; reads ``cfg["pressure"]`` for the
+    ``safety_factor_*`` keys (G4 defaults below), matching every other
+    `_pressure_*` config read in this file. ``cond_max`` reuses
+    ``pressure.weight_refit.cond_max`` (`fit_burn_weights`'s own key, G4
+    default 1.0e6) rather than a second pressure-level copy, so a single
+    knob governs both the fit's own fallback threshold and how hard this
+    curve leans on a bad condition number.
+
+    Pure (G0): reads ``residual_fraction``/``condition_number``/``cfg``,
+    mutates nothing, no I/O, no ``save_state``.
+    """
+    # A nan input means "fit confidence is unknown/degenerate" -- coerce to
+    # +inf (not a finite sentinel) so it flows through the *same* saturating
+    # paths inf already uses below, widening conservatively toward the cap
+    # instead of silently collapsing to the floor (nan fails every `_clamp`
+    # comparison, which would otherwise leak nan straight out of this
+    # load-bearing "never blow the limit" function).
+    if math.isnan(residual_fraction):
+        residual_fraction = math.inf
+    if math.isnan(condition_number):
+        condition_number = math.inf
+
+    pressure_cfg = (cfg or {}).get("pressure", {}) or {}
+    base = float(pressure_cfg.get("safety_factor_base", 1.2))
+    cap = float(pressure_cfg.get("safety_factor_max", 3.0))
+    residual_gain = float(pressure_cfg.get("safety_factor_residual_gain", 1.8))
+    cond_gain = float(pressure_cfg.get("safety_factor_cond_gain", 0.6))
+    cond_max = float((pressure_cfg.get("weight_refit", {}) or {}).get("cond_max", 1.0e6))
+
+    cond_term = _clamp(math.log10(max(condition_number, 1.0)) / math.log10(cond_max), 0.0, 1.0)
+    raw = base + residual_gain * residual_fraction + cond_gain * cond_term
+    return _clamp(raw, base, cap)
+
+
+# ---------------------------------------------------------------------------
+# Task 20 (spec-2 token-pressure forecaster, STAGE 1, integration): assemble
+# the single pressure.json artifact from Phase-D products — level, normalized
+# pool/per-account curves+ETAs, binding, required reductions, weight-fit
+# confidence, per-session table — written atomic tmp+rename (NEVER
+# save_state). `_pressure_snapshot` is PURE (state, config, now) PLUS the
+# EXPLICIT injected Phase-D products (partition/session_table/weight_fit/
+# attribution — round-3 finding 2: a pure (state, config, now) builder cannot
+# reach filesystem-backed Phase-D reads itself); `_pressure_write_json` is the
+# only I/O this task performs, and it is a plain atomic write — never
+# `save_state` (this artifact lives outside state.json, G0).
+# ---------------------------------------------------------------------------
+
+PRESSURE_JSON = ACCOUNTS_DIR / "pressure.json"
+
+# Task 23 (STAGE 1): root of every pressure-owned artifact that is NOT
+# pressure.json itself -- the shadow log (`_shadow_log`) and the cus-side
+# last-emit hysteresis registry (`_pressure_last_emit_path`). Same direct-
+# monkeypatch precedent as `PRESSURE_JSON` (an import-time constant a test
+# repoints wholesale, e.g. `monkeypatch.setattr(cus, "PRESSURE_ROOT", tmp)`)
+# rather than the `_swap_lock_path()`-style call-time function -- both
+# precedents already coexist in this file; this one is chosen for
+# consistency with `PRESSURE_JSON`, the other pressure-owned path.
+PRESSURE_ROOT = ACCOUNTS_DIR / "pressure"
+
+_PRESSURE_SESSION_ROW_KEYS = (
+    "session_id", "account_shares", "model", "fable_share", "pane", "socket",
+    "cwd", "class", "rate", "trend", "coordinator_of",
+)
+
+
+def _pressure_session_row(row: dict) -> dict:
+    """Normalize one injected `session_table` row to the pinned pressure.json
+    `sessions[]` shape (Task 20 — the brief's schema pins these 11 keys).
+    Missing keys default to `None` (`account_shares` to `{}`) rather than
+    silently dropping/renaming whatever the caller's Phase-D pipeline
+    produced. Pure (G0): reads `row`, mutates nothing.
+    """
+    out = {}
+    for key in _PRESSURE_SESSION_ROW_KEYS:
+        if key == "account_shares":
+            out[key] = dict(row.get(key) or {})
+        else:
+            out[key] = row.get(key)
+    return out
+
+
+def _pressure_binding_view(trigger: dict | None) -> dict | None:
+    """The nested `binding` block (Task 20, finding 7): `{view, name,
+    constraint, window, eta_min}` — NEVER a flat `binding_view`. Derived from
+    the single most-severe trigger `_pressure_level`/`_pressure_binding`
+    (Task 9) already picked, so `eta_min` is always numerically identical to
+    the per-account/pool ETA field that trigger corresponds to (round-3
+    finding 1, `test_binding_eta_consistent_240`).
+
+    `name` is `pool:<window>` for a pool trigger, or the account name parsed
+    out of the trigger's own `binding_constraint` string
+    (`token-pressure:account:<name>:<window|fable>`, Task 9's own
+    convention — a trigger dict carries no separate "name" field, so this is
+    the one place that string is parsed). `constraint` is `fable_weekly` for
+    a level_bound (Fable) trigger, else the trigger's own `window`. `None`
+    when nothing is binding (`level == "ok"`). Pure (G0).
+    """
+    if trigger is None:
+        return None
+    view = trigger.get("view")
+    window = trigger.get("window")
+    constraint = "fable_weekly" if trigger.get("level_bound") else window
+    if view == "pool":
+        name = f"pool:{window}"
+    else:
+        parts = str(trigger.get("binding_constraint", "")).split(":")
+        name = parts[2] if len(parts) > 2 else None
+    return {
+        "view": view,
+        "name": name,
+        "constraint": constraint,
+        "window": window,
+        "eta_min": trigger.get("eta"),
+    }
+
+
+def _pressure_snapshot(state: dict, config: dict, now, *, partition, session_table,
+                       weight_fit: dict, attribution: dict, episode_id=None) -> dict:
+    """Assemble the full pressure.json object (Task 20, PURE — no I/O).
+
+    Delegates the trigger/level computation to the EXISTING Task 9
+    `_pressure_triggers`/`_pressure_level` with the REAL injected
+    `partition` (replacing the synthetic `FakePartition` the Phase-F tests
+    inject) — this function never reimplements the curve/ETA math. The
+    per-window pool/per-account ETA and required-reduction fields reuse the
+    SAME Task 5/6/7/8 building blocks those two functions call internally
+    (`_pool_remaining_curve`/`_pool_rotatable_burn`/`_pool_knots`/
+    `_pinned_account_eta`/`_required_reduction_pool`/
+    `_required_reduction_pinned`), at the SAME `horizon = H+margin = 240`
+    `_pressure_triggers` uses (`_pressure_trigger_horizon`) — so every
+    published ETA is numerically identical to the trigger it corresponds to
+    (round-3 finding 1), and `binding.eta_min` (built from the SAME trigger
+    dict `_pressure_binding` picked) is trivially consistent with them.
+
+    Phase-D products the daemon/CLI caller (Task 21/23) built from
+    filesystem I/O are EXPLICIT injected inputs (round-3 finding 2 — a pure
+    `(state, config, now)` builder cannot reach `_read_active_tails`/
+    `_attribute_burn`/`fit_burn_weights` itself):
+      - `partition`: Task 11 `_partition_burn` output (or a test double) —
+        exposes `pinned_burn_units(name, window)` / `rotatable_burn_units(
+        name, window)` in reference units/min, the Task 5 protocol.
+      - `session_table`: per-session rows (account_shares + class/rate/
+        trend/coordinator_of) from Task 11-13 — copied into `sessions[]`
+        verbatim (shape-normalized by `_pressure_session_row`), NEVER
+        re-derived from `state` (finding 2).
+      - `weight_fit`: Task 16 `fit_burn_weights` output — copied into the
+        `weight_fit` block and used (via `residual_fraction`/
+        `condition_number`) to derive `safety_factor` (Task 17
+        `_safety_factor`).
+      - `attribution`: Task 19 `_attribution_confidence` output, merged by
+        the caller with Task 11's `residual_fraction` — copied into the
+        `attribution` block verbatim.
+
+    `episode_id` (§6): minting on an `ok -> elevated` upward transition
+    needs the PRIOR level, which this pure per-snapshot builder has no way
+    to know (it only ever sees the CURRENT state) — so real minting/
+    persistence is the CALLER's job (Task 21/23 owns the episode ledger).
+    Here it is accepted as a plain injected/optional value and published
+    verbatim, defaulting to `None` when the caller has nothing to report
+    yet.
+
+    Live gates (finding 6): every published `gate` (`accounts.<name>.5h/7d/
+    fable_weekly.gate`) is read from `config` AT SNAPSHOT TIME via the
+    EXISTING `_pressure_gate`/`per_model_weekly.cap_pct` reads (never a
+    hardcoded literal) — `_pressure_gate` itself already falls back to cus's
+    own in-code default ladder top when `thresholds.steps` is empty/absent
+    (G3).
+
+    Read-only (G0): never mutates `state` or any injected product, builds
+    only new dicts/lists, and never calls `save_state`. Performs no Phase-D
+    I/O of its own — no transcript reads / attribution / weight-fit; those
+    products are injected inputs, per above. It MAY transitively READ
+    credential-tier files for capacity, via cus's normal
+    `_account_raw_capacity_x` -> `_read_rate_limit_tier` path (reached
+    through `_pool_release_suppressed`/`_pressure_pool_set`), when an
+    account's state lacks a `capacity_x` override — a benign read, not a
+    state mutation (G0 still holds; fix-wave-1 finding 2, was overclaimed as
+    "no filesystem I/O of its own").
+    """
+    triggers = _pressure_triggers(state, config, now, partition)
+    level_out = _pressure_level(triggers, config)
+
+    H240 = _pressure_trigger_horizon(config)
+    accounts_state = state.get("accounts", {})
+    disabled = _disabled_accounts(config)
+    suppressed = _pool_release_suppressed(state, config)
+
+    pool_block: dict = {}
+    for window in _PRESSURE_WINDOWS:
+        gate = _pressure_gate(window, config)
+        pool_set = _pressure_pool_set(state, window, config)
+        pool_curve = _pool_remaining_curve(state, window, config, now, partition,
+                                           horizon=H240)
+        rotatable = _pool_rotatable_burn(state, window, config, now, partition)
+        knots = _pool_knots(state, window, config, now, partition, horizon=H240)
+        # Mirror `_pressure_triggers`'s own `if pool:` guard exactly: an EMPTY
+        # pool_set (every account gated/disabled/unknown-tier) has no pool to
+        # forecast at all, so the ETA is None ("not applicable") — NOT a false
+        # immediate 0.0. Without this guard `_first_crossing_eta`'s own
+        # `g(0) <= 0` shortcut (remaining is vacuously 0 for an empty sum)
+        # would publish a misleading "already exhausted" ETA for a pool that
+        # structurally has nothing in it, diverging from `_pressure_triggers`
+        # (which never even creates a pool trigger in this case).
+        if pool_set:
+            eta = _first_crossing_eta(pool_curve, rotatable, knots, config, now)
+            rr = _required_reduction_pool(pool_curve, rotatable, knots, config, now)
+        else:
+            eta = None
+            rr = {"delta_units": 0.0, "unmeetable": False}
+        capacity_units = sum(
+            _pressure_cap_units(gate, _pressure_acct_ratio(accounts_state.get(name, {}), config))
+            for name in pool_set
+        )
+        pool_block[window] = {
+            "capacity_units": capacity_units,
+            "remaining_units": pool_curve(0.0),
+            "burn_units_per_min": rotatable,
+            "exhaustion_eta_min": eta,
+            "required_reduction_units_per_min": rr["delta_units"],
+            "release_suppressed": suppressed,
+        }
+
+    fable_cfg = config.get("per_model_weekly", {}) or {}
+    fable_gate = float(fable_cfg.get("cap_pct", 95))
+
+    accounts_block: dict = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts_state.get(name, {})
+        acct = dict(acct_state, name=name)  # inject name for the partition lookup
+        capacity_x = acct_state.get("capacity_x")
+        capacity_x = float(capacity_x) if capacity_x else 1.0
+        entry: dict = {"capacity_x": capacity_x}
+        for window in _PRESSURE_WINDOWS:
+            gate = _pressure_gate(window, config)
+            ratio = _pressure_acct_ratio(acct_state, config)
+            pct = acct_state.get(f"current_{window}_pct", 0.0) or 0.0
+            remaining_units = _pressure_remaining_units(pct, gate, ratio)
+            pinned_units = _pinned_burn_rate(acct, window, partition)
+            burn_pct_per_min = pinned_units * 100.0 / ratio if ratio else pinned_units * 100.0
+            pinned_eta = _pinned_account_eta(acct, window, config, now, partition,
+                                             horizon=H240)
+            rr = _required_reduction_pinned(acct, window, config, now, partition,
+                                            horizon=H240)
+            entry[window] = {
+                "pct": pct,
+                "gate": gate,
+                "remaining_units": remaining_units,
+                "burn_pct_per_min": burn_pct_per_min,
+                "pinned_eta_min": pinned_eta,
+                "required_reduction_pct_per_min": rr["delta_pct_per_min"],
+            }
+        fable_pct = (acct_state.get("per_model_weekly_pct", {}) or {}).get("Fable")
+        entry["fable_weekly"] = {"pct": fable_pct, "gate": fable_gate, "level_bound": True}
+        accounts_block[name] = entry
+
+    safety_factor = _safety_factor(weight_fit["residual_fraction"],
+                                   weight_fit["condition_number"], config)
+
+    return {
+        "level": level_out["level"],
+        "generated_at": now.isoformat(),
+        "reference_x": _pressure_resolve_reference_x(state, config),
+        "horizon_min": _pressure_enter_horizon(config),
+        "pool": pool_block,
+        "accounts": accounts_block,
+        "binding": _pressure_binding_view(level_out["binding"]),
+        "episode_id": episode_id,
+        "weight_fit": dict(weight_fit),
+        "safety_factor": safety_factor,
+        "attribution": dict(attribution),
+        "sessions": [_pressure_session_row(row) for row in session_table],
+    }
+
+
+def _pressure_write_json(snapshot: dict) -> None:
+    """Atomic tmp+os.replace write of the pressure.json `snapshot` (Task 20)
+    into `PRESSURE_JSON` (`~/claude-accounts/pressure.json`) — NEVER
+    `save_state`: this artifact lives outside state.json entirely (G0, the
+    forecaster never mutates the daemon's own state), so a `save_state`
+    failure elsewhere in the same cycle can never block or corrupt this
+    write. Reuses the existing `write_json`/`atomic_write_bytes` primitive
+    (tempfile in the same directory + `os.replace`, POSIX-atomic) — a
+    concurrent reader always sees the prior file or the fully-written new
+    one, never a partial write.
+    """
+    write_json(PRESSURE_JSON, snapshot)
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
@@ -18424,6 +21730,81 @@ def _sl_pin_label(pin_account: str | None, active: str, color_on: bool) -> str:
     return click.style(raw, fg="yellow", bold=True) if color_on else raw
 
 
+def _pressure_statusline_glyph(snapshot: dict) -> str:
+    """Compact non-`ok` token-pressure glyph for `cus statusline` (Task 22,
+    spec-2 token-pressure forecaster). PURE formatter over an
+    already-computed pressure.json `snapshot` (Task 20's `_pressure_snapshot`
+    schema) — reads `snapshot["level"]`/`snapshot["binding"]` plus the
+    corresponding `pool`/`accounts` window block for the binding's required
+    reduction. NEVER recomputes the snapshot, never mutates it, never writes
+    anything (G0 — same read-only contract every pressure path holds).
+
+    `""` at `level == "ok"` (nothing to show), and `""` whenever the snapshot
+    is missing/malformed in a way that would make the glyph meaningless (no
+    `binding`, unknown `view`, or no matching window block) — fail-safe, so a
+    partial/stale snapshot degrades to no glyph rather than crashing the
+    statusline the operator relies on every render.
+
+    Pool form: `⚡pool <eta_h>h -<req>%`. Account form: `⚡<acct> <eta_h>h
+    -<req>%`. `<eta_h>` is `binding["eta_min"] / 60`, 1 decimal place (144 ->
+    "2.4h"). `<req>` is the binding's required reduction, as an integer-ish
+    percent:
+      - pool: `pool[window]["required_reduction_units_per_min"]` is in
+        reference UNITS/min (`_pressure_cap_units`: units = gate/100 * ratio,
+        Task 2 §10.10) — the glyph reads a unit as a reference-account-
+        equivalent percent (`units * 100`), the same `*100/ratio` convention
+        `_required_reduction_pinned` @5686 uses for a ratio=1 account.
+      - account: `accounts[name][window]["required_reduction_pct_per_min"]`
+        is already a percent (Task 8 §5.3) — used as-is, no rescale.
+
+    Fable form: `⚡<acct> fable` — a `fable_weekly` binding
+    (`binding["constraint"] == "fable_weekly"`) is LEVEL-bound (G6: a
+    qualitative Fable-cap→Sonnet-throttle ask), not ETA-bound, so it has no
+    real numeric eta/required-reduction of its own. `binding["window"]` is
+    always the literal `"7d"` for this case (Task 9 §5829) and
+    `binding["eta_min"]` is always `0.0` — both are artifacts of how the
+    trigger is built, NOT a real 7-day breach ETA. Reading the account's
+    ordinary 7d `required_reduction_pct_per_min` here would render a
+    misleading `⚡<acct> 0.0h -0%` (looks like "nothing to do") for what is
+    actually a CRITICAL condition, so this case is special-cased BEFORE the
+    numeric formatting below and renders a qualitative glyph instead — no
+    fake eta/percent, never `""` (this must not hide a critical condition).
+    """
+    if snapshot.get("level") == "ok":
+        return ""
+    binding = snapshot.get("binding")
+    if not binding:
+        return ""
+    view = binding.get("view")
+    window = binding.get("window")
+    eta_min = binding.get("eta_min")
+    if window is None or eta_min is None:
+        return ""
+    if binding.get("constraint") == "fable_weekly":
+        acct = binding.get("name")
+        if not acct:
+            return ""
+        return f"⚡{acct} fable"
+    if view == "pool":
+        label = "pool"
+        block = (snapshot.get("pool") or {}).get(window) or {}
+        if "required_reduction_units_per_min" not in block:
+            return ""
+        req_pct = block["required_reduction_units_per_min"] * 100.0
+    elif view == "account":
+        label = binding.get("name")
+        if not label:
+            return ""
+        block = ((snapshot.get("accounts") or {}).get(label) or {}).get(window) or {}
+        if "required_reduction_pct_per_min" not in block:
+            return ""
+        req_pct = block["required_reduction_pct_per_min"]
+    else:
+        return ""
+    eta_h = eta_min / 60.0
+    return f"⚡{label} {eta_h:.1f}h -{round(req_pct)}%"
+
+
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
@@ -18466,6 +21847,22 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     # every output path (SOS / warning / compact / verbose) so the operator
     # can always tell render-time staleness regardless of which branch hit.
     render_stamp = _fmt_render_stamp_eastern()
+
+    # Task 22 (spec-2 token-pressure forecaster): a read-only glyph appended
+    # to every output line below when pressure is non-`ok`. Plain file read
+    # of the daemon/CLI-produced pressure.json (Task 20) — NEVER recomputed
+    # here (that would violate the forecaster's own G0 read-only contract,
+    # and the statusline renders far too often to afford a fresh
+    # sessions.log scan/attribution pass anyway). Absent/unreadable/corrupt
+    # pressure.json (not yet written, mid-write, or a stale schema) degrades
+    # to "" so a missing forecaster artifact never breaks the statusline.
+    pressure_glyph = ""
+    if PRESSURE_JSON.exists():
+        try:
+            pressure_glyph = _pressure_statusline_glyph(read_json(PRESSURE_JSON))
+        except Exception:
+            pressure_glyph = ""
+    pressure_bit = f" {pressure_glyph}" if pressure_glyph else ""
 
     # SOS surfacing (2026-07-03): a human-action-needed condition is emitted as
     # its OWN first line, but we NO LONGER early-return — the normal account /
@@ -18578,7 +21975,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if unknown5 and unknown7:
             pin_bit = f" {pin_lbl}" if pin_lbl else ""
             slot_bit = f" {slot_lbl}" if slot_lbl else ""
-            click.echo(f"cus:{active_lbl}{slot_bit}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
+            click.echo(f"cus:{active_lbl}{slot_bit}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)}{pressure_bit} · {render_stamp}", color=color_on)
             return
         # GH #59: compact mode must flag a rolled-over 5h window live, exactly
         # like verbose mode already does. The reset countdown elapses between
@@ -18645,7 +22042,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         sd_piece = "7d:?" if unknown7 else f"7d:{_sl_pct(sd, nx, color_on)}"
         click.echo(
             f"{prefix} {fh_piece} {sd_piece} "
-            f"{nxt_lbl(nx)}{poll_part} · {render_stamp}",
+            f"{nxt_lbl(nx)}{poll_part}{pressure_bit} · {render_stamp}",
             color=color_on,
         )
         return
@@ -18773,7 +22170,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 poll_piece = f"poll {_fmt_duration(age)}ago·due now"
             pieces.append(click.style(poll_piece, dim=True) if color_on else poll_piece)
 
-    click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}", color=color_on)
+    click.echo(pieces_prefix + " | ".join(pieces) + f"{pressure_bit} · {render_stamp}", color=color_on)
 
 
 @cli.command(name="decisions")
@@ -18845,6 +22242,3109 @@ def decisions_cmd(tail: int, swaps_only: bool, as_json: bool) -> None:
         if panes:
             shown = ", ".join(panes[:8]) + (f" +{len(panes) - 8} more" if len(panes) > 8 else "")
             click.echo(f"             where: {where.get('live_pane_count', len(panes))} panes — {shown}")
+
+
+# ---------------------------------------------------------------------------
+# Task 21 (spec-2 token-pressure forecaster, STAGE 1): `cus pressure [--json]`
+# -- the on-demand CALLER that performs the Phase-D I/O (round-3 finding 2:
+# the pure `_pressure_snapshot`, Task 20, cannot reach the filesystem itself)
+# and prints the result. READ-ONLY end to end: loads state through the
+# deep-copying `_pressure_load_state` (Task 1), reads transcript tails with
+# `persist=False` (never advances the offset registry -- CLI/daemon can't
+# race, §3), and NEVER calls `save_state` or `_pressure_write_json` (this
+# command only prints; writing pressure.json to disk is a daemon-cycle
+# concern, not this on-demand path).
+# ---------------------------------------------------------------------------
+
+# `fit_burn_weights` publishes weights keyed by the pinned
+# `_PRESSURE_WEIGHT_COLUMNS` (`input`/`output`/`cache_read`/
+# `cache_create_5m`/`cache_create_1h`), but `_attribute_burn`'s
+# per-MESSAGE `_message_burn_units` dot-products against the REAL
+# transcript `usage` field names (verified real-transcript-shaped in
+# `tests/test_pressure_attribution.py`: `input_tokens`/`output_tokens`/
+# `cache_read_input_tokens`/`cache_creation_input_tokens`) -- ONE flat
+# cache-creation field, no per-message 5m/1h TTL split (that split only
+# exists in Task 14's WINDOW-level regression input, built from
+# account-level polled token totals, not from individual transcript
+# lines). This is the translation table Task 21 needs to bridge the two;
+# it did not exist before this task. 5m is Anthropic's DEFAULT cache TTL,
+# so the 5m weight is used as the per-message cache-creation proxy -- the
+# 1h weight has no per-message target and is intentionally not used here.
+_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_read": "cache_read_input_tokens",
+    "cache_create_5m": "cache_creation_input_tokens",
+}
+
+
+def _pressure_message_weights(weight_fit_weights: dict) -> dict:
+    """Translate a `fit_burn_weights` (Task 16) weights dict into the
+    real-usage-field-keyed weights `_attribute_burn` (Task 11) needs -- see
+    `_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN` for the documented Stage-1
+    5m/1h collapse. Pure: reads its argument, mutates nothing."""
+    return {
+        usage_key: weight_fit_weights[col]
+        for col, usage_key in _PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN.items()
+    }
+
+
+def _pressure_session_child_flags(session_id: str, projects_dir: Path) -> tuple[bool, bool]:
+    """``(has_subagent_children, has_workflow_children)`` for
+    `_classify_session` (Task 12) -- the SAME FACT #6 nested-transcript glob
+    `_has_nested_children` (Task 13) checks, split into its two constituent
+    signals (that helper ORs them together for coordinator-DETECTION, which
+    doesn't need to distinguish the two; `_classify_session`'s heuristic
+    ladder ranks ``"subagent-heavy"`` above generic ``"workflow"``, so it
+    needs them separately). Read-only glob-only, same cost class as Task
+    10/13's own directory walks. Missing ``projects_dir`` -> ``(False,
+    False)``."""
+    has_subagent = False
+    has_workflow = False
+    if projects_dir.is_dir():
+        for slug_dir in projects_dir.iterdir():
+            if not slug_dir.is_dir():
+                continue
+            if any(slug_dir.glob(f"{session_id}/subagents/agent-*.jsonl")):
+                has_subagent = True
+            if any(slug_dir.glob(f"{session_id}/workflows/*.jsonl")):
+                has_workflow = True
+    return has_subagent, has_workflow
+
+
+def _pressure_build_session_table(attribution_table, intervals: dict, coord_map: dict[str, str],
+                                  projects_dir: Path, now: datetime, config: dict,
+                                  persist: bool = False) -> list[dict]:
+    """Assemble the ``sessions[]`` rows `_pressure_snapshot` (Task 20) needs
+    (Task 21 wiring -- no earlier task pins this exact shape): coordinator
+    rollup (`_rollup_children`, Task 13) over the raw per-message
+    attribution (`_attribute_burn`, Task 11), then per-(rolled)session
+    ``rate``/``class``/``trend`` (Task 12).
+
+    ACCUMULATED HISTORY (Task 27b): `_trend_class` now sees this session's
+    own persisted trailing rate history (`_pressure_load_rate_history`,
+    grouped oldest-first per session_id by `_pressure_rate_history_by_
+    session`) with this cycle's freshly-computed `rate` appended, instead
+    of a single-point history -- so a session with >=3 accumulated samples
+    over its trailing window can genuinely read "rising"/"falling", not
+    just `_trend_class`'s own conservative <3-point "steady" default. A
+    session with no prior history (first time seen, or its history has
+    aged out) still gets that same honest "steady" default -- this is not
+    a regression of the old single-sample behavior, only an extension of
+    it.
+
+    ``persist`` (mirrors `_read_active_tails(..., persist=...)`'s own
+    contract, and `_pressure_accumulated_weight_windows`'s new one): the
+    daemon cycle (`_pressure_cycle`, persist=True) appends this cycle's
+    freshly-computed ``(session_id, rate, ts)`` samples to the accumulated
+    store AFTER building the table (so THIS cycle's own trend read is
+    computed from strictly prior history, never self-referential); the
+    on-demand CLI (`pressure_cmd`, persist=False) reads the accumulated
+    store as it stands and never appends -- so it can never race the
+    daemon over the same on-disk store.
+
+    ``account_shares``: a session's rolled-up burn split by account (a
+    session can be joined to more than one account across its own
+    `sessions.log` intervals, e.g. an account swap mid-session, FACT #5).
+    ``model``/``fable_share`` are not derivable at this attribution
+    granularity (no per-model breakdown at Phase D, only at cus's own
+    per-account `per_model_weekly_pct`) and are left ``None`` --
+    `_pressure_session_row` (Task 20) already defaults absent keys, so this
+    is not silently dropping a value the pipeline could otherwise produce.
+    ``coordinator_of`` publishes the (sorted) list of child session_ids
+    that rolled INTO this row (``None`` when this row is not a
+    coordinator) -- observability only, `_pressure_snapshot` does not
+    interpret it.
+    """
+    rolled = _rollup_children(attribution_table, coord_map)
+
+    coordinated_children: dict[str, list[str]] = {}
+    for child_sid, coord_sid in coord_map.items():
+        coordinated_children.setdefault(coord_sid, []).append(child_sid)
+
+    totals_by_session: dict[str, dict[str, float]] = {}
+    for (account, sid), burn in rolled.per_session.items():
+        acct_burns = totals_by_session.setdefault(sid, {})
+        acct_burns[account] = acct_burns.get(account, 0.0) + burn
+
+    pressure_cfg = config.get("pressure", {}) or {}
+    rate_window_min = float(pressure_cfg.get("rate_window_min", 10))
+    accel_thresh = float(pressure_cfg.get("trend_accel_thresh", 0.02))
+
+    rate_history_by_session = _pressure_rate_history_by_session(_pressure_load_rate_history())
+    new_rate_samples: list[dict] = []
+
+    session_table: list[dict] = []
+    for sid, acct_burns in totals_by_session.items():
+        total_burn = sum(acct_burns.values())
+        account_shares = {
+            a: (v / total_burn if total_burn > 0 else 0.0) for a, v in acct_burns.items()
+        }
+        ivs = intervals.get(sid)
+        last_iv = ivs[-1] if ivs else None
+        session_age_s = max(0.0, (now - last_iv.start).total_seconds()) if last_iv else 0.0
+        rate = _session_rate([total_burn], session_age_s, rate_window_min)
+        history = rate_history_by_session.get(sid, [])
+        trend = _trend_class(history + [rate], accel_thresh)
+        new_rate_samples.append({"session_id": sid, "rate": rate, "ts": now.isoformat()})
+        has_sub, has_wf = _pressure_session_child_flags(sid, projects_dir)
+        cwd = last_iv.cwd if last_iv else None
+        record = {
+            "rate_pct_per_min": rate,
+            "sample_count": 1 if total_burn > 0 else 0,
+            "has_subagent_children": has_sub,
+            "has_workflow_children": has_wf,
+            "cwd": cwd,
+            # Task 24b corroboration signals for `_classify_session`'s
+            # rate-only fallback: `session_age_s`/`rate_window_min` -- the
+            # SAME values `_session_rate` just used for this session's own
+            # rate -- are what let a genuinely mature/sustained rate
+            # reading corroborate, while a young single-burst session
+            # (still riding `_session_rate`'s 60s age floor) does not.
+            "trend": trend,
+            "session_age_s": session_age_s,
+            "rate_window_min": rate_window_min,
+        }
+        session_table.append({
+            "session_id": sid,
+            "account_shares": account_shares,
+            "model": None,
+            "fable_share": None,
+            "pane": rolled.session_pane.get(sid) or (last_iv.pane if last_iv else None),
+            "socket": last_iv.tmux_socket if last_iv else None,
+            "cwd": cwd,
+            "class": _classify_session(record),
+            "rate": rate,
+            "trend": trend,
+            "coordinator_of": sorted(coordinated_children.get(sid, [])) or None,
+        })
+    if persist and new_rate_samples:
+        _pressure_rate_history_append(new_rate_samples, now)
+    return session_table
+
+
+def _pressure_coordinator_map(sessions_rows: list[dict], projects_dir: Path) -> dict[str, str]:
+    """Build the ``{child_session_id: coordinator_session_id}`` map
+    `_rollup_children` (Task 13) needs, from `_registered_coordinators`'
+    coordinator-CWD set and `_coordinator_of`'s per-child prefix match
+    (both Task 13) -- neither function resolves a coordinator cwd back to
+    its OWN session_id, so this is the join Task 21 supplies. Uses the
+    FIRST sessions.log row seen for a given cwd as that cwd's session_id
+    (a coordinator's cwd is registered once, at its own launch row)."""
+    registered_cwds = _registered_coordinators(sessions_rows, projects_dir)
+    session_id_by_cwd: dict[str, str] = {}
+    for row in sessions_rows:
+        cwd, sid = row.get("cwd"), row.get("session_id")
+        if cwd and sid and cwd not in session_id_by_cwd:
+            session_id_by_cwd[cwd] = sid
+
+    coord_map: dict[str, str] = {}
+    for row in sessions_rows:
+        sid, cwd = row.get("session_id"), row.get("cwd")
+        if not sid or not cwd:
+            continue
+        coord_cwd = _coordinator_of(cwd, registered_cwds)
+        if coord_cwd is None:
+            continue
+        coord_sid = session_id_by_cwd.get(coord_cwd)
+        if coord_sid and coord_sid != sid:
+            coord_map[sid] = coord_sid
+    return coord_map
+
+
+def _render_pressure_table(snapshot: dict) -> None:
+    """`cus pressure` default (non-``--json``) render (Task 21): level, per-
+    window pool remaining/burn + exhaustion ETA, binding view+constraint+
+    ETA, required reduction, weight-fit confidence, per-session rows.
+    ``rich`` imports stay INSIDE this function (same pattern
+    `_render_status_pretty` @18152 already uses) so a plain/`--json`
+    invocation never pays for them."""
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console(highlight=False)
+    level = snapshot["level"]
+    level_style = {"ok": "green", "elevated": "yellow", "critical": "red"}.get(level, "white")
+    ref_x = snapshot["reference_x"]
+    horizon = snapshot["horizon_min"]
+    console.print(
+        f"[bold {level_style}]{level.upper()}[/bold {level_style}]  "
+        f"generated={snapshot['generated_at']}  reference_x={ref_x:.2f}  horizon={horizon:.0f}m"
+    )
+
+    binding = snapshot.get("binding")
+    if binding:
+        # `binding['name']` is already fully-qualified for a pool binding
+        # (`_pressure_binding_view`: `f"pool:{window}"`), so prefixing it
+        # again with `view` here would print "pool:pool:5h" -- only an
+        # ACCOUNT binding's bare account name needs the `view:` prefix.
+        label = binding["name"] if binding["view"] == "pool" else f"{binding['view']}:{binding['name']}"
+        console.print(
+            f"binding: {label}  "
+            f"constraint={binding['constraint']}  window={binding['window']}  "
+            f"eta_min={binding['eta_min']}"
+        )
+    else:
+        console.print("binding: none")
+    console.print()
+
+    pool_tbl = Table(title="Pool", box=box.SIMPLE_HEAD, pad_edge=False)
+    pool_tbl.add_column("window")
+    pool_tbl.add_column("remaining (u)")
+    pool_tbl.add_column("burn (u/min)")
+    pool_tbl.add_column("exhaustion ETA (min)")
+    pool_tbl.add_column("required reduction (u/min)")
+    for window, p in snapshot["pool"].items():
+        eta = p["exhaustion_eta_min"]
+        pool_tbl.add_row(
+            window,
+            f"{p['remaining_units']:.3f}",
+            f"{p['burn_units_per_min']:.4f}",
+            "-" if eta is None else f"{eta:.0f}",
+            f"{p['required_reduction_units_per_min']:.4f}",
+        )
+    console.print(pool_tbl)
+
+    wf = snapshot["weight_fit"]
+    console.print(
+        f"weight_fit: source={wf['source']}  n_windows={wf['n_windows']}  "
+        f"condition_number={wf['condition_number']}  "
+        f"residual_fraction={wf['residual_fraction']:.3f}  "
+        f"safety_factor={snapshot['safety_factor']:.3f}"
+    )
+
+    attribution = snapshot["attribution"]
+    console.print(
+        f"attribution: confidence={attribution['confidence']:.2f}  "
+        f"blindness={attribution['blindness']}  reason={attribution['reason']}"
+    )
+    console.print()
+
+    sessions = snapshot["sessions"]
+    if sessions:
+        sess_tbl = Table(title="Sessions", box=box.SIMPLE_HEAD, pad_edge=False)
+        sess_tbl.add_column("session_id")
+        sess_tbl.add_column("account_shares")
+        sess_tbl.add_column("class")
+        sess_tbl.add_column("rate (%/min)")
+        sess_tbl.add_column("trend")
+        sess_tbl.add_column("cwd")
+        for row in sessions:
+            shares = ", ".join(f"{a}={v:.2f}" for a, v in (row["account_shares"] or {}).items())
+            rate = row["rate"]
+            sess_tbl.add_row(
+                str(row["session_id"])[:12],
+                shares,
+                str(row["class"]),
+                "-" if rate is None else f"{rate:.3f}",
+                str(row["trend"]),
+                str(row["cwd"]),
+            )
+        console.print(sess_tbl)
+    else:
+        console.print("No attributed sessions this cycle.")
+
+
+def _pressure_compute_snapshot(config: dict, now: datetime) -> dict:
+    """Task 21/29 (spec-2 token-pressure forecaster, STAGE 1): the shared
+    read-only Phase-D pipeline both `cus pressure` (Task 21) and
+    `replay_forecast` (Task 29, golden-file replay) drive -- state load ->
+    transcript tails -> sessions.log intervals -> weight fit -> per-message
+    attribution/partition -> per-session rate/class/trend -> blindness/
+    cold-start confidence -> the pure `_pressure_snapshot` (Task 20).
+
+    READ-ONLY, on-demand (G0/§3, round-3 finding 2): this function PERFORMS
+    the Phase-D I/O the pure `_pressure_snapshot` (Task 20) cannot reach
+    itself -- state load, transcript tails, sessions.log intervals, a
+    weight fit, per-message attribution/partition, per-session rate/class/
+    trend -- and hands the results to `_pressure_snapshot` as explicit
+    products. It never `save_state`s, never `_pressure_write_json`s
+    (writing pressure.json to disk is a future daemon-cycle concern, not
+    this on-demand path), and reads transcript tails with ``persist=False``
+    (a fresh, empty ``offsets`` dict every invocation) so a caller can
+    never race the daemon over a shared offset registry (§3) -- there is
+    no on-disk offsets registry in Stage 1 either way (Task 10:
+    caller-owned in-memory only).
+
+    ACCUMULATED HISTORY, READ-ONLY (Task 27b): the weight-fit regression
+    windows and per-session rate history are read from the daemon's
+    persisted cross-cycle stores under `PRESSURE_ROOT`
+    (`_pressure_accumulated_weight_windows`/`_pressure_build_session_table`,
+    both called with ``persist=False`` below) -- so this benefits from
+    whatever the daemon has already accumulated (a real fit once
+    >=``weight_refit.min_windows`` windows exist, a real trend once a
+    session has >=3 accumulated rate samples) without ever appending its
+    own observation to either store. Immediately after a fresh deploy, or
+    against an isolated fixture tree (Task 29) that never populates
+    `PRESSURE_ROOT`, this naturally falls out to
+    ``source="insufficient-data"`` (seed weights) / ``trend="steady"`` --
+    an honest reflection of not-yet-enough history, not a targeting bug.
+    For the identical persist=False reason the ``offsets`` dict is always
+    empty, `_attribution_confidence` (Task 19) naturally reports low
+    confidence / ``blindness=True`` whenever sessions are active -- an
+    honest reflection of a stateless snapshot having no persisted read
+    history to compare against, not a targeting bug
+    (`_attribution_confidence`'s own gating already keeps this from ever
+    suppressing §5.4 supply-side escalation).
+
+    Reads module-global paths (`STATE_JSON`/`CONFIG_YAML`/`CLAUDE_DIR`/
+    `SESSIONS_LOG`/`ACCOUNTS_DIR`/`PRESSURE_ROOT`/...) at CALL TIME via the
+    helpers below -- a caller wanting an isolated/replayed run (Task 29)
+    points those globals at a fixture tree before calling this function,
+    exactly what `replay_forecast` does.
+    """
+    # 1. Read-only deep-copied state (Task 1, G0) -- the ONLY state object
+    #    this call may touch; the daemon's own live state is never reached.
+    state = _pressure_load_state(config)
+
+    # 2. Bounded transcript tails (Task 10), on-demand persist=False --
+    #    must never advance the offset registry (G0/§3). A fresh, empty
+    #    `offsets` dict every call; `_read_active_tails` guarantees it is
+    #    left untouched when persist=False.
+    offsets: dict[Path, int] = {}
+    tails = _read_active_tails(now, config, offsets, persist=False)
+
+    # 3. sessions.log -> per-session account-binding intervals (Task 11).
+    sessions_rows = _parse_sessions_log()
+    intervals = _session_account_intervals(sessions_rows)
+
+    # 4. Weight-fit inputs: read-only over the daemon's accumulated
+    #    cross-cycle history (Task 27b), persist=False -- never appends
+    #    this call's own observation to the store (see docstring).
+    A, b, _dropped_reason_counts = _pressure_accumulated_weight_windows(
+        state, tails, intervals, config, now, persist=False)
+    weight_fit = fit_burn_weights(A, b, None, config)
+
+    # 5. Per-message attribution (Task 11) -> disjoint pinned/rotatable
+    #    partition (Task 11) -- the real `partition` Task 20 needs.
+    message_weights = _pressure_message_weights(weight_fit["weights"])
+    attribution_table = _attribute_burn(tails, intervals, message_weights)
+    partition = _partition_burn(attribution_table, state, config)
+
+    # 6. Per-session rate/class/trend + coordinator rollup (Task 12/13).
+    #    persist=False (Task 27b): reads accumulated rate history, never
+    #    appends this call's own samples to the store.
+    projects_dir = CLAUDE_DIR / "projects"
+    coord_map = _pressure_coordinator_map(sessions_rows, projects_dir)
+    session_table = _pressure_build_session_table(
+        attribution_table, intervals, coord_map, projects_dir, now, config, persist=False)
+
+    # 7. Blindness / cold-start confidence (Task 19). `offsets` is still
+    #    exactly the empty dict from step 2 -- persist=False guarantees it
+    #    (see docstring for why this makes blindness the honest default).
+    attribution = dict(_attribution_confidence(offsets, list(tails.keys()), now))
+    attribution["residual_fraction"] = attribution_table.residual_fraction
+
+    # 8. Assemble the pure snapshot (Task 20) -- NEVER (state, config, now)
+    #    alone; every Phase-D product above is an explicit injected input
+    #    (round-3 finding 2).
+    return _pressure_snapshot(
+        state, config, now,
+        partition=partition,
+        session_table=session_table,
+        weight_fit=weight_fit,
+        attribution=attribution,
+    )
+
+
+_REPLAY_PATCHED_GLOBALS = (
+    "STATE_JSON", "CONFIG_YAML", "SESSIONS_LOG", "CLAUDE_DIR",
+    "ACCOUNTS_DIR", "PRESSURE_JSON", "PRESSURE_ROOT",
+)
+
+
+def replay_forecast(fixture_dir) -> dict:
+    """Task 29 (spec-2 token-pressure forecaster, STAGE 1): deterministic
+    golden-file replay.
+
+    Loads a scrubbed fixture's ``state.json`` (+ ``sessions.log`` +
+    transcript jsonl under ``claude_home/projects/``) and ``config.yaml``
+    from ``fixture_dir``, runs the FULL forecaster pipeline
+    (`_pressure_compute_snapshot`, Task 21's `pressure_cmd` pipeline
+    factored out for exactly this reuse) off a FROZEN ``now`` read from the
+    fixture's ``fixture.json`` manifest (key ``"now"``, an ISO-8601
+    timestamp), and returns the resulting `pressure_state` snapshot dict.
+
+    Fixture directory layout (``fixture_dir``)::
+
+        fixture.json        -- {"now": "<ISO-8601 UTC timestamp>"}
+        state.json           -- accounts/slots (same shape load_state() reads)
+        config.yaml           -- same shape load_config() merges onto DEFAULT_CONFIG
+        sessions.log           -- _parse_sessions_log() CSV rows (optional)
+        claude_home/projects/  -- transcript jsonl tree (optional)
+
+    READ-ONLY/deterministic (G0): identical read path to ``cus pressure
+    --json``, just sourced from ``fixture_dir`` instead of the live
+    ``~/.claude`` / ``~/claude-accounts`` trees. The fixture's own state.json
+    is never mutated (`_pressure_compute_snapshot` -> `_pressure_load_state`
+    deep-copies before this function ever sees it), and `ACCOUNTS_DIR`
+    (hence `PRESSURE_ROOT`) is pointed at a path under `fixture_dir` that
+    the fixture never populates, so the weight-fit accumulated-history read
+    (Task 27b, `persist=False`) always finds nothing on disk and
+    deterministically falls back to the fixed seed weights
+    (``source="insufficient-data"``) -- the same isolation
+    `tests/test_pressure_cli.py`'s `_env()` fixture uses, done here by hand
+    (manual save/restore in a `try`/`finally`) since this function lives
+    inside cus.py itself and has no pytest `monkeypatch` fixture available.
+
+    Two `replay_forecast` calls on the same fixture are byte-identical:
+    every module-global path is restored in `finally` (no leaked state
+    between calls), `now` is the fixture's own frozen value (never wall
+    clock), and the pipeline underneath (fixed-iteration NNLS + stdlib
+    bracket-then-bisect root-find) has no other source of nondeterminism.
+    """
+    fixture_dir = Path(fixture_dir)
+    manifest = read_json(fixture_dir / "fixture.json")
+    now = datetime.fromisoformat(str(manifest["now"]).replace("Z", "+00:00"))
+
+    accounts_dir = fixture_dir / "claude-accounts"
+    patched = {
+        "STATE_JSON": fixture_dir / "state.json",
+        "CONFIG_YAML": fixture_dir / "config.yaml",
+        "SESSIONS_LOG": fixture_dir / "sessions.log",
+        "CLAUDE_DIR": fixture_dir / "claude_home",
+        "ACCOUNTS_DIR": accounts_dir,
+        "PRESSURE_JSON": accounts_dir / "pressure.json",
+        "PRESSURE_ROOT": accounts_dir / "pressure",
+    }
+    saved = {name: globals()[name] for name in _REPLAY_PATCHED_GLOBALS}
+    try:
+        for name, value in patched.items():
+            globals()[name] = value
+        config = load_config()
+        return _pressure_compute_snapshot(config, now)
+    finally:
+        for name, value in saved.items():
+            globals()[name] = value
+
+
+@cli.command(name="pressure")
+@click.option("--json", "as_json", is_flag=True, help="Emit the pressure snapshot as JSON instead of a table.")
+@click.option("--shadow-report", "shadow_report_flag", is_flag=True,
+              help="Score the shadow jsonl week against the G7 flip-gate constants "
+                   "and print the verdict (Task 27) instead of a live snapshot.")
+def pressure_cmd(as_json: bool, shadow_report_flag: bool) -> None:
+    """Token-pressure forecaster snapshot (spec-2 §3/§10.11) -- level,
+    normalized pool/per-account curves + exhaustion ETAs, binding
+    constraint, required reduction, weight-fit confidence, per-session
+    rows.
+
+    READ-ONLY, on-demand (Task 21, round-3 finding 2): this command PRINTS
+    the result of `_pressure_compute_snapshot` (the actual Phase-D pipeline
+    -- see that function's docstring for the full G0/persist=False
+    contract) and otherwise only handles CLI concerns (the shadow-report
+    short-circuit, JSON vs. table rendering).
+    """
+    config = load_config()
+    now = datetime.now(timezone.utc)
+
+    if shadow_report_flag:
+        # Task 27: score the shadow jsonl week against the G7 flip-gate
+        # constants -- entirely read-only over `_pressure_shadow_dir()`,
+        # never touches state.json/pressure.json/the live snapshot pipeline
+        # below. Short-circuits the rest of this command.
+        report = shadow_report(_pressure_shadow_dir(), config, now)
+        if as_json:
+            click.echo(json.dumps(report, indent=2, default=str))
+        else:
+            click.echo(f"verdict: {report['verdict']}")
+            if report["blocking_metrics"]:
+                click.echo(f"blocking_metrics: {', '.join(report['blocking_metrics'])}")
+            eg = report["exercise_gate"]
+            click.echo(
+                f"exercise_gate: episodes={eg['episodes']} "
+                f"reset_crossings={eg['reset_crossings']} met={eg['met']}"
+            )
+            click.echo(
+                f"elapsed_days: {report['elapsed_days']:.2f} "
+                f"days_remaining: {report['days_remaining']:.2f}"
+            )
+            for name, metric in report["per_metric"].items():
+                mark = "PASS" if metric["pass"] else "FAIL"
+                click.echo(f"  [{mark}] {name}: {metric['value']} (threshold {metric['threshold']})")
+        return
+
+    snapshot = _pressure_compute_snapshot(config, now)
+
+    if as_json:
+        click.echo(json.dumps(snapshot, indent=2, default=str))
+        return
+
+    _render_pressure_table(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Task 23 (spec-2 token-pressure forecaster, STAGE 1): the daemon's per-cycle
+# counterpart to `pressure_cmd` (Task 21) -- shadow-mode logging harness
+# (observe + log, never emit/act by default) plus the cus-side half of §4's
+# two-place emit hysteresis. Three named interfaces: `_pressure_cycle`,
+# `_pressure_emit_decision`, `_shadow_log`. Everything else below is
+# implementation support these three need but that no earlier task pins an
+# interface for (the emit-hysteresis key convention, the §4 payload builder,
+# the cross-cycle last-emit registry, the Stage-1 emit/marker choke-points,
+# and the blindness-fallback supply partition -- the USER-APPROVED safety
+# addition).
+# ---------------------------------------------------------------------------
+
+# Caller-owned, in-memory-only transcript-offset registry (Task 10's own
+# contract, applied at the daemon-process level): `_pressure_cycle` reads
+# and advances this IN PLACE via `_read_active_tails(..., persist=True)`.
+# There is no on-disk offsets store in Stage 1 -- a daemon restart is a
+# genuine cold start (blindness=True until the reader catches back up),
+# which is the correct, honest behavior (Task 19), not a bug to work around.
+_PRESSURE_TAIL_OFFSETS: dict[Path, int] = {}
+
+_PRESSURE_LEVEL_RANK = {"ok": 0, "elevated": 1, "critical": 2}
+
+
+def _pressure_supply_partition(state: dict, config: dict, now) -> "_PressureSupplyPartition":
+    """Build the blindness-fallback partition (see `_PressureSupplyPartition`
+    below) from `state`'s COARSE per-account rate fields
+    (`burn_rate_5h_pct_per_min`/`burn_rate_7d_pct_per_min` -- populated by
+    `_compute_burn_rate` at every poll, attribution-independent: no
+    transcript reads at all), converted to reference units/min via the SAME
+    pure `_pressure_acct_ratio`/`_pressure_burn_units` building blocks the
+    real attributed path uses (never a parallel ad-hoc conversion).
+
+    USER-APPROVED ADDITION (safety, carried forward from Task 19/20's own
+    review): under cold-start `attribution["blindness"]`, the real
+    per-message attributed partition (`_partition_burn`) is built from a
+    starved/absent read window and UNDERSTATES burn -- forecasting off it
+    would publish an artificially long, unsafe ETA. This coarse fallback
+    treats the account's ENTIRE observed burn as PINNED (conservative: the
+    real partition's rotatable/pinned split is exactly the information
+    blindness says we don't trust yet) -- `rotatable_burn_units` is always
+    0, so the pool math never credits this coarse burn as reducible/
+    rotatable demand, staying at least as conservative as the real
+    partition would be. `now` accepted for call-shape symmetry with the
+    rest of the Phase-D pipeline (a rate needs no timestamp of its own).
+    Read-only (G0): reads `state`, mutates nothing.
+    """
+    accounts_state = state.get("accounts", {})
+    disabled = _disabled_accounts(config)
+    pinned: dict[tuple[str, str], float] = {}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts_state.get(name, {})
+        ratio = _pressure_acct_ratio(acct_state, config)
+        for window in _PRESSURE_WINDOWS:
+            rate = acct_state.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
+            pinned[(name, window)] = _pressure_burn_units(float(rate), ratio)
+    return _PressureSupplyPartition(pinned)
+
+
+class _PressureSupplyPartition:
+    """Matches the `PartitionedTable`/`FakePartition` accessor protocol
+    (`pinned_burn_units(name, window)` / `rotatable_burn_units(name,
+    window)`, reference units/min, name-keyed per the Task-5 protocol) --
+    see `_pressure_supply_partition` above for why/how this is built.
+    """
+
+    def __init__(self, pinned: dict[tuple[str, str], float]) -> None:
+        self._pinned = pinned
+
+    def pinned_burn_units(self, name: str, window: str) -> float:
+        return self._pinned.get((name, window), 0.0)
+
+    def rotatable_burn_units(self, name: str, window: str) -> float:
+        return 0.0  # conservative: all coarse burn treated as pinned (see above)
+
+
+def _pressure_parse_binding_key(key: str) -> dict:
+    """Parse a `binding_constraint`-style emit-hysteresis `key` back into
+    its parts. `_pressure_triggers` (Task 9) already mints exactly this
+    string per trigger (`token-pressure:pool:<window>` /
+    `token-pressure:account:<name>:<window>` /
+    `token-pressure:account:<name>:fable`) -- Task 23 reuses that existing
+    convention verbatim as its own emit-hysteresis key rather than inventing
+    a second parallel scheme, mirroring `_pressure_binding_view`'s own
+    account-name parse of the same string. Read-only (G0): pure string
+    parsing, no I/O.
+    """
+    parts = key.split(":")
+    if parts[1] == "pool":
+        return {"view": "pool", "window": parts[2], "name": None, "fable": False}
+    name = parts[2]
+    tail = parts[3] if len(parts) > 3 else None
+    return {"view": "account", "window": None if tail == "fable" else tail,
+            "name": name, "fable": tail == "fable"}
+
+
+def _pressure_binding_key(binding: dict) -> str:
+    """The emit-hysteresis key string for a snapshot's `binding` block
+    (`_pressure_binding_view`'s own `{view, name, constraint, window,
+    eta_min}` shape) -- the exact INVERSE of `_pressure_parse_binding_key`.
+    """
+    if binding["view"] == "pool":
+        return f"token-pressure:pool:{binding['window']}"
+    if binding["constraint"] == "fable_weekly":
+        return f"token-pressure:account:{binding['name']}:fable"
+    return f"token-pressure:account:{binding['name']}:{binding['window']}"
+
+
+def _pressure_key_state(key: str, snapshot: dict, config: dict) -> dict:
+    """Current `{level, required_reduction, eta_min}` for one emit-
+    hysteresis `key`, read directly from the ALREADY-ASSEMBLED Task-20
+    `snapshot` -- never recomputed independently, so it always agrees with
+    what pressure.json / the statusline glyph publish for the same cycle.
+    The eta-threshold level classification mirrors `_pressure_level`'s own
+    per-trigger `is_critical` (Task 9) exactly, applied per-key rather than
+    fleet-wide; the Fable-weekly case reuses `_fable_binding` verbatim
+    (Task 18) rather than duplicating its cap/margin math.
+
+    A key with no eta AND (for the pool view) no `release_suppressed`
+    override is genuinely "ok" -- NOT currently binding at all, mirroring
+    `_pressure_trigger_is_binding`'s own binding condition (`level_bound` OR
+    `eta is not None` OR `view == "pool" and release_suppressed`) so this
+    function agrees with `_pressure_triggers`/`_pressure_level` about which
+    keys are live, including when called directly (not just for a key
+    already known-binding from `all_binding`). Read-only (G0).
+    """
+    parsed = _pressure_parse_binding_key(key)
+    critical_eta = float(config.get("pressure", {}).get("critical_eta_min", 60))
+
+    if parsed["view"] == "pool":
+        p = snapshot["pool"].get(parsed["window"], {}) or {}
+        eta = p.get("exhaustion_eta_min")
+        suppressed = bool(p.get("release_suppressed"))
+        if eta is None and not suppressed:
+            level = "ok"
+        elif eta is not None and eta < critical_eta:
+            level = "critical"
+        else:
+            level = "elevated"
+        return {"level": level,
+                "required_reduction": p.get("required_reduction_units_per_min"),
+                "eta_min": eta}
+
+    acct = snapshot["accounts"].get(parsed["name"], {}) or {}
+    if parsed["fable"]:
+        fw = acct.get("fable_weekly", {}) or {}
+        fb = _fable_binding(fw.get("pct"), config)
+        return {"level": fb["level"], "required_reduction": None, "eta_min": None}
+
+    w = acct.get(parsed["window"], {}) or {}
+    eta = w.get("pinned_eta_min")
+    if eta is None:
+        level = "ok"
+    elif eta < critical_eta:
+        level = "critical"
+    else:
+        level = "elevated"
+    return {"level": level,
+            "required_reduction": w.get("required_reduction_pct_per_min"),
+            "eta_min": eta}
+
+
+def _pressure_emit_decision(key: str, snapshot: dict, last_emit: dict | None,
+                            config: dict, now) -> tuple[bool, str]:
+    """THE cus half of §4's two-place emit hysteresis (Task 23) -- the
+    daemon's own when-to-emit decision for one binding `key` (a
+    `binding_constraint`-style string, see `_pressure_parse_binding_key`).
+    `last_emit` is this key's own prior `{level, required_reduction, ts}`
+    record, or `None`/`{}` for a never-before-seen key (treated as an
+    implicit prior level of "ok" -- so a first-ever emit is itself an
+    upward transition, not a special case).
+
+    EMIT iff (1) an UPWARD level transition (elevated/critical strictly
+    outranks the prior level), OR (2) newly-critical (current key is
+    critical, prior was not -- overlaps (1) whenever the prior level wasn't
+    already critical, by design: both are named separately in the brief and
+    checked separately here for exact traceability to §4's own two triggers),
+    OR (3) required-reduction GROWTH >25% since the last emit for this key
+    (the §4 third trigger -- catches a worsening-but-not-yet-level-crossing
+    breach, e.g. the ask jumps -8%/min -> -20%/min while staying "elevated").
+    All three BYPASS `reemit_cooldown_min` (default 20) -- a sharply
+    worsening ask must never go silent for up to 20 minutes. Otherwise EMIT
+    only once `reemit_cooldown_min` has elapsed since `last_emit["ts"]` (or
+    immediately, if no prior emit is on record for this key at all).
+
+    `level == "ok"` (nothing currently binding for this key) never emits,
+    regardless of `last_emit`. Read-only (G0): never mutates `snapshot` or
+    `last_emit`.
+    """
+    cur = _pressure_key_state(key, snapshot, config)
+    level = cur["level"]
+    if level == "ok":
+        return False, f"{key}: not currently binding (ok)"
+
+    last_emit = last_emit or {}
+    prior_level = last_emit.get("level", "ok")
+    prior_rr = last_emit.get("required_reduction")
+    required_reduction = cur["required_reduction"]
+
+    if _PRESSURE_LEVEL_RANK.get(level, 0) > _PRESSURE_LEVEL_RANK.get(prior_level, 0):
+        return True, f"{key}: upward transition {prior_level}->{level} (bypasses cooldown)"
+
+    if level == "critical" and prior_level != "critical":
+        return True, f"{key}: newly critical, was {prior_level!r} (bypasses cooldown)"
+
+    if (required_reduction is not None and prior_rr is not None and prior_rr > 0
+            and (required_reduction - prior_rr) / prior_rr > 0.25):
+        return True, (f"{key}: required_reduction grew >25% "
+                      f"({prior_rr!r} -> {required_reduction!r}) (bypasses cooldown)")
+
+    cooldown_min = float(config.get("pressure", {}).get("reemit_cooldown_min", 20))
+    last_ts = last_emit.get("ts")
+    last_dt = last_ts if isinstance(last_ts, datetime) else (
+        _pressure_parse_ts(last_ts) if last_ts else None)
+    if last_dt is None:
+        return True, f"{key}: no prior emit on record, due"
+    elapsed_min = (now - last_dt).total_seconds() / 60.0
+    if elapsed_min >= cooldown_min:
+        return True, f"{key}: cooldown elapsed ({elapsed_min:.1f}min >= {cooldown_min:.0f}min)"
+    return False, (f"{key}: same level ({level}) within cooldown "
+                   f"({elapsed_min:.1f}min < {cooldown_min:.0f}min)")
+
+
+def _pressure_build_emit_payload(key: str, snapshot: dict, cur: dict, now) -> dict:
+    """The §4 event-emission payload (sentinel design doc §4) for one
+    binding `key` admitted by `_pressure_emit_decision` -- severity + a
+    compact SELF-COMPOSED summary + a `pressure.json` detail pointer for
+    the sentineld-side corroboration re-read (§7b.2), never the raw numbers
+    standing in for a re-check on the receiving end.
+
+    `episode_id` (§6 minting/persistence) is `None`: no prior task builds
+    an episode ledger, it is not one of Task 23's three named interfaces,
+    and this is the SAME placeholder `_pressure_snapshot` (Task 20) already
+    defaults to. Read-only (G0).
+    """
+    parsed = _pressure_parse_binding_key(key)
+    if parsed["view"] == "pool":
+        dedupe_key = f"token-pressure:pool:{parsed['window']}"
+        account = None
+        constraint = parsed["window"]
+        subject = f"pool:{parsed['window']}"
+    else:
+        dedupe_key = f"token-pressure:{parsed['name']}"
+        account = parsed["name"]
+        constraint = "fable_weekly" if parsed["fable"] else parsed["window"]
+        subject = parsed["name"]
+
+    rr = cur["required_reduction"]
+    eta = cur["eta_min"]
+    if eta is not None and rr:
+        summary = (f"{cur['level']}: {subject} ({constraint}) breaches in "
+                  f"{eta / 60.0:.1f}h -- need -{rr:.3g}/min")
+    elif eta is not None:
+        summary = f"{cur['level']}: {subject} ({constraint}) breaches in {eta / 60.0:.1f}h"
+    else:
+        summary = f"{cur['level']}: {subject} ({constraint})"
+
+    return {
+        "dedupe_key": dedupe_key,
+        "severity": cur["level"],
+        "account": account,
+        "constraint": constraint,
+        "eta_min": eta,
+        "required_reduction": rr,
+        "summary": summary,
+        "detail_pointer": str(PRESSURE_JSON),
+        "episode_id": None,
+        "generated_at": now.isoformat(),
+    }
+
+
+def _sentinel_emit_socket_path() -> Path:
+    """The well-known filesystem path of sentineld's authenticated §4 emit
+    socket (Task 32, Stage 2 -- binds `SENTINEL_ROOT/run/emit.sock`). cus
+    does NOT import the `sentineld` package -- the two repos/daemons stay
+    independent, so a missing/uninstalled sentinel install must never
+    become an import-time crash here -- so this mirrors sentineld's OWN
+    `SENTINEL_ROOT` env-var resolution (`sentineld/__init__.py`: a set-but-
+    empty/whitespace-only `SENTINEL_ROOT` falls back to the same default)
+    rather than importing it, letting both sides agree on the path by
+    CONVENTION, not code sharing.
+    """
+    env_root = os.environ.get("SENTINEL_ROOT", "")
+    root = Path(env_root) if env_root.strip() else HOME / "claude-accounts" / "sentinel-runtime"
+    return root / "run" / "emit.sock"
+
+
+def _sentinel_available() -> bool:
+    """Task 28 install/ordering gate (§10.5): True iff BOTH (1) the
+    `sentinel` CLI is on PATH (`shutil.which`), AND (2) sentineld's
+    authenticated §4 emit socket (`_sentinel_emit_socket_path`) exists AND
+    accepts a connection. Normally False in Stage 1: Task 32's socket
+    server (Stage 2) is not built yet, so on a real Stage-1 box this always
+    reads as unavailable -- the correct, safe default. `_pressure_cycle`'s
+    live emit path (see there) degrades every admitted emit to log-only
+    whenever this is False, rather than crashing or silently dropping it.
+
+    Never raises: the PATH lookup, the socket-path existence check, and the
+    connect probe are ALL wrapped so ANY failure (missing binary,
+    missing/stale socket file, an unreadable/untraversable ancestor
+    directory, connection refused, permission denied, timeout, or
+    `SOCK_SEQPACKET`/`AF_UNIX` simply not being defined on this platform's
+    `socket` module) reads as "unavailable" -- an availability probe must
+    never itself break the daemon's forecasting loop (G0). Note in
+    particular that `pathlib.Path.exists()` on its own only swallows
+    ENOENT/ENOTDIR/EBADF/ELOOP -- it does NOT swallow `PermissionError` (or
+    any other `OSError`) raised when an ancestor directory isn't
+    traversable by the current user, which is why that check is wrapped
+    explicitly below rather than trusted to be exception-safe by itself.
+    """
+    if shutil.which("sentinel") is None:
+        return False
+    sock_path = _sentinel_emit_socket_path()
+    try:
+        if not sock_path.exists():
+            return False
+    except OSError:
+        return False
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    except (OSError, AttributeError):
+        return False
+    try:
+        probe.settimeout(0.25)
+        probe.connect(str(sock_path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def _pressure_degrade_to_log_only(payload: dict, reason: str) -> None:
+    """Task 28 install/ordering gate's shared degrade path -- used by BOTH
+    `_pressure_cycle` (sentinel absent/unreachable BEFORE any connection is
+    attempted) and `_pressure_emit_to_sentinel` (connection attempted but
+    failed). Logs the would-emit at WARN (stdlib `logging` -- no handler
+    configured here; Python's own last-resort handler prints WARNING+ to
+    stderr with zero setup, and a test can capture it via `caplog`) and
+    appends the SAME payload to the cus-side shadow log
+    (`_pressure_shadow_log_path`/`_shadow_log`), so a degraded live cycle
+    leaves the same calibration trail a `shadow_mode: true` cycle would.
+
+    `now` is recovered from `payload["generated_at"]`
+    (`_pressure_build_emit_payload` always sets it to the cycle's own `now`)
+    rather than accepted as a parameter, so this one function shape serves
+    both call sites regardless of what each has in local scope. Best-effort
+    (`_shadow_log`'s atomic append can itself raise `OSError` on a broken
+    filesystem) -- swallowed, matching `_pressure_load_last_emit`/
+    `_log_decision`'s tolerant style: a lost log line must never be why the
+    daemon's forecasting loop crashes.
+    """
+    logging.warning("token-pressure emit degraded to log-only (%s): %s",
+                     reason, payload.get("summary") or payload.get("dedupe_key"))
+    now = _pressure_parse_ts(payload.get("generated_at")) or datetime.now(timezone.utc)
+    record = {"ts": now.isoformat(), "would_emit": payload, "degraded_reason": reason}
+    try:
+        _shadow_log(record, now)
+    except OSError:
+        pass
+
+
+def _pressure_emit_socket(payload: dict) -> None:
+    """Task 28: the raw connect+send over sentineld's authenticated §4 emit
+    socket (`_sentinel_emit_socket_path`, Task 32's real `EmitSocket`
+    server, Stage 2). A single UNIX `SOCK_SEQPACKET` connect+send -- no
+    retry, no error handling of its own (that's `_pressure_emit_to_
+    sentinel`'s job, its only caller). Kept as its own function/choke-point
+    (the SAME name pre-Task-28 code already spied on in
+    `tests/test_pressure_shadow.py`) so a test can replace just the
+    wire-level send without also restubbing the degrade-on-error handling
+    around it. Raises `OSError` on any connect/send failure -- the caller
+    catches it.
+    """
+    sock_path = _sentinel_emit_socket_path()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+        client.settimeout(1.0)
+        client.connect(str(sock_path))
+        client.send(json.dumps(payload, default=str, separators=(",", ":")).encode())
+
+
+def _pressure_emit_to_sentinel(payload: dict, config: dict) -> bool:
+    """Task 28 cus -> socket emit CLIENT. `_pressure_cycle`'s LIVE
+    (`shadow_mode: false`) branch calls this, and only this, to hand an
+    admitted emit off to sentineld -- called ONLY after `_sentinel_
+    available()` has already read True for this cycle (the install/
+    ordering gate above). Still wraps the actual connect+send
+    (`_pressure_emit_socket`) in its OWN try/except: the availability probe
+    and this call are two SEPARATE connections, so a same-cycle TOCTOU
+    (sentineld exits/hangs between the two) is possible and must degrade
+    exactly like "never available" would have -- `_pressure_cycle` must
+    NEVER see a raised exception out of the emit path (G0: a dependency
+    going away mid-cycle must never crash the daemon's forecasting loop).
+
+    Returns True iff the send completed without an `OSError` (a delivery
+    guarantee to the local socket, NOT an ack from sentineld -- there is no
+    reply channel here); on False, `_pressure_cycle` must NOT advance the
+    live `last_emit.json` hysteresis for this key (nothing was actually
+    emitted -- advancing it on a phantom success would silently suppress a
+    legitimate re-emit once sentinel comes back). On False this function
+    has ALREADY performed the log-only degrade itself
+    (`_pressure_degrade_to_log_only`) -- the caller only needs to skip its
+    own marker/registry bookkeeping, not degrade a second time.
+
+    `config` is accepted for call-shape symmetry with the rest of the §4
+    emit path (a future auth-secret/timeout override belongs here) --
+    unused today; Task 32's HMAC shared secret is sentineld-side only.
+    Argv/payload-safe: `payload` is sent as a single JSON-encoded datagram
+    body, never interpolated into a shell command or file path (mirrors the
+    §7b.3 wrapper discipline for the socket path).
+    """
+    try:
+        _pressure_emit_socket(payload)
+        return True
+    except OSError:
+        _pressure_degrade_to_log_only(payload, "connect_error")
+        return False
+
+
+def _pressure_write_emit_marker(key: str, payload: dict, now) -> None:
+    """Stage-1 stub for the §6 advisory marker / episode-ledger write that
+    accompanies a real emit. §6 (episode_id minting, delivery/compliance
+    tracking) is explicitly out of Task 23's scope -- not one of its three
+    named interfaces, and no prior task builds an episode ledger. Kept as
+    its own choke-point (rather than inlined into `_pressure_cycle`) so a
+    future task only needs to fill this one function in, and so tests can
+    spy on it independently of the emit-socket call. No-op until then.
+    """
+
+
+def _pressure_last_emit_path() -> Path:
+    """Path of the cus-side cross-cycle last-emit hysteresis registry
+    (Task 23) -- call-time derived from `PRESSURE_ROOT` so a test
+    repointing `PRESSURE_ROOT` at a tmp tree never touches the real
+    `~/claude-accounts/pressure/`. Not one of Task 23's three named
+    interfaces, but SOME cross-cycle persistence is required for
+    `_pressure_emit_decision`'s hysteresis to mean anything across daemon
+    restarts -- `last_emit` cannot live in-process only (G0 also forbids
+    parking it in state.json; this artifact lives entirely outside it,
+    same as pressure.json).
+    """
+    return PRESSURE_ROOT / "last_emit.json"
+
+
+def _pressure_load_last_emit() -> dict:
+    """Best-effort read of the last-emit registry -- `{}` on missing/
+    corrupt (matches `_log_decision`'s tolerant style: a lost hysteresis
+    record degrades to "treat as first-ever emit for every key", never a
+    crash).
+    """
+    path = _pressure_last_emit_path()
+    try:
+        return read_json(path)
+    except (OSError, ValueError):
+        return {}
+
+
+def _pressure_save_last_emit(registry: dict) -> None:
+    """Atomic tmp+rename write of the last-emit registry (never
+    `save_state` -- this lives outside state.json entirely, G0/G1)."""
+    write_json(_pressure_last_emit_path(), registry)
+
+
+def _pressure_last_would_emit_path() -> Path:
+    """Path of the shadow-mode's OWN cross-cycle would-emit hysteresis
+    registry (Task 23 fix wave 1) -- a SEPARATE file from
+    `_pressure_last_emit_path`'s `last_emit.json`, never that file itself.
+    `last_emit.json` is read+written only by the live (`shadow_mode: false`)
+    path; in shadow-only operation (the Stage-1 default) it is NEVER
+    written, so a shadow path that consulted it directly would always see
+    an empty registry and `_pressure_emit_decision` would treat every cycle
+    as a first-ever emit -- `would_emit` firing on every cycle regardless of
+    level/cooldown/growth, defeating the whole point of the shadow log as
+    Stage-1 calibration data for the emit hysteresis. Giving shadow its own
+    registry also means flipping `shadow_mode` off later never inherits
+    (or corrupts) whatever hysteresis state the shadow path had accumulated
+    -- the live path starts its own `last_emit.json` clean, exactly as
+    today.
+    """
+    return PRESSURE_ROOT / "last_would_emit.json"
+
+
+def _pressure_load_last_would_emit() -> dict:
+    """Best-effort read of the shadow would-emit registry -- `{}` on
+    missing/corrupt, mirroring `_pressure_load_last_emit`'s tolerant style
+    exactly (a lost hysteresis record degrades to "treat as first-ever
+    would-emit for every key", never a crash)."""
+    path = _pressure_last_would_emit_path()
+    try:
+        return read_json(path)
+    except (OSError, ValueError):
+        return {}
+
+
+def _pressure_save_last_would_emit(registry: dict) -> None:
+    """Atomic tmp+rename write of the shadow would-emit registry (mirrors
+    `_pressure_save_last_emit`'s mechanism exactly, via the same
+    `write_json` atomic tmp+rename helper; never `save_state` -- this lives
+    outside state.json entirely, G0/G1)."""
+    write_json(_pressure_last_would_emit_path(), registry)
+
+
+def _pressure_shadow_dir() -> Path:
+    return PRESSURE_ROOT / "shadow"
+
+
+def _pressure_shadow_log_path(now) -> Path:
+    """Path of today's shadow-log file (Task 23) -- one JSONL file per UTC
+    calendar day, dated from `now` (the SAME `now` the cycle computed its
+    snapshot at -- never a freshly-sampled wall-clock time)."""
+    return _pressure_shadow_dir() / f"{now:%Y-%m-%d}.jsonl"
+
+
+def _shadow_log(record: dict, now) -> None:
+    """Atomic per-day JSONL append (Task 23) --
+    ``~/claude-accounts/pressure/shadow/<YYYY-MM-DD>.jsonl``, one line per
+    cycle. This is the STAGE-1 calibration data source, so the write uses
+    `os.open(O_APPEND) + fcntl.flock(LOCK_EX)` around the single-line write
+    (the same flock idiom `_swap_lock` uses elsewhere in this file) rather
+    than `_log_decision`'s bare best-effort `open("a")` -- the lock
+    additionally serializes a concurrent reader that wants a consistent
+    whole-file snapshot (e.g. the future calibration read), on top of
+    POSIX's own atomic-single-`write()`-under-PIPE_BUF guarantee. Read-only
+    over `record` (G0): builds the line, mutates nothing.
+    """
+    path = _pressure_shadow_log_path(now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, default=str, separators=(",", ":")) + "\n"
+    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _pressure_shadow_reset_models(state: dict, snapshot: dict, config: dict, now) -> dict:
+    """Both post-reset models' per-account/window forecast, for the shadow
+    record's `reset_models` block (Task 26 -- fills Task 23's own
+    `rolling_integral: None` placeholder; `decayed_step` was already
+    populate-able there, Task 4). Returns
+    `{"decayed_step": {name: {window: {...}}}, "rolling_integral": {...}}`.
+
+    Neither call here is reachable from the live (`shadow_mode: false`)
+    path: `_pressure_snapshot`'s own curve calls (`_pinned_account_eta`/
+    `_required_reduction_pinned`/`_account_knots`) never pass `model=`, so
+    the published ETAs/level/emit decision are unaffected regardless of
+    what this function computes (Part 3, G5 -- shadow never gates).
+
+    `pinned_burn_units` is NOT re-derived from a `partition` object --
+    `_pressure_build_shadow_record`'s own signature (an existing Task-23
+    caller depends on it) carries no `partition`, only `state`/`snapshot`/
+    `config`/`now` -- it is RECOVERED from the snapshot's own already-
+    published `accounts.<name>.<window>.burn_pct_per_min` by inverting Task
+    20's own `burn_pct_per_min = pinned_units*100/ratio` with the SAME
+    `_pressure_acct_ratio`, so the reconstructed value is the real Task-11
+    pinned burn the live snapshot used (mod float round-trip), not a fresh
+    approximation.
+
+    Per model: `eta_min` is that model's own first-crossing-to-zero
+    (`_first_crossing_eta` over `_pressure_reset_model_knots`'s model-aware
+    knot set) and `remaining_at_plus_60` is that model's curve evaluated at
+    `config.pressure.critical_eta_min` (default 60) minutes ahead -- the
+    same lead Task 9's own critical-level classification uses. Read-only
+    (G0): reads `state`/`snapshot`/`config`, mutates nothing.
+    """
+    horizon = _pressure_trigger_horizon(config)
+    lead = float(config.get("pressure", {}).get("critical_eta_min", 60))
+    accounts_state = state.get("accounts", {})
+    disabled = _disabled_accounts(config)
+    snap_accounts = snapshot.get("accounts", {})
+    out: dict = {"decayed_step": {}, "rolling_integral": {}}
+    for a in config.get("accounts", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in disabled:
+            continue
+        acct_state = accounts_state.get(name, {})
+        ratio = _pressure_acct_ratio(acct_state, config)
+        snap_entry = snap_accounts.get(name, {}) or {}
+        for model in ("decayed_step", "rolling_integral"):
+            out[model][name] = {}
+        for window in _PRESSURE_WINDOWS:
+            win_snap = snap_entry.get(window, {}) or {}
+            burn_pct_per_min = float(win_snap.get("burn_pct_per_min", 0.0) or 0.0)
+            pinned_units = (burn_pct_per_min * ratio / 100.0 if ratio
+                           else burn_pct_per_min / 100.0)
+            for model in ("decayed_step", "rolling_integral"):
+                curve = _pressure_remaining_curve(
+                    acct_state, window, config, now, pinned_units,
+                    horizon=horizon, model=model)
+                knots = _pressure_reset_model_knots(
+                    acct_state, window, config, now, pinned_units,
+                    horizon=horizon, model=model)
+                eta = _first_crossing_eta(curve, 0.0, knots, config, now)
+                out[model][name][window] = {
+                    "eta_min": eta,
+                    "remaining_at_plus_60": curve(lead),
+                }
+    return out
+
+
+def _pressure_shadow_actual_remaining(snapshot: dict) -> dict:
+    """Current actual per-account/window remaining units (Task 26, G0),
+    read directly from the snapshot's own already-computed `accounts` block
+    (Task 20's pure `_pressure_remaining_units` result -- never
+    recomputed), so the Task 30 backtest can temporally-join a cycle-N
+    model prediction of `remaining_at_plus_60` to the cycle-~N+60min ACTUAL
+    reading logged here. This function only reads `snapshot`; the temporal
+    join itself is Task 30's job, out of scope here."""
+    out: dict = {}
+    for name, entry in snapshot.get("accounts", {}).items():
+        out[name] = {
+            window: (entry.get(window, {}) or {}).get("remaining_units")
+            for window in _PRESSURE_WINDOWS
+        }
+    return out
+
+
+_PRESSURE_ELASTIC_CLASSES = ("workflow", "committee-loop", "subagent-heavy")
+"""The classes §5.2 allows as targeting candidates -- "Never interactive
+human-paced sessions" (and never `idle`, which has nothing to shed)."""
+
+_PRESSURE_DEFAULT_ELASTICITY_WEIGHTS = {
+    "subagent-heavy": 1.0,
+    "workflow": 0.9,
+    "committee-loop": 0.8,
+}
+"""Default per-class elasticity weights (Task 24) -- not pinned by the
+design doc; a documented, defensible, config-overridable default
+(`config.pressure.elasticity_weights`) ranking `subagent-heavy` work (most
+throttleable -- a coordinator can simply run fewer/cheaper subagents)
+above generic `workflow` above `committee-loop` (most disruptive to
+interrupt mid-round). Same "documented, defensible choice" precedent as
+Task 12's `_CLASSIFY_HIGH_RATE_PCT_PER_MIN`."""
+
+
+def _pressure_elasticity_weight(cls: str, config: dict) -> float:
+    """Per-class elasticity weight used to rank candidates (§5.2: "Rank by
+    contribution x elasticity_weight descending")."""
+    weights = (config or {}).get("pressure", {}).get(
+        "elasticity_weights", _PRESSURE_DEFAULT_ELASTICITY_WEIGHTS
+    )
+    return float(weights.get(cls, _PRESSURE_DEFAULT_ELASTICITY_WEIGHTS.get(cls, 0.0)))
+
+
+def _pressure_session_contribution(
+    session: dict, binding: dict, accounts_block: dict, reference_x: float
+) -> float:
+    """A session's §5.3 "contribution" to the bound breach, in the bound
+    view's own natural unit -- the SAME quantity used for both the §5.2
+    floor/rank test and the §5.3 sizing walk (Task 24 design decision: one
+    unified quantity, not a separate share-for-filtering vs
+    contribution-for-sizing pair).
+
+    - ``view == "account"``: the session's own %/min rate scaled by its
+      share of burn ON that one bound account
+      (``rate * account_shares[bound_acct]``) -- directly comparable to the
+      account's own ``required_reduction_pct_per_min`` (same %/min unit).
+    - ``view == "pool"``: the ROTATABLE share only, summed over EVERY
+      account the session rotated across (FACT #5) --
+      ``Σ_acct (rate * account_shares[acct] / 100) * capacity_x_acct /
+      reference_x``, i.e. each account's %/min contribution converted to
+      reference units/min via the exact same `_pressure_burn_units`
+      ratio-normalization Task 2 already established, then summed.
+    """
+    rate = float(session.get("rate") or 0.0)
+    shares = session.get("account_shares") or {}
+    view = binding.get("view")
+    if view == "account":
+        bound_acct = binding.get("name")
+        return rate * float(shares.get(bound_acct, 0.0))
+    if view == "pool":
+        total = 0.0
+        for acct_name, share in shares.items():
+            acct = accounts_block.get(acct_name) or {}
+            capacity_x = acct.get("capacity_x")
+            if capacity_x is None:
+                continue
+            ratio = float(capacity_x) / float(reference_x) if reference_x else 0.0
+            share_pct_per_min = rate * float(share)
+            total += _pressure_burn_units(share_pct_per_min, ratio)
+        return total
+    return 0.0
+
+
+def _pressure_session_share_pct_per_min(session: dict) -> float:
+    """A session's total PERCENT-scale burn-share rate -- ``Σ_acct (rate *
+    account_shares[acct])`` summed over EVERY account it rotated across --
+    independent of the binding view. This is the §5.2 CANDIDACY-FLOOR
+    quantity (``share_pct_per_min >= share_floor_pct``), always %-scale
+    regardless of whether the binding is account- or pool-bound.
+
+    Deliberately NOT the same quantity as `_pressure_session_contribution`
+    (§5.3 SIZING): for a pool view, that function reference-x normalizes
+    each account's term (``.../100 * capacity_x/reference_x``), which is
+    routinely 12-100x SMALLER than this %-scale sum. Follow-up 1 (Important
+    bug fix): comparing that reference-unit ``contribution`` against the
+    %-scale ``share_floor_pct`` (the pre-fix code) silently degenerated the
+    §5.2 OR-filter to "only rising sessions qualify" for pool bindings,
+    pushing genuinely-meetable pool breaches toward avoidable
+    ``escalate=True``. For an account view, ``share_pct_per_min`` and the
+    bound-account slice of `_pressure_session_contribution` coincide
+    whenever the session's entire share is on the bound account (the common
+    case) -- the account-view floor was already %-scale and is unaffected
+    by this fix.
+    """
+    rate = float(session.get("rate") or 0.0)
+    shares = session.get("account_shares") or {}
+    return sum(rate * float(share) for share in shares.values())
+
+
+def _pressure_dry_run_candidates(
+    sessions: list[dict], binding: dict, accounts_block: dict, reference_x: float, config: dict,
+    floor: float | None = None,
+) -> list[dict]:
+    """§5.2 candidate filter + contribution/rank annotation, sorted
+    descending by ``contribution * elasticity_weight`` with the
+    deterministic near-tie break: higher raw pool-unit/`%`-per-min
+    ``contribution`` first, then ``session_id`` lexical (NO LLM, no
+    randomness, no dict/set-iteration dependence -- both tie-break keys are
+    plain value comparisons over a list already sorted by `session_id` on
+    input, so ties resolve identically across repeated calls).
+
+    Filter (§5.2): class in {workflow, committee-loop, subagent-heavy} AND
+    (share_pct_per_min >= share_floor_pct OR trend == "rising"). NEVER
+    `interactive`, never `idle` -- the class gate always applies first,
+    regardless of ``floor``. The floor gates on the %-scale
+    `_pressure_session_share_pct_per_min` (Follow-up 1 fix) -- NOT on the
+    reference-unit `contribution`, which remains the §5.3 ranking/sizing
+    quantity below, unchanged.
+
+    ``floor``, when given, OVERRIDES ``config.pressure.share_floor_pct`` for
+    this one call (Task 25): `dry_run_target` passes ``floor=0.0`` for a
+    `level == "critical"` breach so this returns the FULL class-gated
+    elastic pool (every session admitted regardless of its %-share, since
+    `share_pct_per_min` is never negative) each annotated with its own
+    `share_pct_per_min` -- the pool the critical descent then re-filters at
+    each successively lower step (`_pressure_filter_candidates_by_floor`)
+    without ever re-deriving anything from the raw `sessions` again.
+    ``floor=None`` (every other caller) keeps today's behavior: filter at
+    the single configured `share_floor_pct`.
+    """
+    share_floor_pct = float(
+        floor if floor is not None
+        else (config or {}).get("pressure", {}).get("share_floor_pct", 15.0)
+    )
+    out = []
+    for session in sorted(sessions, key=lambda s: s.get("session_id", "")):
+        cls = session.get("class")
+        if cls not in _PRESSURE_ELASTIC_CLASSES:
+            continue
+        contribution = _pressure_session_contribution(
+            session, binding, accounts_block, reference_x
+        )
+        share_pct_per_min = _pressure_session_share_pct_per_min(session)
+        trend = session.get("trend")
+        if share_pct_per_min < share_floor_pct and trend != "rising":
+            continue
+        elasticity_weight = _pressure_elasticity_weight(cls, config)
+        out.append(
+            {
+                "session_id": session.get("session_id"),
+                "class": cls,
+                "trend": trend,
+                "contribution": contribution,
+                "elasticity_weight": elasticity_weight,
+                "share_pct_per_min": share_pct_per_min,
+            }
+        )
+    return _pressure_rank_candidates(out)
+
+
+def _pressure_rank_candidates(candidates: list[dict]) -> list[dict]:
+    """Deterministic §5.2 rank order, applied defensively regardless of
+    input order: ``contribution * elasticity_weight`` descending, near-tie
+    break by higher raw ``contribution`` then ``session_id`` lexical (NO
+    LLM, no randomness) -- shared by `_size_reduction_walk` here and by
+    Task 25's per-floor-step re-filter/re-rank passes."""
+    return sorted(
+        candidates,
+        key=lambda c: (
+            -(c["contribution"] * c["elasticity_weight"]),
+            -c["contribution"],
+            c["session_id"],
+        ),
+    )
+
+
+def _pressure_filter_candidates_by_floor(candidates: list[dict], floor: float) -> list[dict]:
+    """Task 25: re-apply the §5.2 OR-filter (``share_pct_per_min >= floor OR
+    trend == "rising"``) to an ALREADY-ANNOTATED candidate pool at one
+    descent step's ``floor`` -- the companion to `_pressure_dry_run_candidates`'s
+    own filter, but operating on each candidate's pre-computed
+    `share_pct_per_min` (added to that function's output for exactly this
+    purpose) rather than re-deriving anything from raw session dicts. The
+    critical descent in `_size_reduction_walk` calls this once per step
+    against the SAME full pool (built once, at the lowest floor ever used,
+    by `dry_run_target`) -- a session excluded at a higher floor is still in
+    that pool and becomes eligible the instant a lower step's threshold
+    admits it.
+    """
+    return [
+        c for c in candidates
+        if c["share_pct_per_min"] >= floor or c.get("trend") == "rising"
+    ]
+
+
+def _size_reduction_walk_pass(
+    candidates: list[dict], required: float, safety_factor: float, floor: float
+) -> dict:
+    """The base single-floor §5.3 sizing walk (Task 24) -- rank
+    ``candidates`` deterministically (`_pressure_rank_candidates`, applied
+    regardless of input order) and walk them in that order, accumulating
+    ``contribution``, STOPPING the instant ``planned_shed >= required *
+    safety_factor`` (§5.3's own stopping rule). ``floor`` is recorded on
+    the plan so Task 25's critical descent can report which floor step a
+    pass ran at, but this base pass does not itself re-filter candidates by
+    floor -- that filtering already happened in `_pressure_dry_run_candidates`
+    (or, for a per-floor-step re-filter, whatever Task 25 hands in).
+
+    Returns the raw walk result (`targets`/`planned_shed`/`met`), never the
+    escalate/reason framing -- that is `_size_reduction_walk`'s job, so
+    Task 25 can re-run this same pass at successive floor steps without
+    duplicating the escalate decision.
+    """
+    threshold = required * safety_factor
+    targets: list[dict] = []
+    planned_shed = 0.0
+    for candidate in _pressure_rank_candidates(candidates):
+        if planned_shed >= threshold:
+            break
+        targets.append(candidate)
+        planned_shed += candidate["contribution"]
+    return {
+        "targets": targets,
+        "planned_shed": planned_shed,
+        "met": planned_shed >= threshold,
+        "floor": floor,
+    }
+
+
+def _size_reduction_walk(
+    candidates: list[dict], required: float, safety_factor: float, config: dict,
+    level: str = "elevated",
+) -> dict:
+    """Task 24's base single-floor sizing walk, extended by Task 25 with the
+    critical `[15,10,5,2.5]` descent per finding 12 (`_size_reduction_walk_pass`
+    above is factored out so this extension re-runs the pass at successive
+    floors without a rewrite).
+
+    ``level == "elevated"`` (the default -- unchanged Task 24 behavior):
+    ``candidates`` must already be filtered/ranked (§5.2) at the base
+    `share_floor_pct` -- this branch only performs the §5.3
+    accumulate-and-stop walk plus the §5.4 met/escalate framing. NEVER
+    descends, even if a deeper floor would meet.
+
+    ``level == "critical"``: ``candidates`` must instead be the FULL
+    class-gated elastic pool, each annotated with `share_pct_per_min`
+    (`_pressure_dry_run_candidates(..., floor=0.0)` -- see `dry_run_target`).
+    Descends `config.pressure.critical_share_floor_steps` (default
+    `[15, 10, 5, 2.5]`), RE-FILTERING that SAME pool at each step
+    (`_pressure_filter_candidates_by_floor`) and re-running the §5.3 walk,
+    STOPPING the instant a step meets -- so a session excluded at 15% but
+    with `share_pct_per_min >= 5` becomes eligible the moment the descent
+    reaches 5%, without ever re-deriving anything from raw sessions. The
+    floor actually used is recorded on the plan (`floor`). Stateless/
+    per-episode: every call starts fresh at the first step (15) -- there is
+    no module/global ratchet, so two sequential episodes each redo the full
+    descent from scratch.
+
+    Both branches: meetable -> ``met=True, escalate=False``. Unmeetable
+    (candidates exhausted before reaching the threshold at the last floor
+    tried -- `share_floor_pct` for elevated, `share_floor_min_pct` for a
+    fully-descended critical -- or an empty candidate set on a real
+    ``required > 0``): ``met=False, escalate=True`` with a non-empty
+    ``reason`` -- never a vacuous empty plan that silently "clears" a real
+    breach (§5.4).
+    """
+    pressure_cfg = (config or {}).get("pressure", {})
+    share_floor_pct = float(pressure_cfg.get("share_floor_pct", 15.0))
+    threshold = required * safety_factor
+
+    if level == "critical":
+        steps = [
+            float(step)
+            for step in pressure_cfg.get(
+                "critical_share_floor_steps", [15.0, 10.0, 5.0, 2.5]
+            )
+        ]
+        share_floor_min_pct = float(pressure_cfg.get("share_floor_min_pct", 2.5))
+        floor = share_floor_pct
+        result = _size_reduction_walk_pass([], required, safety_factor, floor)
+        for floor in steps:
+            filtered = _pressure_filter_candidates_by_floor(candidates, floor)
+            result = _size_reduction_walk_pass(filtered, required, safety_factor, floor)
+            if result["met"]:
+                return {
+                    "targets": result["targets"],
+                    "planned_shed": result["planned_shed"],
+                    "met": True,
+                    "escalate": False,
+                    "reason": None,
+                    "floor": floor,
+                }
+        reason = (
+            f"unmeetable even at floor={floor:.4g}% (min {share_floor_min_pct:.4g}%): "
+            f"{len(result['targets'])} elastic candidate(s) shed "
+            f"{result['planned_shed']:.4g} of required {threshold:.4g} "
+            f"(required={required:.4g} x safety_factor={safety_factor:.4g})"
+        )
+        return {
+            "targets": result["targets"],
+            "planned_shed": result["planned_shed"],
+            "met": False,
+            "escalate": True,
+            "reason": reason,
+            "floor": floor,
+        }
+
+    result = _size_reduction_walk_pass(candidates, required, safety_factor, share_floor_pct)
+    if result["met"]:
+        return {
+            "targets": result["targets"],
+            "planned_shed": result["planned_shed"],
+            "met": True,
+            "escalate": False,
+            "reason": None,
+            "floor": share_floor_pct,
+        }
+    reason = (
+        f"unmeetable: {len(candidates)} elastic candidate(s) shed "
+        f"{result['planned_shed']:.4g} of required {threshold:.4g} "
+        f"(required={required:.4g} x safety_factor={safety_factor:.4g})"
+    )
+    return {
+        "targets": result["targets"],
+        "planned_shed": result["planned_shed"],
+        "met": False,
+        "escalate": True,
+        "reason": reason,
+        "floor": share_floor_pct,
+    }
+
+
+def dry_run_target(pressure_state: dict, config: dict) -> dict:
+    """Task 24: the zero-token, fully deterministic "would-have-asked"
+    targeting plan (design doc §5.2 candidate walk + §5.3 sizing bridge),
+    consuming an already-published Task-20 `_pressure_snapshot`-shaped
+    dict. Read-only/pure (G0): never calls `save_state`, never mutates
+    `pressure_state` in place.
+
+    No breach (``binding is None``) is trivially met -- there is nothing to
+    target, which is NOT the §5.4 vacuous-clear case (that case is a REAL
+    breach with an empty/insufficient candidate set, handled below via
+    `_size_reduction_walk`'s own escalate path).
+
+    A level-bound Fable-weekly critical (design doc §3 Outputs) IS a real
+    breach, but §5.4 says it "skips §5.2/§5.3 sizing" for a qualitative
+    Fable->Sonnet downshift ask a later task builds -- NOT built here, so
+    this always escalates rather than defaulting `required` to 0 and
+    vacuously clearing a real breach.
+
+    Task 25: for a ``level == "critical"`` breach, the candidate pool is
+    built with ``floor=0.0`` -- the FULL class-gated elastic pool (every
+    session admitted regardless of %-share, since `share_pct_per_min` is
+    never negative), each annotated with its own `share_pct_per_min` -- so
+    `_size_reduction_walk`'s critical descent can re-filter that SAME pool
+    at each successively lower `critical_share_floor_steps` step without
+    ever re-deriving anything from `pressure_state["sessions"]` again (a
+    session excluded at 15% but with `share_pct_per_min >= 5` becomes
+    eligible once the descent reaches 5%). Any other level (``"elevated"``
+    or unset/malformed, fail-closed to the non-descending base floor) keeps
+    the single-floor pool `_pressure_dry_run_candidates` has always built.
+    """
+    safety_factor = float(pressure_state.get("safety_factor", 1.0))
+    binding = pressure_state.get("binding")
+    if binding is None:
+        return {
+            "targets": [],
+            "planned_shed": 0.0,
+            "required": 0.0,
+            "safety_factor": safety_factor,
+            "met": True,
+            "escalate": False,
+            "reason": None,
+        }
+
+    if binding.get("constraint") == "fable_weekly":
+        return {
+            "targets": [],
+            "planned_shed": 0.0,
+            "required": 0.0,
+            "safety_factor": safety_factor,
+            "met": False,
+            "escalate": True,
+            "reason": (
+                "fable_weekly level-bound critical: §5.4 skips §5.2/§5.3 "
+                "sizing for a qualitative Fable->Sonnet downshift ask "
+                "(not built) -- escalating rather than vacuously clearing"
+            ),
+        }
+
+    accounts_block = pressure_state.get("accounts", {})
+    reference_x = float(pressure_state.get("reference_x", 1.0))
+    view = binding.get("view")
+    window = binding.get("window")
+    if view == "account":
+        acct = accounts_block.get(binding.get("name"), {})
+        required = float(
+            acct.get(window, {}).get("required_reduction_pct_per_min", 0.0)
+        )
+    elif view == "pool":
+        pool_block = pressure_state.get("pool", {})
+        required = float(
+            pool_block.get(window, {}).get("required_reduction_units_per_min", 0.0)
+        )
+    else:
+        required = 0.0
+
+    level = pressure_state.get("level")
+    pool_floor = 0.0 if level == "critical" else None
+    candidates = _pressure_dry_run_candidates(
+        pressure_state.get("sessions", []), binding, accounts_block, reference_x, config,
+        floor=pool_floor,
+    )
+    walk = _size_reduction_walk(
+        candidates, required, safety_factor, config, level=level or "elevated"
+    )
+    return {
+        "targets": walk["targets"],
+        "planned_shed": walk["planned_shed"],
+        "required": required,
+        "safety_factor": safety_factor,
+        "met": walk["met"],
+        "escalate": walk["escalate"],
+        "reason": walk["reason"],
+    }
+
+
+def _pressure_build_shadow_record(state: dict, snapshot: dict, config: dict, now) -> dict:
+    """The shadow-log record for one cycle (Task 23) -- the STAGE-1 data
+    source the eventual calibration reads.
+
+    `would_emit` reflects the SAME `_pressure_emit_decision` hysteresis the
+    live (`shadow_mode: false`) path consults, scoped to the snapshot's
+    single most-severe `binding` (Task 9 `_pressure_binding`) -- the
+    daemon's own headline decision for this cycle. It reads+writes its OWN
+    on-disk `last_would_emit.json` registry (fix wave 1,
+    `_pressure_last_would_emit_path`) -- a file SEPARATE from the live
+    path's `last_emit.json`, NEVER that file itself, and NEVER written by
+    any other path. Consulting the live registry left it permanently empty
+    in shadow-only operation (the Stage-1 default writes it from nowhere
+    else), so `_pressure_emit_decision` always saw a first-ever-emit prior
+    and `would_emit` fired on every cycle -- never demonstrating the
+    cooldown/growth-gated suppression this shadow log exists to calibrate.
+    Giving shadow its own registry, updated on every cycle `would_emit`
+    fires (exactly as the live path updates `last_emit`), reproduces the
+    real cadence: fires on the first cycle of a bound condition, suppressed
+    on a sustained same-level within-cooldown no-growth cycle, and re-fires
+    on an upward transition or >25% required-reduction growth. The live
+    path's own `last_emit.json` is untouched either way -- shadow mode still
+    leaves no trace that would perturb the live path's hysteresis the
+    moment `shadow_mode` is flipped off.
+
+    `would_ask`/`would_target` are wired to Task 24's `dry_run_target`
+    (Follow-up 1, Part 2): whenever there IS a binding/breach, `would_ask`
+    is the full plan `dry_run_target(snapshot, config)` returns (targets,
+    planned_shed, required, safety_factor, met, escalate, reason) and
+    `would_target` is that plan's own `targets` list -- the "would-have-
+    asked" data Task 27's calibration reads. `dry_run_target` consumes an
+    already-published Task-20 `_pressure_snapshot`-shaped dict (the exact
+    shape `snapshot` already is here), so no adaptation is needed. This is
+    independent of `would_emit`'s hysteresis-gated admit decision above --
+    the plan is computed whenever a breach exists, not only on a cycle that
+    would actually emit, since the shadow log's whole purpose is recording
+    what WOULD have been asked every cycle. When there is no breach
+    (`binding is None`, `level == "ok"`), `would_ask`/`would_target` stay
+    `None`/`[]` -- `dry_run_target`'s own `binding is None` branch returns a
+    "trivially met" dict, which is a different thing from "there was no ask
+    to log", so it is deliberately never called in that case. Read-only
+    w.r.t. `state`/`config`/`snapshot` and the live `last_emit.json` (G0);
+    the only mutation is the shadow-owned `last_would_emit.json` registry, a
+    pressure-owned store outside state.json entirely, same as
+    `last_emit.json` itself.
+
+    `reset_models` (Task 26) is `_pressure_shadow_reset_models`'s per-
+    account/window `{"decayed_step": {...}, "rolling_integral": {...}}` --
+    each model's own `eta_min`/`remaining_at_plus_60` forecast, LOG-ONLY
+    (never gates; the live path stays on `decayed_step` regardless, Part
+    3). `reset_models_actual` is the SAME accounts' CURRENT actual
+    remaining (`_pressure_shadow_actual_remaining`, straight off `snapshot`)
+    so the Task 30 backtest can temporally-join a cycle-N prediction to the
+    cycle-~N+60min actual.
+    """
+    binding = snapshot.get("binding")
+    would_emit = None
+    would_ask = None
+    would_target: list = []
+    if binding is not None:
+        key = _pressure_binding_key(binding)
+        registry = _pressure_load_last_would_emit()
+        prior = registry.get(key)
+        admit, _reason = _pressure_emit_decision(key, snapshot, prior, config, now)
+        if admit:
+            cur = _pressure_key_state(key, snapshot, config)
+            would_emit = _pressure_build_emit_payload(key, snapshot, cur, now)
+            registry[key] = {
+                "level": cur["level"],
+                "required_reduction": cur["required_reduction"],
+                "ts": now.isoformat(),
+            }
+            _pressure_save_last_would_emit(registry)
+
+        would_ask = dry_run_target(snapshot, config)
+        would_target = would_ask["targets"]
+
+    return {
+        "ts": now.isoformat(),
+        "level": snapshot["level"],
+        "binding": binding,
+        "would_emit": would_emit,
+        "would_ask": would_ask,
+        "would_target": would_target,
+        "pool": snapshot["pool"],
+        "per_account": snapshot["accounts"],
+        "reset_models": _pressure_shadow_reset_models(state, snapshot, config, now),
+        "reset_models_actual": _pressure_shadow_actual_remaining(snapshot),
+        "weight_fit": snapshot["weight_fit"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 27b (spec-2 token-pressure forecaster, STAGE 1): persisted cross-cycle
+# rolling-history accumulator. Closes a real gap Tasks 14/16 (weight-fit) and
+# 12 (trend) left open: `pressure_cmd`/`_pressure_cycle` have ALWAYS called
+# `_build_weight_windows([], [], [])` literally (Task 21/23's own call --
+# neither task's brief pinned a real producer, see their reports) and
+# `_pressure_build_session_table` has ALWAYS fed `_trend_class` a single-
+# sample history, so `fit_burn_weights` could never see >=
+# `weight_refit.min_windows` (200) real windows (source stuck at
+# "insufficient-data"/seeds forever) and `_trend_class` could never see more
+# than one point (stuck at its own conservative `len < 3` -> "steady"
+# default forever). Two pressure-owned rolling stores under `PRESSURE_ROOT`
+# (NEVER state.json/`save_state`, G0) close this:
+#
+#   1. weight_windows.jsonl -- one row per (account) window observation per
+#      daemon cycle, reconstructable into `_build_weight_windows`'s own
+#      `(pct_history, token_totals_per_window)` inputs. A companion
+#      weight_window_resets.jsonl carries detected reset-crossing rows (its
+#      `resets` input), and a tiny weight_window_cursor.json pointer (last
+#      poll's pct/ts/resets_at per account) is what makes computing a Δpct
+#      window and detecting a crossing possible in the first place -- NOT
+#      itself a rolling history (O(#accounts), never grows unboundedly).
+#      Row growth bounded to `_PRESSURE_WEIGHT_WINDOW_MAX_ROWS` (3000): at a
+#      live ~5 min daemon cadence this is comfortably more than a week even
+#      for several accounts, always >= `weight_refit.min_windows` (200) with
+#      generous headroom for Task 14's own reset-crossing/zero-token/
+#      nonpositive-b exclusions.
+#   2. session_rate_history.jsonl -- one row per (session_id, rate, ts)
+#      sample per daemon cycle, so `_trend_class` sees a real trailing
+#      series instead of one point. Bounded by AGE
+#      (`_PRESSURE_RATE_HISTORY_MAX_AGE_MIN`, 2h, plus a flat row-count
+#      backstop) -- a session with no fresh samples (ended/gone quiet) ages
+#      entirely out of its own trailing window, which is also how a dead
+#      session's history is evicted (no separate liveness check needed).
+#
+# PERSIST GATING mirrors `_read_active_tails(..., persist=...)`'s own
+# contract exactly (Task 10): the daemon cycle (`_pressure_cycle`,
+# persist=True) computes + APPENDS this cycle's own new observations before
+# reading; the on-demand CLI (`pressure_cmd`, persist=False) READS the
+# accumulated stores AS THEY STAND, never appends -- so the CLI benefits
+# from the daemon's accumulated history without ever racing the daemon over
+# the same on-disk store (same G0/§3 rationale Task 10/21 already
+# established for the transcript-offset registry, now applied here too).
+#
+# ATOMICITY: every store is tmp+rename (`atomic_write_bytes`/`write_json`,
+# the SAME mechanism `_pressure_write_json`/`_pressure_save_last_emit`
+# already use), and a JSONL store's read-modify-write append is additionally
+# guarded by a companion `<path>.lock` file's `fcntl.flock` -- a SEPARATE
+# lock file, never the data file itself (flock is tied to an inode, and
+# `os.replace` swaps inodes at rename time, so flock-ing the data file
+# directly would stop protecting the NEW file the instant the rename
+# lands). A reader therefore always sees either the complete prior content
+# or the complete new content, never a torn write -- "a malformed/partial
+# line" can only ever be pre-existing/injected corruption, never a torn
+# append; the tolerant per-line JSONL reader (mirrors `_pressure_shadow_
+# scan`'s own convention exactly) skips such a line without losing any
+# OTHER, already-valid row.
+# ---------------------------------------------------------------------------
+
+_PRESSURE_WEIGHT_WINDOW_MAX_ROWS = 3000
+_PRESSURE_WEIGHT_RESET_MAX_ROWS = 500
+_PRESSURE_RATE_HISTORY_MAX_AGE_MIN = 120.0  # ~2h trailing window per session
+_PRESSURE_RATE_HISTORY_MAX_ROWS = 20000  # hard backstop alongside the age prune
+
+_PRESSURE_RAW_TOKEN_COLUMNS = ("input", "output", "cache_read", "cache_create_5m", "cache_create_1h")
+
+
+def _pressure_weight_window_path() -> Path:
+    """Call-time (not import-time) `PRESSURE_ROOT`-derived path, same
+    convention as `_pressure_last_emit_path` -- a test repointing
+    `cus.PRESSURE_ROOT` at a tmp tree never touches the real store."""
+    return PRESSURE_ROOT / "weight_windows.jsonl"
+
+
+def _pressure_weight_reset_path() -> Path:
+    return PRESSURE_ROOT / "weight_window_resets.jsonl"
+
+
+def _pressure_weight_window_cursor_path() -> Path:
+    return PRESSURE_ROOT / "weight_window_cursor.json"
+
+
+def _pressure_rate_history_path() -> Path:
+    return PRESSURE_ROOT / "session_rate_history.jsonl"
+
+
+def _pressure_read_jsonl(path: Path) -> list[dict]:
+    """Best-effort tolerant JSONL read (Task 27b; mirrors `_pressure_shadow_
+    scan`'s own convention exactly): a missing file yields `[]` (never
+    raises -- the store may not have been written yet), and a malformed/
+    non-dict line is skipped rather than discarding every OTHER,
+    already-valid row."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            rows.append(rec)
+    return rows
+
+
+def _pressure_write_jsonl(path: Path, rows: list[dict]) -> None:
+    """Whole-file tmp+rename JSONL write (Task 27b) -- `atomic_write_bytes`
+    is what makes this safe against a torn read (see the Task 27b banner's
+    ATOMICITY note)."""
+    content = "".join(json.dumps(r, default=str, separators=(",", ":")) + "\n" for r in rows)
+    atomic_write_bytes(path, content.encode())
+
+
+def _pressure_append_jsonl_bounded(path: Path, new_rows: list[dict], *, max_rows: int,
+                                    prune=None) -> None:
+    """Atomically append `new_rows` to the JSONL store at `path`, then prune
+    (Task 27b, bounded-growth requirement): the caller-supplied
+    `prune(rows) -> rows` predicate runs first when given (age-based
+    eviction, the rate-history store), followed by an unconditional
+    ``rows[-max_rows:]`` count-based trim (drop OLDEST first -- the store is
+    append-only chronological, so "keep the last max_rows lines" IS "prune
+    the oldest").
+
+    Concurrency: a companion `<path>.lock` file (never `path` itself, see
+    the Task 27b banner) serializes this read-modify-write under
+    `fcntl.flock`; the actual on-disk write is `_pressure_write_jsonl`'s
+    tmp+rename, so a concurrent reader never observes a torn/partial file.
+    """
+    if not new_rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / (path.name + ".lock")
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            rows = _pressure_read_jsonl(path)
+            rows.extend(new_rows)
+            if prune is not None:
+                rows = prune(rows)
+            if len(rows) > max_rows:
+                rows = rows[-max_rows:]
+            _pressure_write_jsonl(path, rows)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
+def _pressure_load_weight_windows() -> list[dict]:
+    return _pressure_read_jsonl(_pressure_weight_window_path())
+
+
+def _pressure_weight_window_append(rows: list[dict]) -> None:
+    _pressure_append_jsonl_bounded(
+        _pressure_weight_window_path(), rows, max_rows=_PRESSURE_WEIGHT_WINDOW_MAX_ROWS)
+
+
+def _pressure_load_weight_resets() -> list[dict]:
+    return _pressure_read_jsonl(_pressure_weight_reset_path())
+
+
+def _pressure_weight_reset_append(rows: list[dict]) -> None:
+    _pressure_append_jsonl_bounded(
+        _pressure_weight_reset_path(), rows, max_rows=_PRESSURE_WEIGHT_RESET_MAX_ROWS)
+
+
+def _pressure_load_weight_window_cursor() -> dict:
+    """Best-effort read of the tiny per-account last-poll pointer -- `{}` on
+    missing/corrupt, mirroring `_pressure_load_last_emit`'s tolerant style
+    exactly (a lost cursor degrades to "every account looks first-ever-seen
+    next cycle", never a crash -- it costs one cycle's worth of Δpct, not
+    correctness)."""
+    try:
+        return read_json(_pressure_weight_window_cursor_path())
+    except (OSError, ValueError):
+        return {}
+
+
+def _pressure_save_weight_window_cursor(cursor: dict) -> None:
+    """Atomic tmp+rename write (never `save_state` -- this lives outside
+    state.json entirely, G0/G1), mirrors `_pressure_save_last_emit` exactly."""
+    write_json(_pressure_weight_window_cursor_path(), cursor)
+
+
+def _pressure_load_rate_history() -> list[dict]:
+    return _pressure_read_jsonl(_pressure_rate_history_path())
+
+
+def _pressure_rate_history_append(rows: list[dict], now: datetime) -> None:
+    """Append this cycle's new per-session rate samples, pruning any row
+    older than `_PRESSURE_RATE_HISTORY_MAX_AGE_MIN` (Task 27b's age-based
+    bound -- see the module banner: this is also how a dead/ended session's
+    entire history evicts itself, no separate liveness check needed)."""
+    cutoff = now - timedelta(minutes=_PRESSURE_RATE_HISTORY_MAX_AGE_MIN)
+
+    def _prune(all_rows: list[dict]) -> list[dict]:
+        kept = []
+        for r in all_rows:
+            ts = _pressure_parse_ts(r.get("ts"))
+            if ts is not None and ts < cutoff:
+                continue
+            kept.append(r)
+        return kept
+
+    _pressure_append_jsonl_bounded(
+        _pressure_rate_history_path(), rows, max_rows=_PRESSURE_RATE_HISTORY_MAX_ROWS, prune=_prune)
+
+
+def _pressure_rate_history_by_session(rows: list[dict]) -> dict[str, list[float]]:
+    """Group accumulated rate-history rows into a per-session, OLDEST-FIRST
+    list of rates -- `_trend_class`'s own required input shape (Task 12). A
+    row missing/malformed `session_id`/`ts`/`rate` is skipped defensively
+    (a directly-constructed test row, or injected corruption already
+    tolerated by `_pressure_read_jsonl`'s own per-line skip)."""
+    grouped: dict[str, list[tuple[datetime, float]]] = {}
+    for row in rows:
+        sid = row.get("session_id")
+        ts = _pressure_parse_ts(row.get("ts"))
+        rate = row.get("rate")
+        if not sid or ts is None or not isinstance(rate, (int, float)) or isinstance(rate, bool):
+            continue
+        grouped.setdefault(sid, []).append((ts, float(rate)))
+    result: dict[str, list[float]] = {}
+    for sid, pts in grouped.items():
+        pts.sort(key=lambda p: p[0])
+        result[sid] = [r for _, r in pts]
+    return result
+
+
+def _pressure_raw_token_totals_by_account(tails: dict, intervals: dict) -> dict[str, dict[str, float]]:
+    """RAW (unweighted) per-token-type totals per account, summed from this
+    cycle's transcript tails (Task 27b) -- the `token_totals_per_window`
+    ingredient `_build_weight_windows` (Task 14) needs, which nothing
+    before this task ever produced (Task 21/23 always called it with
+    `[]`/`[]`).
+
+    Deliberately a SEPARATE pass from `_attribute_burn` (Task 11), not a
+    refactor of it: `_attribute_burn` sums one WEIGHTED scalar per
+    `(account, session_id)` using the CURRENT fit's weights, which THIS
+    function is an input to (calling `_attribute_burn` here would be
+    circular) -- and it is a load-bearing, golden-replay-covered function
+    this task must not touch. This mirrors its exact flatten -> dedup ->
+    `_join_usage_account` time-join pattern (§10.9's 7-day dedup window,
+    chronological-order first-occurrence-wins) but groups by ACCOUNT ONLY
+    (the weight-fit window is per-account, not per-session) and sums the 4
+    real-usage-field columns `_PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN`
+    names -- `cache_create_1h` has no raw source in Stage 1 (the SAME
+    documented 5m/1h collapse `_pressure_message_weights` already
+    codifies) and is always 0.0 here. An unjoinable line (`account is
+    None`) contributes to no account's totals, same as `_attribute_burn`'s
+    residual treatment.
+    """
+    entries: list[tuple[datetime, str, str, dict]] = []
+    for _path, lines in tails.items():
+        for line in lines:
+            if not isinstance(line, dict) or line.get("type") != "assistant":
+                continue
+            message = line.get("message")
+            if not isinstance(message, dict):
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            uid = line.get("uuid")
+            session_id = line.get("sessionId")
+            ts_raw = line.get("timestamp")
+            if not (uid and session_id and ts_raw):
+                continue
+            ts = _pressure_parse_ts(ts_raw)
+            if ts is None:
+                continue
+            entries.append((ts, session_id, uid, usage))
+    entries.sort(key=lambda e: e[0])
+
+    totals: dict[str, dict[str, float]] = {}
+    seen_at: dict[tuple[str, str], datetime] = {}
+    for ts, session_id, uid, usage in entries:
+        key = (session_id, uid)
+        prior = seen_at.get(key)
+        if prior is not None and abs(ts - prior) <= _ATTRIBUTION_DEDUP_WINDOW:
+            continue
+        seen_at[key] = ts
+        session_intervals = intervals.get(session_id, [])
+        account, _confidence = _join_usage_account(ts, session_intervals)
+        if account is None:
+            continue
+        acct_totals = totals.setdefault(account, {c: 0.0 for c in _PRESSURE_RAW_TOKEN_COLUMNS})
+        for col, usage_key in _PRESSURE_USAGE_FIELD_BY_WEIGHT_COLUMN.items():
+            v = usage.get(usage_key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                acct_totals[col] += v
+    return totals
+
+
+def _pressure_window_observations(state: dict, config: dict, now: datetime,
+                                   raw_totals_by_account: dict[str, dict[str, float]],
+                                   cursor: dict) -> tuple[list[dict], list[dict], dict]:
+    """This cycle's NEW weight-fit window-observation row(s) (Task 27b) --
+    one per account that has a PRIOR cursor entry to diff against (an
+    account seen for the first time ever only seeds the cursor; it cannot
+    yield a Δpct window yet -- the SAME cold-start-is-honest posture Task
+    19 already established elsewhere in this module), any reset-crossing(s)
+    detected since the cursor, and the UPDATED cursor for next cycle.
+
+    Window-type fixed to "5h" (Stage-1 scope pin -- no earlier task pins
+    this): the fastest-moving, ladder-gated window (`_pressure_gate`'s LIVE
+    top step, FACT #1/#7). A "7d" window barely moves at a live ~5 min
+    daemon cadence, contributing near-zero informative Δpct per cycle and
+    diluting the accumulator rather than accelerating it toward
+    `weight_refit.min_windows`.
+
+    `cursor` is `{account: {"ts": iso, "pct": float, "resets_at": iso|None}}`
+    -- a SEPARATE, tiny (O(#accounts), never unboundedly growing) pointer,
+    NOT the row history itself. `five_hour_resets_at` is state's own
+    upcoming-reset-boundary timestamp (the SAME field `_pressure_reset_
+    knot` reads, and the SAME `cur_resets_at != prev_resets_at` crossing
+    test the daemon's own ladder-reset detection already uses elsewhere in
+    this file) -- when it CHANGES between two consecutive cycles, the
+    account crossed that exact boundary sometime in between, and the OLD
+    value IS that boundary's timestamp (Task 14 responsibility 1's
+    `resets` input).
+
+    Pure (G0): reads its inputs, mutates none of them; the caller decides
+    whether/how to persist the returned rows/cursor (persist gating lives
+    at the call site, `_pressure_accumulated_weight_windows`, mirroring
+    `_read_active_tails(..., persist=...)`'s own split).
+    """
+    window_rows: list[dict] = []
+    reset_rows: list[dict] = []
+    new_cursor: dict = {}
+    accounts = state.get("accounts", {}) or {}
+    for account, acct_state in accounts.items():
+        if not isinstance(acct_state, dict):
+            continue
+        cur_pct = acct_state.get("current_5h_pct")
+        if cur_pct is None:
+            continue
+        cur_resets_at = acct_state.get("five_hour_resets_at")
+        prior = cursor.get(account)
+        if isinstance(prior, dict) and prior.get("ts") is not None:
+            prior_resets_at = prior.get("resets_at")
+            if prior_resets_at and cur_resets_at and prior_resets_at != cur_resets_at:
+                reset_rows.append({"account": account, "ts": prior_resets_at})
+            ratio = _pressure_acct_ratio(acct_state, config)
+            totals = raw_totals_by_account.get(account, {})
+            window_rows.append({
+                "account": account,
+                "start_ts": prior.get("ts"),
+                "end_ts": now.isoformat(),
+                "pct_start": float(prior.get("pct", 0.0)),
+                "pct_end": float(cur_pct),
+                "ratio": ratio,
+                "input": float(totals.get("input", 0.0) or 0.0),
+                "output": float(totals.get("output", 0.0) or 0.0),
+                "cache_read": float(totals.get("cache_read", 0.0) or 0.0),
+                "cache_create_5m": float(totals.get("cache_create_5m", 0.0) or 0.0),
+                "cache_create_1h": float(totals.get("cache_create_1h", 0.0) or 0.0),
+            })
+        new_cursor[account] = {
+            "ts": now.isoformat(), "pct": float(cur_pct), "resets_at": cur_resets_at,
+        }
+    return window_rows, reset_rows, new_cursor
+
+
+def _pressure_accumulated_weight_windows(state: dict, tails: dict, intervals: dict,
+                                          config: dict, now: datetime, *,
+                                          persist: bool) -> tuple[list[list[float]], list[float], dict[str, int]]:
+    """The accumulated-history counterpart (Task 27b) to a bare
+    `_build_weight_windows([], [], [])` call -- Task 14's own solver-input
+    builder is UNCHANGED (still pure, still the G4 exclusion boundary);
+    this function only changes WHERE its three inputs come from: the
+    persisted cross-cycle stores instead of an always-empty literal.
+
+    persist=True (daemon, `_pressure_cycle`): builds + appends THIS cycle's
+    own new window/reset rows first (`_pressure_window_observations`),
+    updates the cursor, THEN reads the (now-extended) accumulated stores.
+    persist=False (on-demand CLI, `pressure_cmd`): reads the accumulated
+    stores AS THEY STAND -- never computes or appends its own observation,
+    so the CLI can never race the daemon over the same on-disk store (same
+    G0/§3 rationale as `_read_active_tails`'s own `persist` contract). Both
+    paths benefit from whatever the daemon has already accumulated.
+    """
+    if persist:
+        raw_totals = _pressure_raw_token_totals_by_account(tails, intervals)
+        cursor = _pressure_load_weight_window_cursor()
+        new_windows, new_resets, new_cursor = _pressure_window_observations(
+            state, config, now, raw_totals, cursor)
+        if new_windows:
+            _pressure_weight_window_append(new_windows)
+        if new_resets:
+            _pressure_weight_reset_append(new_resets)
+        _pressure_save_weight_window_cursor(new_cursor)
+
+    all_windows = _pressure_load_weight_windows()
+    all_resets = _pressure_load_weight_resets()
+    pct_history = [
+        {"account": w.get("account"), "start_ts": w.get("start_ts"), "end_ts": w.get("end_ts"),
+         "pct_start": w.get("pct_start"), "pct_end": w.get("pct_end"), "ratio": w.get("ratio")}
+        for w in all_windows
+    ]
+    token_totals_per_window = [
+        {col: w.get(col, 0.0) for col in _PRESSURE_RAW_TOKEN_COLUMNS}
+        for w in all_windows
+    ]
+    return _build_weight_windows(pct_history, token_totals_per_window, all_resets)
+
+
+def _pressure_cycle(state: dict, config: dict, now) -> dict:
+    """The daemon's per-cycle Phase-D pipeline + snapshot assembly + shadow/
+    emit gate (Task 23) -- the persist=True twin of `pressure_cmd`'s
+    on-demand persist=False path (Task 21), sharing every Phase-D step
+    verbatim except transcript-offset persistence.
+
+    `state` is deep-copied immediately (G0/§10.11, `_pressure_load_state`'s
+    own established technique): this is the ONLY state object the rest of
+    the cycle touches; the caller's live `state` is never mutated in place,
+    and this function NEVER calls `save_state`. `state`/`config` are
+    explicit parameters (unlike `pressure_cmd`, which loads both itself) --
+    the caller (a future daemon task) owns load cadence/reload policy.
+
+    Cold-start blindness (Task 19) is judged against the offset registry AS
+    IT STOOD BEFORE this cycle's own read -- a snapshot taken prior to
+    `_read_active_tails(persist=True)`, NOT the post-read `_PRESSURE_TAIL_
+    OFFSETS`. `persist=True` advances the registry in place for whatever it
+    fully reads THIS cycle (Task 10), so feeding `_attribution_confidence`
+    the POST-read offsets would make a session look "already known" the
+    instant it is first read -- defeating cold-start detection on a
+    daemon's very first cycle (the read always happens before the
+    confidence check does, every cycle, including the first). Feeding it
+    the pre-read snapshot instead asks the right question -- "was this
+    session known as of the END of the PRIOR cycle" -- matching
+    `pressure_cmd`'s own persist=False path, whose `offsets` is always the
+    untouched pre-call dict by construction.
+
+    shadow_mode (config `pressure.shadow_mode`, default True): computes and
+    atomic-writes pressure.json exactly as `pressure_cmd` would, calls
+    `_shadow_log`, and RETURNS -- no emit, no §6 marker/delivery write,
+    ever (the STAGE-1 dark-by-default guarantee). shadow_mode false:
+    recomputes `_pressure_triggers`/`_pressure_level` from the SAME
+    `state`/`config`/`now`/`partition_for_snapshot` inputs `_pressure_
+    snapshot` already used internally (deterministically identical --
+    `_pressure_snapshot`'s own `all_binding` is not exposed on the
+    published snapshot, so this is the one clean way to recover every
+    currently-binding key without modifying `_pressure_snapshot`, which is
+    out of this task's scope) to get every currently-binding key, consults
+    `_pressure_emit_decision` per key, and for each ADMITTED key gates on
+    Task 28's `_sentinel_available()` install/ordering check: available ->
+    emit via `_pressure_emit_to_sentinel` (Task 32's real `EmitSocket`
+    server is Stage 2, so in Stage 1 this is exercised only through test
+    spies) and persist that key into the last-emit registry; unavailable
+    (the Stage-1 default) -> `_pressure_degrade_to_log_only` instead (WARN
+    + shadow-log append, the live registry left untouched for that key --
+    nothing was actually emitted). Never raises either way, and always
+    persists whatever last-emit registry entries a real emit did add so the
+    hysteresis means something across daemon cycles.
+    """
+    state = copy.deepcopy(state)
+
+    offsets = _PRESSURE_TAIL_OFFSETS
+    offsets_before_read = dict(offsets)  # blindness judged pre-read (see docstring)
+    tails = _read_active_tails(now, config, offsets, persist=True)
+
+    sessions_rows = _parse_sessions_log()
+    intervals = _session_account_intervals(sessions_rows)
+
+    # Task 27b: persist=True -- appends this cycle's own new weight-window/
+    # reset observation(s) to the accumulated cross-cycle stores (deriving
+    # them from THIS cycle's tails/intervals) before reading them back, so
+    # the fit input is the accumulated history, not an always-empty literal.
+    A, b, _dropped_reason_counts = _pressure_accumulated_weight_windows(
+        state, tails, intervals, config, now, persist=True)
+    weight_fit = fit_burn_weights(A, b, None, config)
+
+    message_weights = _pressure_message_weights(weight_fit["weights"])
+    attribution_table = _attribute_burn(tails, intervals, message_weights)
+    attributed_partition = _partition_burn(attribution_table, state, config)
+
+    projects_dir = CLAUDE_DIR / "projects"
+    coord_map = _pressure_coordinator_map(sessions_rows, projects_dir)
+    # Task 27b: persist=True -- appends this cycle's freshly-computed
+    # per-session rate sample(s) to the accumulated rate-history store
+    # (after this cycle's own trend read, which is computed from strictly
+    # prior history -- see `_pressure_build_session_table`'s docstring).
+    session_table = _pressure_build_session_table(
+        attribution_table, intervals, coord_map, projects_dir, now, config, persist=True)
+
+    attribution = dict(_attribution_confidence(offsets_before_read, list(tails.keys()), now))
+    attribution["residual_fraction"] = attribution_table.residual_fraction
+
+    # USER-APPROVED ADDITION (safety): under cold-start blindness the real
+    # attributed partition is built from a starved/absent read window and
+    # UNDERSTATES burn -- forecasting off it would publish an artificially
+    # long, unsafe ETA. Fall back to cus's own coarse per-account rate for
+    # the SUPPLY forecast only; `session_table` still carries the real (if
+    # incomplete) per-session attribution -- display-only here, never fed
+    # back into the ETA/required-reduction math.
+    partition_for_snapshot = (
+        _pressure_supply_partition(state, config, now)
+        if attribution["blindness"] else attributed_partition
+    )
+
+    snapshot = _pressure_snapshot(
+        state, config, now,
+        partition=partition_for_snapshot,
+        session_table=session_table,
+        weight_fit=weight_fit,
+        attribution=attribution,
+    )
+
+    _pressure_write_json(snapshot)
+
+    pressure_cfg = config.get("pressure", {}) or {}
+    shadow_mode = pressure_cfg.get("shadow_mode", True)
+
+    if shadow_mode:
+        record = _pressure_build_shadow_record(state, snapshot, config, now)
+        _shadow_log(record, now)
+        return snapshot
+
+    # LIVE (shadow_mode: false) -- consult the cus-side emit hysteresis per
+    # currently-binding key; emit only when admitted.
+    triggers = _pressure_triggers(state, config, now, partition_for_snapshot)
+    level_out = _pressure_level(triggers, config)
+    binding_keys = [t["binding_constraint"] for t in level_out["all_binding"]]
+
+    registry = _pressure_load_last_emit()
+    changed = False
+    for key in binding_keys:
+        prior = registry.get(key)
+        admit, _reason = _pressure_emit_decision(key, snapshot, prior, config, now)
+        if not admit:
+            continue
+        cur = _pressure_key_state(key, snapshot, config)
+        payload = _pressure_build_emit_payload(key, snapshot, cur, now)
+
+        # Task 28 install/ordering gate (§10.5): a missing/unreachable
+        # sentinel degrades THIS admitted emit to log-only -- independent
+        # of shadow_mode (a missing dependency is always log-only, even
+        # here in the live shadow_mode:false path). Never raises either
+        # way; on a degrade the live last_emit.json registry is left
+        # untouched for this key (nothing was actually emitted), so a real
+        # emit is not silently suppressed once sentinel becomes available.
+        if not _sentinel_available():
+            _pressure_degrade_to_log_only(payload, "sentinel_unavailable")
+            continue
+        if not _pressure_emit_to_sentinel(payload, config):
+            continue
+
+        _pressure_write_emit_marker(key, payload, now)
+        registry[key] = {
+            "level": cur["level"],
+            "required_reduction": cur["required_reduction"],
+            "ts": now.isoformat(),
+        }
+        changed = True
+    if changed:
+        _pressure_save_last_emit(registry)
+
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Task 27 (spec-2 token-pressure forecaster, STAGE 1, Phase S final task):
+# `cus pressure --shadow-report` -- the G7 flip-gate scorer. Reads the
+# shadow jsonl week (Task 23's `_shadow_log` records, enriched by Task 24's
+# `would_ask`/`would_target` and Task 26's `reset_models`/
+# `reset_models_actual`) and emits a PASS/FAIL verdict against every named
+# flip-gate constant, PLUS the minimum-exercise gate (quiet week -> EXTEND)
+# and the elapsed-days gate (a compressed busy window must never certify
+# FLIP-READY). This is the ONLY artifact the operator's `shadow_mode:false`
+# flip is gated on. Read-only (G0): scans `*.jsonl` files and one
+# `.clock-started` marker under `shadow_dir`; never writes config, never
+# `save_state`, never mutates a shadow file -- the sentinel may produce/
+# journal this report but never edits config itself (that is the operator's
+# manual flip, per the operating contract).
+# ---------------------------------------------------------------------------
+
+# G7 flip-gate constants (task brief). Every threshold below is read ONLY
+# from these module constants -- never a hardcoded literal at the call
+# site -- so a future retune is a one-line change.
+FORECAST_ERR_MEDIAN_MAX = 0.10
+FORECAST_ERR_P90_MAX = 0.20
+WEIGHT_CV_MAX = 0.25
+WEIGHT_MASS_MIN_FRACTION = 0.10  # a column below this share of total weighted mass is excluded from WEIGHT_CV
+MIN_CLEAN_WINDOWS = 200
+FIT_R2_MEDIAN_MIN = 0.80
+COND_MEDIAN_MAX = 30.0
+COND_P90_MAX = 100.0
+RESIDUAL_MEDIAN_MAX = 0.15
+RESIDUAL_P90_MAX = 0.30
+SAFETY_FACTOR_ABSORB_MEDIAN_MAX = 1.5
+SAFETY_FACTOR_ABSORB_CAP = 3.0  # `safety_factor_max` default (Task 17) -- "never hit 3.0" during a materialized breach
+MIN_EPISODES = 5
+MIN_RESET_CROSSINGS = 10
+FLIP_GATE_ELAPSED_DAYS = 7.0
+_PRESSURE_FORECAST_JOIN_LEAD_MIN = 60.0  # Task 26's fixed `remaining_at_plus_60` lookahead
+_PRESSURE_FORECAST_JOIN_TOLERANCE_MIN = 15.0  # how far a candidate cycle-M record may drift from N.ts+60min and still join
+
+# Monotone-ordering priors `fit_burn_weights`'s `_PRESSURE_WEIGHT_T` reparam
+# is built to hold (Task 16, G4 docstring): output >= input >= 0, and
+# 0 <= cache_read <= cache_create_5m <= cache_create_1h.
+_PRESSURE_WEIGHT_ORDER_CHAIN = ("cache_read", "cache_create_5m", "cache_create_1h")
+
+
+def _pressure_shadow_scan(shadow_dir) -> list[dict]:
+    """Load every record from every ``<shadow_dir>/*.jsonl`` file (Task 23's
+    per-day shadow log), sorted ascending by ``ts``. Best-effort/read-only:
+    a missing directory yields ``[]`` (never raises -- the Task 31 deploy
+    smoke may call ``--shadow-report`` before the shadow dir has ever been
+    written), and a malformed line is skipped rather than crashing the whole
+    report over one corrupt append (the shadow log's own writer is
+    best-effort append-only, Task 23)."""
+    shadow_dir = Path(shadow_dir)
+    records: list[dict] = []
+    if not shadow_dir.is_dir():
+        return records
+    for path in sorted(shadow_dir.glob("*.jsonl")):
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                records.append(rec)
+    records.sort(key=lambda r: r.get("ts") or "")
+    return records
+
+
+def _pressure_median(values: list[float]) -> float:
+    """Hand-rolled median (stdlib `statistics`, no numpy dep) -- ``0.0`` for
+    an empty/all-non-finite input (never raises)."""
+    vals = [float(v) for v in values if v is not None and not math.isnan(v)]
+    if not vals:
+        return 0.0
+    return statistics.median(vals)
+
+
+def _pressure_p90(values: list[float]) -> float:
+    """Hand-rolled 90th percentile, nearest-rank convention: the
+    ``ceil(0.9*n)``-th smallest of ``n`` sorted samples (1-indexed) -- no
+    numpy/statistics.quantiles dep, ``0.0`` for an empty input."""
+    vals = sorted(float(v) for v in values if v is not None and not math.isnan(v))
+    if not vals:
+        return 0.0
+    n = len(vals)
+    rank = max(1, min(n, math.ceil(0.9 * n)))
+    return vals[rank - 1]
+
+
+def _pressure_shadow_reference_x(config: dict) -> float:
+    """Side-effect-free ``reference_x`` for the shadow-report path, which has
+    no ``state`` to consult (``shadow_report``'s signature is
+    ``(shadow_dir, config, now)`` -- Task 1's `_pressure_resolve_reference_x`
+    needs a state dict this path was never given). Reuses ONLY the
+    config-pin branch (production runs pinned, FACT #4: ``reference_x: 5``);
+    an unpinned fleet falls back to the neutral 1.0 rather than guess at a
+    fleet-min this path cannot observe."""
+    pinned = (config or {}).get("capacity_aware", {}).get("reference_x")
+    if isinstance(pinned, (int, float)) and not isinstance(pinned, bool) and pinned >= 1:
+        return float(pinned)
+    return 1.0
+
+
+def _pressure_shadow_forecast_errors(records: list[dict], config: dict, window: str) -> list[float]:
+    """Forecast error @60-min lead for the `decayed_step` model (the
+    production one), one window at a time (Task 27).
+
+    Temporally-joins each cycle-N record's
+    ``reset_models.decayed_step.<name>.<window>.remaining_at_plus_60``
+    prediction to the ACTUAL remaining ``reset_models_actual`` of the
+    nearest later record within `_PRESSURE_FORECAST_JOIN_TOLERANCE_MIN` of
+    N.ts + 60min (`_PRESSURE_FORECAST_JOIN_LEAD_MIN`, Task 26's fixed
+    lookahead) -- a candidate outside that tolerance is skipped (no data
+    close enough to N+60min to compare against) rather than joined to a
+    stale/premature sample. ``error = |predicted - actual| / denom``, where
+    ``denom = Σ_accounts capacity_x/reference_x`` (CAPACITY per the fleet at
+    N, per the brief -- never the remaining amount, which would blow up
+    toward zero at exactly the moments accuracy matters most)."""
+    reference_x = _pressure_shadow_reference_x(config)
+    errors: list[float] = []
+    for i, rec in enumerate(records):
+        decayed = ((rec.get("reset_models") or {}).get("decayed_step")) or {}
+        per_account = rec.get("per_account") or {}
+        if not decayed or not per_account:
+            continue
+        denom = sum(
+            float(acct.get("capacity_x") or 0.0) / reference_x
+            for acct in per_account.values()
+            if isinstance(acct, dict)
+        )
+        if denom <= 0.0:
+            continue
+        ts_n = _pressure_parse_ts(rec.get("ts"))
+        if ts_n is None:
+            continue
+        target_ts = ts_n + timedelta(minutes=_PRESSURE_FORECAST_JOIN_LEAD_MIN)
+
+        best_rec = None
+        best_gap = None
+        for other in records[i + 1:]:
+            ts_m = _pressure_parse_ts(other.get("ts"))
+            if ts_m is None:
+                continue
+            gap_min = (ts_m - target_ts).total_seconds() / 60.0
+            if gap_min > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                break  # records are ascending -- nothing closer remains
+            if abs(gap_min) > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                continue
+            if best_gap is None or abs(gap_min) < best_gap:
+                best_rec, best_gap = other, abs(gap_min)
+        if best_rec is None:
+            continue
+
+        actual_block = best_rec.get("reset_models_actual") or {}
+        for name, win_map in decayed.items():
+            predicted = (win_map or {}).get(window, {}).get("remaining_at_plus_60")
+            if predicted is None:
+                continue
+            actual = (actual_block.get(name) or {}).get(window)
+            if actual is None:
+                continue
+            errors.append(abs(float(predicted) - float(actual)) / denom)
+    return errors
+
+
+def _pressure_shadow_false_clears(records: list[dict], config: dict) -> list[dict]:
+    """FALSE_CLEAR detections (Task 27, HARD-ZERO, G7): a cycle-N
+    `decayed_step` forecast declares an account/window CLEAR by the logged
+    +60-min lookahead (``remaining_at_plus_60 > 0`` -- Task 26's fixed
+    forecast horizon is the closest available proxy to "a post-reset release
+    within exit_margin_hours", since Task 26 logs no configurable-horizon
+    forecast) while that account/window is ACTUALLY breached right now
+    (``remaining_units <= 0`` at N) -- and the ACTUAL series crosses back
+    into breach again at some later record within ``horizon_hours``
+    (`_pressure_enter_horizon`, ``config.pressure.horizon_hours``) of N.
+    Returns every detection (empty list -> the HARD-ZERO gate passes) so the
+    report can name the offending metric per the brief."""
+    horizon_min = _pressure_enter_horizon(config)
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        ts_n = _pressure_parse_ts(rec.get("ts"))
+        if ts_n is None:
+            continue
+        decayed = ((rec.get("reset_models") or {}).get("decayed_step")) or {}
+        per_account = rec.get("per_account") or {}
+        deadline = ts_n + timedelta(minutes=horizon_min)
+        for name, win_map in decayed.items():
+            cur_acct = per_account.get(name) or {}
+            for window in _PRESSURE_WINDOWS:
+                predicted = (win_map or {}).get(window, {}).get("remaining_at_plus_60")
+                if predicted is None or float(predicted) <= 0.0:
+                    continue  # not a "declared clear"
+                cur_remaining = (cur_acct.get(window) or {}).get("remaining_units")
+                if cur_remaining is None or float(cur_remaining) > 0.0:
+                    continue  # not currently in breach -- nothing to falsely clear
+                for other in records[i + 1:]:
+                    ts_m = _pressure_parse_ts(other.get("ts"))
+                    if ts_m is None or ts_m > deadline:
+                        break
+                    later_acct = (other.get("per_account") or {}).get(name) or {}
+                    later_remaining = (later_acct.get(window) or {}).get("remaining_units")
+                    if later_remaining is not None and float(later_remaining) <= 0.0:
+                        hits.append({
+                            "account": name, "window": window,
+                            "declared_clear_ts": rec.get("ts"),
+                            "recontradicted_ts": other.get("ts"),
+                        })
+                        break
+    return hits
+
+
+def _pressure_shadow_vacuous_clears(records: list[dict]) -> list[dict]:
+    """VACUOUS_CLEAR detections (Task 27, HARD-ZERO, G7): a real breach
+    (``binding`` not None) whose Task-24 dry-run plan needed a genuine
+    reduction (``would_ask.required > 0``) but emitted an EMPTY plan
+    (``would_target == []``) without escalating (``would_ask.escalate`` is
+    falsy) -- §5.4 says an unmeetable/insufficient candidate set must
+    escalate, never silently "clear" a real breach with nothing asked."""
+    hits: list[dict] = []
+    for rec in records:
+        binding = rec.get("binding")
+        would_ask = rec.get("would_ask")
+        if binding is None or not would_ask:
+            continue
+        required = float(would_ask.get("required") or 0.0)
+        targets = rec.get("would_target") or []
+        escalate = bool(would_ask.get("escalate"))
+        if required > 0.0 and not targets and not escalate:
+            hits.append({"ts": rec.get("ts"), "binding": binding, "required": required})
+    return hits
+
+
+def _pressure_shadow_weight_cv(records: list[dict]) -> dict[str, float]:
+    """Per-column coefficient of variation (population stdev / mean) of the
+    week's logged ``weight_fit.weights``, restricted to columns whose
+    AVERAGE share of total weighted mass is >= `WEIGHT_MASS_MIN_FRACTION`
+    (a column that never carries meaningful mass is excluded per the brief,
+    rather than penalized for looking "unstable" on noise alone)."""
+    mass_totals = {col: 0.0 for col in _PRESSURE_WEIGHT_COLUMNS}
+    series: dict[str, list[float]] = {col: [] for col in _PRESSURE_WEIGHT_COLUMNS}
+    mass_n = 0
+    for rec in records:
+        weights = ((rec.get("weight_fit") or {}).get("weights")) or {}
+        if not weights:
+            continue
+        total = sum(float(v) for v in weights.values() if v is not None)
+        if total > 0.0:
+            mass_n += 1
+            for col in _PRESSURE_WEIGHT_COLUMNS:
+                val = weights.get(col)
+                if val is not None:
+                    mass_totals[col] += float(val) / total
+        for col in _PRESSURE_WEIGHT_COLUMNS:
+            val = weights.get(col)
+            if val is not None:
+                series[col].append(float(val))
+
+    cvs: dict[str, float] = {}
+    for col in _PRESSURE_WEIGHT_COLUMNS:
+        avg_mass = (mass_totals[col] / mass_n) if mass_n else 0.0
+        if avg_mass < WEIGHT_MASS_MIN_FRACTION:
+            continue
+        vals = series[col]
+        if len(vals) < 2:
+            cvs[col] = 0.0
+            continue
+        mean = statistics.mean(vals)
+        if mean == 0.0:
+            cvs[col] = 0.0 if statistics.pstdev(vals) == 0.0 else math.inf
+            continue
+        cvs[col] = statistics.pstdev(vals) / abs(mean)
+    return cvs
+
+
+def _pressure_shadow_ordering_held_fraction(records: list[dict]) -> float:
+    """Fraction of refits (records carrying a ``weight_fit.weights`` block)
+    that held the monotone-ordering priors `fit_burn_weights`'s reparam is
+    built to guarantee (Task 16 docstring): ``output >= input >= 0`` and
+    ``0 <= cache_read <= cache_create_5m <= cache_create_1h``. ``1.0``
+    (vacuously "held") when no refit is present -- there is nothing to
+    violate."""
+    checked = 0
+    held = 0
+    for rec in records:
+        weights = ((rec.get("weight_fit") or {}).get("weights")) or {}
+        if not weights:
+            continue
+        checked += 1
+        output = float(weights.get("output", 0.0))
+        input_ = float(weights.get("input", 0.0))
+        ok = output >= input_ >= 0.0
+        prev = 0.0
+        for col in _PRESSURE_WEIGHT_ORDER_CHAIN:
+            val = float(weights.get(col, 0.0))
+            ok = ok and (prev <= val)
+            prev = val
+        if ok:
+            held += 1
+    return (held / checked) if checked else 1.0
+
+
+def _pressure_shadow_fit_stats(records: list[dict]) -> tuple[list[float], list[float], list[float]]:
+    """Per-record derived R², published condition_number, and n_windows
+    from every logged ``weight_fit`` block (Task 27).
+
+    `fit_burn_weights` (Task 16) never publishes an ``r2`` field directly
+    (only ``residual_fraction = ||Aw-b|| / ||b||``); this derives
+    ``r2 = 1 - residual_fraction**2`` -- the standard relation between a
+    normalized-residual-norm fraction and R² when the design has no
+    intercept (``SStot = ||b||**2``, matching `_pressure_residual_fraction`'s
+    own un-centered normalization, Task 16). A degenerate all-zero-``b``
+    fit (Stage 1's real ``_pressure_cycle`` calls `fit_burn_weights` with
+    empty windows every cycle today -- a known, separately-tracked gap, see
+    ``progress.md``) yields ``residual_fraction = 0.0`` -> ``r2 = 1.0``
+    (vacuously "perfect", since there was no real data to fit against) --
+    this is why `fit_r2_median` and `min_clean_windows` are deliberately
+    SEPARATE gates: R² alone cannot detect "there was no data".
+    """
+    r2s: list[float] = []
+    conds: list[float] = []
+    n_windows: list[float] = []
+    for rec in records:
+        wf = rec.get("weight_fit") or {}
+        residual = wf.get("residual_fraction")
+        if residual is not None:
+            residual = float(residual)
+            r2 = 1.0 - residual * residual
+            if not math.isnan(r2):
+                r2s.append(r2)
+        cond = wf.get("condition_number")
+        if cond is not None:
+            conds.append(float(cond))
+        nw = wf.get("n_windows")
+        if nw is not None:
+            n_windows.append(float(nw))
+    return r2s, conds, n_windows
+
+
+def _pressure_shadow_realized_safety_factors(records: list[dict]) -> list[float]:
+    """Realized ``safety_factor`` (Task 17) from every record with a
+    materialized breach (``binding`` not None and a logged ``would_ask``) --
+    the SOFT residual gate's absorption check reads these."""
+    out: list[float] = []
+    for rec in records:
+        if rec.get("binding") is None:
+            continue
+        would_ask = rec.get("would_ask")
+        if not would_ask:
+            continue
+        sf = would_ask.get("safety_factor")
+        if sf is not None:
+            out.append(float(sf))
+    return out
+
+
+def _pressure_shadow_exercise(records: list[dict]) -> tuple[int, int]:
+    """Minimum-exercise counts (Task 27): ``episodes`` = number of
+    ok -> bound transitions (a maximal run of consecutive bound cycles
+    counts once); ``reset_crossings`` = number of ACTUAL
+    (account, window) sign changes of ``remaining_units`` across the gate
+    (breached <-> clear) over the week, summed over every account/window."""
+    episodes = 0
+    in_episode = False
+    for rec in records:
+        bound = rec.get("binding") is not None or (rec.get("level") not in (None, "ok"))
+        if bound and not in_episode:
+            episodes += 1
+        in_episode = bound
+
+    crossings = 0
+    last_state: dict[tuple[str, str], bool] = {}
+    for rec in records:
+        per_account = rec.get("per_account") or {}
+        for name, acct in per_account.items():
+            if not isinstance(acct, dict):
+                continue
+            for window in _PRESSURE_WINDOWS:
+                remaining = (acct.get(window) or {}).get("remaining_units")
+                if remaining is None:
+                    continue
+                breached = float(remaining) <= 0.0
+                key = (name, window)
+                prev = last_state.get(key)
+                if prev is not None and prev != breached:
+                    crossings += 1
+                last_state[key] = breached
+    return episodes, crossings
+
+
+def _pressure_shadow_clock(shadow_dir, now) -> tuple[float, bool]:
+    """``(elapsed_days, marker_exists)`` from ``<shadow_dir>/.clock-started``
+    (the Task 31 marker, findings 4 & 9). Absent/unparseable marker ->
+    ``(0.0, False)`` -- NEVER raises ``FileNotFoundError``, NEVER treated as
+    a started clock (the Task 31 deploy smoke may call ``--shadow-report``
+    before this file has ever been written)."""
+    marker = Path(shadow_dir) / ".clock-started"
+    try:
+        text = marker.read_text().strip()
+    except OSError:
+        return 0.0, False
+    started = _pressure_parse_ts(text)
+    if started is None:
+        return 0.0, False
+    elapsed = (now - started).total_seconds() / 86400.0
+    return max(0.0, elapsed), True
+
+
+def _pressure_shadow_spotcheck(shadow_dir) -> tuple[bool, "bool | None", str]:
+    """Task 40's spot-check artifact -- NOT built until a later (H2/stage-2)
+    task, so in Stage 1 it never exists. Returns ``(pending, agree_3of3,
+    display)``: absent/unreadable/malformed -> ``(True, None, "pending")``
+    -- a PENDING gate (prevents FLIP-READY, contributes to EXTEND) that
+    NEVER raises and NEVER counts as a hard BLOCK by itself. Present ->
+    ``(False, agree == total == 3, "agree/total")`` -- a real HARD gate
+    result once Task 40 starts publishing it."""
+    path = Path(shadow_dir) / "spotcheck.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True, None, "pending"
+    try:
+        agree = int(data.get("agree"))
+        total = int(data.get("total"))
+    except (TypeError, ValueError, AttributeError):
+        return True, None, "pending"
+    return False, (agree == 3 and total == 3), f"{agree}/{total}"
+
+
+def shadow_report(shadow_dir, config: dict, now) -> dict:
+    """The G7 flip-gate scorer (Task 27): scans ``<shadow_dir>/*.jsonl``
+    (default ``~/claude-accounts/pressure/shadow/``, Task 23's per-day
+    shadow log) and evaluates every named flip-gate metric, the minimum-
+    exercise gate, and the elapsed-days gate. Read-only (G0): never writes
+    ``config``, never ``save_state``, never mutates a shadow file -- the
+    RETURNED artifact enforces every gate as data (``per_metric``), never
+    prose-only.
+
+    VERDICT PRECEDENCE (derived to satisfy the brief's named tests):
+      1. Any HARD-ZERO safety violation (``false_clear_count`` or
+         ``vacuous_clear_count`` > 0) -> ``BLOCKED``, naming the metric --
+         a safety violation blocks even a short/quiet window.
+      2. Else if elapsed days < `FLIP_GATE_ELAPSED_DAYS` (including an
+         absent ``.clock-started`` marker), OR the minimum-exercise gate is
+         unmet, OR the spot-check gate is still pending (no Task 40
+         artifact yet) -> ``EXTEND`` -- regardless of how fast the exercise
+         + hard gates were otherwise met (a compressed busy window must
+         never certify FLIP-READY).
+      3. Else if any other HARD gate fails -> ``BLOCKED``, naming every
+         failing metric.
+      4. Else -> ``FLIP-READY``.
+    """
+    shadow_dir = Path(shadow_dir)
+    config = config or {}
+    records = _pressure_shadow_scan(shadow_dir)
+
+    per_metric: dict[str, dict] = {}
+
+    def _add(name: str, value, threshold, passed: bool, **extra) -> None:
+        entry = {"pass": bool(passed), "value": value, "threshold": threshold}
+        entry.update(extra)
+        per_metric[name] = entry
+
+    # --- forecast error @60-min lead, decayed_step, per window (HARD) ---
+    for window in _PRESSURE_WINDOWS:
+        errs = _pressure_shadow_forecast_errors(records, config, window)
+        med = _pressure_median(errs)
+        p90 = _pressure_p90(errs)
+        _add(f"forecast_err_median_{window}", med, FORECAST_ERR_MEDIAN_MAX, med <= FORECAST_ERR_MEDIAN_MAX)
+        _add(f"forecast_err_p90_{window}", p90, FORECAST_ERR_P90_MAX, p90 <= FORECAST_ERR_P90_MAX)
+
+    # --- false-clear / vacuous-clear (HARD-ZERO) ---
+    false_clears = _pressure_shadow_false_clears(records, config)
+    vacuous_clears = _pressure_shadow_vacuous_clears(records)
+    _add("false_clear_count", len(false_clears), 0, len(false_clears) == 0, detections=false_clears)
+    _add("vacuous_clear_count", len(vacuous_clears), 0, len(vacuous_clears) == 0, detections=vacuous_clears)
+
+    # --- weight stability (HARD) ---
+    cvs = _pressure_shadow_weight_cv(records)
+    worst_cv = max(cvs.values()) if cvs else 0.0
+    _add("weight_cv", worst_cv, WEIGHT_CV_MAX, worst_cv <= WEIGHT_CV_MAX, per_column=cvs)
+
+    ordering_frac = _pressure_shadow_ordering_held_fraction(records)
+    _add("ordering_priors_held", ordering_frac, 1.0, ordering_frac >= 1.0)
+
+    r2s, conds, n_windows = _pressure_shadow_fit_stats(records)
+    min_clean = max(n_windows) if n_windows else 0.0
+    _add("min_clean_windows", min_clean, MIN_CLEAN_WINDOWS, min_clean >= MIN_CLEAN_WINDOWS)
+
+    r2_median = _pressure_median(r2s)
+    _add("fit_r2_median", r2_median, FIT_R2_MEDIAN_MIN, r2_median >= FIT_R2_MEDIAN_MIN)
+
+    cond_median = _pressure_median(conds)
+    cond_p90 = _pressure_p90(conds)
+    _add("cond_median", cond_median, COND_MEDIAN_MAX, cond_median <= COND_MEDIAN_MAX)
+    _add("cond_p90", cond_p90, COND_P90_MAX, cond_p90 <= COND_P90_MAX)
+
+    # --- SOFT residual, absorbable by a conservative realized safety factor ---
+    residuals = [
+        float((rec.get("weight_fit") or {}).get("residual_fraction"))
+        for rec in records
+        if (rec.get("weight_fit") or {}).get("residual_fraction") is not None
+    ]
+    residual_median = _pressure_median(residuals)
+    residual_p90 = _pressure_p90(residuals)
+    residual_within = residual_median <= RESIDUAL_MEDIAN_MAX and residual_p90 <= RESIDUAL_P90_MAX
+
+    safety_factors = _pressure_shadow_realized_safety_factors(records)
+    sf_median = _pressure_median(safety_factors)
+    sf_saturated = any(sf >= SAFETY_FACTOR_ABSORB_CAP for sf in safety_factors)
+    absorbed = bool(safety_factors) and sf_median <= SAFETY_FACTOR_ABSORB_MEDIAN_MAX and not sf_saturated
+    residual_pass = residual_within or absorbed
+    _add("residual_median", residual_median, RESIDUAL_MEDIAN_MAX, residual_pass,
+         soft=True, absorbed=(not residual_within) and absorbed)
+    _add("residual_p90", residual_p90, RESIDUAL_P90_MAX, residual_pass,
+         soft=True, absorbed=(not residual_within) and absorbed)
+
+    # --- spot-check (Task 40 -- not built in Stage 1; handled gracefully) ---
+    spotcheck_pending, spotcheck_pass, spotcheck_display = _pressure_shadow_spotcheck(shadow_dir)
+    _add("spotcheck_agree", spotcheck_display, "3/3",
+         (spotcheck_pass is True), pending=spotcheck_pending)
+
+    # --- minimum-exercise gate ---
+    episodes, reset_crossings = _pressure_shadow_exercise(records)
+    exercise_met = episodes >= MIN_EPISODES and reset_crossings >= MIN_RESET_CROSSINGS
+    exercise_gate = {
+        "episodes": episodes, "reset_crossings": reset_crossings, "met": exercise_met,
+    }
+
+    # --- elapsed-days gate ---
+    elapsed_days, marker_exists = _pressure_shadow_clock(shadow_dir, now)
+    days_remaining = max(0.0, FLIP_GATE_ELAPSED_DAYS - elapsed_days)
+    days_met = marker_exists and elapsed_days >= FLIP_GATE_ELAPSED_DAYS
+
+    # --- verdict precedence ---
+    blocking_metrics: list[str] = []
+    if not per_metric["false_clear_count"]["pass"]:
+        blocking_metrics.append("false_clear_count")
+    if not per_metric["vacuous_clear_count"]["pass"]:
+        blocking_metrics.append("vacuous_clear_count")
+
+    if blocking_metrics:
+        verdict = "BLOCKED"
+    elif not days_met or not exercise_met or spotcheck_pending:
+        verdict = "EXTEND"
+    else:
+        hard_metric_names = (
+            "forecast_err_median_5h", "forecast_err_p90_5h",
+            "forecast_err_median_7d", "forecast_err_p90_7d",
+            "weight_cv", "ordering_priors_held", "min_clean_windows",
+            "fit_r2_median", "cond_median", "cond_p90",
+        )
+        for name in hard_metric_names:
+            if not per_metric[name]["pass"]:
+                blocking_metrics.append(name)
+        if not residual_pass:
+            blocking_metrics.append("residual_median")
+        if spotcheck_pass is False:
+            blocking_metrics.append("spotcheck_agree")
+        verdict = "BLOCKED" if blocking_metrics else "FLIP-READY"
+
+    return {
+        "per_metric": per_metric,
+        "exercise_gate": exercise_gate,
+        "elapsed_days": elapsed_days,
+        "days_remaining": days_remaining,
+        "verdict": verdict,
+        "blocking_metrics": blocking_metrics,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task 30 (spec-2 token-pressure forecaster, STAGE 1): shadow-week BACKTEST
+# scorer. `shadow_report` (Task 27) evaluates the flip GATES; this pairs each
+# forecast record with the realized outcome N cycles later and scores
+# forecast-vs-actual, over/under-throttle, and reset over/under-prediction --
+# feeding Task 27's verdict inputs and the risk-4 tunability review.
+# ---------------------------------------------------------------------------
+
+# Same 240-min ceiling `_pressure_trigger_horizon`'s default (horizon_hours=3
+# + exit_margin_hours=1) already computes every `binding.eta_min` against
+# (Task 9), plus the SAME `_PRESSURE_EXIT_MARGIN_MIN` (60) tolerance used
+# elsewhere in this module for the "+margin" in "horizon+margin". Task 30's
+# own interface takes only `records` (no `config` -- brief), so these mirror
+# the config-absent defaults rather than re-deriving them per call.
+_PRESSURE_BACKTEST_HORIZON_MIN = 240.0
+_PRESSURE_BACKTEST_MARGIN_MIN = _PRESSURE_EXIT_MARGIN_MIN
+
+
+def _pressure_backtest_target(binding) -> tuple[str, str | None, str] | None:
+    """``(view, name, window)`` identifying which per-account/pool
+    ``remaining_units`` series a forecast record's ``binding`` refers to, or
+    ``None`` when there's nothing to join against: no binding, a malformed
+    one, or a level-bound ``fable_weekly`` breach (``dry_run_target``'s own
+    §5.4 branch) -- there's no per-window ``remaining_units`` series for a
+    qualitative Fable->Sonnet downshift ask to confirm against actual data.
+    ``name`` is ``None`` for the pool view (there's no per-account name)."""
+    if not isinstance(binding, dict):
+        return None
+    if binding.get("constraint") == "fable_weekly":
+        return None
+    window = binding.get("window")
+    if not window:
+        return None
+    view = binding.get("view")
+    if view == "account":
+        name = binding.get("name")
+        if not name:
+            return None
+        return ("account", name, window)
+    if view == "pool":
+        return ("pool", None, window)
+    return None
+
+
+def _pressure_backtest_remaining(rec: dict, target: tuple[str, str | None, str]) -> float | None:
+    """The actual ``remaining_units`` reading ``target`` names, straight off
+    a shadow record's already-published ``per_account``/``pool`` blocks
+    (Task 20) -- NEVER recomputed."""
+    view, name, window = target
+    block = (rec.get("per_account") or {}).get(name) or {} if view == "account" else (rec.get("pool") or {})
+    return (block.get(window) or {}).get("remaining_units")
+
+
+def _pressure_backtest_required(rec: dict, target: tuple[str, str | None, str]) -> float:
+    """The required-reduction reading ``target`` names at ``rec`` -- the
+    account view's ``required_reduction_pct_per_min`` or the pool view's
+    ``required_reduction_units_per_min`` (Task 20), i.e. whatever reduction
+    was ACTUALLY needed at that record's own moment in time (as opposed to
+    the earlier forecast-time estimate a plan was built from)."""
+    view, name, window = target
+    if view == "account":
+        block = (rec.get("per_account") or {}).get(name) or {}
+        val = (block.get(window) or {}).get("required_reduction_pct_per_min")
+    else:
+        block = rec.get("pool") or {}
+        val = (block.get(window) or {}).get("required_reduction_units_per_min")
+    return float(val) if val is not None else 0.0
+
+
+def _pressure_backtest_first_materialization(records: list[dict], i: int,
+                                              target: tuple[str, str | None, str]) -> tuple[dict | None, bool]:
+    """``(materialized_record, covered)``: the first record at-or-after
+    ``records[i]`` (including ``records[i]`` itself, for an already-bound
+    breach) whose ``target`` reading has actually crossed into breach
+    (``remaining_units <= 0``) within
+    ``_PRESSURE_BACKTEST_HORIZON_MIN + _PRESSURE_BACKTEST_MARGIN_MIN`` of
+    ``records[i]``'s own ``ts`` -- the realized confirmation that a forecast
+    breach "came true", mirroring `_pressure_shadow_false_clears`'s own
+    later-record scan (Task 27). ``covered`` is ``True`` once either a
+    materialization is found OR the records extend at least to the
+    horizon+margin deadline; ``False`` means the window is still open (not
+    enough logged lookahead yet) -- callers must not read "no breach found"
+    as "never breaches" when ``covered`` is ``False`` (that would falsely
+    score a shadow week that simply hasn't run long enough as an over-
+    throttle). Assumes ``records`` is sorted ascending by ``ts`` (the same
+    assumption every reused Task-27 helper already makes)."""
+    ts_n = _pressure_parse_ts(records[i].get("ts"))
+    if ts_n is None:
+        return None, False
+    deadline = ts_n + timedelta(minutes=_PRESSURE_BACKTEST_HORIZON_MIN + _PRESSURE_BACKTEST_MARGIN_MIN)
+
+    remaining0 = _pressure_backtest_remaining(records[i], target)
+    if remaining0 is not None and float(remaining0) <= 0.0:
+        return records[i], True
+
+    for other in records[i + 1:]:
+        ts_m = _pressure_parse_ts(other.get("ts"))
+        if ts_m is None:
+            continue
+        if ts_m > deadline:
+            return None, True  # lookahead reaches past the deadline w/o a breach -- covered
+        remaining = _pressure_backtest_remaining(other, target)
+        if remaining is not None and float(remaining) <= 0.0:
+            return other, True
+    return None, False  # ran out of records before reaching the deadline -- window still open
+
+
+def _pressure_backtest_materialized_breaches(records: list[dict]) -> list[dict]:
+    """Every forecast record (``binding`` naming a per-window series) whose
+    breach actually materialized within horizon+margin -- "did forecast
+    breaches materialize" (Task 30 brief). Independent of whether the plan's
+    coverage was adequate (that's under/over-throttle's job below); this is
+    the raw materialization signal both of those derive from."""
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        target = _pressure_backtest_target(rec.get("binding"))
+        if target is None:
+            continue
+        mat_rec, _covered = _pressure_backtest_first_materialization(records, i, target)
+        if mat_rec is None:
+            continue
+        view, name, window = target
+        hits.append({
+            "view": view, "name": name, "window": window,
+            "forecast_ts": rec.get("ts"), "materialized_ts": mat_rec.get("ts"),
+        })
+    return hits
+
+
+def _pressure_backtest_under_throttle_events(records: list[dict]) -> list[dict]:
+    """§1 SAFETY (the important metric): a forecast breach whose realized
+    outcome (`_pressure_backtest_first_materialization`) actually crossed
+    into breach, where the dry-run plan's ``planned_shed`` was LESS than the
+    required-reduction logged AT THE MOMENT OF MATERIALIZATION (the REALIZED
+    severity -- not the earlier forecast-time estimate, which
+    ``forecast_err_series`` already scores separately). This is the failure
+    the whole backtest exists to surface: the plan would have under-
+    throttled and the box could have blown the limit."""
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        would_ask = rec.get("would_ask")
+        if not would_ask:
+            continue
+        target = _pressure_backtest_target(rec.get("binding"))
+        if target is None:
+            continue
+        mat_rec, _covered = _pressure_backtest_first_materialization(records, i, target)
+        if mat_rec is None:
+            continue
+        planned_shed = float(would_ask.get("planned_shed") or 0.0)
+        required_realized = _pressure_backtest_required(mat_rec, target)
+        if planned_shed < required_realized:
+            view, name, window = target
+            hits.append({
+                "view": view, "name": name, "window": window,
+                "forecast_ts": rec.get("ts"), "materialized_ts": mat_rec.get("ts"),
+                "planned_shed": planned_shed,
+                "required_at_forecast": float(would_ask.get("required") or 0.0),
+                "required_realized": required_realized,
+                "deficit": required_realized - planned_shed,
+            })
+    return hits
+
+
+def _pressure_backtest_over_throttle_events(records: list[dict]) -> list[dict]:
+    """Advisory fairness cost (NOT a safety failure): a plan that SHED
+    (``would_target`` non-empty -- the plan would have asked sessions to
+    slow) on a forecast that never actually breached within horizon+margin.
+    Only counted when the lookahead `_pressure_backtest_first_
+    materialization` actually COVERS that full window -- a window that is
+    simply still open (not enough logged cycles yet) is not evidence of
+    "never breaches", so it's skipped rather than mis-scored."""
+    hits: list[dict] = []
+    for i, rec in enumerate(records):
+        targets = rec.get("would_target") or []
+        if not targets:
+            continue
+        target = _pressure_backtest_target(rec.get("binding"))
+        if target is None:
+            continue
+        mat_rec, covered = _pressure_backtest_first_materialization(records, i, target)
+        if mat_rec is not None or not covered:
+            continue
+        would_ask = rec.get("would_ask") or {}
+        view, name, window = target
+        hits.append({
+            "view": view, "name": name, "window": window,
+            "forecast_ts": rec.get("ts"),
+            "planned_shed": float(would_ask.get("planned_shed") or 0.0),
+            "targets": list(targets),
+        })
+    return hits
+
+
+def _pressure_backtest_reset_signed_errors(records: list[dict], model: str) -> list[float]:
+    """Signed forecast error @60-min lead for ``model`` (``decayed_step`` or
+    ``rolling_integral``), one value per joined (predicted, actual) pair,
+    pooled over every account/window (Task 30 -- reuses the SAME temporal
+    join `_pressure_shadow_forecast_errors` (Task 27) already performs for
+    ``decayed_step`` alone, but keeps the SIGN and scores ``rolling_
+    integral`` too, per the brief -- ``rolling_integral`` stays informational
+    only, never gates, Part 3).
+
+    Sign convention: ``predicted - actual``. Positive = the model predicted
+    MORE remaining than there actually was post-reset -- OVER-predicted (too
+    optimistic). Negative = it predicted LESS than there actually was --
+    UNDER-predicted (too pessimistic)."""
+    errors: list[float] = []
+    for i, rec in enumerate(records):
+        model_block = ((rec.get("reset_models") or {}).get(model)) or {}
+        if not model_block:
+            continue
+        ts_n = _pressure_parse_ts(rec.get("ts"))
+        if ts_n is None:
+            continue
+        target_ts = ts_n + timedelta(minutes=_PRESSURE_FORECAST_JOIN_LEAD_MIN)
+
+        best_rec = None
+        best_gap = None
+        for other in records[i + 1:]:
+            ts_m = _pressure_parse_ts(other.get("ts"))
+            if ts_m is None:
+                continue
+            gap_min = (ts_m - target_ts).total_seconds() / 60.0
+            if gap_min > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                break  # records are ascending -- nothing closer remains
+            if abs(gap_min) > _PRESSURE_FORECAST_JOIN_TOLERANCE_MIN:
+                continue
+            if best_gap is None or abs(gap_min) < best_gap:
+                best_rec, best_gap = other, abs(gap_min)
+        if best_rec is None:
+            continue
+
+        actual_block = best_rec.get("reset_models_actual") or {}
+        for name, win_map in model_block.items():
+            for window, entry in (win_map or {}).items():
+                predicted = (entry or {}).get("remaining_at_plus_60")
+                if predicted is None:
+                    continue
+                actual = (actual_block.get(name) or {}).get(window)
+                if actual is None:
+                    continue
+                errors.append(float(predicted) - float(actual))
+    return errors
+
+
+def score_shadow_window(records: list[dict]) -> dict:
+    """Task 30: the shadow-week BACKTEST scorer -- pairs each forecast
+    record with the realized outcome N cycles later and scores forecast-vs-
+    actual, over/under-throttle, and reset over/under-prediction, feeding
+    Task 27's ``shadow_report`` verdict inputs and the risk-4 tunability
+    review.
+
+    Read-only (G0): operates purely on the passed ``records`` list -- never
+    reads/writes files or state (that's `_pressure_shadow_scan`'s/
+    `shadow_report`'s job, one layer up). ``records`` is assumed pre-sorted
+    ascending by ``ts``, the SAME assumption every reused Task-27 helper
+    already makes.
+
+    Reuses Task 27's own forecast-error/false-clear/vacuous-clear helpers
+    verbatim (`_pressure_shadow_forecast_errors`/`_pressure_shadow_false_
+    clears`/`_pressure_shadow_vacuous_clears`) with an empty ``config={}`` --
+    each already degrades gracefully to the SAME config-absent defaults an
+    unconfigured `shadow_report` would use (`_pressure_shadow_reference_x`:
+    reference_x=1.0; `_pressure_enter_horizon`: horizon_hours=3 -> 180min);
+    Task 30's own interface takes only ``records`` (no ``config``), per the
+    brief.
+    """
+    config: dict = {}
+    forecast_err_series = {
+        window: _pressure_shadow_forecast_errors(records, config, window)
+        for window in _PRESSURE_WINDOWS
+    }
+    reset_over_under = {
+        model: _pressure_median(_pressure_backtest_reset_signed_errors(records, model))
+        for model in ("decayed_step", "rolling_integral")
+    }
+    return {
+        "forecast_err_series": forecast_err_series,
+        "false_clears": _pressure_shadow_false_clears(records, config),
+        "vacuous_clears": _pressure_shadow_vacuous_clears(records),
+        "materialized_breaches": _pressure_backtest_materialized_breaches(records),
+        "over_throttle_events": _pressure_backtest_over_throttle_events(records),
+        "under_throttle_events": _pressure_backtest_under_throttle_events(records),
+        "realized_safety_factor_series": _pressure_shadow_realized_safety_factors(records),
+        "reset_over_under": reset_over_under,
+    }
 
 
 @cli.command(name="sos")

@@ -1,0 +1,1 @@
+{"type": "assistant", "uuid": "u1", "sessionId": "sess-l", "timestamp": "2026-07-15T11:58:00Z", "message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 20, "output_tokens": 0}}}

@@ -122,6 +122,21 @@ cus uninstall                       # stops daemon, removes hooks, statusline, w
 cus uninstall --keep-data           # ... but preserves ~/claude-accounts/
 ```
 
+### Token-pressure emit — install ordering (advanced, Stage 1: dark by default)
+
+The daemon's token-pressure forecaster can emit early-warning events over an
+authenticated socket to a separate `sentinel` daemon once an operator flips
+`pressure.shadow_mode: false` in `config.yaml` (Stage 1 ships with
+`pressure.shadow_mode: true` — forecast + log only, nothing is emitted).
+**Install and enable `sentinel`, including its token-pressure source, *before*
+flipping `pressure.shadow_mode: false`** — an absent `sentinel` on `PATH`, or an unreachable
+emit socket, is never a crash: `cus` always degrades the same way, logging
+the would-emit at WARN and appending it to
+`~/claude-accounts/pressure/shadow/<date>.jsonl`, exactly as it would in
+shadow-only mode. Flipping `pressure.shadow_mode: false` before `sentinel` is
+installed is therefore safe but has no effect beyond that log entry until
+the install order is corrected.
+
 ## Quick reference
 
 ```bash

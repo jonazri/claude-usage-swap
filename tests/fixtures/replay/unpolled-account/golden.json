@@ -1,0 +1,114 @@
+{
+  "accounts": {
+    "Ghost": {
+      "5h": {
+        "burn_pct_per_min": 0.0,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": null,
+        "remaining_units": 0.44,
+        "required_reduction_pct_per_min": 0.0
+      },
+      "7d": {
+        "burn_pct_per_min": 0.0,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": null,
+        "remaining_units": 0.7,
+        "required_reduction_pct_per_min": 0.0
+      },
+      "capacity_x": 1.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    },
+    "Known": {
+      "5h": {
+        "burn_pct_per_min": 0.0,
+        "gate": 94.0,
+        "pct": 50.0,
+        "pinned_eta_min": null,
+        "remaining_units": 1.76,
+        "required_reduction_pct_per_min": 0.0
+      },
+      "7d": {
+        "burn_pct_per_min": 0.0,
+        "gate": 80.0,
+        "pct": 10.0,
+        "pinned_eta_min": null,
+        "remaining_units": 2.8,
+        "required_reduction_pct_per_min": 0.0
+      },
+      "capacity_x": 20.0,
+      "fable_weekly": {
+        "gate": 95.0,
+        "level_bound": true,
+        "pct": null
+      }
+    }
+  },
+  "attribution": {
+    "allow_supply_escalation": true,
+    "blindness": false,
+    "confidence": 1.0,
+    "reason": "no active sessions",
+    "residual_fraction": 0.0,
+    "suppress_residual_widening": false,
+    "suppress_targeting": false
+  },
+  "binding": {
+    "constraint": "5h",
+    "eta_min": null,
+    "name": "pool:5h",
+    "view": "pool",
+    "window": "5h"
+  },
+  "episode_id": null,
+  "generated_at": "2026-07-15T12:00:00+00:00",
+  "horizon_min": 180.0,
+  "level": "elevated",
+  "pool": {
+    "5h": {
+      "burn_units_per_min": 0.0,
+      "capacity_units": 3.76,
+      "exhaustion_eta_min": null,
+      "release_suppressed": true,
+      "remaining_units": 1.76,
+      "required_reduction_units_per_min": 0.0
+    },
+    "7d": {
+      "burn_units_per_min": 0.0,
+      "capacity_units": 3.2,
+      "exhaustion_eta_min": null,
+      "release_suppressed": true,
+      "remaining_units": 2.8,
+      "required_reduction_units_per_min": 0.0
+    }
+  },
+  "reference_x": 5.0,
+  "safety_factor": 1.7999999999999998,
+  "sessions": [],
+  "weight_fit": {
+    "condition_number": Infinity,
+    "n_windows": 0,
+    "residual_fraction": 0.0,
+    "seed_pinned": [
+      "input",
+      "output",
+      "cache_read",
+      "cache_create_5m",
+      "cache_create_1h"
+    ],
+    "seed_scale": 1.0,
+    "source": "insufficient-data",
+    "weights": {
+      "cache_create_1h": 2.0,
+      "cache_create_5m": 1.25,
+      "cache_read": 0.1,
+      "input": 1.0,
+      "output": 5.0
+    }
+  }
+}
