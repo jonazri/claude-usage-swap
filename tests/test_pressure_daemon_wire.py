@@ -4,23 +4,37 @@ loop (`daemon()` / its nested `one_cycle()`).
 
 Before this fix, `_pressure_cycle` was defined but never called by anything
 in the daemon — the shadow-mode forecaster never ran in production. This
-file proves two things:
+file proves:
 
   1. `_pressure_cycle` is actually invoked, once per daemon cycle, with the
-     daemon's live `(state, config, now)` — regardless of which of
+     daemon's own `(state, config, now)` — regardless of which of
      `one_cycle()`'s several account-management branches (reactive-429 /
      per_session / hybrid / hold / lazy-defer / no-execute / executed-swap)
-     is the one that fired this cycle. `one_cycle()` has NO single tail —
-     it returns from six different points plus one implicit fall-through —
-     so the wiring calls a small guarded helper, `_pressure_cycle_safe`,
-     from every one of those exit points.
+     is the one that fired this cycle.
   2. THE MOST IMPORTANT PROPERTY: a forecaster fault can NEVER crash or
      disrupt account rotation. If `_pressure_cycle` raises, `one_cycle()`
      must still complete normally (account work already happened), the
      exception must never propagate out of `daemon --once`, and a WARNING
      must be logged.
+  3. Fix wave 1, Part 1 (stale-state + 7-site fragility fix): the
+     forecaster is called from a SINGLE choke point — right after
+     `one_cycle()` returns, at the two places that actually call it (the
+     `--once` branch and the persistent while-loop in `daemon()`) — with a
+     FRESHLY `load_state()`'d dict, never a value `one_cycle()` built
+     mid-cycle. `one_cycle()` itself has NO single tail (it returns from
+     six different points plus one implicit fall-through); the ORIGINAL
+     wiring called a small guarded helper, `_pressure_cycle_safe`, from
+     every one of those seven exit points, passing `one_cycle()`'s own
+     local `state` — which was STALE on the two executed-swap paths (the
+     swap persists the new `active` account via its OWN
+     load_state()/save_state(), never refreshing `one_cycle()`'s local
+     copy). Consolidating to the loop-level choke point fixes both the
+     staleness and the "a future eighth exit point could silently skip the
+     call" fragility by construction.
+     `test_pressure_cycle_uses_fresh_state_after_cycle` proves this by
+     object identity.
 
-Both tests monkeypatch `cus._pressure_cycle` itself (spy / raiser) rather
+Tests 1/2/3 (below) monkeypatch `cus._pressure_cycle` itself (spy / raiser) rather
 than letting the real forecaster run — the real function reads real
 transcripts under `CLAUDE_DIR`/`SESSIONS_LOG` and writes real
 `PRESSURE_JSON`/`PRESSURE_ROOT` files, none of which this file's `_Env`
@@ -257,6 +271,67 @@ def test_pressure_cycle_called_on_no_execute_swap_branch():
         )
         assert len(calls) == 1, f"expected exactly one _pressure_cycle call, got {len(calls)}"
     finally:
+        cus._pressure_cycle = saved_pressure_cycle
+        env.restore()
+
+
+def test_pressure_cycle_uses_fresh_state_after_cycle():
+    """Fix wave 1, Part 1 (stale-state fix): the choke point must hand the
+    forecaster a FRESHLY `load_state()`'d dict obtained AFTER one_cycle()'s
+    account-management work has completed — never a `state` object
+    one_cycle() built mid-cycle (stale post-swap on two of the old seven
+    per-branch call sites).
+
+    Proven by object identity (stronger than shape/equality — a stale copy
+    could still coincidentally have the right keys): spy on `cus.load_state`
+    to capture every dict it returns during the whole `daemon --once`
+    invocation, and spy on `cus._pressure_cycle` to capture the `state`
+    object it actually receives. Assert that object `is` (identity) the
+    result of the LAST `load_state()` call made during the cycle — the
+    choke point's own post-cycle load — and is NOT the result of the FIRST
+    `load_state()` call — `one_cycle()`'s top-of-cycle read, which is what
+    the old per-branch wiring reused unchanged."""
+    from click.testing import CliRunner
+
+    env = _Env(TWO_ACCOUNTS, active="a", live_creds=_creds("rt-a", "at-a"))
+    saved_load_state = cus.load_state
+    saved_pressure_cycle = cus._pressure_cycle
+    load_state_calls = []
+    pressure_cycle_calls = []
+
+    def _spy_load_state():
+        st = saved_load_state()
+        load_state_calls.append(st)
+        return st
+
+    def _spy_pressure_cycle(state, config, now):
+        pressure_cycle_calls.append(state)
+        return {}
+
+    cus.load_state = _spy_load_state
+    cus._pressure_cycle = _spy_pressure_cycle
+    try:
+        with _DaemonHarness(poll_pct=10.0):   # hold branch (well under every threshold)
+            result = CliRunner().invoke(cus.cli, ["daemon", "--once", "--no-execute"],
+                                        catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        assert len(pressure_cycle_calls) == 1, (
+            f"expected exactly one _pressure_cycle call, got {len(pressure_cycle_calls)}")
+        assert len(load_state_calls) >= 2, (
+            "expected at least one load_state() call inside one_cycle() PLUS the "
+            f"choke point's own post-cycle load_state() call, got {len(load_state_calls)}"
+        )
+        assert pressure_cycle_calls[0] is load_state_calls[-1], (
+            "forecaster did not receive the state object from the LAST load_state() "
+            "call — the choke point must pass a freshly loaded post-cycle state, not "
+            "one_cycle()'s own (possibly stale) local"
+        )
+        assert pressure_cycle_calls[0] is not load_state_calls[0], (
+            "forecaster received one_cycle()'s stale top-of-cycle state instead of a "
+            "fresh post-cycle load"
+        )
+    finally:
+        cus.load_state = saved_load_state
         cus._pressure_cycle = saved_pressure_cycle
         env.restore()
 
