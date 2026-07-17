@@ -81,6 +81,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -20667,7 +20668,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         try:
             _pressure_cycle(state, config, datetime.now(timezone.utc))
         except Exception as exc:  # noqa: BLE001 — intentional catch-all; forecaster must never crash the daemon
-            click.echo(f"  [WARNING] token-pressure cycle failed (non-fatal, shadow-only): {exc}")
+            # Log the exception TYPE + full traceback (not just the message) so a
+            # swallowed forecaster fault is diagnosable from daemon.log without a repro.
+            click.echo(
+                f"  [WARNING] token-pressure cycle failed (non-fatal, shadow-only): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            click.echo("    " + traceback.format_exc().rstrip().replace("\n", "\n    "))
 
     def one_cycle() -> None:
         state = load_state()
