@@ -6647,21 +6647,29 @@ def _session_account_intervals(rows: list[dict]) -> dict[str, list[Interval]]:
 def _log_launch_time_fallback(session_id: str, account: str | None) -> None:
     """G8 / committee #10: launch-time degradation is a KNOWN, LOGGED
     limitation, never silent. One structured, greppable line per fallback
-    join -- same `click.echo`-to-stdout convention as CRED-AUDIT (@7116),
-    not a new log file. Never raises into its caller (observability must
-    never break attribution)."""
+    join -- emitted to STDERR (post-deploy fix: launch-time is the
+    UNIVERSAL case today, no rotation rows in sessions.log, so this used to
+    land on the SAME `click.echo`-to-stdout convention as CRED-AUDIT (@7116)
+    and corrupt every stdout-JSON caller -- `cus pressure --json`/
+    `--shadow-report`/statusline -- with dozens of interleaved log lines.
+    stderr keeps the line just as visible/greppable (systemd still captures
+    it into daemon.log) while leaving stdout clean). Not a new log file.
+    Never raises into its caller (observability must never break
+    attribution)."""
     try:
         click.echo(
             "pressure.attribution.launch_time_fallback "
             f"session_id={session_id} account={account} "
-            'reason="no rotation rows in sessions.log; single launch-time interval"'
+            'reason="no rotation rows in sessions.log; single launch-time interval"',
+            err=True,
         )
     except Exception:  # noqa: BLE001 -- observability must never break attribution
         pass
 
 
 def _join_usage_account(usage_ts: datetime,
-                         intervals: list[Interval]) -> tuple[str | None, str]:
+                         intervals: list[Interval], *,
+                         already_logged: set[str] | None = None) -> tuple[str | None, str]:
     """Task 11: time-join one usage-line timestamp to the account active
     then, via the covering interval `start <= usage_ts < end` (`end=None`
     treated as +inf -- the session's current/most-recent binding).
@@ -6677,6 +6685,16 @@ def _join_usage_account(usage_ts: datetime,
     at ITS timestamp, not the launch account -- i.e. today's single-interval
     behavior is the *degraded* case, not a hardcoded assumption.
 
+    `already_logged` (post-deploy fix): an OPTIONAL caller-owned dedup set,
+    keyed by `session_id`, that throttles `_log_launch_time_fallback` to AT
+    MOST ONCE per session per set lifetime. `_attribute_burn` (the
+    per-message loop) passes ONE shared set for its whole attribution pass
+    so a session with dozens of messages logs the fallback line exactly
+    once per pass, not once per message (launch-time is the universal case
+    -- per-message logging floods daemon.log). Default `None` preserves the
+    original always-log behavior for direct/standalone callers (e.g. tests
+    exercising this function in isolation).
+
     No covering interval (usage_ts before the earliest known binding, or no
     sessions.log history for this session at all -- `intervals=[]`) returns
     `(None, "unattributed")`: the caller (`_attribute_burn`) keeps this as
@@ -6686,7 +6704,10 @@ def _join_usage_account(usage_ts: datetime,
         return None, "unattributed"
     if len(intervals) == 1:
         iv = intervals[0]
-        _log_launch_time_fallback(iv.session_id, iv.account)
+        if already_logged is None or iv.session_id not in already_logged:
+            _log_launch_time_fallback(iv.session_id, iv.account)
+            if already_logged is not None:
+                already_logged.add(iv.session_id)
         return iv.account, "launch-time"
     for iv in sorted(intervals, key=lambda i: i.start):
         if iv.start <= usage_ts and (iv.end is None or usage_ts < iv.end):
@@ -6768,6 +6789,12 @@ def _attribute_burn(tails: dict, intervals: dict, weights: dict) -> AttributionT
       (see `AttributionTable`'s scope note), and `residual_fraction` is
       published as `residual / (residual + attributed)` (0.0 when both are
       zero, never a divide-by-zero).
+    - Post-deploy fix: a single `already_logged` set (scoped to this one
+      call, matching the dedup set above) is threaded through every
+      `_join_usage_account` call so `_log_launch_time_fallback` fires AT
+      MOST ONCE per `session_id` for this whole attribution pass, not once
+      per message -- launch-time is the universal case (FACT #5, no
+      rotation rows today), so per-message logging would flood daemon.log.
     """
     entries: list[tuple[datetime, str, str, dict]] = []
     for _path, lines in tails.items():
@@ -6795,6 +6822,7 @@ def _attribute_burn(tails: dict, intervals: dict, weights: dict) -> AttributionT
 
     table = AttributionTable()
     seen_at: dict[tuple[str, str], datetime] = {}
+    fallback_logged: set[str] = set()  # dedup set for this pass (see docstring)
 
     for ts, session_id, uid, usage in entries:
         key = (session_id, uid)
@@ -6805,7 +6833,8 @@ def _attribute_burn(tails: dict, intervals: dict, weights: dict) -> AttributionT
 
         burn = _message_burn_units(usage, weights)
         session_intervals = intervals.get(session_id, [])
-        account, _confidence = _join_usage_account(ts, session_intervals)
+        account, _confidence = _join_usage_account(
+            ts, session_intervals, already_logged=fallback_logged)
 
         if account is None:
             table.unattributed_residual["unattributed"] = (
@@ -24267,6 +24296,11 @@ def _pressure_raw_token_totals_by_account(tails: dict, intervals: dict) -> dict[
 
     totals: dict[str, dict[str, float]] = {}
     seen_at: dict[tuple[str, str], datetime] = {}
+    fallback_logged: set[str] = set()  # post-deploy fix: same once-per-pass
+    # throttle as `_attribute_burn` -- this is a SEPARATE pass over the same
+    # tails/intervals (see docstring), so it needs its own dedup set rather
+    # than sharing one across passes; still bounds this pass to at most one
+    # fallback line per session, not one per message.
     for ts, session_id, uid, usage in entries:
         key = (session_id, uid)
         prior = seen_at.get(key)
@@ -24274,7 +24308,8 @@ def _pressure_raw_token_totals_by_account(tails: dict, intervals: dict) -> dict[
             continue
         seen_at[key] = ts
         session_intervals = intervals.get(session_id, [])
-        account, _confidence = _join_usage_account(ts, session_intervals)
+        account, _confidence = _join_usage_account(
+            ts, session_intervals, already_logged=fallback_logged)
         if account is None:
             continue
         acct_totals = totals.setdefault(account, {c: 0.0 for c in _PRESSURE_RAW_TOKEN_COLUMNS})

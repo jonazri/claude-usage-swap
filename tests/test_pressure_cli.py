@@ -29,6 +29,7 @@ Run: ``python3 -m pytest tests/test_pressure_cli.py -q``.
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -269,6 +270,76 @@ def test_snapshot_receives_phase_d_products(tmp_path, monkeypatch):
     attribution = captured["attribution"]
     for key in ("confidence", "blindness", "residual_fraction", "reason"):
         assert key in attribution, f"attribution missing {key!r}: {attribution}"
+
+
+
+# ==================== test_pressure_json_stdout_is_clean_json ====================
+
+def test_pressure_json_stdout_is_clean_json(tmp_path, monkeypatch):
+    """THE critical post-deploy regression: `_log_launch_time_fallback`'s
+    greppable line must NEVER land on stdout, or it corrupts `cus pressure
+    --json`'s output for every stdout-JSON consumer (statusline,
+    `--shadow-report`-adjacent tooling, any scripted caller doing
+    `json.loads` on stdout). Launch-time is the UNIVERSAL case today (FACT
+    #5 -- no rotation rows in sessions.log), so a real session with a real
+    transcript line WILL hit the fallback and WOULD have printed
+    `pressure.attribution.launch_time_fallback ...` straight into stdout
+    ahead of the JSON, breaking `json.loads`. This builds exactly that
+    session (one sessions.log row -> single interval -> launch-time; one
+    real assistant transcript line so `_attribute_burn` genuinely drives
+    the join) and asserts stdout is nothing but parseable JSON while the
+    fallback line lands on stderr instead."""
+    _env(tmp_path, monkeypatch)
+
+    now = datetime.now(timezone.utc)
+    session_id = "sFallback"
+    account = "A"
+
+    def _iso(dt: datetime) -> str:
+        return dt.isoformat().replace("+00:00", "Z")
+
+    # sessions.log: ONE row for this session (FACT #5 shape, no rotation
+    # rows) -> `_session_account_intervals` yields a single interval ->
+    # `_join_usage_account` always degrades to launch-time for it.
+    sessions_log = tmp_path / "sessions.log"
+    launch_ts = _iso(now - timedelta(minutes=5))
+    sessions_log.write_text(
+        f"{launch_ts},{session_id},{account},%1,/tmp/tmux-1000/default,/home/yaz/project\n"
+    )
+    monkeypatch.setattr(cus, "SESSIONS_LOG", sessions_log)
+
+    # A real, recently-modified transcript with a real assistant usage line
+    # -> `_read_active_tails` picks it up and `_attribute_burn` actually
+    # calls `_join_usage_account` on it (not just an empty-tails no-op).
+    projects_dir = cus.CLAUDE_DIR / "projects" / "-home-yaz-project"
+    projects_dir.mkdir(parents=True)
+    transcript = projects_dir / f"{session_id}.jsonl"
+    line = {
+        "type": "assistant",
+        "uuid": "uid-1",
+        "sessionId": session_id,
+        "timestamp": _iso(now - timedelta(minutes=1)),
+        "message": {
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+            "model": "claude-opus-4-8",
+        },
+    }
+    transcript.write_text(json.dumps(line) + "\n")
+
+    result = CliRunner(mix_stderr=False).invoke(cus.cli, ["pressure", "--json"])
+    assert result.exit_code == 0, result.output
+
+    # stdout must be ONLY the JSON snapshot -- parseable, and no fallback
+    # text leaked into it.
+    snap = json.loads(result.stdout)
+    assert snap["level"] in ("ok", "elevated", "critical")
+    assert "launch_time_fallback" not in result.stdout
+    assert "pressure.attribution" not in result.stdout
+
+    # The fallback line must have genuinely fired (not merely absent
+    # because nothing happened) -- on stderr, naming the session.
+    assert "pressure.attribution.launch_time_fallback" in result.stderr
+    assert f"session_id={session_id}" in result.stderr
 
 
 if __name__ == "__main__":
