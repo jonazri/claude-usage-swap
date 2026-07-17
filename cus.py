@@ -81,6 +81,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -20626,6 +20627,55 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             for c in conditions:
                 click.echo(f"  [{c.severity.upper()}] {c.summary}")
 
+    def _pressure_cycle_safe(state: dict, config: dict) -> None:
+        # Token-pressure forecaster shadow cycle (spec-2 Stage 1, deploy-time
+        # integration fix): `_pressure_cycle` was previously never wired into
+        # the daemon, so the shadow-mode forecaster never ran in production.
+        #
+        # Fix wave 1, Part 1 (stale-state + 7-site fragility fix): the
+        # original wiring called this from all seven of one_cycle()'s exit
+        # points, passing one_cycle()'s own local `state`. Two of those
+        # (the executed-swap sub-case of the reactive-429 branch, and the
+        # executed-swap tail) are STALE: the swap persists the new `active`
+        # account via its OWN load_state()/save_state(), but one_cycle()'s
+        # local `state` is never refreshed, so the forecaster saw the
+        # pre-swap `active`. Consolidated to a SINGLE choke point instead:
+        # the two places that actually CALL one_cycle() (the --once branch
+        # and the persistent while-loop, both below `one_cycle`'s own def)
+        # call this exactly once, immediately AFTER one_cycle() returns,
+        # with a FRESH `load_state()`/`load_config()` — never a value
+        # one_cycle() built mid-cycle. This guarantees the accumulator
+        # (Task 27b) advances exactly once per cycle, on every outcome,
+        # always with up-to-date post-cycle state (including a swap that
+        # just executed), by construction — no per-branch call to forget
+        # when a future eighth exit point is added. Matches the old
+        # wiring's skip semantics: if one_cycle() itself raises, the caller
+        # never reaches the call, so the forecaster is skipped that cycle
+        # exactly as before.
+        #
+        # FAIL-SAFE (non-negotiable): a forecaster fault must NEVER disrupt
+        # account rotation, which has already finished by the time this
+        # runs. `_pressure_cycle` deep-copies `state` immediately and never
+        # calls `save_state` (G0 — see its docstring), so handing it a
+        # freshly loaded, post-cycle `state` is safe and read-only; any
+        # exception it raises is caught here and logged at WARNING, never
+        # propagated.
+        #
+        # Adds bounded latency to each tick: transcript reads are already
+        # byte-capped (Task 10, PER_CYCLE_TAIL_BYTES=64 MiB) and the fit is a
+        # tiny 5-column solve, so the per-cycle cost is small; no timeout for
+        # v1.
+        try:
+            _pressure_cycle(state, config, datetime.now(timezone.utc))
+        except Exception as exc:  # noqa: BLE001 — intentional catch-all; forecaster must never crash the daemon
+            # Log the exception TYPE + full traceback (not just the message) so a
+            # swallowed forecaster fault is diagnosable from daemon.log without a repro.
+            click.echo(
+                f"  [WARNING] token-pressure cycle failed (non-fatal, shadow-only): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            click.echo("    " + traceback.format_exc().rstrip().replace("\n", "\n    "))
+
     def one_cycle() -> None:
         state = load_state()
         config = load_config()
@@ -20905,6 +20955,15 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
     if once:
         one_cycle()
+        # Single fresh-state choke point (fix wave 1, Part 1): call the
+        # forecaster exactly once per cycle, AFTER one_cycle()'s account-
+        # management work has fully completed, with a FRESH
+        # load_state()/load_config() rather than a value one_cycle() built
+        # mid-cycle (which is stale post-swap on two of its former seven
+        # call sites -- see _pressure_cycle_safe's docstring). Skipped if
+        # one_cycle() itself raised, matching the old per-branch wiring's
+        # skip semantics exactly.
+        _pressure_cycle_safe(load_state(), load_config())
         return
 
     config = load_config()
@@ -20923,6 +20982,17 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             cycle_t0 = time.monotonic()
             try:
                 one_cycle()
+                # Single fresh-state choke point (fix wave 1, Part 1) -- see
+                # the --once call site above for the full rationale. Reloads
+                # config fresh too (not the outer, loop-lifetime `config`
+                # loaded once before this while-loop started, which would
+                # otherwise go stale for the forecaster across a long-running
+                # daemon even though one_cycle() itself already reloads
+                # config every cycle). Runs only when one_cycle() completed
+                # without raising, matching the old per-branch wiring's skip
+                # semantics exactly (an exception here never reaches this
+                # line either way).
+                _pressure_cycle_safe(load_state(), load_config())
             except Exception as e:
                 click.echo(f"ERROR in cycle: {type(e).__name__}: {e}", err=True)
             # GH #59: adaptive repoll — wake just after the soonest known 5h
