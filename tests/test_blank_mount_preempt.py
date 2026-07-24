@@ -729,13 +729,15 @@ def test_e_legacy_independent_login_lane_never_heals_from_snapshot():
         store = cus.login_store_creds_path("rayi", slot)
         store.parent.mkdir(parents=True, exist_ok=True)
         store.write_text(json.dumps(
-            _valid("at-legacy", "rt-legacy-independent", expires_at=1_700_000_000_000)))
+            _valid("at-legacy", "rt-own-lineage", expires_at=1_700_000_000_000)))
         env.shadow_path(slot).write_text(json.dumps(
             _valid("at-shadow-own-lineage", "rt-own-lineage", expires_at=1_700_000_000_000)))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-own-lineage"
-        # In-lineage preference, not a shadow-vs-snapshot comparison → no pick line.
-        assert env.audit_lines("blank-heal-source") == []
+        # A real in-lineage comparison happened → forensic pick line (round-4),
+        # naming the rejected store.
+        picks = env.audit_lines("blank-heal-source")
+        assert len(picks) == 1 and f"rejected={store}" in picks[0]
     finally:
         env.restore()
 
@@ -782,6 +784,75 @@ def test_e_tokenless_canonical_never_beats_refresh_capable_shadow():
             _valid("at-shadow-older-capable", "rt-shadow", expires_at=1_700_000_000_000)))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-older-capable"
+    finally:
+        env.restore()
+
+
+def test_e_tokenless_shadow_never_beats_refresh_capable_canonical():
+    # Committee round-4 (Claude, Important): the capability gate must be
+    # SYMMETRIC — a token-less shadow (mintable by _update_lane_lastvalid from
+    # a mount healed with a token-less canonical) that is strictly fresher must
+    # not beat a refresh-capable canonical. Canonical expiry is in the future,
+    # so the dead-probe's cheap valid-access path decides without network.
+    shadow = _valid("at-shadow-tokenless-fresher", "rt-ignored", expires_at=2_000_000_000_000)
+    shadow["claudeAiOauth"].pop("refreshToken")
+    env = _Env({"rayi": _valid("at-snap-capable", "rt-snap", expires_at=1_900_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(shadow))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-snap-capable"
+    finally:
+        env.restore()
+
+
+def test_e_legacy_tokenless_shadow_loses_to_store():
+    # Round-4 mirror inside the legacy branch: the store is refresh-capable by
+    # construction (`has_independent_login` requires a refreshToken), so a
+    # token-less shadow loses at ANY freshness there too.
+    shadow = _valid("at-shadow-tokenless", "rt-ignored", expires_at=2_000_000_000_000)
+    shadow["claudeAiOauth"].pop("refreshToken")
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_100_000_000_000)},
+               active="rayi",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(
+            _valid("at-legacy-capable", "rt-legacy", expires_at=1_700_000_000_000)))
+        env.shadow_path(slot).write_text(json.dumps(shadow))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-legacy-capable"
+    finally:
+        env.restore()
+
+
+def test_e_mount_refresh_age_routing_parity():
+    # Committee round-4 (Claude): the round-3 parity fix to
+    # `_mount_refresh_age_days` had no coverage. Pin the routing itself with
+    # sentinel values: lease RECORD alone (gate off) → the family's provenance;
+    # legacy store + gate on → the (account, slot) provenance; legacy store +
+    # gate off (vestigial) → the snapshot mint proxy.
+    env = _Env({"rayi": _valid("at-snap", "rt-snap")}, active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_valid("at-mount", "rt-mount"))
+        env.patch(cus, "login_age_days", lambda *a: ("family" if a[1].startswith("family") else "legacy"))
+        env.patch(cus, "_account_snapshot_age_days", lambda account: "snapshot-proxy")
+        gate_off = {"independent_logins": {"use_independent_logins": False}}
+        gate_on = {"independent_logins": {"use_independent_logins": True}}
+        # 1. Lease record decides even with the gate off (matches _lane_heal_source).
+        state = {"slots": {slot: {"login_family": "rayi/family-1"}}}
+        assert cus._mount_refresh_age_days("rayi", slot, state, gate_off) == "family"
+        # 2. Legacy store + gate on → legacy provenance.
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(_valid("at-legacy", "rt-legacy")))
+        assert cus._mount_refresh_age_days("rayi", slot, {"slots": {}}, gate_on) == "legacy"
+        # 3. Same store with the gate off is vestigial → snapshot mint proxy.
+        assert cus._mount_refresh_age_days("rayi", slot, {"slots": {}}, gate_off) == "snapshot-proxy"
     finally:
         env.restore()
 

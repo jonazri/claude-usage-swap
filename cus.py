@@ -14672,6 +14672,19 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
         rt = _cand_oauth(creds).get("refreshToken")
         return rt if isinstance(rt, str) and rt else None
 
+    def _audit_shape(creds: Any) -> Any:
+        # The global audit renderers (`_audit_token_fp` → _credential_refresh_token,
+        # `_expiry_repr` → _creds_expires_at) read ONLY the nested
+        # creds["claudeAiOauth"] shape, while the comparisons here deliberately
+        # tolerate a FLAT candidate (see _cand_oauth). Without normalizing, a
+        # flat-shaped winner would log token_fp=none/source_expiry=none — the
+        # forensic line contradicting the decision it documents (committee
+        # 2026-07-24, #13 round-2). Wrap flat creds into the nested shape for
+        # RENDERING only; already-nested creds pass through untouched.
+        if isinstance(creds, dict) and isinstance(creds.get("claudeAiOauth"), dict):
+            return creds
+        return {"claudeAiOauth": _cand_oauth(creds)}
+
     # LEGACY per-(slot,account) independent login (pre-pool store, distinct from
     # the pooled `slot_leased_family` branch above): handled BEFORE any
     # canonical-snapshot consideration, including the no-shadow fallback.
@@ -14702,7 +14715,41 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
         except (json.JSONDecodeError, OSError):
             pass  # unreadable/blank legacy store isn't a candidate either
         if shadow_creds is not None and legacy_creds is not None:
-            return legacy_store if _cand_expiry(legacy_creds) > _cand_expiry(shadow_creds) else shadow
+            # Same comparison discipline as the plain lane below (committee
+            # 2026-07-24, #13 round-4 mirrors): the store is refresh-capable by
+            # construction (`has_independent_login` requires a refreshToken),
+            # so a token-less shadow loses at ANY freshness (capability gate);
+            # an exact tie is broken by refresh-token IDENTITY (same token →
+            # shadow, byte-provenance-certain for THIS mount; different →
+            # the store — a shadow captured BEFORE the legacy login was
+            # provisioned carries shared-snapshot bytes, and installing it
+            # would be exactly the cross-family install this branch exists to
+            # prevent); otherwise the freshest wins.
+            _lrt = _cand_refresh(legacy_creds)
+            _srt_l = _cand_refresh(shadow_creds)
+            l_exp = _cand_expiry(legacy_creds)
+            s_exp = _cand_expiry(shadow_creds)
+            if _srt_l is None:
+                store_wins = True
+            elif l_exp == s_exp:
+                store_wins = _srt_l != _lrt
+            else:
+                store_wins = l_exp > s_exp
+            l_winner, l_wcreds = (legacy_store, legacy_creds) if store_wins else (shadow, shadow_creds)
+            l_loser, l_lcreds = (shadow, shadow_creds) if store_wins else (legacy_store, legacy_creds)
+            # Forensics parity with the plain-lane pick line (round-4): a real
+            # in-lineage comparison rejected a candidate, and a legacy-lane
+            # replay of the #13 incident must be reconstructible from the
+            # CRED-AUDIT stream too. Never probed → never "picked-unprobed".
+            _cred_audit(
+                "blank-heal-source", "picked",
+                "freshest usable in-lineage candidate wins (legacy per-slot store "
+                "vs lane shadow) — never install a token generation staler than "
+                "another available source (GH #13 reuse-revocation)",
+                slot=slot, account=account, token_fp=_audit_token_fp(_audit_shape(l_wcreds)),
+                extra=(f"source={l_winner} source_expiry={_expiry_repr(_audit_shape(l_wcreds))} "
+                       f"rejected={l_loser} rejected_expiry={_expiry_repr(_audit_shape(l_lcreds))}"))
+            return l_winner
         if shadow_creds is not None:
             return shadow
         if legacy_creds is not None:
@@ -14773,6 +14820,15 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
     _crt = _cand_refresh(canonical_creds)
     if _crt is None and _srt is not None:
         canonical_wins = False
+    elif _srt is None and _crt is not None:
+        # MIRROR of the gate above (committee 2026-07-24, #13 round-4): the
+        # capability rule must be symmetric — a token-less SHADOW that happens
+        # to be strictly fresher (e.g. minted by _update_lane_lastvalid from a
+        # mount the no-shadow fallback healed with a token-less canonical)
+        # must not beat a refresh-capable canonical either. Safe because a
+        # winning canonical is still dead-probed below, so a rotated-away
+        # canonical generation gets vetoed regardless.
+        canonical_wins = True
     elif canonical_exp == shadow_exp:
         canonical_wins = not (_srt is not None and _srt == _crt)
     else:
@@ -14803,20 +14859,6 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
                 return shadow  # snapshot vanished mid-probe → shadow still usable
     winner, winner_creds = (canonical, canonical_creds) if canonical_wins else (shadow, shadow_creds)
     loser, loser_creds = (shadow, shadow_creds) if canonical_wins else (canonical, canonical_creds)
-
-    def _audit_shape(creds: Any) -> Any:
-        # The global audit renderers (`_audit_token_fp` → _credential_refresh_token,
-        # `_expiry_repr` → _creds_expires_at) read ONLY the nested
-        # creds["claudeAiOauth"] shape, while the comparison above deliberately
-        # tolerated a FLAT candidate (see _cand_oauth). Without normalizing, a
-        # flat-shaped winner would log token_fp=none/source_expiry=none — the
-        # forensic line contradicting the decision it documents (committee
-        # 2026-07-24, #13 round-2). Wrap flat creds into the nested shape for
-        # RENDERING only; already-nested creds pass through untouched.
-        if isinstance(creds, dict) and isinstance(creds.get("claudeAiOauth"), dict):
-            return creds
-        return {"claudeAiOauth": _cand_oauth(creds)}
-
     # Forensics (the incident was only reconstructible from CRED-AUDIT lines):
     # record which source won the comparison and why, next to the blank-heal
     # line the caller emits. Only when a real comparison happened — a single
