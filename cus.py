@@ -1419,6 +1419,25 @@ def migrate_account_dir(account_dir: Path) -> dict:
     return {"action": "migrated", "details": details}
 
 
+def _swap_snapshot_creds_path(account: str) -> Path:
+    """The per-account snapshot credentials path AS THE SWAP PATH RESOLVES IT:
+    auto-migrate a pre-migration dir first (the read-side migrate
+    _execute_swap_locked has always performed), then return the post-migration
+    .credentials.json unconditionally — unlike `account_creds_path`, which
+    probes for the legacy filename instead of migrating. One helper shared by
+    _execute_swap_locked (target_creds), _slot_move_plan's byte overlay, and
+    _recover_pending_swap's legacy-journal fallback (GH #15 round 3 finding 6)
+    so preview and recovery resolve the exact candidate file execution
+    installs. Migration is skipped for a missing dir (nothing to migrate; the
+    caller's own exists()/FileNotFoundError handling owns that case — and
+    write_json's mkdir must not scaffold a bogus account dir from a preview
+    or a recovery pass)."""
+    d = ACCOUNTS_DIR / f"account-{account}"
+    if d.exists():
+        migrate_account_dir(d)
+    return d / ".credentials.json"
+
+
 # --------------------------------------------------------------------------
 # Mounts + slots (per_session mode)
 #
@@ -2169,6 +2188,36 @@ def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
     return out
 
 
+def _candidate_family_colliders(candidate: Path, this_mount: str | None, state: dict,
+                                config: dict | None = None) -> tuple[str | None, list[str]]:
+    """Fingerprint the CANDIDATE install bytes and name every OTHER live mount
+    already running that refresh-token family — the single byte-level,
+    name-AGNOSTIC collision primitive behind every point that installs
+    candidate bytes (GH #15; shared per round 3 finding 1 so they can never
+    drift): _execute_swap_locked's forward guard, _slot_move_plan's preview
+    overlay, and _recover_pending_swap's roll-forward copy. `this_mount` is
+    the install DESTINATION (a slot name, or None = the shared ~/.claude
+    pair), excluded from the collider list — landing on yourself is not a
+    second mount. session_aware=True throughout, matching the neighboring
+    swap guards (an orphan holder refreshes no token). Returns
+    (fingerprint, ["mount (account)", ...]); (None, []) when the candidate is
+    unreadable or carries no refresh token — no family to collide, and the
+    #141 definitive install-point gate owns refusing unreadable/blank sources.
+    """
+    try:
+        cand_rt = _credential_refresh_token(read_json(candidate))
+    except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
+        return None, []
+    if not cand_rt:
+        return None, []
+    fp = _refresh_fingerprint(cand_rt)
+    this = this_mount if this_mount is not None else "shared-mount"
+    return fp, [f"{m} ({a or '?'})"
+                for m, a, live_fp in _live_mount_refresh_fingerprints(state, config,
+                                                                      session_aware=True)
+                if live_fp == fp and m != this]
+
+
 def duplicate_live_mount_families(state: dict) -> list[dict]:
     """One refresh-token family live on TWO+ mounts — the #104 clobber itself,
     measured at the LIVE mounts (slot dirs + the global ~/.claude pair) rather
@@ -2394,10 +2443,15 @@ def shared_family_allowed(config: dict | None = None) -> bool:
     refuses at pool exhaustion ("pool exhausted for ...") before this knob is
     ever consulted, and the byte-level name-agnostic collision guard consults
     it only gate-off for the same reason. (The one gate-on consult left is the
-    SHARED-mount install, slot=None, which has no pool to claim from — there
-    the hatch still distinguishes refuse from proceed, and actual byte
-    collisions are refused regardless by the byte-level guards.)
-    _slot_move_plan previews with the same gate-off-only rule
+    NAME-KEYED guard on the SHARED-mount install, slot=None, which has no pool
+    to claim from — there the hatch still distinguishes refuse from proceed.
+    Stated precisely — round 3 finding 3: gate-ON's hatch-INDEPENDENT refusals
+    are (a) lane pool exhaustion and (b) BYTE-IDENTICAL family collisions (the
+    byte-level guards); a gate-on + hatch-on slot=None install whose
+    shared-family snapshot has ROTATION-DIVERGED from the live mount's copy —
+    same family lineage, different bytes — passes both and installs. The
+    slot=None hatch consult is deliberate, but its backstop is byte-deep, not
+    lineage-deep.) _slot_move_plan previews with the same gate-off-only rule
     (`elif not gate and shared_family_allowed(...)`), keeping preview and
     execution agreed."""
     cfg = config if config is not None else load_config()
@@ -9429,7 +9483,9 @@ def _swap_lock(timeout_seconds: float | None = None):
             pass
 
 
-def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot: str | None = None) -> None:
+def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot: str | None = None,
+                        install_src: Path | None = None, used_independent: bool = False,
+                        login_family: str | None = None) -> None:
     """Persist swap intent BEFORE the first mutating step (GH #76).
 
     If the process dies anywhere inside the swap sequence, this file is what
@@ -9440,6 +9496,16 @@ def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot:
     per_session: `slot` names the mount the swap targets (None = the global
     ~/.claude/ pair). `from_name` may be None for a swap-into-empty-slot
     (a `cus launch` install — there is no outgoing account).
+
+    GH #15 round 3 (finding 1): `install_src` records the ONE install source
+    the guards above the journal write APPROVED (account snapshot, claimed
+    pool family, or legacy per-slot login), `used_independent` its provenance
+    flag, and `login_family` the lease the final save_state would have
+    recorded for a claimed family. _recover_pending_swap's landed=='to'
+    roll-forward completes the install from THAT file — never substituting
+    the snapshot for a claimed family, which would double-book the family the
+    forward path deliberately steered around. Absent fields = a legacy
+    journal, which keeps the historic GH #76 snapshot semantics.
     """
     payload = {
         "from": from_name, "to": to_name, "trigger": trigger, "ts": now_iso(),
@@ -9448,6 +9514,11 @@ def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot:
     }
     if slot is not None:
         payload["slot"] = slot
+    if install_src is not None:
+        payload["install_src"] = str(install_src)
+        payload["used_independent"] = bool(used_independent)
+        if login_family is not None:
+            payload["login_family"] = login_family
     write_json(_swap_journal_path(), payload)
 
 
@@ -9955,30 +10026,120 @@ def _recover_pending_swap() -> None:
         # job. If the live creds still carry `from`'s lineage — or, for a
         # slot mount, are missing entirely (empty-slot install crashed
         # between the identity write and the creds copy) — complete the
-        # install from `to`'s snapshot.
-        target_creds = ACCOUNTS_DIR / f"account-{to}" / ".credentials.json"
+        # install from the source the crashed swap had APPROVED. GH #15
+        # round 3 (finding 1): the journal records that source (install_src —
+        # a claimed pool family, a legacy per-slot login, or the snapshot);
+        # rolling forward from the SNAPSHOT when the forward guards had
+        # deliberately steered onto a distinct FAMILY would double-book the
+        # family across two live mounts — the exact #104/GH #15 hazard. A
+        # legacy journal (no install_src field) keeps the historic GH #76
+        # snapshot semantics; a journaled source that has since VANISHED does
+        # NOT fall back to the snapshot (same double-book hazard) — the copy
+        # is skipped and the relogin/SOS machinery owns the lane.
+        _j_src = j.get("install_src") if isinstance(j, dict) else None
+        # Non-str/empty install_src (hand-edited journal) degrades to legacy
+        # semantics rather than crashing recovery — same tolerance as the
+        # rest of the journal fields.
+        legacy_journal = not (isinstance(_j_src, str) and _j_src)
+        if legacy_journal:
+            recovery_src = _swap_snapshot_creds_path(to)
+            j_family = None
+        else:
+            recovery_src = Path(_j_src)
+            _j_fam = j.get("login_family")
+            j_family = _j_fam if isinstance(_j_fam, str) and _j_fam else None
         try:
             live_creds = read_json(live_creds_path) if live_creds_path.exists() else None
         except (json.JSONDecodeError, OSError):
             live_creds = None
         state = load_state()
         installed_note = ""
-        if live_creds is not None and target_creds.exists():
+        note_if_copied = ""
+        needs_copy = False
+        if live_creds is not None:
             verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
             if verdict == "foreign":
+                needs_copy = True
+                note_if_copied = " (live creds still held the outgoing account's tokens; completed the install)"
+        elif slot:
+            needs_copy = True
+            note_if_copied = " (slot had no creds yet; completed the install)"
+        if needs_copy and not recovery_src.exists():
+            needs_copy = False
+            installed_note = (f" (creds copy SKIPPED: recovery source {recovery_src.name} is gone"
+                              f"{'' if legacy_journal else ' — no snapshot substitution for a journaled source'}; "
+                              f"relogin/SOS owns the mount from here)")
+        if needs_copy:
+            # ---- GH #15 round 3 (finding 1b): recovery honors the byte guard.
+            # This roll-forward copy is exactly as much an install as the
+            # forward path's atomic_copy, and the world can change between the
+            # journal write and recovery (another mount installed/claimed the
+            # same family; a legacy journal's snapshot may alias one) — so run
+            # the SAME name-agnostic fingerprint check the forward path runs,
+            # hatch semantics included (gate-off + allow_shared_family
+            # proceeds LOUDLY; everything else refuses). On refusal: NO copy —
+            # clear the journal and stop. The cleared journal + already-merged
+            # identity degrades to the identity-drift/SOS detection surface
+            # (foreign creds on the mount, pointing at relogin); a paused lane
+            # beats a guard-free double-book.
+            config = load_config()
+            _fp, _colliders = _candidate_family_colliders(recovery_src, slot, state, config)
+            if _colliders and not (not independent_logins_enabled(config)
+                                   and shared_family_allowed(config)):
+                _cred_audit("family-collision-refuse", "refused-recovery-roll-forward",
+                            "crash-recovery roll-forward source's refresh-token family is LIVE on "
+                            "another mount — copy refused; lane left to relogin/SOS (GH #15 round 3)",
+                            slot=slot, mount=(slot or "shared-mount"), account=to,
+                            shared=True, token_fp=(_fp or "none"))
+                msg = (f"[URGENT] crashed swap {frm!r} -> {to!r}: the "
+                       f"{'snapshot' if legacy_journal else 'journaled install source'} "
+                       f"({recovery_src.name}) carries refresh-token family {_fp} ALREADY LIVE on "
+                       f"{', '.join(_colliders)} — refusing the recovery copy: a guard-free "
+                       f"roll-forward would double-book the family and risk the reuse-detection "
+                       f"revocation (GH #15). Journal cleared; the mount keeps its current creds. "
+                       f"Run `cus sos` / `cus relogin {to}` to finish placing it.")
+                click.echo(f"swap-journal: {msg}", err=True)
+                try:
+                    append_inbox("crash-recovery", "recovery roll-forward refused (family collision)", msg)
+                except OSError:
+                    pass
+                _clear_swap_journal()
+                return
+            if _colliders:
+                _cred_audit("family-collision-hatch", "urgent-proceed-shared-family",
+                            "crash-recovery roll-forward source's family is LIVE on another mount — "
+                            "proceeding only under allow_shared_family (GH #15)",
+                            slot=slot, mount=(slot or "shared-mount"), account=to,
+                            shared=True, token_fp=(_fp or "none"))
+                click.echo(f"[URGENT] crash-recovery: completing {to!r} install from a family "
+                           f"({_fp}) ALREADY LIVE on {', '.join(_colliders)} — proceeding only "
+                           f"because independent_logins.allow_shared_family is true (GH #15)")
+            if live_creds is not None:
                 backup_credentials_file(live_creds_path)   # GH #79 choke point
-                atomic_copy(target_creds, live_creds_path, mode=0o600)
-                installed_note = " (live creds still held the outgoing account's tokens; completed the install)"
-        elif live_creds is None and slot and target_creds.exists():
-            atomic_copy(target_creds, live_creds_path, mode=0o600)
-            installed_note = " (slot had no creds yet; completed the install)"
+            atomic_copy(recovery_src, live_creds_path, mode=0o600)
+            installed_note = note_if_copied
         if slot:
             entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
+            dirty = False
             if entry.get("account") != to:
                 entry["account"] = to
                 state.setdefault("swap_history", []).append({
                     "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery", "slot": slot,
                 })
+                dirty = True
+            # New-format journal: also reconcile the family LEASE the crashed
+            # swap's final save_state would have recorded — without it a
+            # recovery-completed FAMILY install leaves the family looking
+            # FREE, claimable by another lane (the same double-book the copy
+            # guard above refuses). Legacy journals leave the lease untouched
+            # (historic GH #76 behavior).
+            if not legacy_journal:
+                if j_family and entry.get("login_family") != j_family:
+                    entry["login_family"] = j_family
+                    dirty = True
+                elif not j_family and entry.pop("login_family", None) is not None:
+                    dirty = True
+            if dirty:
                 save_state(state)
             where = f"slots.{slot}.account"
         else:
@@ -10250,8 +10411,9 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     target_dir = ACCOUNTS_DIR / f"account-{target_name}"
     current_dir = ACCOUNTS_DIR / f"account-{current}" if current is not None else None
 
-    # Auto-migrate if dir is in old layout
-    migrate_account_dir(target_dir)
+    # Auto-migrate if dir is in old layout (target's migrate rides inside
+    # _swap_snapshot_creds_path below — the one construction shared with the
+    # _slot_move_plan overlay and crash recovery, round 3 finding 6)
     if current_dir is not None:
         migrate_account_dir(current_dir)
 
@@ -10261,7 +10423,7 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # (target, slot), swap_install_source substitutes that login's own family so
     # two live mounts on one account don't clobber on rotation (#104/#103/#3).
     # Gate off (default) => install_src == target_creds, i.e. today's copy path.
-    target_creds = target_dir / ".credentials.json"
+    target_creds = _swap_snapshot_creds_path(target_name)
     target_cj = target_dir / ".claude.json"
     if not target_creds.exists():
         raise FileNotFoundError(f"{target_creds} missing — re-run `cus init --force`")
@@ -10587,75 +10749,86 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # names. The detector half already measured this
     # (`duplicate_live_mount_families` groups live mounts by fingerprint
     # regardless of name) but was passive; this enforces the same primitive
-    # (`_live_mount_refresh_fingerprints`) at the one point that sees the
-    # CANDIDATE bytes actually about to be installed — install_src is fully
-    # resolved above (snapshot, claimed pool family, or legacy store), and
-    # live_creds_path is still untouched, so raising is a clean no-op for the
-    # mount. Deliberately NOT scoped to independent_logins_enabled and NOT keyed
-    # on target_name — those two scopings ARE the gap. session_aware semantics
-    # match the neighboring guards (an orphan holder refreshes no token; an idle
-    # slot can't clobber). The allow_shared_family hatch applies here exactly as
+    # (via the shared `_candidate_family_colliders`) at the forward install
+    # point, where install_src is fully resolved above (snapshot, claimed pool
+    # family, or legacy store) and live_creds_path is still untouched, so
+    # raising is a clean no-op for the mount. The OTHER point that installs
+    # candidate bytes — _recover_pending_swap's roll-forward copy of a
+    # journaled source — runs the same shared check before ITS copy (round 3
+    # finding 1), so no install point is guard-free. Deliberately NOT scoped
+    # to independent_logins_enabled and NOT keyed on target_name — those two
+    # scopings ARE the gap. session_aware semantics match the neighboring
+    # guards (an orphan holder refreshes no token; an idle slot can't
+    # clobber). The allow_shared_family hatch applies here exactly as
     # documented on `shared_family_allowed` — gate-OFF only: an opted-in
     # gate-off operator keeps the old proceed contract, made LOUD (URGENT +
-    # CRED-AUDIT), while gate-ON always refuses (the operator asked for
-    # independent families; silently sharing one would contradict the stronger
-    # setting — same rationale as the hatchless pool-exhaustion refusal above).
-    # Limits, stated honestly: fingerprints match token BYTES, so a family whose
-    # live copy already ROTATED past the candidate slips this check — that
-    # rotation-blind case is what the name-keyed guards above still catch for
-    # same-name installs. The two layers compose; neither subsumes the other.
-    try:
-        _cand_rt = _credential_refresh_token(read_json(install_src))
-    except (json.JSONDecodeError, OSError):
-        _cand_rt = None  # unreadable source: no family to collide — the #141
-                         # definitive install-point gate (at the write, below)
-                         # refuses it
-    if _cand_rt:
-        _cand_fp = _refresh_fingerprint(_cand_rt)
-        _colliders = [f"{m} ({a or '?'})"
-                      for m, a, fp in _live_mount_refresh_fingerprints(state, config,
-                                                                       session_aware=True)
-                      if fp == _cand_fp and m != (slot if slot is not None else "shared-mount")]
-        if _colliders:
-            if not independent_logins_enabled(config) and shared_family_allowed(config):
-                _cred_audit("family-collision-hatch", "urgent-proceed-shared-family",
-                            "install source's refresh-token family is LIVE on another mount "
-                            "(byte-level, name-agnostic) — proceeding only under allow_shared_family (GH #15)",
-                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
-                            shared=True, token_fp=_cand_fp)
-                click.echo(
-                    f"[URGENT] creds-install: '{target_name}' install source carries refresh-token family "
-                    f"{_cand_fp} ALREADY LIVE on {', '.join(_colliders)} — proceeding only because "
-                    f"independent_logins.allow_shared_family is true; a rotation on either mount can trip "
-                    f"the auth server's reuse detection and revoke the whole family (GH #15)")
-            else:
-                _cred_audit("family-collision-refuse", "refused-name-agnostic-collision",
-                            "install source's refresh-token family is LIVE on another mount "
-                            "(byte-level, name-agnostic) — refused fail-closed (GH #15)",
-                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
-                            shared=True, token_fp=_cand_fp)
-                raise RuntimeError(
-                    f"refusing to install '{target_name}' onto "
-                    f"{('lane ' + slot) if slot else 'the shared mount'}: the credentials about to be "
-                    f"installed carry OAuth refresh-token family {_cand_fp}, which is ALREADY LIVE on "
-                    f"{', '.join(_colliders)} — account names are only labels; the token family is the "
-                    f"identity, so a copied/renamed account dir or two logical accounts on one Anthropic "
-                    f"login double-book the family even under different names. Two live mounts on one "
-                    f"family rotate it out from under each other, and re-presenting the rotated-away "
-                    f"token trips the auth server's reuse detection, revoking the WHOLE family "
-                    f"server-side (GH #15, the 2026-07-24 sentinel outage). Provision an independent "
-                    f"family (`cus login-mount {target_name}`) or move to a different account. To "
-                    f"consciously accept shared-family risk set independent_logins.allow_shared_family: "
-                    f"true (honored only with use_independent_logins off). Mount left on its prior "
-                    f"account (no creds written).")
+    # CRED-AUDIT), while gate-ON refuses HERE regardless of the hatch (the
+    # operator asked for independent families; silently sharing one would
+    # contradict the stronger setting — same rationale as the hatchless
+    # pool-exhaustion refusal above). Stated precisely (round 3 finding 3):
+    # gate-ON's hatch-independent refusals are pool exhaustion (lanes) and
+    # byte-identical collisions (this guard + the #104 guard); the NAME-KEYED
+    # slot=None guard above consults the hatch even gate-on, so a hatch-on
+    # shared-mount install whose snapshot has rotation-DIVERGED from the live
+    # family's bytes is refused by nothing — this guard is byte-deep, not
+    # lineage-deep. Limits, stated honestly: fingerprints match token BYTES,
+    # so a family whose live copy already ROTATED past the candidate slips
+    # this check — that rotation-blind case is what the name-keyed guards
+    # above still catch for same-name installs. The two layers compose;
+    # neither subsumes the other. (Unreadable source / no refresh token ⇒
+    # (None, []) — no family to collide; the #141 definitive install-point
+    # gate, at the write below, refuses it.)
+    _cand_fp, _colliders = _candidate_family_colliders(install_src, slot, state, config)
+    if _colliders:
+        if not independent_logins_enabled(config) and shared_family_allowed(config):
+            _cred_audit("family-collision-hatch", "urgent-proceed-shared-family",
+                        "install source's refresh-token family is LIVE on another mount "
+                        "(byte-level, name-agnostic) — proceeding only under allow_shared_family (GH #15)",
+                        slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                        shared=True, token_fp=_cand_fp)
+            click.echo(
+                f"[URGENT] creds-install: '{target_name}' install source carries refresh-token family "
+                f"{_cand_fp} ALREADY LIVE on {', '.join(_colliders)} — proceeding only because "
+                f"independent_logins.allow_shared_family is true; a rotation on either mount can trip "
+                f"the auth server's reuse detection and revoke the whole family (GH #15)")
+        else:
+            _cred_audit("family-collision-refuse", "refused-name-agnostic-collision",
+                        "install source's refresh-token family is LIVE on another mount "
+                        "(byte-level, name-agnostic) — refused fail-closed (GH #15)",
+                        slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                        shared=True, token_fp=_cand_fp)
+            raise RuntimeError(
+                f"refusing to install '{target_name}' onto "
+                f"{('lane ' + slot) if slot else 'the shared mount'}: the credentials about to be "
+                f"installed carry OAuth refresh-token family {_cand_fp}, which is ALREADY LIVE on "
+                f"{', '.join(_colliders)} — account names are only labels; the token family is the "
+                f"identity, so a copied/renamed account dir or two logical accounts on one Anthropic "
+                f"login double-book the family even under different names. Two live mounts on one "
+                f"family rotate it out from under each other, and re-presenting the rotated-away "
+                f"token trips the auth server's reuse detection, revoking the WHOLE family "
+                f"server-side (GH #15, the 2026-07-24 sentinel outage). Provision an independent "
+                f"family (`cus login-mount {target_name}`) or move to a different account. To "
+                f"consciously accept shared-family risk set independent_logins.allow_shared_family: "
+                f"true (honored only with use_independent_logins off). Mount left on its prior "
+                f"account (no creds written).")
 
     # GH #76: write the intent journal BEFORE the first step that mutates the
-    # live mount or account storage (the login-family store maintenance inside
-    # the hoisted claim above is the one deliberate exception — journal-free by
-    # design, see the hoist comment). From here to the post-save_state clear, a
-    # crash leaves the journal on disk and _recover_pending_swap reconciles on
-    # the next swap / daemon start.
-    _write_swap_journal(current, target_name, trigger, slot=slot)
+    # live mount or account storage. Two deliberate, journal-free-by-design
+    # exceptions live in the hoisted block above (round 3 finding 4): the
+    # login-family STORE maintenance inside claim_verified_login_family
+    # (rotation persistence, dead-store retirement — see the hoist comment),
+    # and the dead-snapshot fallback's `_account_snapshot_dead` probe, whose
+    # "alive" verdict persists the rotated tokens into the SNAPSHOT (plus the
+    # network probe itself). Both mutate account/store state only, never the
+    # live mount or the journal, so a crash after either still leaves nothing
+    # to roll forward. From here to the post-save_state clear, a crash leaves
+    # the journal on disk and _recover_pending_swap reconciles on the next
+    # swap / daemon start — completing the creds copy from the SAME approved
+    # install_src recorded here (round 3 finding 1), not a re-guessed snapshot.
+    _write_swap_journal(current, target_name, trigger, slot=slot,
+                        install_src=install_src, used_independent=used_independent,
+                        login_family=(f"{target_name}/{claimed_family}"
+                                      if claimed_family is not None else None))
 
     # Save current identity + creds back to current's storage — skipped
     # entirely for a swap into an EMPTY slot (current is None: nothing to
@@ -11016,6 +11189,15 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         except (json.JSONDecodeError, OSError):
             _mcp_injected = 0
     except BaseException:
+        # Ordering (round 3 finding 2): retire the JOURNAL first, then attempt
+        # the .claude.json restore. The restore is itself a write that can
+        # fail (ENOSPC, EIO, ...), and the old restore-then-clear order left a
+        # double-fault holding the journal NEXT TO the merged identity — the
+        # exact residue _recover_pending_swap "completes" as a guard-free
+        # install. Cleared-journal-first degrades the same double-fault to a
+        # mutated .claude.json with NO journal: identity-drift detection
+        # (doctor/SOS) territory, never a roll-forward.
+        _clear_swap_journal()
         if _pre_merge_cj_bytes is None:
             # The merge CREATED the live .claude.json (empty-slot install path);
             # a refusal un-creates it.
@@ -11025,7 +11207,6 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 pass
         else:
             atomic_write_bytes(live_cj_path, _pre_merge_cj_bytes)
-        _clear_swap_journal()
         raise
     if _mcp_injected:
         # Write the merged payload instead of the raw source bytes. Only the
@@ -26925,12 +27106,16 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     previews "refuse" (naming family + colliding mounts), or — gate-off with
     allow_shared_family, the same asymmetry as `shared_family_allowed` — stays
     on its plan with a would-proceed-LOUDLY caution, matching execution's
-    [URGENT] hatch path. One knowable gap, stated honestly: a "claim" backed
-    by a FREE pooled family previews without the byte check (execute_swap
-    picks the family at claim time with a side-effectful liveness probe this
-    pure helper must not run); a freshly claimed family is distinct by
-    construction, so the execute-time byte guard is a defense-in-depth no-op
-    there.
+    [URGENT] hatch path. One knowable preview/execution DIVERGENCE, stated
+    honestly (round 3 finding 5): a "claim" backed by a FREE pooled family
+    previews without the byte check — execute_swap picks the family at claim
+    time with a side-effectful liveness probe this pure helper must not run,
+    so the preview cannot know which bytes will install. The execute-time
+    byte guard deliberately DOES check the claimed family's bytes, so a
+    mis-provisioned pool family that aliases a live mount's family (e.g. a
+    snapshot copied into the pool) previews "claim" here yet REFUSES at
+    execute. A correctly-minted family is distinct and installs as previewed;
+    the divergence is confined to that mis-provisioned-family case.
 
     Returns {current, target, plan, held_by, gate, detail}. `held_by` is a
     human-readable list of the OTHER live mounts already on `target` (live slots
@@ -27002,41 +27187,38 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     if plan in ("snapshot", "claim"):
         candidate: Path | None = None
         if plan == "snapshot":
+            # _swap_snapshot_creds_path = the execute path's exact target_creds
+            # construction (round 3 finding 6). Its migrate-on-read of a legacy
+            # account dir is the same normalization every read path performs —
+            # idempotent, not a planning side effect.
             candidate, _ = swap_install_source(
-                target, slot_name, ACCOUNTS_DIR / f"account-{target}" / ".credentials.json", config)
+                target, slot_name, _swap_snapshot_creds_path(target), config)
         elif not has_free_login_family(target, state):
             # "claim" via the legacy per-slot login — the only claim source
             # resolvable without execute-time side effects (a free-pool claim's
             # family is picked by the liveness probe; distinct by construction).
             candidate = login_store_creds_path(target, slot_name)
-        cand_rt = None
-        if candidate is not None:
-            try:
-                cand_rt = _credential_refresh_token(read_json(candidate))
-            except (json.JSONDecodeError, OSError):
-                cand_rt = None  # unreadable candidate: execute's #141 gate owns that refusal
-        if cand_rt:
-            cand_fp = _refresh_fingerprint(cand_rt)
-            colliders = [f"{m} ({a or '?'})"
-                         for m, a, fp in _live_mount_refresh_fingerprints(state, config,
-                                                                          session_aware=True)
-                         if fp == cand_fp and m != slot_name]
-            if colliders:
-                if not gate and shared_family_allowed(config):
-                    # Execution's hatch path proceeds LOUDLY — the preview must
-                    # say would-proceed, not pretend the install is clean.
-                    detail += (
-                        f" — CAUTION: the install bytes carry refresh-token family {cand_fp} ALREADY "
-                        f"LIVE on {', '.join(colliders)}; execute_swap will proceed only because "
-                        f"independent_logins.allow_shared_family is true, and LOUDLY ([URGENT] + "
-                        f"CRED-AUDIT — GH #15)")
-                else:
-                    plan, detail = "refuse", (
-                        f"the credentials that would be installed carry OAuth refresh-token family "
-                        f"{cand_fp}, ALREADY LIVE on {', '.join(colliders)} — account names are only "
-                        f"labels; the token family is the identity, so execute_swap's byte-level "
-                        f"name-agnostic guard refuses this install (GH #15). Provision an independent "
-                        f"family with `cus login-mount {target}` or pick a different account")
+        # Shared primitive with the execute-time guard and crash recovery
+        # (round 3 finding 6); (None, []) for an unreadable/token-less
+        # candidate — execute's #141 gate owns that refusal.
+        cand_fp, colliders = (_candidate_family_colliders(candidate, slot_name, state, config)
+                              if candidate is not None else (None, []))
+        if colliders:
+            if not gate and shared_family_allowed(config):
+                # Execution's hatch path proceeds LOUDLY — the preview must
+                # say would-proceed, not pretend the install is clean.
+                detail += (
+                    f" — CAUTION: the install bytes carry refresh-token family {cand_fp} ALREADY "
+                    f"LIVE on {', '.join(colliders)}; execute_swap will proceed only because "
+                    f"independent_logins.allow_shared_family is true, and LOUDLY ([URGENT] + "
+                    f"CRED-AUDIT — GH #15)")
+            else:
+                plan, detail = "refuse", (
+                    f"the credentials that would be installed carry OAuth refresh-token family "
+                    f"{cand_fp}, ALREADY LIVE on {', '.join(colliders)} — account names are only "
+                    f"labels; the token family is the identity, so execute_swap's byte-level "
+                    f"name-agnostic guard refuses this install (GH #15). Provision an independent "
+                    f"family with `cus login-mount {target}` or pick a different account")
     return {"current": current, "target": target, "plan": plan, "held_by": held_by, "gate": gate, "detail": detail}
 
 

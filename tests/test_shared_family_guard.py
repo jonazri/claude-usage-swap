@@ -38,6 +38,16 @@ crash recovery (guard-free roll-forward — the round-2 critical finding).
 byte-level overlay (finding 2); the slot=None / per_session tests close the
 coverage gaps of finding 4.
 
+Committee ROUND 3 (2026-07-24): the `test_recovery_*` trio pins that crash
+recovery honors the guards — the journal records the APPROVED install source
+(a claimed family recovers as FAMILY bytes, never the snapshot; legacy
+journals keep GH #76 snapshot semantics) and the roll-forward copy runs the
+same byte-level collision check (refuse ⇒ no copy + journal cleared + audit).
+`test_refusal_unwind_restore_failure_still_clears_journal` pins the
+journal-cleared-FIRST unwind ordering (finding 2);
+`test_gate_on_shared_mount_hatch_byte_identical_still_refused` pins the
+gate-ON hatch boundary the docs now state precisely (finding 3).
+
 Run standalone:  python3 tests/test_shared_family_guard.py
 Run under pytest: pytest tests/test_shared_family_guard.py
 """
@@ -173,6 +183,8 @@ def test_gate_off_second_mount_refuses_shared_family_copy():
         assert raised_msg, "second live mount on beta's shared family must refuse, not clobber (GH #15)"
         assert "cus login-mount beta" in raised_msg, raised_msg
         assert "allow_shared_family" in raised_msg, raised_msg
+        # The name-keyed refusal leaves its CRED-AUDIT trace (round 3 finding 6).
+        assert any("op=shared-family-refuse" in e for e in env.echoes), env.echoes
         # The refused lane held: still on alpha, live creds untouched.
         assert cus.load_state()["slots"][s2]["account"] == "alpha"
         assert cus._credential_refresh_token(
@@ -549,6 +561,183 @@ def test_slot_move_preview_names_cross_name_byte_collision():
         plan2 = cus._slot_move_plan(cus.load_state(), cus.load_config(), mover, "gamma")
         assert plan2["plan"] == "snapshot", plan2
         assert "URGENT" in plan2["detail"], plan2
+    finally:
+        env.restore()
+
+
+def test_recovery_completes_from_journaled_family_not_snapshot():
+    """Committee ROUND 3, finding 1(i): a crash in the merge→copy window used
+    to recover from the account SNAPSHOT even when the crashed swap's approved
+    install source was a CLAIMED POOL FAMILY — double-booking the shared
+    family the forward guards had just steered around. Post-fix the journal
+    records the approved source and recovery copies THAT: the family bytes
+    land, not the snapshot's, and the lease the crashed swap never got to
+    persist is re-recorded (so the family can't be re-claimed elsewhere)."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        env.make_slot("beta", live=True)              # beta live → family, not snapshot
+        mover = env.make_slot("alpha", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        # Crash simulation: journal written (with the approved family source)
+        # + identity merged; the creds copy never happened.
+        cus._write_swap_journal("alpha", "beta", "auto-ladder", slot=mover,
+                                install_src=cus.login_family_creds_path("beta", "family-1"),
+                                used_independent=True, login_family="beta/family-1")
+        (cus.slot_path(mover) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "beta@x"}}))
+        cus._recover_pending_swap()
+        assert not cus._swap_journal_path().exists()
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-beta-fam1", \
+            "recovery must install the journaled FAMILY bytes, never the snapshot"
+        st = cus.load_state()
+        assert st["slots"][mover]["account"] == "beta"
+        assert st["slots"][mover]["login_family"] == "beta/family-1"
+    finally:
+        env.restore()
+
+
+def test_recovery_roll_forward_collision_refuses_no_copy():
+    """Committee ROUND 3, finding 1(ii): the recovery roll-forward is an
+    install point, so it must run the same byte-level guard as the forward
+    path. A recovery source whose family is LIVE on another mount does NOT
+    copy: the journal is cleared (nothing left to roll forward), a CRED-AUDIT
+    refusal + [URGENT] line fire, and the lane is left to the relogin/SOS
+    machinery — a paused lane beats a guard-free double-book."""
+    env = _Env()
+    try:
+        env.make_slot("beta", live=True)              # beta's family live on a lane
+        mover = env.make_slot("alpha", live=True)
+        # Journaled source = beta's SNAPSHOT (same family as the live lane) —
+        # the world changed between the journal write and recovery.
+        cus._write_swap_journal("alpha", "beta", "auto-ladder", slot=mover,
+                                install_src=env.accounts_dir / "account-beta" / ".credentials.json",
+                                used_independent=False)
+        (cus.slot_path(mover) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "beta@x"}}))
+        cus._recover_pending_swap()
+        assert not cus._swap_journal_path().exists(), "refused roll-forward must clear the journal"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha", \
+            "collision must mean NO copy — the mount keeps its current creds"
+        assert cus.load_state()["slots"][mover]["account"] == "alpha", \
+            "a refused completion must not half-complete the bookkeeping"
+        assert any("op=family-collision-refuse" in e
+                   and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
+        assert any("[URGENT]" in e for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_recovery_legacy_journal_keeps_snapshot_semantics():
+    """Committee ROUND 3, finding 1(iii): a LEGACY journal (no install_src
+    field — written by a pre-fix cus) keeps the historic GH #76 behavior:
+    recovery completes the install from the account snapshot. beta is live
+    nowhere else, so the byte guard stays silent and the copy lands."""
+    env = _Env()
+    try:
+        mover = env.make_slot("alpha", live=True)
+        cus.write_json(cus._swap_journal_path(), {
+            "from": "alpha", "to": "beta", "trigger": "auto-ladder",
+            "slot": mover, "ts": cus.now_iso(),
+        })
+        (cus.slot_path(mover) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "beta@x"}}))
+        cus._recover_pending_swap()
+        assert not cus._swap_journal_path().exists()
+        assert cus.load_state()["slots"][mover]["account"] == "beta"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-beta"
+    finally:
+        env.restore()
+
+
+def test_refusal_unwind_restore_failure_still_clears_journal():
+    """Committee ROUND 3, finding 2: the refusal-unwind used to restore the
+    pre-merge .claude.json BEFORE clearing the journal — if the restore itself
+    raised (ENOSPC/EIO), the journal survived NEXT TO the merged identity and
+    the next swap's recovery completed the REFUSED install. Post-fix the
+    journal is cleared FIRST: the same double-fault now degrades to
+    identity-drift detection (no journal ⇒ recovery is a no-op), never a
+    guard-free install."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        env.make_slot("beta", live=True)              # beta held → pool-claim path
+        mover = env.make_slot("alpha", live=True)
+        # Blank-shaped family: claimable (probe is "unknown"/fail-open),
+        # collides with nothing, and trips the late #141 install-point gate —
+        # the one refusal that legitimately fires PAST the journal write.
+        d = cus.login_family_dir("beta", "family-1")
+        d.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path("beta", "family-1").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "", "refreshToken": "rt-beta-fam1",
+                               "expiresAt": 2_000_000_000_000}}))
+        lane_cj = cus.slot_path(mover) / ".claude.json"
+        orig_write = cus.atomic_write_bytes
+        writes = {"n": 0}
+
+        def flaky(path, content, mode=0o644):
+            if Path(path) == lane_cj:
+                writes["n"] += 1
+                if writes["n"] >= 2:      # 1st = the identity merge; 2nd = the unwind restore
+                    raise OSError("simulated ENOSPC during the unwind restore")
+            return orig_write(path, content, mode=mode)
+
+        cus.atomic_write_bytes = flaky
+        try:
+            raised = None
+            try:
+                cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+            except (RuntimeError, OSError) as e:
+                raised = e
+            assert raised is not None, "the late #141 gate (or the injected restore fault) must raise"
+        finally:
+            cus.atomic_write_bytes = orig_write
+        # Double fault: the identity stayed merged (the restore failed)...
+        assert cus.read_json(lane_cj)["oauthAccount"]["emailAddress"] == "beta@x"
+        # ...but the journal is GONE, so recovery completes nothing.
+        assert not cus._swap_journal_path().exists(), "journal must be cleared BEFORE the cj restore"
+        cus._recover_pending_swap()
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha"
+    finally:
+        env.restore()
+
+
+def test_gate_on_shared_mount_hatch_byte_identical_still_refused():
+    """Committee ROUND 3, finding 3 (coverage): gate-ON + slot=None +
+    allow_shared_family:true. The name-keyed slot=None guard consults the
+    hatch even gate-on (the documented rotation-divergence caveat), but a
+    byte-IDENTICAL snapshot must still refuse — pinning the docs' precise
+    claim that gate-ON's hatch-independent refusals include byte-identical
+    collisions. Same-name shape refuses via the #104 collide guard;
+    cross-name (gamma = renamed copy of beta) via the name-agnostic guard."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True,
+                                               "allow_shared_family": True}})
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        env.make_slot("beta", live=True)              # beta's family live on a lane
+        raised_same = ""
+        try:
+            cus.execute_swap("beta", trigger="manual")            # slot=None: shared mount
+        except RuntimeError as e:
+            raised_same = str(e)
+        assert raised_same and "refresh-token family" in raised_same, raised_same
+        raised_cross = ""
+        try:
+            cus.execute_swap("gamma", trigger="manual")           # renamed copy of beta
+        except RuntimeError as e:
+            raised_cross = str(e)
+        assert raised_cross, "gate-on hatch must not open a byte-identical shared-mount install"
+        assert cus._refresh_fingerprint("rt-beta") in raised_cross, raised_cross
+        assert cus.load_state()["active"] == "alpha"
+        assert cus._credential_refresh_token(cus.read_json(cus.CREDS_JSON)) == "rt-bare"
+        assert not cus._swap_journal_path().exists()
     finally:
         env.restore()
 
