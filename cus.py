@@ -1746,11 +1746,17 @@ def _rot_skip_audit(op: str, account: str, store: str, creds: Any, rot_verdict: 
     decision = {"rotten": "skipped-rotten",
                 "unjudgeable": "skipped-unjudgeable-expiry",
                 "fresh": "skipped-probe-dead"}[rot_verdict]
+    # The extra= field is keyed on the VERDICT, not on expired_h-is-None:
+    # `_creds_access_expired_hours` returns None both for an unjudgeable
+    # expiry AND for a fresh (not-yet-expired) token, so testing None alone
+    # would stamp a judgeable fresh store `unjudgeable` — misleading exactly
+    # the grep the three decisions exist to serve (Copilot, PR #16).
+    hours_repr = (f"{expired_h:.1f}" if rot_verdict == "rotten" and expired_h is not None
+                  else "unjudgeable" if rot_verdict == "unjudgeable"
+                  else "fresh")
     _cred_audit(op, decision, f"{measured} and {why} (#14)",
                 account=account, login_family=store, token_fp=_audit_token_fp(creds),
-                extra=(f"access_expired_hours={expired_h:.1f} grace_hours={grace_h:g}"
-                       if expired_h is not None
-                       else f"access_expired_hours=unjudgeable grace_hours={grace_h:g}"))
+                extra=f"access_expired_hours={hours_repr} grace_hours={grace_h:g}")
     # Echo worded per-decision (committee round-3): the skipped-probe-dead case
     # is a store that looked FRESH and was PROVEN dead by its probe —
     # "possibly-rotten" would misname exactly the case this decision exists to
