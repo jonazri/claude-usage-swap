@@ -48,6 +48,15 @@ journal-cleared-FIRST unwind ordering (finding 2);
 `test_gate_on_shared_mount_hatch_byte_identical_still_refused` pins the
 gate-ON hatch boundary the docs now state precisely (finding 3).
 
+Committee ROUND 4 (2026-07-24):
+`test_recovery_roll_forward_blank_source_skips_copy` pins that the recovery
+roll-forward also honors the GH #141 blank/unreadable gate —
+_candidate_family_colliders returns (None, []) for those sources and
+delegates the refusal to a gate that lives only in _execute_swap_locked,
+which recovery never re-enters; a crash in the journal-write → late-gate
+window (the save-back section is real I/O) journals an UNVALIDATED
+install_src, and pre-fix recovery installed its blank bytes onto a live mount.
+
 Run standalone:  python3 tests/test_shared_family_guard.py
 Run under pytest: pytest tests/test_shared_family_guard.py
 """
@@ -626,6 +635,51 @@ def test_recovery_roll_forward_collision_refuses_no_copy():
         assert any("op=family-collision-refuse" in e
                    and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
         assert any("[URGENT]" in e for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_recovery_roll_forward_blank_source_skips_copy():
+    """Committee ROUND 4, finding 1: the recovery roll-forward must apply the
+    GH #141 blank/unreadable gate before its copy. A pool-family install_src is
+    blank-validated only at the LATE forward gate — which sits PAST the journal
+    write and the save-back's real I/O — so a crash in that window journals an
+    unvalidated source; pre-fix recovery atomic_copy'd its blank bytes onto the
+    live mount (the exact blanked-live-mount incident, arriving via recovery).
+    Post-fix: NO copy (the mount keeps its current creds), vanished-source
+    semantics otherwise — bookkeeping reconciles (the identity had already
+    merged), a SKIPPED note + CRED-AUDIT fire, journal cleared, relogin/SOS
+    owns the lane."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        # Blank-shaped family store (empty accessToken): claimable fail-open
+        # under the unverifiable probe, collides with nothing — only the #141
+        # gate would catch it, and recovery never reached that gate.
+        d = cus.login_family_dir("beta", "family-1")
+        d.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path("beta", "family-1").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "", "refreshToken": "rt-beta-fam1",
+                               "expiresAt": 2_000_000_000_000}}))
+        # Crash simulation: journal written (with the blank, never-validated
+        # source) + identity merged; the crash landed before the late gate.
+        cus._write_swap_journal("alpha", "beta", "auto-ladder", slot=mover,
+                                install_src=cus.login_family_creds_path("beta", "family-1"),
+                                used_independent=True, login_family="beta/family-1")
+        (cus.slot_path(mover) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "beta@x"}}))
+        cus._recover_pending_swap()
+        assert not cus._swap_journal_path().exists()
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha", \
+            "a blank journaled source must mean NO copy — the mount keeps its current creds"
+        # Vanished-source semantics: state reconciles to the journal's `to`
+        # (the identity merge had already happened) with the copy skipped.
+        assert cus.load_state()["slots"][mover]["account"] == "beta"
+        assert any("op=blank-source-refuse" in e
+                   and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
+        assert any("SKIPPED" in e and "GH #141" in e for e in env.echoes), env.echoes
     finally:
         env.restore()
 

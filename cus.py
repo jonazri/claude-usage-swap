@@ -2201,8 +2201,10 @@ def _candidate_family_colliders(candidate: Path, this_mount: str | None, state: 
     second mount. session_aware=True throughout, matching the neighboring
     swap guards (an orphan holder refreshes no token). Returns
     (fingerprint, ["mount (account)", ...]); (None, []) when the candidate is
-    unreadable or carries no refresh token — no family to collide, and the
-    #141 definitive install-point gate owns refusing unreadable/blank sources.
+    unreadable or carries no refresh token — no family to collide; refusing
+    unreadable/blank sources is owned by the #141 definitive install-point
+    gate on the forward path and by the recovery roll-forward's own in-line
+    blank gate (round 4 finding 1 — recovery never reaches the forward gate).
     """
     try:
         cand_rt = _credential_refresh_token(read_json(candidate))
@@ -10066,9 +10068,41 @@ def _recover_pending_swap() -> None:
             note_if_copied = " (slot had no creds yet; completed the install)"
         if needs_copy and not recovery_src.exists():
             needs_copy = False
-            installed_note = (f" (creds copy SKIPPED: recovery source {recovery_src.name} is gone"
+            installed_note = (f" (creds copy SKIPPED: recovery source {recovery_src} is gone"
                               f"{'' if legacy_journal else ' — no snapshot substitution for a journaled source'}; "
                               f"relogin/SOS owns the mount from here)")
+        if needs_copy:
+            # ---- GH #15 round 4 (finding 1): recovery honors the #141 blank gate.
+            # _candidate_family_colliders deliberately returns (None, []) for a
+            # blank/unreadable source, delegating the refusal to "the #141
+            # definitive install-point gate" — but that gate lives in
+            # _execute_swap_locked, which this roll-forward never re-enters. The
+            # journal is written BEFORE the save-back section's real I/O, and the
+            # pool paths are blank-validated only at that LATE gate — so a crash
+            # in the journal-write → late-gate window journals an install_src no
+            # gate ever validated, and copying it here would blank a live mount
+            # (the exact GH #141 incident, arriving via recovery). Same detector,
+            # same verdict as the forward gate; a blank/unreadable source skips
+            # the copy exactly like a vanished one — journal handling and state
+            # reconciliation proceed below, relogin/SOS owns the mount.
+            _rec_creds: Any = None
+            try:
+                _rec_creds = read_json(recovery_src)
+            except (json.JSONDecodeError, OSError) as e:
+                _rec_bad = f"unreadable ({e})"
+            else:
+                _rec_bad = ("blank/expired (empty accessToken or expiresAt<=0)"
+                            if _live_mount_creds_invalid(_rec_creds) else None)
+            if _rec_bad:
+                needs_copy = False
+                _cred_audit("blank-source-refuse", "refused-recovery-roll-forward",
+                            f"crash-recovery roll-forward source is {_rec_bad} — copy skipped; "
+                            f"installing it would blank the live mount (GH #141)",
+                            slot=slot, mount=(slot or "shared-mount"), account=to,
+                            token_fp=_audit_token_fp(_rec_creds))
+                installed_note = (f" (creds copy SKIPPED: recovery source {recovery_src} is {_rec_bad} — "
+                                  f"installing it would blank the live mount (GH #141); "
+                                  f"relogin/SOS owns the mount from here)")
         if needs_copy:
             # ---- GH #15 round 3 (finding 1b): recovery honors the byte guard.
             # This roll-forward copy is exactly as much an install as the
@@ -10093,7 +10127,7 @@ def _recover_pending_swap() -> None:
                             shared=True, token_fp=(_fp or "none"))
                 msg = (f"[URGENT] crashed swap {frm!r} -> {to!r}: the "
                        f"{'snapshot' if legacy_journal else 'journaled install source'} "
-                       f"({recovery_src.name}) carries refresh-token family {_fp} ALREADY LIVE on "
+                       f"({recovery_src}) carries refresh-token family {_fp} ALREADY LIVE on "
                        f"{', '.join(_colliders)} — refusing the recovery copy: a guard-free "
                        f"roll-forward would double-book the family and risk the reuse-detection "
                        f"revocation (GH #15). Journal cleared; the mount keeps its current creds. "
@@ -11197,7 +11231,19 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         # install. Cleared-journal-first degrades the same double-fault to a
         # mutated .claude.json with NO journal: identity-drift detection
         # (doctor/SOS) territory, never a roll-forward.
-        _clear_swap_journal()
+        # Best-effort (round 4 finding 2): the clear's unlink can itself fail
+        # (EIO/EACCES — only FileNotFoundError is swallowed inside), and letting
+        # that propagate here would ABORT the unwind before the identity restore
+        # below AND mask the original refusal. Swallow it: the restore must
+        # always be attempted, and a surviving journal next to a RESTORED
+        # identity reconciles as landed=='from' (nothing moved — a no-op clear
+        # on the next recovery pass), while the clear+restore double-fault is
+        # the same journal+merged-identity residue the old ordering left —
+        # identity-drift detection territory either way, never worse.
+        try:
+            _clear_swap_journal()
+        except OSError:
+            pass
         if _pre_merge_cj_bytes is None:
             # The merge CREATED the live .claude.json (empty-slot install path);
             # a refusal un-creates it.
@@ -20669,7 +20715,7 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
 @click.argument("target")
 @click.option("--dry-run", is_flag=True, help="Show what would happen without writing anything.")
 @click.option("--trigger", default="manual", help="Tag for the swap history entry.")
-@click.option("--force", is_flag=True, help="Swap even onto an account a live slot already holds (GH #104: normally refused — two live mounts on one account log one out).")
+@click.option("--force", is_flag=True, help="Skip the pre-flight refusal for an account a live slot already holds (GH #104: two live mounts on one account log one out). Does NOT override execute_swap's shared-family fail-closed guard — a clobbering copy still refuses unless independent_logins.allow_shared_family: true (GH #15).")
 def switch(target: str, dry_run: bool, trigger: str, force: bool) -> None:
     """Atomically swap the shared ~/.claude/ mount to a different account.
 
@@ -27229,8 +27275,10 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
               help="Print the plan (old account, target, whether a login family would be claimed or the move would refuse) WITHOUT moving anything.")
 @click.option("--force", is_flag=True,
               help="Bypass cus's pre-flight refusals: move a LOCKED slot (see `cus lock`) and skip the double-book guard. "
-                   "Does NOT override the GH #104 pool-exhaustion safety inside execute_swap — with the login pool on, a "
-                   "genuinely exhausted target still refuses rather than clobber a live token family. Mirrors `cus switch --force`.")
+                   "Does NOT override the safeties inside execute_swap: the GH #104 pool-exhaustion refusal (login pool on, "
+                   "a genuinely exhausted target still refuses rather than clobber a live token family) and the "
+                   "gate-independent GH #15 shared-family fail-closed guard (a clobbering copy still refuses unless "
+                   "independent_logins.allow_shared_family: true). Mirrors `cus switch --force`.")
 def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> None:
     """Move a slot's credential mount onto ACCOUNT, IN PLACE.
 
