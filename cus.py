@@ -1626,29 +1626,40 @@ def _family_creds_usable(account: str, family_id: str) -> bool:
         return False
 
 
+def _expiry_unjudgeable(creds: Any) -> bool:
+    """True iff this credential payload carries NO judgeable access-token
+    expiry — a missing/blank/<=0 or bool expiresAt (the logout shape, `{}`, a
+    stray `expiresAt: true`). THE single source for the #14 "can't measure"
+    predicate: _creds_access_expired_hours (no age to report) and
+    _family_rot_verdict (verdict "unjudgeable") both consume this one test, so
+    the two can never drift (committee round-2 finding 6 — they used to
+    duplicate the check inline). `bool` is excluded locally, mirroring
+    _live_mount_creds_invalid — True is an `int` subclass, so a stray
+    `expiresAt: true` would read as epoch-ms 1 and report a ~56-year "expiry".
+    Guarded HERE rather than in the global _creds_expires_at reader because its
+    other callers (freshness max-compares) have not been audited for a
+    semantics change."""
+    exp = _creds_expires_at(creds)
+    return exp is None or isinstance(exp, bool) or exp <= 0
+
+
 def _creds_access_expired_hours(creds: Any) -> float | None:
     """Hours a credential payload's ACCESS token has sat expired, or None when
-    it is not expired / carries no judgeable expiresAt.
+    it is not expired / carries no judgeable expiresAt (_expiry_unjudgeable).
 
     The #14 rot discriminator: nothing refreshes a family while it sits FREE in
     the pool, so its expiresAt records the last time ANY refresh grant succeeded
     on it — days of expiry lag means days without a successful refresh, the
     signature of a rotated-away/revoked family (see FAMILY_ROT_GRACE_HOURS).
-    A missing/blank/<=0/bool expiresAt returns None because there is no AGE to
-    report (a since-epoch figure would be nonsense in a rot audit line) — but
-    None is NOT "fresh": the lease paths read this through _family_rot_verdict,
-    which classifies an unjudgeable expiry as rot-SUSPECT (committee finding:
-    an earlier draft delegated the blank shape to the GH #141 install-point
-    guard, which never runs on the lease path, so a blank store leased blind).
-    `bool` is excluded locally, mirroring _live_mount_creds_invalid — True is an
-    `int` subclass, so a stray `expiresAt: true` would read as epoch-ms 1 and
-    report a ~56-year "expiry". Guarded HERE rather than in the global
-    _creds_expires_at reader because its other callers (freshness max-compares)
-    have not been audited for a semantics change."""
-    exp = _creds_expires_at(creds)
-    if exp is None or isinstance(exp, bool) or exp <= 0:
+    An unjudgeable expiry returns None because there is no AGE to report (a
+    since-epoch figure would be nonsense in a rot audit line) — but None is NOT
+    "fresh": the lease paths read this through _family_rot_verdict, which
+    classifies an unjudgeable expiry as rot-SUSPECT (committee finding: an
+    earlier draft delegated the blank shape to the GH #141 install-point guard,
+    which never runs on the lease path, so a blank store leased blind)."""
+    if _expiry_unjudgeable(creds):
         return None
-    hours = (time.time() * 1000 - float(exp)) / 3_600_000
+    hours = (time.time() * 1000 - float(_creds_expires_at(creds))) / 3_600_000
     return hours if hours > 0 else None
 
 
@@ -1660,6 +1671,13 @@ def _family_rot_grace_hours(config: dict | None = None) -> float:
     cfg = config if config is not None else load_config()
     raw = (cfg.get("independent_logins", {}) or {}).get(
         "family_rot_grace_hours", FAMILY_ROT_GRACE_HOURS)
+    # bool is an int subclass: float(True)/float(False) sail straight through
+    # the finite/>=0 checks below, so a YAML `family_rot_grace_hours: true`
+    # silently became a 1h grace (false → 0h) instead of falling back. Same
+    # malformed-config contract as everything else here — default it (committee
+    # round-2 finding 4, mirroring _expiry_unjudgeable's bool exclusion).
+    if isinstance(raw, bool):
+        return float(FAMILY_ROT_GRACE_HOURS)
     try:
         val = float(raw)
     except (TypeError, ValueError):
@@ -1693,9 +1711,10 @@ def _family_rot_verdict(creds: Any, grace_h: float) -> tuple[str, float | None]:
 
     The single shared discriminator for every lease path — the pooled-family
     claim walk AND the legacy per-slot install fallback — so one discipline
-    covers them all (committee findings 1-2)."""
-    exp = _creds_expires_at(creds)
-    if exp is None or isinstance(exp, bool) or exp <= 0:
+    covers them all (committee findings 1-2). The unjudgeable predicate itself
+    lives in _expiry_unjudgeable (shared with _creds_access_expired_hours —
+    committee round-2 finding 6)."""
+    if _expiry_unjudgeable(creds):
         return "unjudgeable", None
     expired_h = _creds_access_expired_hours(creds)
     if expired_h is not None and expired_h > grace_h:
@@ -1711,16 +1730,22 @@ def _rot_skip_audit(op: str, account: str, store: str, creds: Any, rot_verdict: 
     unknown-verdict blocks in claim_verified_login_family; also serves the
     legacy-fallback gate's skip reasons. The decision distinguishes MEASURED
     rot (skipped-rotten) from an unjudgeable expiry (skipped-unjudgeable-expiry)
-    so a log grep can tell "sat expired for days" from "blank/malformed
-    expiresAt" at a glance; `cause` names which gate refused (verify gate off /
+    from a fresh-looking store whose probe returned a death certificate
+    (skipped-probe-dead — the round-2 finding-3 case: a recently-revoked
+    refresh token can ride a within-grace expiresAt) so a log grep can tell the
+    three apart at a glance; `cause` names which gate refused (verify gate off /
     probe unverifiable / probe invalid_grant)."""
     measured = (f"access token expired {expired_h / 24.0:.1f}d ago (> {grace_h:g}h grace)"
                 if rot_verdict == "rotten"
-                else "access-token expiry unjudgeable (missing/blank/non-numeric expiresAt)")
+                else "access-token expiry unjudgeable (missing/blank/non-numeric expiresAt)"
+                if rot_verdict == "unjudgeable"
+                else "access token looked fresh (within grace)")
     why = {"gate-off": "the verify gate is off — refusing to lease blind",
            "probe-unknown": "its liveness probe is unverifiable — refusing to fail open",
            "probe-dead": "its liveness probe returned invalid_grant"}[cause]
-    decision = "skipped-rotten" if rot_verdict == "rotten" else "skipped-unjudgeable-expiry"
+    decision = {"rotten": "skipped-rotten",
+                "unjudgeable": "skipped-unjudgeable-expiry",
+                "fresh": "skipped-probe-dead"}[rot_verdict]
     _cred_audit(op, decision, f"{measured} and {why} (#14)",
                 account=account, login_family=store, token_fp=_audit_token_fp(creds),
                 extra=(f"access_expired_hours={expired_h:.1f} grace_hours={grace_h:g}"
@@ -2013,54 +2038,107 @@ def claim_verified_login_family(account: str, state: dict, config: dict | None =
     return None
 
 
-def _legacy_login_lease_ok(account: str, slot: str, config: dict | None = None) -> bool:
-    """#14 rot gate for the LEGACY per-(account, slot) install fallback in
-    _execute_swap_locked — the one remaining lease path that could still install
-    a store blind (committee finding 1). `has_independent_login` only proves the
-    file parses and carries a refresh token — exists/parses/has-refresh is the
-    thin evidence on which the 2026-07-07 chats1a incident's fallback printed
-    "installed independent login" for a store that was not a live independent
-    family. Same discipline as the pooled claim walk above:
+def _legacy_login_lease_verdict(account: str, slot: str, config: dict | None = None,
+                                state: dict | None = None) -> str:
+    """#104+#14 gate for the LEGACY per-(account, slot) install paths — BOTH of
+    them: _execute_swap_locked's double-booked fallback AND swap_install_source's
+    non-double-booked branch funnel through this one helper (committee round-2
+    finding 2 — the latter used to install on has_independent_login alone, which
+    only proves the file parses and carries a refresh token; exists/parses/
+    has-refresh is the thin evidence on which the 2026-07-07 chats1a incident's
+    fallback printed "installed independent login" for a store that was not a
+    live independent family). Returns one of:
 
-      - fresh                        → True; installs exactly as it always did.
-      - rot-suspect, verify gate ON  → only a proven-alive #127 grant admits it,
-        and the grant's rotation is persisted into the store FIRST (the grant
-        is single-use — installing the pre-grant bytes after a successful probe
-        would install an already-rotated-away token). Dead/unknown → False.
-      - rot-suspect, verify gate OFF → False: never lease blind.
+      "collision" — the store's CURRENT (pre-probe) bytes carry a refresh-token
+                    family that is LIVE on another mount of `account` (#104).
+                    Refused before anything else ran: no probe, no rotation,
+                    grant preserved.
+      "ok"        — collision-free and rot-vetted; safe to install.
+      "refused"   — unreadable store / rot-suspect it could not prove alive /
+                    probe returned a death certificate. The caller degrades to
+                    its safe terminal (the pool-exhausted refusal, or the
+                    snapshot fallthrough).
 
-    False falls through to the caller's pool-exhausted refusal — the same
-    degrade-to-safe terminal the claim-returns-None path produces (a refused
-    swap strands nothing; an installed dead token wedges the session). The
-    store is never retired here even on a dead probe: legacy stores are P5
-    cleanup territory, and refusing the install is the load-bearing part."""
+    ORDERING (committee round-2 finding 1, CRITICAL): collision validation MUST
+    precede any credential-rotating probe. The rot ladder's alive rescue
+    _persist_rotated_grant()s the grant's ROTATED refresh token into the store —
+    which rewrites the very fingerprint the #104 guards compare. Probe first and
+    a store that aliased a family live on another mount (the 2026-07-07 chats1a
+    stale-copy shape) no longer matches at the install-point
+    _live_family_would_collide guard: the swap silently double-books the family,
+    AND the burned single-use grant has already invalidated the original
+    holder's token. So the collision check reads the store's PRE-probe bytes,
+    and a collision returns with zero probes. The later install-point guard in
+    _execute_swap_locked stays as belt-and-braces — it is no longer the only
+    line of defense.
+
+    Rot/probe ladder (only reached collision-free), gated on
+    independent_logins.verify_family_on_claim — pooled-claim-walk parity
+    (committee round-2 finding 3: fresh stores used to skip the probe even with
+    the gate ON, so a recently-revoked refresh token riding a within-grace
+    expiresAt installed blind):
+
+      gate ON  → EVERY store probes, fresh included. alive → persist the
+                 rotation FIRST (the grant is single-use — installing the
+                 pre-grant bytes would install an already-rotated-away token),
+                 then "ok". dead → "refused". unknown → fail open ("ok") ONLY
+                 when the offline verdict is fresh (#127 parity: a network blip
+                 must not refuse a working install); rot-suspect + unverifiable
+                 is the incident's install-a-dead-token shape → "refused".
+      gate OFF → offline-only, probe-free (pooled parity): fresh "ok",
+                 rot-suspect "refused" — never lease blind.
+
+    "refused" lands on the same degrade-to-safe terminal the pooled
+    claim-returns-None path produces (a refused swap strands nothing; an
+    installed dead token wedges the session). The store is never retired here
+    even on a dead probe: legacy stores are P5 cleanup territory, and refusing
+    the install is the load-bearing part."""
     cfg = config if config is not None else load_config()
     path = login_store_creds_path(account, slot)
     try:
         creds = read_json(path)
     except (json.JSONDecodeError, OSError):
-        return False  # racing rewrite since has_independent_login said usable
+        return "refused"  # racing rewrite since has_independent_login said usable
+    store = f"{account}/{slot}(legacy)"
+    # ---- Collision check FIRST, on the pre-probe bytes (see ORDERING above) ----
+    st = state if state is not None else load_state()
+    if _live_family_would_collide(account, path, slot, st, cfg, session_aware=True):
+        _cred_audit("legacy-login-install", "refused-collision",
+                    "legacy store's refresh-token family is LIVE on another mount — refused "
+                    "BEFORE any rotating probe could re-fingerprint the store (#104/#14 "
+                    "collision-before-probe ordering)",
+                    account=account, login_family=store, shared=True,
+                    token_fp=_audit_token_fp(creds))
+        click.echo(f"claim-verify: {store} carries a token family already live on another "
+                   f"mount of '{account}' — refusing the legacy install before any probe "
+                   f"could rotate it (#104)")
+        return "collision"
     grace_h = _family_rot_grace_hours(cfg)
     rot_verdict, expired_h = _family_rot_verdict(creds, grace_h)
-    if rot_verdict == "fresh":
-        return True
-    store = f"{account}/{slot}(legacy)"
     if not cfg.get("independent_logins", {}).get("verify_family_on_claim", True):
+        if rot_verdict == "fresh":
+            return "ok"  # gate off: offline heuristic only, probe-free (pooled parity)
         _rot_skip_audit("legacy-login-install", account, store, creds,
                         rot_verdict, expired_h, grace_h, "gate-off")
-        return False
+        return "refused"
     rt = _credential_refresh_token(creds)
     if not rt:
-        return False  # nothing to probe (and nothing that could sustain a mount)
+        return "refused"  # nothing to probe (and nothing that could sustain a mount)
     verdict, tok = _oauth_refresh_grant(rt)
     if verdict == "alive":
         _persist_rotated_grant(path, creds, rt, tok)
-        click.echo(f"claim-verify: {store} rot-suspect but proven alive (refresh grant OK; "
+        click.echo(f"claim-verify: {store} proven alive (refresh grant OK; "
                    f"store updated with rotated tokens — #127/#14)")
-        return True
+        return "ok"
+    if verdict == "unknown" and rot_verdict == "fresh":
+        # #127 parity with the pooled walk: fresh + unverifiable fails OPEN — a
+        # network blip must not turn a working legacy install into a refusal.
+        click.echo(f"claim-verify: {store} unverifiable (network/endpoint) — "
+                   f"installing unverified, fail-open (#127)")
+        return "ok"
     _rot_skip_audit("legacy-login-install", account, store, creds, rot_verdict,
                     expired_h, grace_h, "probe-dead" if verdict == "dead" else "probe-unknown")
-    return False
+    return "refused"
 
 
 def login_family_provenance_path(account: str, family_id: str) -> Path:
@@ -2557,7 +2635,7 @@ def independent_logins_enabled(config: dict | None = None) -> bool:
 
 
 def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path,
-                        config: dict | None = None) -> tuple[Path, bool]:
+                        config: dict | None = None, state: dict | None = None) -> tuple[Path, bool]:
     """Which creds file to install into a live mount when swapping to target_name.
 
     Returns (path, used_independent). Phase 2 (#109): a SLOT swap, with the gate
@@ -2566,8 +2644,21 @@ def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path
     refresh-token family to clobber (#104/#103/#3). Every other case (gate off,
     no slot, no provisioned login) returns the shared per-account snapshot, i.e.
     today's copy path. Lazy fallback is deliberate: an un-provisioned pair still
-    works (as a copy), it just isn't clobber-safe until `cus login-mount` runs."""
-    if slot is not None and independent_logins_enabled(config) and has_independent_login(target_name, slot):
+    works (as a copy), it just isn't clobber-safe until `cus login-mount` runs.
+
+    #14/#104 (committee round-2 finding 2): the legacy branch is GATED through
+    _legacy_login_lease_verdict — the #104 collision check against the store's
+    pre-probe bytes first, then the rot/probe ladder with pooled-claim parity.
+    It used to return the store on has_independent_login alone (exists/parses/
+    has-refresh), installing a possibly-rotten or colliding legacy store blind
+    on the NON-double-booked path — and its used_independent=True then skipped
+    the dead-snapshot refusal downstream. Any non-"ok" verdict falls through to
+    the snapshot exactly as if no login were provisioned (used_independent
+    False), so every downstream snapshot guard (dead-snapshot seed/refuse, the
+    #141 blank-shape gate) applies unchanged."""
+    if (slot is not None and independent_logins_enabled(config)
+            and has_independent_login(target_name, slot)
+            and _legacy_login_lease_verdict(target_name, slot, config, state) == "ok"):
         return (login_store_creds_path(target_name, slot), True)
     return (snapshot_creds, False)
 
@@ -10808,26 +10899,47 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         if claimed_family is not None:
             install_src = login_family_creds_path(target_name, claimed_family)
             used_independent = True
-        elif (has_independent_login(target_name, slot)
-              and _legacy_login_lease_ok(target_name, slot, config)):
-            # Legacy per-slot family (superseded; retained until P5). #14 rot
-            # gate (committee finding 1): this exact fallback class is what the
+        else:
+            # Legacy per-slot family (superseded; retained until P5). #14/#104
+            # (committee rounds 1-2): this exact fallback class is what the
             # 2026-07-07 chats1a incident rode in on (see the divergence-logout
             # comment below) — has_independent_login only proves exists/parses/
-            # has-refresh-token, so without the gate a rotten legacy store
-            # bypassed BOTH the rot check and the #127 probe that the pooled
-            # claim above enforces. A rot-suspect store the gate cannot prove
-            # alive falls through to the pool-exhausted refusal below — never
-            # install a known-rotten legacy store.
-            install_src = login_store_creds_path(target_name, slot)
-            used_independent = True
-        else:
-            raise RuntimeError(
-                f"pool exhausted for '{target_name}': it is live on another mount and has no free "
-                f"independent login family to claim — refusing to install a clobbering copy. "
-                f"Provision another: `cus login-mount {target_name}`.")
+            # has-refresh-token, so ungated it bypassed BOTH the rot check and
+            # the #127 probe that the pooled claim above enforces.
+            # _legacy_login_lease_verdict runs the whole discipline in the one
+            # order that is safe: the #104 collision check FIRST, on the store's
+            # PRE-probe bytes — collision validation MUST precede any
+            # credential-rotating probe, because an alive probe persists a
+            # ROTATED refresh token into the store and would un-match the very
+            # fingerprint the install-point guard below compares (silently
+            # double-booking the family while the burned single-use grant
+            # invalidates the original holder). "collision" refuses right here
+            # with zero probes; "refused" (rot-suspect it could not prove alive,
+            # or unreadable) falls to the pool-exhausted refusal — never install
+            # a known-rotten or colliding legacy store.
+            legacy_verdict = (_legacy_login_lease_verdict(target_name, slot, config, state)
+                              if has_independent_login(target_name, slot) else "refused")
+            if legacy_verdict == "ok":
+                install_src = login_store_creds_path(target_name, slot)
+                used_independent = True
+            elif legacy_verdict == "collision":
+                raise RuntimeError(
+                    f"refusing to install '{target_name}' onto lane {slot}: its legacy per-slot "
+                    f"login store carries the SAME OAuth refresh-token family already live on the "
+                    f"shared mount or another lane of '{target_name}' — a stale snapshot copy, not "
+                    f"an independent login. Installing it would double-book the family and the next "
+                    f"token rotation would log one side out (GH #104 divergence — the 2026-07-07 "
+                    f"chats1a logout). Refused BEFORE the liveness probe, so the store's pre-probe "
+                    f"bytes and single-use refresh grant are preserved. Provision a real family "
+                    f"(`cus login-mount {target_name}`) and retry. Lane left on its prior account "
+                    f"(no creds written).")
+            else:
+                raise RuntimeError(
+                    f"pool exhausted for '{target_name}': it is live on another mount and has no free "
+                    f"independent login family to claim — refusing to install a clobbering copy. "
+                    f"Provision another: `cus login-mount {target_name}`.")
     if install_src is None:
-        install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+        install_src, used_independent = swap_install_source(target_name, slot, target_creds, config, state)
     # ---- 2026-07-07 dead-snapshot family-seed (merkos incident) ----
     # At this point, if neither the claimed-pool-family block above nor
     # swap_install_source picked a distinct login family, install_src is the account
@@ -10961,6 +11073,15 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # under this one, so it must not trigger the family-collision refuse. Keeps
     # this execute-time guard consistent with the slot-move preview, which also
     # judges occupancy session-aware.
+    #
+    # 2026-07-24 (committee round-2 finding 1): the legacy fallback now refuses a
+    # colliding store BEFORE its rot probe can rotate the stored token
+    # (_legacy_login_lease_verdict, collision-before-probe ordering) — this
+    # install-point check is deliberately KEPT as belt-and-braces behind it: it
+    # still covers every other source (claimed pool family, snapshot,
+    # shared-mount install) and any future path that reaches the install line
+    # un-gated. It must never again be the ONLY collision defense for a source a
+    # probe may have re-fingerprinted.
     if (independent_logins_enabled(config)
             and _account_held_by_other_live_mount(state, target_name, slot, config,
                                                   session_aware=True)
@@ -26084,30 +26205,33 @@ def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
         os.execvpe("claude", ["claude"], env)
 
 
-def _login_store_rot_hours(account: str, slot_or_family: str, config: dict) -> float | None:
-    """Hours this login store's access token has sat expired — reported only
-    when that EXCEEDS the #14 rot grace; None when fresh / within grace /
-    unreadable.
+def _login_store_rot_state(account: str, slot_or_family: str, config: dict) -> tuple[str, float | None]:
+    """#14 rot verdict for one on-disk login store, for the `--list` views:
+    (verdict, expired_hours) straight from _family_rot_verdict — "rotten" (with
+    the RAW hours-since-expiry, what an operator should read as "how stale")
+    only beyond the lease grace, since within-grace expiry is normal free-pool
+    idleness and the assumed state stands; "unjudgeable" for the
+    no-measurable-expiry shapes (missing/blank/bool expiresAt) the lease path
+    refuses outright; "fresh" otherwise — and for an unreadable store (the
+    has_login/usable paths own that story).
 
     The MEASURED counterpart to login_expiry_state's ASSUMED provenance-age TTL
     — the incident lesson (2026-07-24): the assumed state said '[ok] ~11-30d
     left (assumed)' for families whose access tokens had been expired 5-7 days
     (refresh tokens revoked server-side), so `--list` showed a healthy pool
-    while every lease installed a dead token. Works for both store shapes —
-    pooled families and legacy per-(account, slot) dirs live at the same
-    logins/<account>/<name>/.credentials.json path — so both `--list` views can
-    share it. The returned figure is the RAW hours-since-expiry (what an
-    operator should read as "how stale"), only GATED on exceeding the grace:
-    within-grace expiry is normal free-pool idleness, so None means "the
-    assumed state stands"."""
+    while every lease installed a dead token. Committee round-2 finding 5: the
+    same lie survived for UNJUDGEABLE-expiry stores — no measurable staleness,
+    so the label fell back to the assumed '[ok]' while the lease path refused
+    the store — hence the verdict (not just the hours) is surfaced, so list
+    matches lease for every shape. Works for both store shapes — pooled
+    families and legacy per-(account, slot) dirs live at the same
+    logins/<account>/<name>/.credentials.json path — so both `--list` views
+    share it."""
     try:
         creds = read_json(login_store_creds_path(account, slot_or_family))
     except (json.JSONDecodeError, OSError):
-        return None  # unreadable → the has_login/usable paths own that story
-    expired_h = _creds_access_expired_hours(creds)
-    if expired_h is None or expired_h <= _family_rot_grace_hours(config):
-        return None
-    return expired_h
+        return ("fresh", None)  # unreadable → the has_login/usable paths own that story
+    return _family_rot_verdict(creds, _family_rot_grace_hours(config))
 
 
 def _family_pool_list_label(account: str, family_id: str, config: dict) -> str:
@@ -26117,12 +26241,16 @@ def _family_pool_list_label(account: str, family_id: str, config: dict) -> str:
     age word ('ok' until ~refresh_token_ttl_days after minting), which showed
     the 2026-07-24 rotten families as '[ok]'. When the stored access token has
     sat expired beyond the lease grace (the same rot signature the claim path
-    skips on), the measured STALE age replaces the assumed word, so the
-    operator sees exactly what the lease path will refuse to install
-    unverified. Otherwise the assumed word stands unchanged."""
-    rot_h = _login_store_rot_hours(account, family_id, config)
-    if rot_h is not None:
+    skips on), the measured STALE age replaces the assumed word; an UNJUDGEABLE
+    expiry — the shape the lease path refuses just as hard (committee round-2
+    finding 5: it used to hide behind the assumed '[ok]') — is surfaced the
+    same red way. So the operator sees exactly what the lease path will refuse
+    to install unverified. Otherwise the assumed word stands unchanged."""
+    verdict, rot_h = _login_store_rot_state(account, family_id, config)
+    if verdict == "rotten":
         return click.style(f"STALE {rot_h / 24.0:.1f}d", fg="red")
+    if verdict == "unjudgeable":
+        return click.style("UNJUDGEABLE expiry", fg="red")
     return login_expiry_state(account, family_id, config)[0]
 
 
@@ -26140,11 +26268,16 @@ def _login_mount_status_line(rec: dict, config: dict) -> str:
     # #14: the MEASURED access-token expiry outranks the assumed TTL — this line
     # is where the incident's '[ok] ~11-30d left (assumed)' lie was printed for
     # families whose tokens had been dead for days (pool family dirs surface in
-    # this legacy view too, sharing the same store path shape).
-    rot_h = _login_store_rot_hours(account, slot, config)
-    if rot_h is not None:
+    # this legacy view too, sharing the same store path shape). An UNJUDGEABLE
+    # expiry gets the same red treatment (round-2 finding 5): the lease path
+    # refuses that store, so the assumed word may not vouch for it here either.
+    rot_verdict, rot_h = _login_store_rot_state(account, slot, config)
+    if rot_verdict == "rotten":
         fresh = click.style(f"STALE ~{rot_h / 24.0:.1f}d — access token expired (measured; "
                             f"assumed TTL said '{state}')", fg="red")
+    elif rot_verdict == "unjudgeable":
+        fresh = click.style(f"UNJUDGEABLE expiry — no measurable expiresAt, the lease path "
+                            f"refuses this store unprobed (assumed TTL said '{state}')", fg="red")
     elif state == "expired":
         fresh = click.style(f"EXPIRED ~{-days_left:.0f}d ago (assumed)", fg="red")
     elif state == "near":
@@ -26325,7 +26458,7 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
         if pool_accts:
             click.echo("Independent-login pools (GH #109):")
             want = config.get("independent_logins", {}).get("pool_size", 3)
-            any_stale = False
+            any_stale = any_unjudgeable = False
             for a in pool_accts:
                 fams = list_login_families(a)
                 # #14: measured access-token staleness outranks the assumed
@@ -26333,6 +26466,7 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
                 # showed '[ok]' here while every lease installed a dead token).
                 labels = [_family_pool_list_label(a, f, config) for f in fams]
                 any_stale = any_stale or any("STALE" in l for l in labels)
+                any_unjudgeable = any_unjudgeable or any("UNJUDGEABLE" in l for l in labels)
                 short = "  ".join(f"{f}[{l}]" for f, l in zip(fams, labels))
                 flag = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
                 click.echo(f"  {a}: {len(fams)} family(ies)  {short}{flag}")
@@ -26342,6 +26476,12 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
                     "the lease grace (independent_logins.family_rot_grace_hours) — the claim path "
                     "leases it only if its liveness probe proves it alive; if it probes dead, "
                     "re-login with `cus login-mount <account>` (#14).", fg="red"))
+            if any_unjudgeable:
+                click.echo(click.style(
+                    "  UNJUDGEABLE expiry = the store carries no measurable expiresAt "
+                    "(missing/blank/non-numeric) — rot-suspect, the claim path leases it only "
+                    "on a proven-alive probe, exactly like STALE; re-login with "
+                    "`cus login-mount <account>` (#14).", fg="red"))
         # Legacy per-(slot,account) entries, if any remain.
         recs = list_provisioned_logins()
         if recs:

@@ -1701,6 +1701,33 @@ def test_login_mount_list_marks_rotten_family_stale():
         env.restore()
 
 
+def test_login_mount_list_marks_unjudgeable_family():
+    """Round-2 finding 5: an UNJUDGEABLE-expiry family (missing/bool expiresAt —
+    the shape the lease path refuses outright) used to fall back to the assumed
+    provenance-age '[ok]' because there is no measurable staleness to print.
+    The list must match the lease: surface the unjudgeable state, styled like
+    STALE, never '[ok]'."""
+    env = _Env()
+    try:
+        _plant_family_raw("alpha", "family-1",
+                          {"claudeAiOauth": {"accessToken": "at-x", "refreshToken": "rt-x"}})
+        _plant_family_raw("alpha", "family-2",
+                          {"claudeAiOauth": {"accessToken": "at-y", "refreshToken": "rt-y",
+                                             "expiresAt": True}})
+        env.plant_family("alpha", "family-3", "rt-a3")   # fresh control
+        for fam in ("family-1", "family-2", "family-3"):
+            cus.write_json(cus.login_family_provenance_path("alpha", fam),
+                           {"account": "alpha", "family_id": fam, "minted_ts": cus.now_iso()})
+        r = CliRunner().invoke(cus.cli, ["login-mount", "--list"])
+        assert r.exit_code == 0, r.output
+        assert "family-1[UNJUDGEABLE expiry]" in r.output, r.output
+        assert "family-2[UNJUDGEABLE expiry]" in r.output, r.output
+        assert "family-1[ok]" not in r.output and "family-2[ok]" not in r.output, r.output
+        assert "family-3[ok]" in r.output, r.output   # fresh family keeps the assumed word
+    finally:
+        env.restore()
+
+
 def test_login_mount_list_legacy_line_marks_rotten_store():
     """The legacy per-slot view is where the incident's '[ok] ~11-30d left
     (assumed)' line came from (pool family dirs surface there too). A store
@@ -1726,17 +1753,21 @@ def test_login_mount_list_legacy_line_marks_rotten_store():
 # ---------------------------------------------------------------------------
 # #14 committee-review hardening (2026-07-24 follow-up).
 #
-# Finding 1: the LEGACY per-(account, slot) fallback in _execute_swap_locked
-# installed on has_independent_login alone (exists/parses/has-refresh-token) —
-# bypassing BOTH the rot gate and the #127 probe; the same fallback class that
-# caused the 2026-07-07 chats1a incident. It now runs the same rot discipline
-# (_legacy_login_lease_ok). Finding 2/4: a family with NO judgeable expiresAt
-# (missing / <=0 / bool `true`) is rot-SUSPECT, not silently fresh — the #141
-# blank-shape guard never runs on the lease path, so "can't measure" leased
-# blind pre-fix (decision=skipped-unjudgeable-expiry distinguishes it in the
-# audit log). Finding 3: family_rot_grace_hours must be finite and >= 0 —
-# nan/inf silently DISABLED rot detection, a negative over-triggered on any
-# expiry lag.
+# Round 1 finding 1: the LEGACY per-(account, slot) fallback in
+# _execute_swap_locked installed on has_independent_login alone (exists/parses/
+# has-refresh-token) — bypassing BOTH the rot gate and the #127 probe; the same
+# fallback class that caused the 2026-07-07 chats1a incident. It now runs the
+# same rot discipline (_legacy_login_lease_verdict). Finding 2/4: a family with
+# NO judgeable expiresAt (missing / <=0 / bool `true`) is rot-SUSPECT, not
+# silently fresh — the #141 blank-shape guard never runs on the lease path, so
+# "can't measure" leased blind pre-fix (decision=skipped-unjudgeable-expiry
+# distinguishes it in the audit log). Finding 3: family_rot_grace_hours must be
+# finite and >= 0 — nan/inf silently DISABLED rot detection, a negative
+# over-triggered on any expiry lag.
+#
+# Round 2 (below, after these): collision-before-probe ordering (CRITICAL), the
+# non-double-booked swap_install_source gate, verify-on probes for fresh legacy
+# stores, bool grace config, and the UNJUDGEABLE --list label.
 # ---------------------------------------------------------------------------
 
 def _plant_legacy_store(account: str, slot: str, refresh: str,
@@ -1782,17 +1813,46 @@ def test_legacy_fallback_rotten_store_refuses():
         env.restore()
 
 
-def test_legacy_fallback_fresh_store_installs_without_probe():
-    """Finding 1, no-over-block leg: a FRESH legacy store passes the gate
-    offline (no probe call) and installs exactly as before — the direct-gate
-    twin of test_swap_onto_shared_mount_genuine_distinct_legacy_allowed's e2e
-    coverage of the supported Track-B case."""
+def test_legacy_fallback_fresh_store_gate_off_installs_without_probe():
+    """Round-2 finding 3, verify-OFF leg: with probes opted out, a FRESH legacy
+    store passes the gate offline (no probe call) and installs exactly as
+    before — pooled parity with test_claim_verify_gate_off_skips_probe. (With
+    the verify gate ON a fresh store now probes too — see
+    test_legacy_fresh_but_revoked_probe_dead_refused_verify_on.)"""
     env = _Env()
     probe = _Probe({})
     try:
         _plant_legacy_store("alpha", "slot-9", "rt-legacy")   # far-future expiry
-        assert cus._legacy_login_lease_ok("alpha", "slot-9", {"independent_logins": {}}) is True
-        assert probe.calls == [], "a fresh legacy store must not cost a probe"
+        cfg = {"independent_logins": {"verify_family_on_claim": False}}
+        assert cus._legacy_login_lease_verdict("alpha", "slot-9", cfg, cus.load_state()) == "ok"
+        assert probe.calls == [], "gate off must stay offline for a fresh legacy store"
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_legacy_fresh_but_revoked_probe_dead_refused_verify_on():
+    """Round-2 finding 3: with the verify gate ON the legacy gate must probe a
+    FRESH store too, exactly like the pooled claim walk probes every candidate —
+    a recently-revoked refresh token can ride a within-grace expiresAt, and
+    pre-fix the fresh verdict returned True with zero probes, installing it
+    blind. Probe says dead → refused (decision=skipped-probe-dead); fresh +
+    unverifiable still fails open (#127 parity, covered by the e2e
+    test_swap_onto_shared_mount_genuine_distinct_legacy_allowed)."""
+    env = _Env()
+    probe = _Probe({"rt-legacy": ("dead", None)})
+    try:
+        _plant_legacy_store("alpha", "slot-9", "rt-legacy")   # fresh, far-future expiry
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = cus._legacy_login_lease_verdict(
+                "alpha", "slot-9", {"independent_logins": {}}, cus.load_state())
+        assert got == "refused", got
+        assert probe.calls == ["rt-legacy"], "verify-on must probe even a fresh store"
+        audit = [l for l in buf.getvalue().splitlines()
+                 if "CRED-AUDIT" in l and "op=legacy-login-install" in l
+                 and "skipped-probe-dead" in l]
+        assert audit, buf.getvalue()
     finally:
         probe.restore()
         env.restore()
@@ -1822,6 +1882,102 @@ def test_legacy_fallback_rotten_store_alive_probe_installs_rotated():
         store_rt = cus._credential_refresh_token(
             cus.read_json(cus.login_store_creds_path("merkos", mover)))
         assert store_rt == "rt-indep-merkos-rotated", store_rt
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_legacy_collision_refused_before_any_probe():
+    """Round-2 finding 1 (CRITICAL) — collision validation MUST precede any
+    credential-rotating probe. The shape: a legacy store that is rot-suspect
+    AND whose refresh token EQUALS a family LIVE on another mount (the
+    2026-07-07 chats1a stale-copy signature). Pre-fix the rot gate probed it
+    FIRST; an alive grant _persist_rotated_grant()ed a NEW refresh token into
+    the store, so the later #104 install-point guard re-read rotated bytes that
+    no longer fingerprint-matched the live holder — the swap silently
+    double-booked the family while the burned single-use grant invalidated the
+    original holder's token. Post-fix: refused on the PRE-probe bytes with ZERO
+    probe calls (the probe here raises, so any attempt fails the test), the
+    store bytes unchanged (grant preserved), the lane held."""
+    env = _Env(accounts=("merkos", "beta"))
+    def _boom(rt):  # noqa: E306 — any probe call is an ordering violation
+        raise AssertionError("probe fired before collision validation (#104/#14 ordering)")
+    cus._oauth_refresh_grant = _boom   # env.restore() reinstates the real one
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-merkos")))   # shared mount live on merkos
+        mover = env.make_slot("beta", live=True)
+        # Rot-suspect (6d expired) AND same family as the shared mount.
+        _plant_legacy_store("merkos", mover, "rt-merkos", expires_at=_ms_ago(6 * 24))
+        store_path = cus.login_store_creds_path("merkos", mover)
+        pre_bytes = store_path.read_bytes()
+        buf = io.StringIO()
+        raised = False
+        try:
+            with contextlib.redirect_stdout(buf):
+                cus.execute_swap("merkos", trigger="manual-slot-move", slot=mover)
+        except RuntimeError as e:
+            raised = "GH #104" in str(e)
+        assert raised, "colliding legacy store must refuse with the #104 divergence error"
+        assert store_path.read_bytes() == pre_bytes, "pre-probe store bytes must be preserved"
+        assert cus.load_state()["slots"][mover]["account"] == "beta"   # lane held
+        audit = [l for l in buf.getvalue().splitlines()
+                 if "CRED-AUDIT" in l and "op=legacy-login-install" in l
+                 and "refused-collision" in l]
+        assert audit and "merkos" in audit[0], buf.getvalue()
+    finally:
+        env.restore()
+
+
+def test_nondoublebooked_swap_rotten_legacy_falls_to_snapshot():
+    """Round-2 finding 2: swap_install_source's legacy branch — the
+    NON-double-booked path — used to install on has_independent_login alone,
+    with no rot gate or probe (and used_independent=True even skipped the
+    dead-snapshot refusal downstream). A rotten legacy store the gate cannot
+    prove alive must now fall through to the SNAPSHOT exactly as if no login
+    were provisioned: the swap still succeeds, on the snapshot family, with no
+    family lease recorded."""
+    env = _Env()
+    probe = _Probe({})   # rot-suspect + unverifiable → refused
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        # beta is NOT live on any other mount (active=alpha) → non-double-booked.
+        _plant_legacy_store("beta", mover, "rt-indep-beta", expires_at=_ms_ago(6 * 24))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cus.execute_swap("beta", trigger="manual-slot-move", slot=mover)
+        state = cus.load_state()
+        assert state["slots"][mover]["account"] == "beta"
+        assert not state["slots"][mover].get("login_family")
+        live_rt = cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta", f"must install the snapshot, not the rotten store: {live_rt}"
+        audit = [l for l in buf.getvalue().splitlines()
+                 if "CRED-AUDIT" in l and "op=legacy-login-install" in l and "skipped-rotten" in l]
+        assert audit, buf.getvalue()
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_nondoublebooked_swap_fresh_legacy_installs_as_before():
+    """Round-2 finding 2, no-over-block leg: on the same non-double-booked path
+    a FRESH legacy store still installs (verify on + unverifiable probe = the
+    #127 fail-open, byte-identical to the pre-gate behavior)."""
+    env = _Env()
+    probe = _Probe({})   # fresh + unknown → fail open
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        _plant_legacy_store("beta", mover, "rt-indep-beta")   # far-future expiry
+        with contextlib.redirect_stdout(io.StringIO()):
+            cus.execute_swap("beta", trigger="manual-slot-move", slot=mover)
+        assert cus.load_state()["slots"][mover]["account"] == "beta"
+        live_rt = cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-indep-beta", live_rt
+        assert probe.calls == ["rt-indep-beta"], "verify-on probes the fresh store (finding 3)"
     finally:
         probe.restore()
         env.restore()
@@ -1908,9 +2064,13 @@ def test_rot_grace_config_rejects_nonfinite_and_negative():
     """Finding 3: float() alone admits 'nan'/'inf'/'-inf'/negatives from a
     hand-edited config.yaml — nan/inf silently DISABLE rot detection (every
     `> grace` comparison is False), a negative/-inf flags every family with any
-    expiry lag as rotten. All must fall back to the module default (the
-    function's stated malformed-config contract); sane overrides still apply."""
-    for bad in ("nan", float("nan"), "inf", float("inf"), float("-inf"), -1, "-5"):
+    expiry lag as rotten. Round-2 finding 4 adds bools: True is an int subclass,
+    so float(True)/float(False) pass the finite/>=0 checks and a YAML
+    `family_rot_grace_hours: true` silently became a 1h grace (false → 0h).
+    All must fall back to the module default (the function's stated
+    malformed-config contract); sane overrides still apply."""
+    for bad in ("nan", float("nan"), "inf", float("inf"), float("-inf"), -1, "-5",
+                True, False):
         cfg = {"independent_logins": {"family_rot_grace_hours": bad}}
         assert cus._family_rot_grace_hours(cfg) == float(cus.FAMILY_ROT_GRACE_HOURS), repr(bad)
     assert cus._family_rot_grace_hours(

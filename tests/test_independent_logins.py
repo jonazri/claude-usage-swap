@@ -87,6 +87,13 @@ class _Env:
         cus.CONFIG_YAML = self.accounts_dir / "config.yaml"
         self._saved_mount_pids = cus.mount_pids
         cus.mount_pids = lambda mount: []
+        # #127/#14: never let a test hit the real OAuth endpoint — the legacy
+        # install gate now probes with verify_family_on_claim on (round-2
+        # finding 3). Verdict "unknown" fail-opens a FRESH store, byte-identical
+        # to the pre-probe behavior these tests were written against (same stub
+        # pattern as test_login_pool._Env).
+        self._saved_probe = cus._oauth_refresh_grant
+        cus._oauth_refresh_grant = lambda rt: ("unknown", None)
 
     def set_config(self, cfg: dict) -> None:
         """Write a config.yaml so load_config() picks up overrides."""
@@ -110,6 +117,7 @@ class _Env:
         for k, v in self._saved.items():
             setattr(cus, k, v)
         cus.mount_pids = self._saved_mount_pids
+        cus._oauth_refresh_grant = self._saved_probe
         self._tmp.cleanup()
 
 
