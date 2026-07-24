@@ -27,9 +27,10 @@ This suite proves the three fixes:
 
 Section (e) adds the GH #13 follow-up (2026-07-24): the reactive heal picks its
 plain-lane source by FRESHNESS (a local shape-tolerant expiresAt reader — NOT
-the strict `_creds_expires_at` — with an exact tie broken by refresh-token
-IDENTITY: same token keeps the shadow, a refresh-capable shadow beats a
-token-less canonical, anything else prefers the canonical) — never installing a
+the strict `_creds_expires_at`; a refresh-capability gate applies FIRST at any
+freshness in both directions — a token-less candidate never beats a
+refresh-capable one; then an exact tie is broken by refresh-token IDENTITY:
+same token keeps the shadow, anything else prefers the canonical) — never installing a
 slot-local last-valid strictly staler than the canonical account snapshot,
 which is what turned a transient blank into a hard reuse-revocation logout.
 The pick is logged as `op=blank-heal-source`.
@@ -533,8 +534,9 @@ def test_d_pooled_lane_ignores_shadow_uses_family():
 # canonical, the saveback-maintained reference), the dead-snapshot probe run
 # only as a VETO on a would-be-winning PRIMARY snapshot (never on a losing one,
 # never on a .bak backup, never under --no-execute), legacy independent-login
-# lanes kept shadow-first, and the pick logged as a `op=blank-heal-source`
-# CRED-AUDIT line naming winner, loser, and expiries.
+# lanes confined to their OWN lineage (freshest of shadow-vs-store, capability
+# gate, identity tie — never the shared snapshot), and the pick logged as a
+# `op=blank-heal-source` CRED-AUDIT line naming winner, loser, and expiries.
 
 
 def test_e_stale_shadow_loses_to_fresher_canonical_snapshot():
