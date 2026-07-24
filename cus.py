@@ -354,6 +354,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # network/endpoint trouble FAILS OPEN to today's install-as-is.
         # False ⇒ bit-for-bit pre-#127 claim behavior.
         "verify_family_on_claim": True,
+        # Shared-family fail-closed guard (GH #15, the 2026-07-24 revocation
+        # incident). False (default): execute_swap REFUSES to make an account
+        # live on a SECOND mount when the install source is a shared-family
+        # copy (the snapshot, or any source that isn't a distinct independent
+        # login family) — regardless of use_independent_logins. Two live
+        # mounts on one OAuth refresh-token family don't just log one session
+        # out anymore: rotation on one invalidates the other, and re-presenting
+        # the rotated-away token trips the auth server's REUSE DETECTION, which
+        # revokes the WHOLE family server-side (this is what took the sentinel
+        # down on 2026-07-24 — lane_sharing put one account live on two mounts
+        # without independent logins, and the daemon's URGENT line was
+        # detect-only). True: consciously opt back into the old warn-and-
+        # proceed behavior; the URGENT double-book SOS still fires so an
+        # opted-in operator keeps the warning.
+        "allow_shared_family": False,
     },
     # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
     # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
@@ -2303,6 +2318,24 @@ def independent_logins_enabled(config: dict | None = None) -> bool:
     OFF by default → the swap path is bit-for-bit today's shared-snapshot copy."""
     cfg = config if config is not None else load_config()
     return bool(cfg.get("independent_logins", {}).get("use_independent_logins", False))
+
+
+def shared_family_allowed(config: dict | None = None) -> bool:
+    """Whether the operator has consciously opted back into shared-family
+    double-booking (independent_logins.allow_shared_family — GH #15).
+
+    False (default) means the execute-time fail-closed guard in
+    _execute_swap_locked REFUSES any install that would make an account live on
+    a SECOND mount from a shared-family source (a snapshot copy), regardless of
+    the use_independent_logins gate. This is deliberately a SEPARATE knob from
+    that gate: the 2026-07-24 incident happened precisely because every
+    execute-time double-book refusal was scoped to gate-on configs, so a
+    gate-off (default) install proceeded as a silent clobbering copy and the
+    daemon's "[URGENT] ... live on 2 mounts without independent logins" line
+    was detect-only. True restores that old warn-and-proceed behavior (the
+    URGENT detection stays)."""
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("independent_logins", {}).get("allow_shared_family", False))
 
 
 def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path,
@@ -10707,6 +10740,56 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"source is a stale snapshot copy). Provision another independent login "
             f"(`cus login-mount {target_name}`) and retry, or move the lane to a different "
             f"account. Lane left on its prior account (no creds written).")
+    # ---- 2026-07-24 shared-family fail-closed guard (GH #15) ----
+    # INVARIANT (gate-INDEPENDENT, unlike every guard above and below): making
+    # an account live on a SECOND mount from a source that is NOT a distinct
+    # independent login family (used_independent False ⇒ the shared snapshot
+    # copy) REFUSES, fail closed. WHY this exists on top of the #104/#109
+    # machinery above: every execute-time double-book refusal so far (the pool
+    # claim/exhaustion block and the byte-level family-collision guard) is scoped
+    # to independent_logins_enabled(config) — so with the gate OFF (the
+    # default), swap_install_source's deliberate "lazy fallback" installed the
+    # clobbering copy with NO refusal anywhere, and _slot_move_plan even
+    # previewed "refuse" while execution proceeded. The daemon's
+    # "[URGENT] <account> is live on 2 mounts without independent logins" SOS
+    # detected the result but only logged it. That warn-and-proceed gap is the
+    # 2026-07-24 sentinel outage: lane_sharing put one account live on two
+    # mounts, both refreshed the ONE OAuth refresh-token family, and
+    # re-presenting the rotated-away token tripped the auth server's REUSE
+    # DETECTION — which revoked the whole family SERVER-SIDE (strictly worse
+    # than the classic #104 single-logout: no mount survives). Degrade-to-safe:
+    # refusing leaves the lane on its prior working account; proceeding risks
+    # every session on the account. independent_logins.allow_shared_family:
+    # true is the conscious operator opt-out (old behavior; the URGENT SOS
+    # still fires). session_aware=True for the same orphan-holds-slot reason as
+    # the neighboring guards: an orphaned dev-server refreshes no token, so it
+    # must not manufacture a phantom second mount. There is deliberately NO
+    # --force path through this, mirroring the pool-exhaustion refusal above
+    # ("inventing one would defeat GH #104") — the config knob is the only door.
+    if (not used_independent
+            and not shared_family_allowed(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)):
+        try:
+            _shared_fp = _audit_token_fp(read_json(install_src))
+        except (json.JSONDecodeError, OSError):
+            _shared_fp = "unreadable"
+        _cred_audit("shared-family-refuse", "refused-shared-family",
+                    "second live mount would run a shared-family copy (#104/GH #15) — refused fail-closed",
+                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                    shared=True, token_fp=_shared_fp)
+        raise RuntimeError(
+            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
+            f"'{target_name}' is already live on another mount and this install would be a shared-family "
+            f"copy, not an independent login family. Two live mounts on one OAuth refresh-token family "
+            f"rotate it out from under each other, and re-presenting the rotated-away token trips the "
+            f"auth server's reuse detection, revoking the WHOLE family server-side (GH #15, the "
+            f"2026-07-24 sentinel outage). Provision an independent family (`cus login-mount "
+            f"{target_name}`, with independent_logins.use_independent_logins: true) and retry, or move "
+            f"to a different account. To consciously accept the old shared-copy behavior set "
+            f"independent_logins.allow_shared_family: true. Mount left on its prior account "
+            f"(no creds written).")
+
     # ---- GH #141 root-cause guard (definitive install-point gate) ----
     # This is THE line that writes creds to the live mount; every swap path
     # (snapshot copy, claimed pool family, legacy per-slot login) funnels through
@@ -26675,6 +26758,17 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
         plan, detail = "claim", (
             f"'{target}' is live on {held_by} — execute_swap will claim a free login family "
             f"(distinct token, no clobber; GH #109)")
+    elif not gate and shared_family_allowed(config):
+        # GH #15 escape hatch, gate-off only: the operator consciously opted
+        # back into the shared-family copy, so execute_swap will proceed and
+        # the preview must say so (preview/execution agreement is this
+        # helper's whole contract). Gate ON never reaches here as "snapshot":
+        # a held target either claims a family above or hits execute_swap's
+        # pool-exhaustion refusal, hatch or no hatch.
+        plan, detail = "snapshot", (
+            f"'{target}' is live on {held_by} but independent_logins.allow_shared_family is true — "
+            f"execute_swap will install the shared-family copy (old warn-and-proceed behavior, "
+            f"GH #15; the URGENT double-book SOS will still fire)")
     else:
         plan, detail = "refuse", (
             f"'{target}' is live on {held_by} and has no free login family to claim — installing a copy "
@@ -27097,7 +27191,8 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                 f"(`cus launch auto`); turn on per_session.lane_sharing to SHARE its lane; or give it a "
                 f"second INDEPENDENT lane — enable independent_logins, run "
                 f"`cus login-mount <free-slot> {account}`, then `cus launch {account} --lane <free-slot>`. "
-                f"(`--force` overrides, but that reintroduces the clobber.)")
+                f"(`--force` overrides this pre-flight, but execute_swap's shared-family guard still "
+                f"refuses the clobbering copy unless independent_logins.allow_shared_family: true — GH #15.)")
         click.echo(f"launch: '{account}' gets a 2nd independent lane {lane} (its own login — GH #109)")
 
     acct_state = state.get("accounts", {}).get(account, {})
@@ -27178,7 +27273,7 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
 @click.argument("account", required=False)
 @click.option("--pool", type=click.Choice(list(VALID_POOLS)), default=None,
               help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
-@click.option("--force", is_flag=True, help="Launch even onto an account already live on another mount (GH #104: normally refused — two live mounts on one account sign one out).")
+@click.option("--force", is_flag=True, help="Skip the pre-flight refusal for an account already live on another mount (GH #104: two live mounts on one account sign one out). Does NOT override execute_swap's shared-family fail-closed guard — a clobbering copy still refuses unless independent_logins.allow_shared_family: true (GH #15).")
 @click.option("--lane", default=None, help="Launch into a specific slot (e.g. slot-8) instead of auto-picking. With independent_logins on + an independent login provisioned for (lane, account), this is how you give one account a 2nd independently-swappable lane (GH #109).")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | None, claude_args: tuple[str, ...]) -> None:
