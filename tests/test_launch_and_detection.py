@@ -327,6 +327,128 @@ def test_launch_prepare_joins_shared_mount():
         env.restore()
 
 
+class _PinnedLaneEnv:
+    """_Env plus one LIVE slot: slot-1 holds alpha with a live mount.
+    The recurring sentinel-recycle failure shape (2026-07-15..24): a session
+    pinned to a lane relaunches onto it while the lane is still/again live."""
+
+    def __init__(self, locked: bool = False) -> None:
+        self.env = _Env()
+        state = cus.load_state()
+        cus.slot_path("slot-1").mkdir(parents=True, exist_ok=True)
+        state["slots"] = {"slot-1": {"account": "alpha"}}
+        cus.save_state(state)
+        live = {str(cus.slot_path("slot-1"))}
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        self.config = cus.deep_merge(cus.load_config(),
+                                     {"per_session": {"lane_sharing": True}})
+        if locked:
+            self.config = cus.deep_merge(self.config,
+                                         {"session_locks": {"locked_slots": ["slot-1"]}})
+        # The auto path's fresh-reading verify loop must not really poll.
+        self._saved_poll = cus._force_poll_launch_candidate
+        cus._force_poll_launch_candidate = lambda *a, **k: False
+
+    def restore(self) -> None:
+        cus._force_poll_launch_candidate = self._saved_poll
+        self.env.restore()
+
+
+def test_launch_prepare_auto_joins_live_pinned_lane():
+    """`cus launch auto --lane slot-1` with slot-1 LIVE on alpha must JOIN
+    alpha's lane (the only launch that can succeed there) instead of
+    auto-picking a different account and dying on the
+    "--lane slot-1 is live on 'alpha', not 'X'" refusal."""
+    p = _PinnedLaneEnv()
+    try:
+        slot_name, slot_dir, account = cus._launch_prepare(
+            "auto", cus.load_state(), p.config, lane="slot-1")
+        assert (slot_name, account) == ("slot-1", "alpha")
+        assert slot_dir == cus.slot_path("slot-1")
+        assert cus.load_state()["slots"]["slot-1"].get("last_launch_ts")
+    finally:
+        p.restore()
+
+
+def test_launch_prepare_explicit_occupant_joins_live_pinned_lane():
+    """`cus launch alpha --lane slot-1` with slot-1 LIVE on alpha must JOIN —
+    today it dies at the GH #104 duplicate-mount guard even though joining the
+    lane creates no second mount."""
+    p = _PinnedLaneEnv()
+    try:
+        slot_name, slot_dir, account = cus._launch_prepare(
+            "alpha", cus.load_state(), p.config, lane="slot-1")
+        assert (slot_name, account) == ("slot-1", "alpha")
+    finally:
+        p.restore()
+
+
+def test_launch_prepare_explicit_other_account_still_refuses_live_lane():
+    """`cus launch beta --lane slot-1` with slot-1 LIVE on alpha stays a
+    refusal (a genuinely conflicting explicit request)."""
+    import click
+    p = _PinnedLaneEnv()
+    try:
+        try:
+            cus._launch_prepare("beta", cus.load_state(), p.config, lane="slot-1")
+            raise AssertionError("expected ClickException")
+        except click.ClickException as e:
+            assert "is live on" in str(e.message)
+    finally:
+        p.restore()
+
+
+def test_launch_prepare_pinned_join_respects_locked_slot():
+    """A LIVE locked lane must not gain sessions via the pinned-lane join:
+    the lock refusal wins (mirroring the explicit-lane lock guard)."""
+    import click
+    p = _PinnedLaneEnv(locked=True)
+    try:
+        try:
+            cus._launch_prepare("auto", cus.load_state(), p.config, lane="slot-1")
+            raise AssertionError("expected ClickException")
+        except click.ClickException as e:
+            assert "locked slot" in str(e.message)
+    finally:
+        p.restore()
+
+
+def test_launch_prepare_pinned_join_returns_fresh_occupant():
+    """The join reloads state before persisting; if a daemon in-place move
+    changed the lane's account between the caller's snapshot and that reload,
+    the returned account must be the FRESH occupant — the mount's real
+    content — not the snapshot's (Copilot review, PR #12)."""
+    p = _PinnedLaneEnv()
+    try:
+        stale = cus.load_state()  # snapshot: slot-1 -> alpha
+        st = cus.load_state()
+        st["slots"]["slot-1"]["account"] = "beta"  # daemon moved the lane
+        cus.save_state(st)
+        slot_name, _, account = cus._launch_prepare(
+            "auto", stale, p.config, lane="slot-1")
+        assert (slot_name, account) == ("slot-1", "beta")
+    finally:
+        p.restore()
+
+
+def test_launch_prepare_pinned_lane_without_lane_sharing_keeps_refusal():
+    """lane_sharing off: the pinned-lane join stays disabled and the existing
+    "is live on ... Pick a free lane" refusal is preserved."""
+    import click
+    p = _PinnedLaneEnv()
+    try:
+        config = cus.deep_merge(cus.load_config(),
+                                {"per_session": {"lane_sharing": False}})
+        try:
+            cus._launch_prepare("auto", cus.load_state(), config, lane="slot-1")
+            raise AssertionError("expected ClickException")
+        except click.ClickException as e:
+            assert "Pick a free lane" in str(e.message) or "live mount" in str(e.message)
+    finally:
+        p.restore()
+
+
 def test_launch_swap_does_not_arm_ladder_hysteresis():
     """trigger='launch' bumps last_swap_ts (display) but NOT last_auto_swap_ts
     (the ladder cooldown clock) — a launch isn't ladder churn (2026-07-03:
