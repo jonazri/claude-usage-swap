@@ -2079,6 +2079,54 @@ def test_rot_grace_config_rejects_nonfinite_and_negative():
         {"independent_logins": {"family_rot_grace_hours": 0}}) == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Round 3 (minors): the legacy gate-OFF branch's missing refresh-token check,
+# and null-tolerant `independent_logins:` config reads on both lease paths.
+# ---------------------------------------------------------------------------
+
+def test_legacy_gate_off_fresh_store_without_refresh_token_refused():
+    """Round-3: the gate-OFF branch used to return "ok" for a FRESH-looking
+    legacy store with NO refreshToken — the rt check sat on the gate-ON path
+    only, unlike the pooled walk (which refuses rt-less candidates before its
+    gate). An rt-less store cannot sustain a mount in either mode: both
+    branches must refuse, still without a single probe."""
+    env = _Env()
+    probe = _Probe({})
+    try:
+        cus.login_store_dir("alpha", "slot-9").mkdir(parents=True, exist_ok=True)
+        cus.login_store_creds_path("alpha", "slot-9").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-x", "expiresAt": 2_000_000_000_000}}))
+        cfg = {"independent_logins": {"verify_family_on_claim": False}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = cus._legacy_login_lease_verdict("alpha", "slot-9", cfg, cus.load_state())
+        assert got == "refused", got
+        assert probe.calls == [], "gate off must stay offline even while refusing"
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_null_independent_logins_config_tolerated_on_both_lease_paths():
+    """Round-3: a literal `independent_logins:` (null) in a hand-edited
+    config.yaml deep-merges to None, and the bare
+    cfg.get("independent_logins", {}).get(...) chain raised AttributeError on
+    BOTH lease paths. Null must read as {} — defaults apply (verify gate ON;
+    the _Env probe's "unknown" verdict then fails open for a fresh store) —
+    matching _family_rot_grace_hours' `or {}` contract in the same diff."""
+    env = _Env()
+    try:
+        cfg = {"independent_logins": None}
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert cus.claim_verified_login_family("beta", cus.load_state(), cfg) == "family-1"
+        _plant_legacy_store("alpha", "slot-9", "rt-legacy")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert cus._legacy_login_lease_verdict(
+                "alpha", "slot-9", cfg, cus.load_state()) == "ok"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

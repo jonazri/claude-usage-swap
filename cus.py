@@ -1751,8 +1751,14 @@ def _rot_skip_audit(op: str, account: str, store: str, creds: Any, rot_verdict: 
                 extra=(f"access_expired_hours={expired_h:.1f} grace_hours={grace_h:g}"
                        if expired_h is not None
                        else f"access_expired_hours=unjudgeable grace_hours={grace_h:g}"))
-    click.echo(f"claim-verify: {store} {measured} and {why} — skipping, never install a "
-               f"possibly-rotten store (#14)")
+    # Echo worded per-decision (committee round-3): the skipped-probe-dead case
+    # is a store that looked FRESH and was PROVEN dead by its probe —
+    # "possibly-rotten" would misname exactly the case this decision exists to
+    # distinguish.
+    never = ("never install a probe-proven-dead store"
+             if decision == "skipped-probe-dead"
+             else "never install a possibly-rotten store")
+    click.echo(f"claim-verify: {store} {measured} and {why} — skipping, {never} (#14)")
 
 
 def _persist_rotated_grant(path: Path, creds: dict, rt: str, tok: dict) -> dict:
@@ -1977,7 +1983,9 @@ def claim_verified_login_family(account: str, state: dict, config: dict | None =
     from idleness, and #14's rule is to refuse what it cannot vouch for rather
     than lease it blind."""
     cfg = config if config is not None else load_config()
-    verify = cfg.get("independent_logins", {}).get("verify_family_on_claim", True)
+    # `or {}`: a literal `independent_logins:` null in config.yaml deep-merges
+    # to None (committee round-3; same guard as _family_rot_grace_hours).
+    verify = (cfg.get("independent_logins", {}) or {}).get("verify_family_on_claim", True)
     grace_h = _family_rot_grace_hours(cfg)
     leased = leased_families(account, state)
     for fam in list_login_families(account):  # lowest-first
@@ -2113,17 +2121,24 @@ def _legacy_login_lease_verdict(account: str, slot: str, config: dict | None = N
                    f"mount of '{account}' — refusing the legacy install before any probe "
                    f"could rotate it (#104)")
         return "collision"
+    # rt check BEFORE the gate branch (committee round-3): pre-fix it sat on
+    # the gate-ON path only, so gate-off + fresh returned "ok" for a store no
+    # mount could survive on. An rt-less store is uninstallable in EITHER mode
+    # — pooled parity: the claim walk refuses rt-less candidates before its
+    # gate too.
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        return "refused"  # nothing to probe, and nothing that could sustain a mount
     grace_h = _family_rot_grace_hours(cfg)
     rot_verdict, expired_h = _family_rot_verdict(creds, grace_h)
-    if not cfg.get("independent_logins", {}).get("verify_family_on_claim", True):
+    # `or {}`: a literal `independent_logins:` null in config.yaml deep-merges
+    # to None (committee round-3; same guard as _family_rot_grace_hours).
+    if not (cfg.get("independent_logins", {}) or {}).get("verify_family_on_claim", True):
         if rot_verdict == "fresh":
             return "ok"  # gate off: offline heuristic only, probe-free (pooled parity)
         _rot_skip_audit("legacy-login-install", account, store, creds,
                         rot_verdict, expired_h, grace_h, "gate-off")
         return "refused"
-    rt = _credential_refresh_token(creds)
-    if not rt:
-        return "refused"  # nothing to probe (and nothing that could sustain a mount)
     verdict, tok = _oauth_refresh_grant(rt)
     if verdict == "alive":
         _persist_rotated_grant(path, creds, rt, tok)
@@ -9970,8 +9985,9 @@ def quarantine_rejected_canonical_write(dest_path: Path, incoming_bytes: bytes, 
 #
 # SCHEMA (fields are space-separated key=value; only non-empty fields appear,
 # but op and decision are always present so the line is stable to grep):
-#   op=            saveback | swap-install | family-claim | refresh |
-#                  freshness-skip | identity-refuse | family-collision-refuse |
+#   op=            saveback | swap-install | family-claim | legacy-login-install |
+#                  refresh | freshness-skip | identity-refuse |
+#                  family-collision-refuse | snapshot-dead-family-fallback |
 #                  divergence-detected
 #   slot= / mount= the SOURCE mount the creds came from (a lane slot dir or the
 #                  shared ~/.claude mount)
@@ -9985,8 +10001,8 @@ def quarantine_rejected_canonical_write(dest_path: Path, incoming_bytes: bytes, 
 #   token_fp=      short non-reversible fingerprint of the refresh token (never
 #                  the raw token) so two families can be told apart in the log
 #   decision=      wrote | skipped-freshness | skipped-rotten |
-#                  skipped-unjudgeable-expiry | refused-identity |
-#                  refused-collision | quarantined | detected
+#                  skipped-unjudgeable-expiry | skipped-probe-dead |
+#                  refused-identity | refused-collision | quarantined | detected
 #   reason=        short human phrase (quoted) explaining the decision
 #
 # NEVER log raw access/refresh token bytes — only identity facets (uuid/email)
