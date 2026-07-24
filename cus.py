@@ -26898,6 +26898,44 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     pool = pool or config.get("per_session", {}).get("default_pool", "premium")
     if pool not in VALID_POOLS:
         raise click.ClickException(f"unknown pool '{pool}'. Valid: {list(VALID_POOLS)}")
+
+    # Pinned-lane join (2026-07-24): an explicit --lane that is LIVE already
+    # fixes the account choice — the only launch that can succeed there is
+    # joining its current occupant (same mount, same login family; the GH #109
+    # join below only covers lane=None). Without this, a pinned relaunch onto
+    # a busy lane ALWAYS hard-fails: an auto-pick != occupant dies at the
+    # "--lane X is live on ... Pick a free lane" guard, and pick == occupant
+    # dies at the #104 duplicate-mount guard (the occupant IS live, on this
+    # very lane). The sentinel's slot-pinned recycle hit exactly that 4x over
+    # 2026-07-15..24 (3x on its slot-6 default, then on slot-5 the same day it
+    # re-laned). Same config gate as every other lane share; an explicitly
+    # DIFFERENT account still falls through to the existing refusals, and the
+    # lock guard wins here too (a locked slot must not quietly gain sessions —
+    # mirroring the explicit-lane lock guard below).
+    if (lane is not None and lane.startswith(SLOT_PREFIX)
+            and lane.removeprefix(SLOT_PREFIX).isdigit()
+            and config.get("per_session", {}).get("lane_sharing", False)):
+        cur = state.get("slots", {}).get(lane, {}).get("account")
+        lane_dir = slot_path(lane)
+        if (cur and cur in state.get("accounts", {}) and lane_dir.exists()
+                and mount_in_use(lane_dir) and account in (None, "auto", cur)):
+            if lane in _locked_slots(config) and not force:
+                raise click.ClickException(
+                    f"refusing to launch onto locked slot '{lane}' (session_locks.locked_slots); "
+                    f"pass --force to override or `cus unlock {lane}`")
+            how = "instead of auto-picking" if account in (None, "auto") else "as requested"
+            click.echo(f"launch: --lane {lane} is live on '{cur}' — joining it {how} "
+                       f"(pinned-lane join — shared login, swap together)")
+            # Same treatment as the GH #109 join: heal the layout, but DON'T
+            # sync .claude.json — the lane has a live writer.
+            for f in doctor_mount(lane_dir, fix=True):
+                click.echo(f"launch: doctor healed {lane}/{f['entry']} ({f['problem']})")
+            state = load_state()
+            entry = state.setdefault("slots", {}).setdefault(lane, {"account": cur, "created_ts": now_iso()})
+            entry["last_launch_ts"] = now_iso()
+            save_state(state)
+            return lane, lane_dir, cur
+
     if account in (None, "auto"):
         pool_config = _config_for_pool(config, pool)
         target = pick_launch_account(state, pool_config)
