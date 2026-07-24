@@ -16,9 +16,12 @@ Run under pytest: pytest tests/test_login_pool.py
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -83,11 +86,19 @@ class _Env:
     def set_config(self, cfg: dict) -> None:
         cus.write_yaml(cus.CONFIG_YAML, cfg)
 
-    def plant_family(self, account: str, family_id: str, refresh: str, usable: bool = True) -> None:
-        """Write a pooled family's creds (usable=carries a refresh token)."""
+    def plant_family(self, account: str, family_id: str, refresh: str, usable: bool = True,
+                     expires_at: int | None = None) -> None:
+        """Write a pooled family's creds (usable=carries a refresh token).
+
+        `expires_at` (Unix ms) overrides the default far-future access-token
+        expiry — the #14 rot tests plant families whose access token expired
+        hours/days ago, the on-disk signature of the 2026-07-24 rotten pool."""
         d = cus.login_family_dir(account, family_id)
         d.mkdir(parents=True, exist_ok=True)
-        blob = _creds(refresh) if usable else {"claudeAiOauth": {"accessToken": "only-access"}}
+        if usable:
+            blob = _creds(refresh) if expires_at is None else _creds(refresh, expires_at=expires_at)
+        else:
+            blob = {"claudeAiOauth": {"accessToken": "only-access"}}
         cus.login_family_creds_path(account, family_id).write_text(json.dumps(blob))
 
     def make_slot(self, account: str, live: bool, family_id: str | None = None) -> str:
@@ -1482,6 +1493,232 @@ def test_sos_does_not_flag_lane_with_distinct_family():
         conds = cus.diagnose(cus.load_state(), cus.load_config())
         assert not any("divergence/logout risk (GH #104)" in c.summary for c in conds), \
             [c.summary for c in conds]
+    finally:
+        env.restore()
+
+
+# ---------------------------------------------------------------------------
+# #14 lease-time rot gate (2026-07-24 sentinel outage).
+#
+# THE INCIDENT: 4 of yaz-tefillinconnection-org-max's 5 pooled families had
+# access tokens expired 5-7 DAYS (their refresh tokens had been rotated away
+# server-side = revoked), yet every pooled relaunch leased one and installed a
+# dead token → /login wedge. Two gaps let that happen: (a) with the #127 probe
+# unavailable/unverifiable (verdict "unknown") the claim FAILED OPEN even on a
+# family whose access token had sat expired for days — the rot signature; and
+# (b) with verify_family_on_claim off, the claim never looked at ANYTHING.
+# Meanwhile `login-mount --list` showed the rotten families as healthy, because
+# its state is ASSUMED from provenance age, never measured from the stored token.
+#
+# THE FIX under test: a family whose stored access token has been expired for
+# more than independent_logins.family_rot_grace_hours (default
+# cus.FAMILY_ROT_GRACE_HOURS) is "possibly rotten" — it may only be leased on a
+# PROVEN-alive probe (which refreshes it, curing the rot), never blind
+# (gate-off) and never fail-open (verdict "unknown"). Each skip emits a
+# CRED-AUDIT decision=skipped-rotten line, and `login-mount --list` shows the
+# MEASURED staleness (STALE <age>) instead of the assumed '[ok]'.
+# ---------------------------------------------------------------------------
+
+def _ms_ago(hours: float) -> int:
+    """Unix-ms timestamp `hours` in the past — an expiresAt that expired then."""
+    return int(time.time() * 1000 - hours * 3_600_000)
+
+
+def test_claim_unknown_probe_skips_rotten_family_claims_fresh():
+    """The incident shape: probe unverifiable (endpoint down — exactly when the
+    outage relaunch storm happens) + a rot-expired family first in line. The old
+    fail-open leased the rotten family; now it must be SKIPPED (with a
+    CRED-AUDIT decision=skipped-rotten line) and the claim falls through to the
+    fresh next family, which still fails open as before."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)  # beta held → claim path
+        env.plant_family("beta", "family-1", "rt-beta-fam1", expires_at=_ms_ago(6 * 24))  # 6d rot
+        env.plant_family("beta", "family-2", "rt-beta-fam2")                              # fresh
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        out = buf.getvalue()
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-2", out
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta-fam2", live_rt
+        # The skip is auditable: one structured line names the rotten family.
+        audit = [l for l in out.splitlines() if "CRED-AUDIT" in l and "skipped-rotten" in l]
+        assert audit and "beta/family-1" in audit[0], out
+        # The rotten family is NOT retired — rot is a suspicion (unproven), not
+        # the definitive invalid_grant death certificate. A later alive probe
+        # can still rescue it.
+        assert cus.list_login_families("beta") == ["family-1", "family-2"]
+    finally:
+        env.restore()
+
+
+def test_claim_unknown_probe_all_rotten_refuses():
+    """Every free family rot-expired + probe unverifiable ⇒ the claim comes back
+    EMPTY and execute_swap refuses (failed move; slot holds) — never install a
+    known-rotten token. This is the direct regression test for the 2026-07-24
+    relaunch loop: pre-fix this leased family-1 and wedged the session."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1", expires_at=_ms_ago(7 * 24))
+        env.plant_family("beta", "family-2", "rt-beta-fam2", expires_at=_ms_ago(5 * 24))
+        raised = False
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised = "pool exhausted" in str(e)
+        assert raised, "an all-rotten pool must refuse, not install a dead token"
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+        # Unproven suspicion never retires stores (unlike the all-dead case).
+        assert cus.list_login_families("beta") == ["family-1", "family-2"]
+    finally:
+        env.restore()
+
+
+def test_claim_alive_probe_rescues_rotten_family():
+    """A rot-expired family whose refresh grant probes ALIVE is a merely-idle
+    family, not a rotten one — the probe's persisted rotation cures the rot and
+    the claim proceeds. The heuristic must never strand an idle-but-healthy
+    pool (the #127 lesson: expired access tokens look identical on dead and
+    live branches; only the grant tells them apart)."""
+    env = _Env()
+    probe = _Probe({"rt-beta-fam1": ("alive", {"access_token": "at-rotated",
+                                               "refresh_token": "rt-beta-fam1-rotated",
+                                               "expires_in": 28800})})
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1", expires_at=_ms_ago(6 * 24))
+        with contextlib.redirect_stdout(io.StringIO()):
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        assert probe.calls == ["rt-beta-fam1"]
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-1"
+        # Rotated tokens persisted to the store AND installed on the mount.
+        store_rt = cus._credential_refresh_token(cus.read_json(cus.login_family_creds_path("beta", "family-1")))
+        assert store_rt == "rt-beta-fam1-rotated", store_rt
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_claim_gate_off_skips_rotten_family():
+    """verify_family_on_claim: false (no probes — the pre-#127 escape hatch)
+    must STILL never lease a rot-expired family blind: the offline expiresAt
+    heuristic is the only check left, so it skips the rotten family and takes
+    the fresh one, without a single network call."""
+    env = _Env()
+    probe = _Probe({})
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True,
+                                               "verify_family_on_claim": False}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1", expires_at=_ms_ago(6 * 24))
+        env.plant_family("beta", "family-2", "rt-beta-fam2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        assert probe.calls == [], "gate off must stay offline — the rot check is expiresAt-only"
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-2"
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_claim_gate_off_all_rotten_refuses():
+    """Gate off + only rot-expired families ⇒ refuse like pool exhaustion.
+    The operator opted out of server verification, so cus cannot tell rot from
+    idleness — degrade-to-safe means refusing (a refused swap strands nothing;
+    an installed dead token wedges the session, the 2026-07-24 shape)."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True,
+                                               "verify_family_on_claim": False}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1", expires_at=_ms_ago(6 * 24))
+        raised = False
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised = "pool exhausted" in str(e)
+        assert raised, "gate-off all-rotten pool must refuse, not lease blind"
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+    finally:
+        env.restore()
+
+
+def test_rot_grace_default_and_config_override():
+    """The grace window: an access token expired 2h ago is normal idleness
+    (well within the default cus.FAMILY_ROT_GRACE_HOURS) and leases fine; a
+    config-tightened independent_logins.family_rot_grace_hours of 1 flags the
+    same family as rotten. Direct claim-level test so both configs see the
+    identical on-disk pool."""
+    env = _Env()
+    try:
+        env.plant_family("beta", "family-1", "rt-beta-fam1", expires_at=_ms_ago(2))
+        state = cus.load_state()
+        cfg_default = {"independent_logins": {"use_independent_logins": True,
+                                              "verify_family_on_claim": False}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert cus.claim_verified_login_family("beta", state, cfg_default) == "family-1"
+        cfg_tight = {"independent_logins": {"use_independent_logins": True,
+                                            "verify_family_on_claim": False,
+                                            "family_rot_grace_hours": 1}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert cus.claim_verified_login_family("beta", state, cfg_tight) is None
+    finally:
+        env.restore()
+
+
+def test_login_mount_list_marks_rotten_family_stale():
+    """`login-mount --list` pool view: a rot-expired family must read STALE
+    (measured from the stored access-token expiry), not the assumed-'ok' the
+    incident showed. A fresh family with the same just-minted provenance keeps
+    its assumed '[ok]'."""
+    env = _Env()
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")                             # fresh
+        env.plant_family("alpha", "family-2", "rt-a2", expires_at=_ms_ago(6 * 24))  # 6d rot
+        # Provenance minted NOW → the assumed-TTL state says 'ok' for BOTH —
+        # exactly the incident's lie for family-2.
+        for fam in ("family-1", "family-2"):
+            cus.write_json(cus.login_family_provenance_path("alpha", fam),
+                           {"account": "alpha", "family_id": fam, "minted_ts": cus.now_iso()})
+        r = CliRunner().invoke(cus.cli, ["login-mount", "--list"])
+        assert r.exit_code == 0, r.output
+        assert "family-1[ok]" in r.output, r.output
+        assert "family-2[STALE" in r.output, r.output
+        assert "family-2[ok]" not in r.output, r.output
+    finally:
+        env.restore()
+
+
+def test_login_mount_list_legacy_line_marks_rotten_store():
+    """The legacy per-slot view is where the incident's '[ok] ~11-30d left
+    (assumed)' line came from (pool family dirs surface there too). A store
+    whose access token sat expired beyond the grace must show the MEASURED
+    staleness instead of the assumed TTL."""
+    env = _Env()
+    try:
+        # A legacy per-(account, slot) store, minted-now provenance (assumed ok)
+        # but a 6-days-expired access token — the rot signature.
+        d = cus.login_store_dir("alpha", "slot-9")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".credentials.json").write_text(json.dumps(_creds("rt-legacy", expires_at=_ms_ago(6 * 24))))
+        cus.write_json(cus.login_store_provenance_path("alpha", "slot-9"),
+                       {"account": "alpha", "slot": "slot-9", "minted_ts": cus.now_iso()})
+        r = CliRunner().invoke(cus.cli, ["login-mount", "--list"])
+        assert r.exit_code == 0, r.output
+        assert "STALE" in r.output, r.output
+        assert "left (assumed)" not in r.output, r.output
     finally:
         env.restore()
 

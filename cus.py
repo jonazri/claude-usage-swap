@@ -257,6 +257,25 @@ OAUTH_TOKEN_TIMEOUT_SECONDS = 15
 # account's poll, whereas the probe runs once at claim time.
 OAUTH_REFRESH_TIMEOUT_SECONDS = 10
 
+# Lease-time rot grace (#14, 2026-07-24 sentinel outage): how long past its
+# stored access token's expiresAt a FREE pooled login family may sit and still
+# be leased WITHOUT server-side proof of life. Access tokens are minted ~8h
+# (expires_in 28800), and nothing refreshes a family while it sits FREE in the
+# pool — so some expiry lag is normal idleness, but a family whose access token
+# has been expired for DAYS is one whose refresh grant hasn't been exercised in
+# days, which is exactly the on-disk signature of a rotated-away/revoked family
+# (the incident: 4 of 5 families sat expired 5-7 days, every relaunch leased one
+# blind, and every lease installed a dead token → /login wedge). Beyond this
+# grace a family may only be leased on a PROVEN-alive #127 probe (which
+# refreshes it, curing the rot); it is never leased blind (verify gate off) and
+# never fail-open (probe verdict "unknown"). 12h ≈ one full token lifetime of
+# slack past expiry: recent legitimate idleness stays leasable offline, multi-day
+# rot does not. Deliberately a cheap OFFLINE read of expiresAt — the lease path
+# must stay probe-free by default (poll cadence, offline safety); the #127 grant
+# remains the only network check. Overridable via
+# independent_logins.family_rot_grace_hours.
+FAMILY_ROT_GRACE_HOURS = 12
+
 
 # --------------------------------------------------------------------------
 # Defaults — everything overridable via config.yaml
@@ -354,6 +373,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # network/endpoint trouble FAILS OPEN to today's install-as-is.
         # False ⇒ bit-for-bit pre-#127 claim behavior.
         "verify_family_on_claim": True,
+        # #14 lease-time rot gate (2026-07-24 sentinel outage): a free family
+        # whose stored ACCESS token has been expired for more than this many
+        # hours is treated as possibly-rotten — leased only on a proven-alive
+        # #127 probe, never blind (gate off) and never fail-open (probe verdict
+        # "unknown"). See FAMILY_ROT_GRACE_HOURS for the full rationale; this
+        # key exists so an operator whose pool legitimately idles for days
+        # (and who keeps the verify gate on to rescue it) can widen the window.
+        "family_rot_grace_hours": FAMILY_ROT_GRACE_HOURS,
     },
     # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
     # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
@@ -1591,6 +1618,39 @@ def _family_creds_usable(account: str, family_id: str) -> bool:
         return False
 
 
+def _creds_access_expired_hours(creds: Any) -> float | None:
+    """Hours a credential payload's ACCESS token has sat expired, or None when
+    it is not expired / carries no positive expiresAt to judge by.
+
+    The #14 rot discriminator: nothing refreshes a family while it sits FREE in
+    the pool, so its expiresAt records the last time ANY refresh grant succeeded
+    on it — days of expiry lag means days without a successful refresh, the
+    signature of a rotated-away/revoked family (see FAMILY_ROT_GRACE_HOURS).
+    expiresAt <= 0 returns None deliberately: that is the blank/logout SHAPE,
+    owned by the GH #141 install-point guard (_live_mount_creds_invalid), not an
+    age we can meaningfully report — and it must never dilute a rot audit line
+    with a nonsense since-epoch figure."""
+    exp = _creds_expires_at(creds)
+    if exp is None or exp <= 0:
+        return None
+    hours = (time.time() * 1000 - float(exp)) / 3_600_000
+    return hours if hours > 0 else None
+
+
+def _family_rot_grace_hours(config: dict | None = None) -> float:
+    """Effective #14 lease-rot grace in hours: the independent_logins.
+    family_rot_grace_hours override, or FAMILY_ROT_GRACE_HOURS. Tolerates a
+    missing/malformed config value (falls back to the module default) — a
+    hand-edited config.yaml must never crash the lease path."""
+    cfg = config if config is not None else load_config()
+    raw = (cfg.get("independent_logins", {}) or {}).get(
+        "family_rot_grace_hours", FAMILY_ROT_GRACE_HOURS)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(FAMILY_ROT_GRACE_HOURS)
+
+
 def list_login_families(account: str) -> list[str]:
     """Usable family ids in an account's pool, sorted by numeric index.
 
@@ -1767,11 +1827,31 @@ def claim_verified_login_family(account: str, state: dict, config: dict | None =
                  A network blip must not turn a working pool into a refused
                  claim; worst case is exactly the old behavior.
 
+    #14 rot gate (2026-07-24 sentinel outage) layered on top: a family whose
+    stored access token has sat expired beyond the FAMILY_ROT_GRACE_HOURS
+    grace is "possibly rotten" — in the incident, 4 of 5 families sat expired
+    5-7 days (refresh tokens rotated away server-side) yet every relaunch
+    leased one and installed a dead token. For such a family the fail-open
+    above is exactly wrong, so the ladder tightens:
+      - alive  → unchanged: the grant is definitive proof of life, and its
+                 persisted rotation cures the rot (an idle-but-healthy pool is
+                 never stranded by the heuristic).
+      - dead   → unchanged: retire.
+      - unknown→ SKIP (CRED-AUDIT decision=skipped-rotten) and try the next
+                 family instead of failing open — "unverifiable + expired for
+                 days" must never install; if every family is rot-skipped the
+                 claim returns None and the caller's existing pool-exhausted
+                 refusal holds the lane (degrade-to-safe: a refused swap
+                 strands nothing, an installed dead token wedges the session).
+
     Config gate independent_logins.verify_family_on_claim (default True);
-    False short-circuits to plain free_login_family."""
+    False skips every probe (pre-#127 offline behavior) — but the OFFLINE rot
+    gate still applies there: with verification opted out, cus cannot tell rot
+    from idleness, and #14's rule is to refuse what it cannot vouch for rather
+    than lease it blind."""
     cfg = config if config is not None else load_config()
-    if not cfg.get("independent_logins", {}).get("verify_family_on_claim", True):
-        return free_login_family(account, state)
+    verify = cfg.get("independent_logins", {}).get("verify_family_on_claim", True)
+    grace_h = _family_rot_grace_hours(cfg)
     leased = leased_families(account, state)
     for fam in list_login_families(account):  # lowest-first
         if fam in leased:
@@ -1784,6 +1864,27 @@ def claim_verified_login_family(account: str, state: dict, config: dict | None =
         rt = _credential_refresh_token(creds)
         if not rt:
             continue
+        # #14: measure (offline) how long this family's access token has sat
+        # expired. Cheap file-local read — the lease path stays probe-free
+        # except for the existing #127 grant below.
+        expired_h = _creds_access_expired_hours(creds)
+        rotten = expired_h is not None and expired_h > grace_h
+        if not verify:
+            # Gate off = no probes, so the offline heuristic is the only
+            # check left. A rotten family is skipped (auditable), everything
+            # else leases exactly as the pre-#127 escape hatch always did.
+            if rotten:
+                _cred_audit("family-claim", "skipped-rotten",
+                            "access token expired beyond family_rot_grace_hours and "
+                            "verify_family_on_claim is off — refusing to lease blind (#14)",
+                            account=account, login_family=f"{account}/{fam}",
+                            token_fp=_audit_token_fp(creds),
+                            extra=f"access_expired_hours={expired_h:.1f} grace_hours={grace_h:g}")
+                click.echo(f"claim-verify: {account}/{fam} access token expired "
+                           f"{expired_h / 24.0:.1f}d ago (> {grace_h:g}h grace) and the verify "
+                           f"gate is off — skipping, never lease a possibly-rotten family (#14)")
+                continue
+            return fam
         verdict, tok = _oauth_refresh_grant(rt)
         if verdict == "dead":
             dead_name = f"{path.name}.dead-{datetime.now(timezone.utc):%Y%m%d}"
@@ -1806,6 +1907,24 @@ def claim_verified_login_family(account: str, state: dict, config: dict | None =
             click.echo(f"claim-verify: {account}/{fam} proven alive (refresh grant OK; "
                        f"store updated with rotated tokens — #127)")
             return fam
+        # verdict == "unknown". #14: fail open ONLY for a family fresh enough
+        # that the expiry heuristic can vouch for it. A rot-expired family with
+        # an unverifiable probe is precisely the incident's install-a-dead-token
+        # shape — skip it (NOT retire: rot is suspicion, invalid_grant is the
+        # death certificate; a later probe can still rescue it) and let the walk
+        # try the next family.
+        if rotten:
+            _cred_audit("family-claim", "skipped-rotten",
+                        "access token expired beyond family_rot_grace_hours and the liveness "
+                        "probe is unverifiable — refusing to fail open on a possibly-rotten "
+                        "family (#14)",
+                        account=account, login_family=f"{account}/{fam}",
+                        token_fp=_audit_token_fp(creds),
+                        extra=f"access_expired_hours={expired_h:.1f} grace_hours={grace_h:g}")
+            click.echo(f"claim-verify: {account}/{fam} unverifiable AND its access token expired "
+                       f"{expired_h / 24.0:.1f}d ago (> {grace_h:g}h grace) — skipping instead of "
+                       f"failing open; trying next family (#14)")
+            continue
         click.echo(f"claim-verify: {account}/{fam} unverifiable (network/endpoint) — "
                    f"claiming unverified, fail-open (#127)")
         return fam
@@ -9642,7 +9761,7 @@ def quarantine_rejected_canonical_write(dest_path: Path, incoming_bytes: bytes, 
 #                  (the divergence signal that precedes a clobber)
 #   token_fp=      short non-reversible fingerprint of the refresh token (never
 #                  the raw token) so two families can be told apart in the log
-#   decision=      wrote | skipped-freshness | refused-identity |
+#   decision=      wrote | skipped-freshness | skipped-rotten | refused-identity |
 #                  refused-collision | quarantined | detected
 #   reason=        short human phrase (quoted) explaining the decision
 #
@@ -25803,6 +25922,48 @@ def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
         os.execvpe("claude", ["claude"], env)
 
 
+def _login_store_rot_hours(account: str, slot_or_family: str, config: dict) -> float | None:
+    """Hours this login store's access token has sat expired — reported only
+    when that EXCEEDS the #14 rot grace; None when fresh / within grace /
+    unreadable.
+
+    The MEASURED counterpart to login_expiry_state's ASSUMED provenance-age TTL
+    — the incident lesson (2026-07-24): the assumed state said '[ok] ~11-30d
+    left (assumed)' for families whose access tokens had been expired 5-7 days
+    (refresh tokens revoked server-side), so `--list` showed a healthy pool
+    while every lease installed a dead token. Works for both store shapes —
+    pooled families and legacy per-(account, slot) dirs live at the same
+    logins/<account>/<name>/.credentials.json path — so both `--list` views can
+    share it. The returned figure is the RAW hours-since-expiry (what an
+    operator should read as "how stale"), only GATED on exceeding the grace:
+    within-grace expiry is normal free-pool idleness, so None means "the
+    assumed state stands"."""
+    try:
+        creds = read_json(login_store_creds_path(account, slot_or_family))
+    except (json.JSONDecodeError, OSError):
+        return None  # unreadable → the has_login/usable paths own that story
+    expired_h = _creds_access_expired_hours(creds)
+    if expired_h is None or expired_h <= _family_rot_grace_hours(config):
+        return None
+    return expired_h
+
+
+def _family_pool_list_label(account: str, family_id: str, config: dict) -> str:
+    """Bracketed per-family state for the `--list` pool view.
+
+    Pre-#14 this was login_expiry_state(...)[0] alone — the ASSUMED provenance-
+    age word ('ok' until ~refresh_token_ttl_days after minting), which showed
+    the 2026-07-24 rotten families as '[ok]'. When the stored access token has
+    sat expired beyond the lease grace (the same rot signature the claim path
+    skips on), the measured STALE age replaces the assumed word, so the
+    operator sees exactly what the lease path will refuse to install
+    unverified. Otherwise the assumed word stands unchanged."""
+    rot_h = _login_store_rot_hours(account, family_id, config)
+    if rot_h is not None:
+        return click.style(f"STALE {rot_h / 24.0:.1f}d", fg="red")
+    return login_expiry_state(account, family_id, config)[0]
+
+
 def _login_mount_status_line(rec: dict, config: dict) -> str:
     """One-line human summary of a provisioned-login record for `--list`."""
     account, slot = rec["account"], rec["slot"]
@@ -25814,7 +25975,15 @@ def _login_mount_status_line(rec: dict, config: dict) -> str:
     email = rec.get("identity_email") or "?"
     prov = rec.get("provenance") or {}
     fp = prov.get("refresh_fp") or "?"
-    if state == "expired":
+    # #14: the MEASURED access-token expiry outranks the assumed TTL — this line
+    # is where the incident's '[ok] ~11-30d left (assumed)' lie was printed for
+    # families whose tokens had been dead for days (pool family dirs surface in
+    # this legacy view too, sharing the same store path shape).
+    rot_h = _login_store_rot_hours(account, slot, config)
+    if rot_h is not None:
+        fresh = click.style(f"STALE ~{rot_h / 24.0:.1f}d — access token expired (measured; "
+                            f"assumed TTL said '{state}')", fg="red")
+    elif state == "expired":
         fresh = click.style(f"EXPIRED ~{-days_left:.0f}d ago (assumed)", fg="red")
     elif state == "near":
         fresh = click.style(f"expiring in ~{days_left:.0f}d (assumed)", fg="yellow")
@@ -25994,11 +26163,23 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
         if pool_accts:
             click.echo("Independent-login pools (GH #109):")
             want = config.get("independent_logins", {}).get("pool_size", 3)
+            any_stale = False
             for a in pool_accts:
                 fams = list_login_families(a)
-                short = "  ".join(f"{f}[{login_expiry_state(a, f, config)[0]}]" for f in fams)
+                # #14: measured access-token staleness outranks the assumed
+                # provenance-age word (the incident's rotten families all
+                # showed '[ok]' here while every lease installed a dead token).
+                labels = [_family_pool_list_label(a, f, config) for f in fams]
+                any_stale = any_stale or any("STALE" in l for l in labels)
+                short = "  ".join(f"{f}[{l}]" for f, l in zip(fams, labels))
                 flag = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
                 click.echo(f"  {a}: {len(fams)} family(ies)  {short}{flag}")
+            if any_stale:
+                click.echo(click.style(
+                    "  STALE <age> = MEASURED: the family's access token has sat expired beyond "
+                    "the lease grace (independent_logins.family_rot_grace_hours) — the claim path "
+                    "leases it only if its liveness probe proves it alive; if it probes dead, "
+                    "re-login with `cus login-mount <account>` (#14).", fg="red"))
         # Legacy per-(slot,account) entries, if any remain.
         recs = list_provisioned_logins()
         if recs:
