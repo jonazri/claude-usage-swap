@@ -26934,7 +26934,10 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             entry = state.setdefault("slots", {}).setdefault(lane, {"account": cur, "created_ts": now_iso()})
             entry["last_launch_ts"] = now_iso()
             save_state(state)
-            return lane, lane_dir, cur
+            # Adopt the FRESH occupant: a daemon in-place move may have changed
+            # the lane's account between the caller's snapshot and this reload —
+            # the mount's real content is what this session joined.
+            return lane, lane_dir, entry.get("account") or cur
 
     if account in (None, "auto"):
         pool_config = _config_for_pool(config, pool)

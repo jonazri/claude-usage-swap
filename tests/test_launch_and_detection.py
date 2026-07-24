@@ -414,6 +414,24 @@ def test_launch_prepare_pinned_join_respects_locked_slot():
         p.restore()
 
 
+def test_launch_prepare_pinned_join_returns_fresh_occupant():
+    """The join reloads state before persisting; if a daemon in-place move
+    changed the lane's account between the caller's snapshot and that reload,
+    the returned account must be the FRESH occupant — the mount's real
+    content — not the snapshot's (Copilot review, PR #12)."""
+    p = _PinnedLaneEnv()
+    try:
+        stale = cus.load_state()  # snapshot: slot-1 -> alpha
+        st = cus.load_state()
+        st["slots"]["slot-1"]["account"] = "beta"  # daemon moved the lane
+        cus.save_state(st)
+        slot_name, _, account = cus._launch_prepare(
+            "auto", stale, p.config, lane="slot-1")
+        assert (slot_name, account) == ("slot-1", "beta")
+    finally:
+        p.restore()
+
+
 def test_launch_prepare_pinned_lane_without_lane_sharing_keeps_refusal():
     """lane_sharing off: the pinned-lane join stays disabled and the existing
     "is live on ... Pick a free lane" refusal is preserved."""
