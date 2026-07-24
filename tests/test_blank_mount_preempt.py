@@ -473,13 +473,15 @@ def test_c_never_logs_raw_tokens():
 
 def test_c_shadow_is_instant_heal_source_for_plain_lane():
     # After a valid scan takes a shadow, a blanked plain lane heals FROM the shadow
-    # even though the account snapshot differs. Shadow and snapshot here carry the
-    # SAME expiresAt (the _valid default) — an exact freshness tie — and the tie
+    # even though the snapshot's ACCESS token differs. Shadow and snapshot here
+    # carry the SAME expiresAt (the _valid default) AND the SAME refreshToken —
+    # an exact freshness tie between verified-same-generation copies — so the tie
     # goes to the shadow (lineage-certain for this mount; see the GH #13 pick in
-    # section (e) for the non-tie cases, where the strictly-freshest source wins).
+    # section (e) for the non-tie cases, where the strictly-freshest source wins,
+    # and for the tie where the refresh tokens DIFFER, which the canonical wins).
     env = _Env({"rayi": _valid("at-snap", "rt-snap")}, active="rayi", mode="per_session")
     try:
-        slot = env.make_slot("rayi", live=True, mount_creds=_valid("at-mount", "rt-mount"))
+        slot = env.make_slot("rayi", live=True, mount_creds=_valid("at-mount", "rt-snap"))
         cus._preempt_live_lane_blanks(cus.load_state(), cus.load_config())  # shadow = at-mount
         env.write_mount(slot, _blank())
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
@@ -522,10 +524,14 @@ def test_d_pooled_lane_ignores_shadow_uses_family():
 # minutes earlier, valid, `cus poll` succeeding against it). Installing the
 # older-generation refresh token guaranteed a reuse-revocation ("OAuth access
 # token has been revoked") — the heal turned a transient blank into a hard
-# logout. These tests pin the fix: compare candidates by `_creds_expires_at`
-# and install the freshest (ties keep the shadow — same generation, and the
-# shadow is lineage-certain for this mount), with the pick logged as a
-# `op=blank-heal-source` CRED-AUDIT line naming winner, loser, and expiries.
+# logout. These tests pin the fix: compare candidates by expiresAt (shape-
+# tolerant) and install the freshest, with an exact tie broken by refresh-token
+# IDENTITY (same token → shadow, lineage-certain for this mount; different →
+# canonical, the saveback-maintained reference), the dead-snapshot probe run
+# only as a VETO on a would-be-winning PRIMARY snapshot (never on a losing one,
+# never on a .bak backup, never under --no-execute), legacy independent-login
+# lanes kept shadow-first, and the pick logged as a `op=blank-heal-source`
+# CRED-AUDIT line naming winner, loser, and expiries.
 
 
 def test_e_stale_shadow_loses_to_fresher_canonical_snapshot():
@@ -563,18 +569,186 @@ def test_e_fresher_shadow_still_wins_over_canonical():
         env.restore()
 
 
-def test_e_equal_expiry_tie_keeps_shadow():
-    # An exact expiresAt tie means the same access-token generation (a refresh
-    # always advances expiresAt), so either copy is safe — the shadow wins the
-    # tie because it is byte-provenance-certain for THIS mount (status quo ante).
-    env = _Env({"rayi": _valid("at-snap", "rt-snap", expires_at=2_000_000_000_000)},
+def test_e_equal_expiry_tie_same_refresh_keeps_shadow():
+    # An exact expiresAt tie PLUS an IDENTICAL refreshToken proves the copies
+    # really are the same token generation — interchangeable — so the shadow
+    # wins the tie: it is byte-provenance-certain for THIS mount (status quo
+    # ante). Identity is what makes the tie safe, not the tie itself.
+    env = _Env({"rayi": _valid("at-snap", "rt-same-generation", expires_at=2_000_000_000_000)},
                active="rayi", mode="per_session")
     try:
         slot = env.make_slot("rayi", live=True, mount_creds=_blank())
         env.shadow_path(slot).write_text(json.dumps(
-            _valid("at-shadow-tie", "rt-shadow", expires_at=2_000_000_000_000)))
+            _valid("at-shadow-tie", "rt-same-generation", expires_at=2_000_000_000_000)))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-tie"
+    finally:
+        env.restore()
+
+
+def test_e_equal_expiry_tie_different_refresh_prefers_canonical():
+    # Committee finding: an equal expiresAt does NOT prove the same access-token
+    # generation — a stale-lineage shadow can coincidentally tie, and installing
+    # it is the exact reuse-revocation GH #13 fixed. On a tie with DIFFERENT
+    # refresh tokens, the canonical snapshot wins: it is the saveback-maintained
+    # family reference, while the shadow's provenance is unverifiable.
+    env = _Env({"rayi": _valid("at-snap-ref", "rt-canonical", expires_at=2_000_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-unverifiable", "rt-unknown-lineage", expires_at=2_000_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-snap-ref"
+        # A real comparison happened → the forensic pick line names both sides.
+        picks = env.audit_lines("blank-heal-source")
+        assert len(picks) == 1 and f"source={cus.account_creds_path('rayi')}" in picks[0]
+    finally:
+        env.restore()
+
+
+def test_e_backup_canonical_never_beats_usable_shadow():
+    # Committee finding: freshest-wins is restricted to the PRIMARY snapshot —
+    # `_account_snapshot_dead` only ever probes account_creds_path, so a rotated
+    # `.bak` generation (which `_newest_usable_creds_source` can also return
+    # when the snapshot itself is blank) is un-vettable: a well-shaped-but-DEAD
+    # backup must never out-fresh a usable shadow. Pre-#13 behavior holds: the
+    # shadow wins outright; the backup stays the no-shadow fallback.
+    env = _Env({"rayi": _blank()}, active="rayi", mode="per_session")  # snapshot blank → picker falls to .bak
+    try:
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: (_ for _ in ()).throw(AssertionError("a .bak backup must never be probed")))
+        bak = cus.account_creds_path("rayi").with_name(".credentials.json.bak.20260724T000000.000000Z")
+        bak.write_text(json.dumps(_valid("at-bak-fresh", "rt-bak", expires_at=2_000_000_000_000)))
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-older", "rt-shadow", expires_at=1_700_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-older"
+        # No PRIMARY-vs-shadow comparison happened → no pick line (fixed preference).
+        assert env.audit_lines("blank-heal-source") == []
+    finally:
+        env.restore()
+
+
+def test_e_no_probe_when_shadow_wins_freshness():
+    # Committee finding: the dead-snapshot probe is a VETO on the would-be
+    # winner, never a precondition — it is a network refresh grant that PERSISTS
+    # a rotated token pair on an alive verdict, so it must not fire when the
+    # shadow out-freshens the snapshot and the snapshot can never be installed.
+    # Both expiries are PAST here so the probe WOULD run if still wired as a
+    # precondition (the valid-access cheap path can't short it out).
+    env = _Env({"rayi": _valid("at-snap-staler", "rt-snap", expires_at=1_600_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: (_ for _ in ()).throw(AssertionError("losing snapshot must not be probed")))
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-fresher", "rt-shadow", expires_at=1_700_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-fresher"
+        # Both candidates were usable → the comparison itself still logs a pick.
+        assert len(env.audit_lines("blank-heal-source")) == 1
+    finally:
+        env.restore()
+
+
+def test_e_no_execute_resolves_source_without_probe():
+    # Committee finding: `--no-execute` must be a true dry run, but the source
+    # pick used to dead-probe the snapshot BEFORE the caller's no_execute branch
+    # — a network grant that persists rotated tokens on an alive verdict (writes
+    # in effect). With no_execute threaded through, the probe is skipped
+    # entirely; the dry-run line marks the source unprobed and nothing is
+    # installed. (Snapshot expiry is past AND it would win the freshness pick,
+    # so an unconditional probe WOULD have fired here.)
+    env = _Env({"rayi": _valid("at-snap-past", "rt-snap", expires_at=1_700_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: (_ for _ in ()).throw(AssertionError("no probe in a dry run")))
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-older", "rt-shadow", expires_at=1_600_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config(), no_execute=True) == []
+        assert env.slot_creds(slot) == _blank()  # dry run → mount untouched
+        dry = [e for e in env.echoes if "WOULD restore" in e]
+        assert len(dry) == 1 and "unprobed" in dry[0]
+    finally:
+        env.restore()
+
+
+def test_e_alive_probe_lets_snapshot_win_with_persisted_rotation():
+    # The probe's third verdict, previously untested here: the snapshot's access
+    # token is expired but its refresh grant is ALIVE — `_account_snapshot_dead`
+    # mints AND persists the rotated pair (single-use grant, #104: the fresh
+    # tokens MUST land on disk) and returns not-dead, so the snapshot keeps its
+    # freshness win. The heal must then install the POST-rotation generation
+    # (the persisted bytes), not the pre-probe read.
+    env = _Env({"rayi": _valid("at-snap-expired", "rt-snap-old", expires_at=1_700_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: ("alive", {"access_token": "at-minted-fresh",
+                                        "refresh_token": "rt-minted-fresh",
+                                        "expires_in": 3600}))
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-staler", "rt-shadow", expires_at=1_600_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        healed = env.slot_creds(slot)["claudeAiOauth"]
+        assert healed["accessToken"] == "at-minted-fresh"      # rotation picked up
+        assert healed["refreshToken"] == "rt-minted-fresh"
+        # The snapshot itself carries the persisted rotation (not just the mount).
+        snap = json.loads(cus.account_creds_path("rayi").read_text())
+        assert snap["claudeAiOauth"]["accessToken"] == "at-minted-fresh"
+        assert len(env.audit_lines("blank-heal-source")) == 1
+    finally:
+        env.restore()
+
+
+def test_e_legacy_independent_login_lane_keeps_shadow_first():
+    # Committee finding: a lane with a LEGACY per-(slot,account) independent
+    # login (`has_independent_login` — the pre-pool store, distinct from the
+    # pooled leased-family branch section (d) covers) was minted for THIS slot,
+    # never copied from the shared snapshot. Freshest-wins must never silently
+    # re-family it onto the shared account family (provenance isolation), so the
+    # pre-#13 shadow-first pick is preserved: the staler shadow still beats the
+    # strictly-fresher canonical snapshot.
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(_valid("at-legacy", "rt-legacy-independent")))
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-own-lineage", "rt-own-lineage", expires_at=1_700_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-own-lineage"
+        # Fixed preference, not a comparison → no pick line.
+        assert env.audit_lines("blank-heal-source") == []
+    finally:
+        env.restore()
+
+
+def test_e_flat_shaped_shadow_can_win_on_freshness():
+    # Committee finding: the usable bar (`_live_mount_creds_invalid`) tolerates
+    # a FLAT top-level OAuth shape, but the strict `_creds_expires_at` reads
+    # only creds["claudeAiOauth"] and returns None for it — scoring a
+    # flat-but-valid candidate 0 and making it LOSE every freshness comparison
+    # unconditionally. The pick uses a shape-tolerant local reader instead, so
+    # this strictly-fresher flat shadow must win.
+    env = _Env({"rayi": _valid("at-snap-older", "rt-snap", expires_at=1_900_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            {"accessToken": "at-flat-fresh", "refreshToken": "rt-flat",
+             "expiresAt": 2_000_000_000_000}))  # flat: no claudeAiOauth nesting
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        # The flat file is installed verbatim (top-level accessToken, no nesting).
+        assert env.slot_creds(slot)["accessToken"] == "at-flat-fresh"
     finally:
         env.restore()
 
