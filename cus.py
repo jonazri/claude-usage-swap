@@ -15185,6 +15185,23 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
         if shadow_creds is not None:
             return shadow
         if legacy_creds is not None:
+            # NO-SHADOW path: trusting the store outright must funnel through
+            # #14's rot discipline (merge-gate finding, PR #17). GH #14
+            # narrowed the installer — `swap_install_source` now REFUSES a
+            # rot-suspect legacy store and silently installs the snapshot
+            # instead, while never retiring the refused store file — so
+            # `has_independent_login` alone no longer proves the store is the
+            # mount's real lineage. A rot-suspect/unjudgeable store here is
+            # exactly the bytes #14's gate refused at swap time; installing
+            # them unprobed replays the #13 reuse-revocation (or a probe-dead
+            # heal→blank loop). The heal cannot probe (probe machinery is
+            # snapshot-only, and single-use grants must not fire here), so the
+            # pure expiry verdict is the bar: non-fresh → None → the URGENT
+            # relogin SOS. With a usable shadow present (above) the comparison
+            # keeps its lineage anchor and stays as-is.
+            _lv, _ = _family_rot_verdict(legacy_creds, _family_rot_grace_hours(config))
+            if _lv != "fresh":
+                return None
             return legacy_store
         return None
     # Canonical-side candidate: the account's newest usable snapshot/backup.
