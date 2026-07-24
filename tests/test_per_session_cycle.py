@@ -713,6 +713,74 @@ def test_premium_slot_degrades_temporarily_when_no_model_safe_target():
         env.restore()
 
 
+def test_premium_slot_on_disabled_account_escapes_via_standard_degrade():
+    # Fork extension to upstream #188: a PREMIUM lane on an operator-DISABLED
+    # account whose only clean escape is a standard-pool target must take it —
+    # vacating a disabled account is an operator mandate, stronger than pool
+    # preference. Premium view: beta is Fable-dead, so Trigger 0 HOLDs
+    # (disabled_evict_no_target); that gate is in the premium→standard degrade
+    # set, and the standard re-run (model gate off) finds beta clean and evicts.
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        # alpha: DISABLED but usage-HEALTHY — the eviction must key on the
+        # operator flag, not on any usage trigger.
+        state["accounts"]["alpha"].update({"current_5h_pct": 10.0, "current_7d_pct": 15.0,
+                                           "per_model_weekly_pct": {"Fable": 30.0}})
+        # beta: Fable-dead (premium target gate rejects it) but aggregate-clean
+        # (7d=30 < steps[0]=50, so the standard pick is non-DEGRADED).
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 30.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage_pm(10.0, 15.0, fable=30.0),
+                 "beta": _usage_pm(0.0, 30.0, fable=100.0)}
+        cfg = _pool_config(accounts=[{"name": "alpha", "priority": 1, "disabled": True},
+                                     {"name": "beta", "priority": 1}])
+
+        moves = cus.decide_slot_swaps(state, cfg, usage)
+        assert len(moves) == 1, moves
+        assert moves[0]["slot"] == slot
+        assert moves[0]["to"] == "beta"
+        assert moves[0]["pool"] == "standard"
+        assert moves[0]["gate"] == "disabled_evict", moves[0]
+        assert moves[0]["deferrable"] is False, moves[0]
+        assert "premium degraded to standard" in moves[0]["reason"]
+    finally:
+        env.restore()
+
+
+def test_disabled_evict_fanout_second_slot_holds_without_clean_target():
+    # Final-review regression (2026-07-24): Trigger 0's "never evict onto a
+    # degraded landing" contract must survive fan-out. Two unlocked lanes on
+    # disabled alpha, ONE clean target (beta), the only remaining candidate
+    # (gamma) over the 7d cap: slot 1 takes beta; slot 2's re-pick returns
+    # cap-degraded gamma, which the generic `not can_pool` acceptance used to
+    # take — walling lane 2 on an over-cap account. It must HOLD instead.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 10.0, "current_7d_pct": 15.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 92.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage(10.0, 15.0), "beta": _usage(5.0, 10.0),
+                 "gamma": _usage(0.0, 92.0)}
+        cfg = _config(accounts=[{"name": "alpha", "priority": 1, "disabled": True},
+                                {"name": "beta", "priority": 1},
+                                {"name": "gamma", "priority": 1}])
+        moves = cus.decide_slot_swaps(state, cfg, usage)
+        assert len(moves) == 1, f"only the clean-target eviction may move: {moves}"
+        assert moves[0]["to"] == "beta" and moves[0]["gate"] == "disabled_evict", moves
+        assert moves[0]["slot"] in (s1, s2), moves
+    finally:
+        env.restore()
+
+
 def test_premium_slot_swaps_off_model_exhausted_standard_holds():
     # alpha's Fable week is at 98% (over the 97 cap) but aggregate is low.
     # A PREMIUM slot on alpha must swap off it (hard-cap force-swap); a
