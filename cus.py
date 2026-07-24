@@ -14965,32 +14965,72 @@ def _blanked_live_lanes(state: dict, config: dict) -> list[tuple[str, str]]:
     return out
 
 
-def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Path | None:
+def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
+                      no_execute: bool = False) -> Path | None:
     """Newest USABLE creds file to reinstall into a blanked live lane mount, or
     None when nothing usable exists (needs a real relogin → escalate to SOS).
 
     Honors the GH #104/#109 login-family discipline, which is the ONE thing that
     differs from the shared-mount heal's source pick:
-      * If the lane LEASES a pooled family (`state.slots[slot].login_family`, and
-        the independent-logins gate is on), the only safe source is THAT family's
-        own creds. Installing the account's shared snapshot instead would put a
+      * If the lane LEASES a pooled family (`state.slots[slot].login_family` —
+        the lease RECORD alone; the live independent-logins gate toggle is
+        deliberately NOT consulted, so switching the gate off never demotes a
+        leased lane to the plain-lane comparison below), the only safe source is
+        THAT family's own creds. Installing the account's shared snapshot instead would put a
         DIFFERENT refresh-token family on the live lane and clobber every other
         holder of that snapshot the next time either side refreshes (#104). So a
         pooled lane whose family store is itself blanked/missing heals from
         NOTHING here (returns None) rather than cross-contaminating — it escalates
         to the relogin SOS, same as the shared-mount "no usable backup" case.
-      * A plain (non-pooled) lane is a shared-snapshot copy, so it heals from its
-        own last-valid SHADOW first (Fix 3, 2026-07-07 — the freshest, guaranteed
-        same-family copy of exactly what this mount last held) and then, failing
-        that, the account's newest usable snapshot/backup — the same
-        `_newest_usable_creds_source` the shared-mount heal uses.
+      * A lane with a LEGACY per-(slot,account) independent login
+        (`has_independent_login` AND the gate on — mirroring the installer,
+        which only ever installs the legacy store gate-on; a gate-off lane's
+        store file is a vestigial leftover, not lineage) never heals from the
+        shared snapshot: a cross-family install would silently re-family it
+        onto the shared account family — a provenance regression the old code
+        could not commit. WITHIN its own lineage the shadow and the store are
+        the same family, so the freshest of the two wins (tie keeps the
+        shadow) — the #13 stale-generation mechanism applies there too.
+      * A plain (non-pooled) lane is a shared-snapshot copy, so BOTH the lane's
+        own last-valid SHADOW (Fix 3, 2026-07-07) and the account's newest usable
+        snapshot/backup (`_newest_usable_creds_source`, the shared-mount heal's
+        picker) are lawful #104-safe candidates — and the FRESHEST usable one
+        wins (GH #13, 2026-07-24), judged by expiresAt (shape-tolerant, see the
+        local reader below) — except that a refresh-token-LESS canonical never
+        beats a refresh-capable shadow at ANY freshness (round-3) — with an
+        exact tie broken by refresh-token IDENTITY (same token → shadow;
+        different/unverifiable → the canonical snapshot).
+        Never by fixed preference: the shadow-first rule this replaces installed
+        a slot-local copy whose refresh-token generation had rotated away days
+        earlier while the canonical snapshot sat there valid — a guaranteed
+        reuse-revocation ("OAuth access token has been revoked") that turned a
+        transient blank into a hard logout. Freshest-wins applies ONLY when the
+        canonical candidate is the PRIMARY snapshot (the one path
+        `_account_snapshot_dead` can vet); a rotated `.bak` generation stays the
+        no-shadow fallback it always was. When a real comparison happens the
+        pick is logged as a `op=blank-heal-source` CRED-AUDIT line naming
+        winner, loser, and both expiries.
+
+    `no_execute` (threaded from the daemon's `--no-execute` dry run) suppresses
+    the dead-snapshot probe: the probe is NOT read-only — it is a network
+    refresh grant, and an alive verdict PERSISTS the rotated token pair to disk
+    (single-use grant, #104) — and a dry run must stay side-effect-free. The
+    dry-run caller logs the picked source as "unprobed" accordingly.
 
     "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
     swap install-point guard and the shared-mount heal apply — so whatever this
     returns is safe to atomic-copy into the mount without re-blanking it.
     """
     lease = slot_leased_family(state, slot)
-    if lease is not None and lease[0] == account and independent_logins_enabled(config):
+    # The lease RECORD alone decides — deliberately NOT conjoined with
+    # independent_logins_enabled(config): the record is the provenance fact
+    # about what lineage is on this mount, while the gate is a live config
+    # toggle. If the gate is switched off while lease records persist, the
+    # lane must NOT demote to the plain-lane freshest-wins path below — that
+    # would let a strictly-fresher shared snapshot beat the family-lineage
+    # shadow and cross-family the mount (#104), exactly what this branch
+    # exists to prevent (committee 2026-07-24, #13 round-2).
+    if lease is not None and lease[0] == account:
         fam_path = login_family_creds_path(*lease)
         if fam_path.exists():
             try:
@@ -15006,30 +15046,285 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
         return None
     # Plain lane. The last-valid shadow is a copy of THIS lane's own mount taken
     # while it was valid — same slot, same refresh-token lineage by construction
-    # — so it is the freshest #104-safe heal source and cannot cross-contaminate.
-    # Prefer it; fall through to the snapshot/backup when there's no usable shadow
-    # (e.g. right after a daemon restart, before any valid scan has taken one).
+    # — and the account's snapshot/backup is the same family too (a plain lane IS
+    # a shared-snapshot copy), so both are #104-safe candidates. Which one is
+    # RIGHT is a freshness question, not a fixed-preference one (GH #13,
+    # 2026-07-24 incident): the shadow-first rule that used to live here restored
+    # a shadow whose refresh-token generation had rotated away days earlier
+    # (expiry Jul-19, shape-"usable" because expiresAt>0 is all the blank check
+    # sees) while the CANONICAL snapshot was strictly fresher (save-back'd 70
+    # minutes before, valid, polling fine) — and installing an older-generation
+    # refresh token is a guaranteed reuse-revocation ("OAuth access token has
+    # been revoked"), turning a transient blank into a hard logout. So, mirroring
+    # the GH #77 save-back freshness guard ("never overwrite a newer stored
+    # login"): never INSTALL a candidate strictly staler than another available
+    # usable one — compare expiresAt (a refresh/re-login always advances it) and
+    # pick the freshest, with the guards below (legacy-lane, backup, dead-probe
+    # veto, tie-by-identity) bounding when that comparison may run at all.
     shadow = _lane_lastvalid_path(mount_creds_path(slot_path(slot)))
+    shadow_creds: Any = None
     if shadow.exists():
         try:
-            if not _live_mount_creds_invalid(read_json(shadow)):
-                return shadow
+            _sc = read_json(shadow)
+            if not _live_mount_creds_invalid(_sc):
+                shadow_creds = _sc
         except (json.JSONDecodeError, OSError):
-            pass
-    # Fall through to the account's newest usable snapshot/backup — UNLESS the
-    # snapshot is DEAD (its refresh grant returns invalid_grant). 2026-07-07 merkos
-    # incident: `_newest_usable_creds_source` only rejects blank-SHAPED creds
-    # (`_live_mount_creds_invalid`), so a well-shaped-but-dead snapshot would be
-    # returned here and re-blank the mount on Claude Code's first refresh — a
-    # heal→blank→heal loop (which the Fix 2 stuck-session detector would then flag).
-    # Dropping the dead snapshot from the plain-lane heal chain means such a lane
-    # escalates straight to the URGENT relogin SOS (a human is genuinely needed)
-    # instead of looping. The pooled-lane branch above already never touches the
-    # snapshot (#176), so this closes the one remaining dead-snapshot heal path.
-    source = _newest_usable_creds_source(account)
-    if source is not None and source == account_creds_path(account) and _account_snapshot_dead(account, config):
+            pass  # unreadable/blank shadow simply isn't a candidate
+
+    def _cand_oauth(creds: Any) -> dict:
+        # LOCAL shape reader for the comparisons in this function only:
+        # `_live_mount_creds_invalid` (the usable bar every candidate passes)
+        # tolerates a FLAT top-level OAuth shape, but the global
+        # `_creds_expires_at` reads only creds["claudeAiOauth"] — that
+        # asymmetry would score a flat-but-valid candidate 0 and make it LOSE
+        # every freshness comparison unconditionally. Mirror the usable bar's
+        # fallback here; the global helper stays strict (its other call sites
+        # depend on the nested-only read). Same tolerance for the tie-break's
+        # refreshToken reads.
+        oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+        if isinstance(oauth, dict):
+            return oauth
+        return creds if isinstance(creds, dict) else {}
+
+    def _cand_expiry(creds: Any) -> int | float:
+        exp = _cand_oauth(creds).get("expiresAt")
+        # bool excluded for the same reason as _live_mount_creds_invalid: a
+        # stray `expiresAt: true` must not read as a positive epoch.
+        return exp if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0
+
+    def _cand_refresh(creds: Any) -> str | None:
+        rt = _cand_oauth(creds).get("refreshToken")
+        return rt if isinstance(rt, str) and rt else None
+
+    def _audit_shape(creds: Any) -> Any:
+        # The global audit renderers (`_audit_token_fp` → _credential_refresh_token,
+        # `_expiry_repr` → _creds_expires_at) read ONLY the nested
+        # creds["claudeAiOauth"] shape, while the comparisons here deliberately
+        # tolerate a FLAT candidate (see _cand_oauth). Without normalizing, a
+        # flat-shaped winner would log token_fp=none/source_expiry=none — the
+        # forensic line contradicting the decision it documents (committee
+        # 2026-07-24, #13 round-2). Wrap flat creds into the nested shape for
+        # RENDERING only; already-nested creds pass through untouched.
+        if isinstance(creds, dict) and isinstance(creds.get("claudeAiOauth"), dict):
+            return creds
+        return {"claudeAiOauth": _cand_oauth(creds)}
+
+    # LEGACY per-(slot,account) independent login (pre-pool store, distinct from
+    # the pooled `slot_leased_family` branch above): handled BEFORE any
+    # canonical-snapshot consideration, including the no-shadow fallback.
+    # Gated on `independent_logins_enabled(config)` to MIRROR the installer —
+    # `swap_install_source` only ever installs the legacy store when the gate
+    # is on, so a store file on a gate-off lane is a vestigial leftover whose
+    # mount lineage is actually the shared snapshot (a gate-off swap installed
+    # the snapshot); treating existence alone as lineage would heal such a lane
+    # from a different, possibly long-rotated family (committee 2026-07-24,
+    # #13 round-3). For a genuine legacy lane the shared snapshot is never a
+    # lawful heal source — falling to it would re-family the mount, the same
+    # #104 clobber the pooled branch refuses (round-2). Within the lane's OWN
+    # lineage, though, the shadow and the store are the same family (the store
+    # is the Phase-3a save-back target of this very mount), so the freshest of
+    # the two wins — the exact #13 stale-generation mechanism applies here too
+    # (round-3); an exact tie keeps the shadow (byte-provenance-certain for
+    # THIS mount). Neither is ever dead-probed (the probe machinery is
+    # snapshot-only). No usable candidate → None → the URGENT relogin SOS (a
+    # human is genuinely needed).
+    if independent_logins_enabled(config) and has_independent_login(account, slot):
+        legacy_store = login_store_creds_path(account, slot)
+        legacy_creds = None
+        try:
+            if legacy_store.exists():
+                _lc = read_json(legacy_store)
+                # The usable bar alone is NOT enough here: this branch's whole
+                # safety argument (and the capability gate below) rests on the
+                # store being refresh-CAPABLE, which `has_independent_login`
+                # checked on a DIFFERENT read — a partial write/corruption
+                # between that check and this re-read could hand us a
+                # token-less store and strand the lane at access expiry
+                # (Copilot, PR #17). Re-verify capability on the bytes we will
+                # actually compare/install.
+                if not _live_mount_creds_invalid(_lc) and _cand_refresh(_lc) is not None:
+                    legacy_creds = _lc
+        except (json.JSONDecodeError, OSError):
+            pass  # unreadable/blank legacy store isn't a candidate either
+        if shadow_creds is not None and legacy_creds is not None:
+            # Same comparison discipline as the plain lane below (committee
+            # 2026-07-24, #13 round-4 mirrors): the store is refresh-capable by
+            # construction (`has_independent_login` requires a refreshToken),
+            # so a token-less shadow loses at ANY freshness (capability gate);
+            # an exact tie is broken by refresh-token IDENTITY (same token →
+            # shadow, byte-provenance-certain for THIS mount; different →
+            # the store — a shadow captured BEFORE the legacy login was
+            # provisioned carries shared-snapshot bytes, and installing it
+            # would be exactly the cross-family install this branch exists to
+            # prevent); otherwise the freshest wins.
+            _lrt = _cand_refresh(legacy_creds)
+            _srt_l = _cand_refresh(shadow_creds)
+            l_exp = _cand_expiry(legacy_creds)
+            s_exp = _cand_expiry(shadow_creds)
+            if _srt_l is None:
+                store_wins = True
+            elif l_exp == s_exp:
+                store_wins = _srt_l != _lrt
+            else:
+                store_wins = l_exp > s_exp
+            l_winner, l_wcreds = (legacy_store, legacy_creds) if store_wins else (shadow, shadow_creds)
+            l_loser, l_lcreds = (shadow, shadow_creds) if store_wins else (legacy_store, legacy_creds)
+            # Forensics parity with the plain-lane pick line (round-4): a real
+            # in-lineage comparison rejected a candidate, and a legacy-lane
+            # replay of the #13 incident must be reconstructible from the
+            # CRED-AUDIT stream too. Never probed → never "picked-unprobed".
+            _cred_audit(
+                "blank-heal-source", "picked",
+                "freshest usable in-lineage candidate wins (legacy per-slot store "
+                "vs lane shadow) — never install a token generation staler than "
+                "another available source (GH #13 reuse-revocation)",
+                slot=slot, account=account, token_fp=_audit_token_fp(_audit_shape(l_wcreds)),
+                extra=(f"source={l_winner} source_expiry={_expiry_repr(_audit_shape(l_wcreds))} "
+                       f"rejected={l_loser} rejected_expiry={_expiry_repr(_audit_shape(l_lcreds))}"))
+            return l_winner
+        if shadow_creds is not None:
+            return shadow
+        if legacy_creds is not None:
+            # NO-SHADOW path: trusting the store outright must funnel through
+            # #14's rot discipline (merge-gate finding, PR #17). GH #14
+            # narrowed the installer — `swap_install_source` now REFUSES a
+            # rot-suspect legacy store and silently installs the snapshot
+            # instead, while never retiring the refused store file — so
+            # `has_independent_login` alone no longer proves the store is the
+            # mount's real lineage. A rot-suspect/unjudgeable store here is
+            # exactly the bytes #14's gate refused at swap time; installing
+            # them unprobed replays the #13 reuse-revocation (or a probe-dead
+            # heal→blank loop). The heal cannot probe (probe machinery is
+            # snapshot-only, and single-use grants must not fire here), so the
+            # pure expiry verdict is the bar: non-fresh → None → the URGENT
+            # relogin SOS. With a usable shadow present (above) the comparison
+            # keeps its lineage anchor and stays as-is.
+            _lv, _ = _family_rot_verdict(legacy_creds, _family_rot_grace_hours(config))
+            if _lv != "fresh":
+                return None
+            return legacy_store
         return None
-    return source
+    # Canonical-side candidate: the account's newest usable snapshot/backup.
+    canonical = _newest_usable_creds_source(account)
+    # Only the PRIMARY snapshot participates in freshness selection and dead
+    # probing — `_account_snapshot_dead` only ever vets account_creds_path, so a
+    # rotated `.bak` generation the picker can also return is un-vettable here.
+    canonical_is_primary = (canonical is not None
+                            and canonical == account_creds_path(account))
+    if shadow_creds is None:
+        # No usable shadow → the canonical pick is the only candidate (pre-#13
+        # behavior, unchanged). The 2026-07-07 merkos dead-snapshot gate still
+        # applies to the primary snapshot: `_newest_usable_creds_source` only
+        # rejects blank-SHAPED creds (`_live_mount_creds_invalid`), so a
+        # well-shaped-but-DEAD snapshot (refresh grant → invalid_grant) would be
+        # returned and re-blank the mount on Claude Code's first refresh — a
+        # heal→blank→heal loop (which the Fix 2 stuck-session detector would
+        # then flag). Dropping it means the lane escalates straight to the
+        # URGENT relogin SOS (a human is genuinely needed) instead of looping.
+        # Under no_execute the probe is skipped — it is a network grant that can
+        # PERSIST a rotated token, which a dry run must never do — and the
+        # dry-run caller logs the returned source as unprobed.
+        if canonical_is_primary and not no_execute and _account_snapshot_dead(account, config):
+            return None
+        return canonical  # may be None → URGENT relogin SOS
+    if canonical is None:
+        return shadow     # snapshot/backups all unusable → shadow only
+    # Freshest-wins is restricted to the PRIMARY snapshot: a `.bak` backup
+    # cannot be dead-probed (see canonical_is_primary above), so letting a
+    # well-shaped-but-possibly-dead backup beat the shadow on freshness would
+    # install an un-vettable candidate — and a backup is by construction an
+    # older generation of the same snapshot lineage anyway. Pre-#13 behavior
+    # kept: a usable shadow beats any backup outright; the backup remains the
+    # no-shadow fallback above.
+    if not canonical_is_primary:
+        return shadow
+    try:
+        canonical_creds = read_json(canonical)
+    except (json.JSONDecodeError, OSError):
+        return shadow     # canonical went unreadable between pick and read
+
+    # Both candidates passed the usable bar, so both expiries are positive
+    # numbers (the 0 fallback is belt-and-braces only). Refresh CAPABILITY is
+    # checked before freshness: a refresh-token-LESS canonical can never beat a
+    # refresh-capable shadow at ANY freshness — not just on a tie (committee
+    # 2026-07-24, #13 round-3). The usable bar (`_live_mount_creds_invalid`)
+    # only checks accessToken+expiresAt, so a token-less canonical passes it,
+    # but installing it strands the healed lane unable to refresh the moment
+    # its access token expires; a shorter runway WITH a working refresh beats a
+    # longer runway with none. Then strictly-fresher expiry wins, and an EXACT
+    # tie is broken by refresh-token IDENTITY, never by assumption: equal
+    # expiresAt alone does NOT prove the same access-token generation (a
+    # stale-lineage shadow can coincidentally tie), and installing an
+    # unverified generation is exactly the #13 reuse-revocation this pick
+    # exists to prevent. So on a tie:
+    #   * identical refreshToken → the copies really are interchangeable →
+    #     keep the shadow (byte-provenance-certain for THIS mount);
+    #   * otherwise (different tokens, or the shadow's is unreadable) → the
+    #     canonical snapshot wins: it is the saveback-maintained family
+    #     reference, while the shadow's provenance is unverifiable.
+    # mtimes are copy times, not token freshness, so they are NOT consulted.
+    shadow_exp = _cand_expiry(shadow_creds)
+    canonical_exp = _cand_expiry(canonical_creds)
+    _srt = _cand_refresh(shadow_creds)
+    _crt = _cand_refresh(canonical_creds)
+    if _crt is None and _srt is not None:
+        canonical_wins = False
+    elif _srt is None and _crt is not None:
+        # MIRROR of the gate above (committee 2026-07-24, #13 round-4): the
+        # capability rule must be symmetric — a token-less SHADOW that happens
+        # to be strictly fresher (e.g. minted by _update_lane_lastvalid from a
+        # mount the no-shadow fallback healed with a token-less canonical)
+        # must not beat a refresh-capable canonical either. Safe because a
+        # winning canonical is still dead-probed below, so a rotated-away
+        # canonical generation gets vetoed regardless.
+        canonical_wins = True
+    elif canonical_exp == shadow_exp:
+        canonical_wins = not (_srt is not None and _srt == _crt)
+    else:
+        canonical_wins = canonical_exp > shadow_exp
+    if canonical_wins:
+        # Dead-probe as a VETO on the would-be winner, never a precondition
+        # (2026-07-07 merkos rule, preserved): a dead snapshot is unusable at
+        # ANY freshness — installing it re-blanks the mount on Claude Code's
+        # first refresh. But the probe is expensive and NOT read-only (a network
+        # refresh grant; an alive verdict PERSISTS the rotated pair — single-use
+        # grant, #104), so it fires only when the snapshot would actually be
+        # installed: never when the shadow wins anyway, and never under
+        # no_execute (the dry-run caller logs the source as unprobed). A dead
+        # verdict hands the heal to the shadow — the one remaining usable
+        # candidate — with no comparison line logged (the dead snapshot was
+        # never a real candidate).
+        if not no_execute:
+            if _account_snapshot_dead(account, config):
+                return shadow
+            # An alive probe may have just persisted a rotated token pair into
+            # the snapshot (the grant is single-use — the fresh pair MUST land
+            # on disk; see _account_snapshot_dead). Re-read so the audit line
+            # below describes the generation the caller will actually install,
+            # not the pre-probe read.
+            try:
+                canonical_creds = read_json(canonical)
+            except (json.JSONDecodeError, OSError):
+                return shadow  # snapshot vanished mid-probe → shadow still usable
+    winner, winner_creds = (canonical, canonical_creds) if canonical_wins else (shadow, shadow_creds)
+    loser, loser_creds = (shadow, shadow_creds) if canonical_wins else (canonical, canonical_creds)
+    # Forensics (the incident was only reconstructible from CRED-AUDIT lines):
+    # record which source won the comparison and why, next to the blank-heal
+    # line the caller emits. Only when a real comparison happened — a single
+    # candidate case is already fully described by blank-heal's `source=`.
+    # Under no_execute a canonical win was NOT dead-probed (the probe is a
+    # side-effectful network grant a dry run must never fire), and a real cycle
+    # may veto it — so the decision is recorded as `picked-unprobed`, never as
+    # a definitive `picked` the forensic trail would then contradict.
+    _decision = ("picked-unprobed" if (no_execute and canonical_wins) else "picked")
+    _cred_audit(
+        "blank-heal-source", _decision,
+        "freshest usable candidate wins — never install a token generation staler "
+        "than another available source (GH #13 reuse-revocation)",
+        slot=slot, account=account, token_fp=_audit_token_fp(_audit_shape(winner_creds)),
+        extra=(f"source={winner} source_expiry={_expiry_repr(_audit_shape(winner_creds))} "
+               f"rejected={loser} rejected_expiry={_expiry_repr(_audit_shape(loser_creds))}"))
+    return winner
 
 
 def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
@@ -15160,7 +15455,8 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
     The lane analogue of `_auto_heal_live_mount`: for every LIVE lane whose own
     mount creds are blanked (`_blanked_live_lanes`), reinstall its owning account's
     newest USABLE credential source (`_lane_heal_source` — the leased family store
-    if pooled, else the account snapshot/backup) into the lane mount, with the SAME
+    if pooled, else the FRESHEST of the lane's last-valid shadow vs the account
+    snapshot/backup, GH #13) into the lane mount, with the SAME
     atomic-write + rotated-backup + never-write-a-blank discipline the shared-mount
     heal uses. Runs in `_emit_sos_after` BEFORE `diagnose()`, so a healable blank
     never reaches the operator as an SOS — the heal fixes the mount and diagnose
@@ -15171,7 +15467,12 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
     the whole thing), never clobbers a healthy lane, and honors login-family
     discipline (a pooled lane heals only from its own family — see
     `_lane_heal_source`). Returns the list of healed slot names. `no_execute` logs
-    the intended heal without writing, for `cus daemon --once --no-execute`.
+    the intended heal without writing, for `cus daemon --once --no-execute` — and
+    is threaded into `_lane_heal_source`, which then skips the dead-snapshot
+    probe (a network refresh grant that persists a rotated token on an alive
+    verdict — a write in effect, which a dry run must never make); the dry-run
+    line marks the source "unprobed" so the operator knows a real cycle may still
+    veto it.
 
     Forensics (Fix 3, 2026-07-07): every blank detection emits a `op=blank-detected`
     CRED-AUDIT line and every successful restore a `op=blank-heal` line, capturing
@@ -15185,7 +15486,7 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
         return []
     healed: list[str] = []
     for slot, account in _blanked_live_lanes(state, config):
-        source = _lane_heal_source(slot, account, state, config)
+        source = _lane_heal_source(slot, account, state, config, no_execute=no_execute)
         dest = mount_creds_path(slot_path(slot))
         # ── Forensics: characterize the blank BEFORE we heal it (Fix 3). ──────
         # Read the now-blank mount + the last-valid shadow so we can log what the
@@ -15218,8 +15519,21 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
                        f"(GH #141 lane follow-up)")
             continue
         if no_execute:
+            # The dead-snapshot probe only ever vets a would-win PRIMARY
+            # snapshot, and `_lane_heal_source(no_execute=True)` skipped it —
+            # the probe is a network refresh grant that persists rotated tokens
+            # on an alive verdict, which a --no-execute cycle must never do. So
+            # ONLY a primary-snapshot pick is annotated UNPROBED (a real cycle
+            # may still veto it and pick the shadow, or escalate); a shadow /
+            # family-store / legacy-store / .bak pick is never probed in a real
+            # cycle either, so labeling those "unprobed" would falsely imply a
+            # real run might choose differently (committee 2026-07-24, #13
+            # round-3).
+            unprobed = (" (source unprobed — the dead-snapshot probe is skipped in a "
+                        "dry run; GH #141 lane follow-up)"
+                        if source == account_creds_path(account) else "")
             click.echo(f"  auto-heal (--no-execute): WOULD restore '{account}' creds from {source} "
-                       f"into live lane {slot} (GH #141 lane follow-up)")
+                       f"into live lane {slot}{unprobed}")
             continue
         # Install-point guard mirror (#141): never write a blank. The source was
         # already validated by _lane_heal_source, but re-check at the install point
@@ -15313,16 +15627,21 @@ def _mount_refresh_age_days(account: str, slot: str | None, state: dict, config:
 
     Resolves the right provenance the same way `_lane_heal_source` resolves the
     right heal source, so the age we age-out on matches the token in play:
-      * a lane LEASING a pooled family → that family's `minted_ts` provenance;
-      * a lane with a legacy per-(slot,account) independent login → its provenance;
+      * a lane LEASING a pooled family → that family's `minted_ts` provenance
+        (the lease RECORD alone — like `_lane_heal_source`, the live
+        independent-logins gate toggle is deliberately not consulted, so a
+        gate-off/lease-persists lane still ages by the family actually on its
+        mount; committee 2026-07-24, #13 round-3 parity fix);
+      * a lane with a legacy per-(slot,account) independent login (gate on,
+        mirroring the installer and `_lane_heal_source`) → its provenance;
       * everything else (a plain shared-snapshot-copy lane, or the shared mount,
         slot=None) → the account snapshot mint proxy (`_account_snapshot_age_days`).
     """
     if slot is not None:
         lease = slot_leased_family(state, slot)
-        if lease is not None and lease[0] == account and independent_logins_enabled(config):
+        if lease is not None and lease[0] == account:
             return login_age_days(*lease)  # login_age_days keys on (account, family_id)
-        if has_independent_login(account, slot):
+        if independent_logins_enabled(config) and has_independent_login(account, slot):
             return login_age_days(account, slot)
     return _account_snapshot_age_days(account)
 
