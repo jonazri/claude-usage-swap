@@ -26,10 +26,13 @@ This suite proves the three fixes:
     a per-lane `.credentials.json.lastvalid` shadow for instant heal + diffing.
 
 Section (e) adds the GH #13 follow-up (2026-07-24): the reactive heal picks its
-plain-lane source by FRESHNESS (`_creds_expires_at`; ties keep the shadow) —
-never installing a slot-local last-valid strictly staler than the canonical
-account snapshot, which is what turned a transient blank into a hard
-reuse-revocation logout. The pick is logged as `op=blank-heal-source`.
+plain-lane source by FRESHNESS (a local shape-tolerant expiresAt reader — NOT
+the strict `_creds_expires_at` — with an exact tie broken by refresh-token
+IDENTITY: same token keeps the shadow, a refresh-capable shadow beats a
+token-less canonical, anything else prefers the canonical) — never installing a
+slot-local last-valid strictly staler than the canonical account snapshot,
+which is what turned a transient blank into a hard reuse-revocation logout.
+The pick is logged as `op=blank-heal-source`.
 
 Run standalone:  python3 tests/test_blank_mount_preempt.py
 Run under pytest: pytest tests/test_blank_mount_preempt.py
@@ -799,6 +802,139 @@ def test_e_blank_heal_source_audit_names_winner_and_loser():
         # The existing blank-heal line still fires with its established shape.
         heal = env.audit_lines("blank-heal")
         assert len(heal) == 1 and f"source={cus.account_creds_path('rayi')}" in heal[0]
+    finally:
+        env.restore()
+
+
+def test_e_equal_expiry_tie_tokenless_canonical_loses():
+    # Committee round-2 (Kiro): the usable bar (`_live_mount_creds_invalid`)
+    # checks only accessToken+expiresAt, so a canonical snapshot WITHOUT a
+    # refreshToken can tie on expiry — and installing it would strand the mount
+    # unable to refresh, while the shadow CAN. On a tie, a refresh-capable
+    # shadow beats a token-less canonical.
+    snap = _valid("at-snap-tokenless", "rt-ignored", expires_at=2_000_000_000_000)
+    snap["claudeAiOauth"].pop("refreshToken")
+    env = _Env({"rayi": snap}, active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-capable", "rt-shadow", expires_at=2_000_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-capable"
+    finally:
+        env.restore()
+
+
+def test_e_no_execute_audit_marks_pick_unprobed():
+    # Committee round-2 (Codex, Important): under --no-execute a canonical win
+    # is NOT dead-probed, and a real cycle may veto it — so the forensic
+    # `blank-heal-source` line must record `decision=picked-unprobed`, never a
+    # definitive `picked` the real run could then contradict.
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: (_ for _ in ()).throw(AssertionError("no probe in a dry run")))
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-stale", "rt-shadow", expires_at=1_700_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config(), no_execute=True) == []
+        assert env.slot_creds(slot) == _blank()  # dry run → mount untouched
+        picks = env.audit_lines("blank-heal-source")
+        assert len(picks) == 1, env.echoes
+        assert "decision=picked-unprobed" in picks[0]
+        # A REAL run of the same shape records a definitive pick (probe ran).
+    finally:
+        env.restore()
+
+
+def test_e_flat_winner_audit_reports_real_fields():
+    # Committee round-2 (Claude + Kiro): the decision uses shape-tolerant local
+    # readers, but the audit line's renderers (`_audit_token_fp`,
+    # `_expiry_repr`) are nested-only — a FLAT-shaped winner used to log
+    # token_fp=none/source_expiry=none, the forensic line contradicting the
+    # decision it documents. The audit shim normalizes the shape for rendering.
+    env = _Env({"rayi": _valid("at-snap-older", "rt-snap", expires_at=1_900_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            {"accessToken": "at-flat-fresh", "refreshToken": "rt-flat",
+             "expiresAt": 2_000_000_000_000}))  # flat winner
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        picks = env.audit_lines("blank-heal-source")
+        assert len(picks) == 1, env.echoes
+        p = picks[0]
+        assert "token_fp=sha256:" in p, f"flat winner lost its fingerprint: {p}"
+        assert "source_expiry=none" not in p, f"flat winner lost its expiry: {p}"
+    finally:
+        env.restore()
+
+
+def test_e_stale_lease_gate_off_never_cross_families():
+    # Committee round-2 (Claude): the pooled-lane pin is decided by the lease
+    # RECORD alone. If the independent-logins gate is toggled off while lease
+    # records persist, the lane must still heal from its family store — never
+    # fall into the plain-lane comparison where a fresher shared snapshot could
+    # cross-family the mount (#104). Direct unit call: the full heal walk only
+    # sees gate-on lanes, but `_lane_heal_source` is the layer that owns this
+    # invariant.
+    env = _Env({"rayi": _valid("at-snap-fresher", "rt-snap", expires_at=2_000_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        fam = cus.login_family_creds_path("rayi", "family-1")
+        fam.parent.mkdir(parents=True, exist_ok=True)
+        fam.write_text(json.dumps(_valid("at-family", "rt-family", expires_at=1_700_000_000_000)))
+        state = {"slots": {slot: {"login_family": "rayi/family-1"}}}
+        config = cus.load_config()
+        config.setdefault("independent_logins", {})["use_independent_logins"] = False
+        src = cus._lane_heal_source(slot, "rayi", state, config)
+        assert src == fam, f"gate-off leased lane must stay family-pinned, got {src}"
+        # Family store blanked → None (escalate), never the shared snapshot.
+        fam.write_text(json.dumps(_blank()))
+        assert cus._lane_heal_source(slot, "rayi", state, config) is None
+    finally:
+        env.restore()
+
+
+def test_e_legacy_lane_no_shadow_heals_from_legacy_store():
+    # Committee round-2 (Claude): the legacy-lane guard used to sit AFTER the
+    # no-shadow early return, so a legacy lane whose shadow was missing healed
+    # from the shared snapshot — the exact re-familying the guard exists to
+    # prevent. With no usable shadow, the lane's own legacy store is the heal
+    # source; the shared snapshot never is.
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(_valid("at-legacy", "rt-legacy-independent")))
+        # No shadow file at all.
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-legacy"
+    finally:
+        env.restore()
+
+
+def test_e_legacy_lane_no_shadow_no_usable_store_escalates():
+    # ...and when the legacy store itself is unusable (blank-shaped but still
+    # carrying a refreshToken, so `has_independent_login` still claims the
+    # lane), the heal returns nothing — the lane escalates to the relogin SOS
+    # rather than cross-familying onto the shared snapshot (mirrors the pooled
+    # branch's no-cross-family rule).
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "", "refreshToken": "rt-legacy",
+                               "expiresAt": 0}}))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == []
+        assert env.slot_creds(slot) == _blank()  # untouched → SOS path owns it
     finally:
         env.restore()
 
