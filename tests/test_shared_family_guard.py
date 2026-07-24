@@ -20,6 +20,15 @@ independent_logins gate, with an error naming `cus login-mount <account>`;
 `independent_logins.allow_shared_family: true` is the conscious opt-back-in
 (old behavior, URGENT detection preserved).
 
+Committee finding 1 (2026-07-24) — byte-level, name-AGNOSTIC layer: the
+name-keyed guard resolves state['slots'][s]['account'] LABELS, so two
+DIFFERENTLY-NAMED accounts carrying ONE refresh-token family (a copied/renamed
+account dir, or two logical accounts logged into the same Anthropic login)
+each passed under their own name. The `test_cross_name_*` /
+`test_candidate_matching_shared_mount_*` tests pin the byte-level guard that
+closes this: candidate install bytes fingerprint-matched against EVERY other
+live mount regardless of account name, hatch honored gate-off only.
+
 Run standalone:  python3 tests/test_shared_family_guard.py
 Run under pytest: pytest tests/test_shared_family_guard.py
 """
@@ -86,6 +95,13 @@ class _Env:
         self._saved_probe = cus._oauth_refresh_grant
         cus._oauth_refresh_grant = lambda rt: ("unknown", None)
 
+        # click.echo capture (CRED-AUDIT / URGENT assertions) — same pattern as
+        # test_dead_snapshot_family_seed's harness.
+        self.echoes: list[str] = []
+        self._saved_echo = cus.click.echo
+        cus.click.echo = lambda *a, **k: self.echoes.append(
+            " ".join(str(x) for x in a) if a else "")
+
     def set_config(self, cfg: dict) -> None:
         cus.write_yaml(cus.CONFIG_YAML, cfg)
 
@@ -115,6 +131,7 @@ class _Env:
         cus.mount_pids = self._saved_mount_pids
         cus._pid_comm = self._saved_pid_comm
         cus._oauth_refresh_grant = self._saved_probe
+        cus.click.echo = self._saved_echo
         cus._OCCUPIED_SLOTS_CACHE.clear()
         self._tmp.cleanup()
 
@@ -225,6 +242,124 @@ def test_slot_move_preview_agrees_with_escape_hatch():
         plan2 = cus._slot_move_plan(cus.load_state(), cus.load_config(), mover, "beta")
         assert plan2["plan"] == "snapshot", plan2
         assert "allow_shared_family" in plan2["detail"], plan2
+    finally:
+        env.restore()
+
+
+def test_cross_name_shared_family_second_mount_refuses():
+    """FINDING 1 (committee, 2026-07-24): 'gamma' is a RENAMED COPY of 'beta'
+    — same OAuth refresh-token family, different logical name. Beta's family is
+    live on a lane; installing gamma onto another lane is a second live mount
+    on that SAME family, but every name-keyed guard sees gamma as held nowhere.
+    The byte-level name-agnostic guard must refuse, naming the fingerprint."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        env.make_slot("beta", live=True)              # beta's family live on a lane
+        mover = env.make_slot("alpha", live=True)
+        raised_msg = ""
+        try:
+            cus.execute_swap("gamma", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert raised_msg, "cross-name shared family must refuse at the byte level (GH #15 finding 1)"
+        assert cus._refresh_fingerprint("rt-beta") in raised_msg, raised_msg
+        assert "cus login-mount gamma" in raised_msg, raised_msg
+        assert any("op=family-collision-refuse" in e for e in env.echoes), env.echoes
+        # The refused lane held: still on alpha, live creds untouched.
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha"
+    finally:
+        env.restore()
+
+
+def test_cross_name_shared_family_hatch_proceeds_with_urgent():
+    """Gate off + allow_shared_family: the conscious opt-in keeps the OLD
+    proceed contract for the cross-name collision too — but LOUDLY: an
+    [URGENT] line plus a CRED-AUDIT record, so the opted-in operator keeps
+    the warning the 2026-07-24 incident relied on."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        env.set_config({"independent_logins": {"allow_shared_family": True}})
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        env.make_slot("beta", live=True)
+        mover = env.make_slot("alpha", live=True)
+        cus.execute_swap("gamma", trigger="auto-ladder", slot=mover)   # opted in: proceeds
+        assert cus.load_state()["slots"][mover]["account"] == "gamma"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-beta"
+        assert any("[URGENT]" in e and "allow_shared_family" in e for e in env.echoes), env.echoes
+        assert any("op=family-collision-hatch" in e for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_cross_name_distinct_families_unaffected():
+    """No byte overlap ⇒ the name-agnostic guard stays silent: an everyday
+    swap onto an account whose own family is live nowhere else installs
+    exactly as before, even with other accounts live on other lanes."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        env.make_slot("beta", live=True)
+        mover = env.make_slot("alpha", live=True)
+        cus.execute_swap("gamma", trigger="auto-ladder", slot=mover)
+        assert cus.load_state()["slots"][mover]["account"] == "gamma"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-gamma"
+        assert not any("op=family-collision-refuse" in e or "op=family-collision-hatch" in e
+                       for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_cross_name_collision_gate_on_refuses_hatch_or_not():
+    """Gate ON: the operator asked for independent families, so the hatch is
+    NOT consulted (finding 2's documented gate-off-only asymmetry) — a
+    cross-name byte collision refuses even with allow_shared_family: true."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True,
+                                               "allow_shared_family": True}})
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        env.make_slot("beta", live=True)
+        mover = env.make_slot("alpha", live=True)
+        raised_msg = ""
+        try:
+            cus.execute_swap("gamma", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert raised_msg, "gate-on cross-name collision must refuse regardless of the hatch"
+        assert cus._refresh_fingerprint("rt-beta") in raised_msg, raised_msg
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+    finally:
+        env.restore()
+
+
+def test_candidate_matching_shared_mount_family_refuses():
+    """The shared ~/.claude mount counts as a live holder UNCONDITIONALLY in
+    global/hybrid (bare sessions set no CLAUDE_CONFIG_DIR, so mount_pids can't
+    see them — the issue-#141 blind spot): a candidate whose family matches
+    the shared mount's live bytes refuses even though no holder is detectable,
+    and even though the target's NAME isn't what the shared mount runs."""
+    env = _Env()
+    try:
+        # beta's snapshot is a copy of whatever the shared mount runs (rt-bare).
+        (env.accounts_dir / "account-beta" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-bare")))
+        mover = env.make_slot("alpha", live=True)
+        raised_msg = ""
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert raised_msg, "candidate sharing the shared mount's live family must refuse"
+        assert "shared-mount" in raised_msg, raised_msg
+        assert cus._refresh_fingerprint("rt-bare") in raised_msg, raised_msg
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
     finally:
         env.restore()
 

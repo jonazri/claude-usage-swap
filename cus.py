@@ -367,7 +367,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # without independent logins, and the daemon's URGENT line was
         # detect-only). True: consciously opt back into the old warn-and-
         # proceed behavior; the URGENT double-book SOS still fires so an
-        # opted-in operator keeps the warning.
+        # opted-in operator keeps the warning. The OPT-IN side is honored only
+        # while use_independent_logins is OFF (committee finding 2,
+        # 2026-07-24): with the gate ON the operator has explicitly asked for
+        # independent families, so silently sharing one would contradict the
+        # stronger setting — a lane landing on a held account CLAIMS a
+        # distinct family or refuses at pool exhaustion ("pool exhausted for
+        # ..."), hatch or no hatch, and the byte-level name-agnostic collision
+        # guard refuses the same way. Only the REFUSE side (this False
+        # default) applies regardless of the gate.
         "allow_shared_family": False,
     },
     # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
@@ -2108,6 +2116,59 @@ def duplicate_login_families() -> list[dict]:
             for fp, pairs in by_fp.items() if len(pairs) > 1]
 
 
+def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
+                                     session_aware: bool = False) -> list[tuple[str, str | None, str]]:
+    """[(mount_name, account, refresh_fp)] for every LIVE mount whose creds
+    carry a refresh token — slot dirs plus the shared ~/.claude pair — using
+    the same `_refresh_fingerprint` primitive login families use, and
+    REGARDLESS of account name (names are labels; the token family is the
+    identity). The single primitive behind both family-collision surfaces
+    (extracted 2026-07-24, GH #15 committee finding 1, so guard and detector
+    can never drift): `duplicate_live_mount_families` — the passive SOS
+    detector — groups these by fingerprint, and `_execute_swap_locked`'s
+    byte-level install guard compares the CANDIDATE bytes about to be
+    installed against them.
+
+    session_aware=False (detector default) is bit-for-bit the detector's
+    historic liveness bar: `mount_in_use` everywhere, shared mount included —
+    an idle mount refreshes no token, so a duplicate there can't clobber yet.
+
+    session_aware=True (the execute-time guard) matches the neighboring swap
+    guards instead: a slot counts only with a live claude SESSION
+    (`mount_has_live_session` — an orphaned dev-server that inherited
+    CLAUDE_CONFIG_DIR refreshes no token, so it must not manufacture a phantom
+    collision; orphan-holds-slot bug, 2026-07-10), and the shared mount is
+    judged the way `_shared_mount_holds` judges it, mode-aware but name-free:
+    UNCONDITIONALLY live in global/hybrid (bare sessions set no
+    CLAUDE_CONFIG_DIR, so mount_pids can't see them — the issue-#141 blind
+    spot), detectable-only in per_session. `config` feeds only that mode read;
+    None re-loads it."""
+    out: list[tuple[str, str | None, str]] = []
+    for d in list_slot_dirs():
+        if not (mount_has_live_session(d) if session_aware else mount_in_use(d)):
+            continue
+        try:
+            rt = read_json(d / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if rt:
+            out.append((d.name, state.get("slots", {}).get(d.name, {}).get("account"),
+                        _refresh_fingerprint(rt)))
+    if session_aware:
+        mode = (config if config is not None else load_config()).get("mode", "global")
+        shared_live = mode in ("global", "hybrid") or mount_in_use(CLAUDE_DIR)
+    else:
+        shared_live = mount_in_use(CLAUDE_DIR)
+    if shared_live:
+        try:
+            rt = read_json(CLAUDE_DIR / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            rt = None
+        if rt:
+            out.append(("shared-mount", state.get("active"), _refresh_fingerprint(rt)))
+    return out
+
+
 def duplicate_live_mount_families(state: dict) -> list[dict]:
     """One refresh-token family live on TWO+ mounts — the #104 clobber itself,
     measured at the LIVE mounts (slot dirs + the global ~/.claude pair) rather
@@ -2117,22 +2178,12 @@ def duplicate_live_mount_families(state: dict) -> list[dict]:
     all-clear while one token refresh away from a forced logout), `cus launch
     --force`, or hand-copied credential files. Idle mounts are skipped: with
     no session to refresh the token, a duplicate can't clobber yet.
+    Groups `_live_mount_refresh_fingerprints` — the shared primitive the
+    execute-time byte-level guard also reads — by fingerprint.
     Returns [{"refresh_fp", "mounts": ["slot-3 (rayi2)", ...]}]."""
-    by_fp: dict[str, list[str]] = {}
-    mounts: list[tuple[str, Path, str | None]] = [
-        (d.name, d, state.get("slots", {}).get(d.name, {}).get("account"))
-        for d in list_slot_dirs()
-    ]
-    mounts.append(("shared-mount", CLAUDE_DIR, state.get("active")))
-    for name, path, acct in mounts:
-        if not mount_in_use(path):
-            continue
-        try:
-            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            continue
-        if rt:
-            by_fp.setdefault(_refresh_fingerprint(rt), []).append((f"{name} ({acct or '?'})", acct))
+    by_fp: dict[str, list[tuple[str, str | None]]] = {}
+    for name, acct, fp in _live_mount_refresh_fingerprints(state):
+        by_fp.setdefault(fp, []).append((f"{name} ({acct or '?'})", acct))
     return [{"refresh_fp": fp,
              "mounts": sorted(label for label, _ in ms),
              "accounts": sorted({a for _, a in ms if a})}
@@ -2333,7 +2384,22 @@ def shared_family_allowed(config: dict | None = None) -> bool:
     gate-off (default) install proceeded as a silent clobbering copy and the
     daemon's "[URGENT] ... live on 2 mounts without independent logins" line
     was detect-only. True restores that old warn-and-proceed behavior (the
-    URGENT detection stays)."""
+    URGENT detection stays) — but ONLY while use_independent_logins is OFF
+    (committee finding 2, 2026-07-24). The asymmetry is by design, not an
+    accident: the REFUSE side (False) is gate-independent because the hazard
+    is, while the OPT-IN side is gate-off-only because with the gate ON the
+    operator has explicitly asked for independent families, and a hatch that
+    silently shared one would contradict the stronger setting. Concretely:
+    gate-on, a LANE landing on a held account CLAIMS a distinct family or
+    refuses at pool exhaustion ("pool exhausted for ...") before this knob is
+    ever consulted, and the byte-level name-agnostic collision guard consults
+    it only gate-off for the same reason. (The one gate-on consult left is the
+    SHARED-mount install, slot=None, which has no pool to claim from — there
+    the hatch still distinguishes refuse from proceed, and actual byte
+    collisions are refused regardless by the byte-level guards.)
+    _slot_move_plan previews with the same gate-off-only rule
+    (`elif not gate and shared_family_allowed(...)`), keeping preview and
+    execution agreed."""
     cfg = config if config is not None else load_config()
     return bool(cfg.get("independent_logins", {}).get("allow_shared_family", False))
 
@@ -10789,6 +10855,80 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"to a different account. To consciously accept the old shared-copy behavior set "
             f"independent_logins.allow_shared_family: true. Mount left on its prior account "
             f"(no creds written).")
+
+    # ---- 2026-07-24 byte-level name-AGNOSTIC family collision guard (GH #15,
+    # committee finding 1) ----
+    # Every refusal above keys on the ACCOUNT NAME: `_account_held_by_other_live_mount`
+    # resolves state['slots'][s]['account'] LABELS, and the one byte-level check
+    # (`_live_family_would_collide`) is gate-scoped AND scoped to other mounts OF
+    # target_name. So two DIFFERENTLY-NAMED account snapshots carrying ONE OAuth
+    # refresh-token family — an account dir copied/renamed, or two logical
+    # accounts logged into the same Anthropic login — each pass under their own
+    # name, and the install double-books the family across labels: the exact
+    # reuse-detection revocation GH #15 exists to prevent, just spelled with two
+    # names. The detector half already measured this
+    # (`duplicate_live_mount_families` groups live mounts by fingerprint
+    # regardless of name) but was passive; this enforces the same primitive
+    # (`_live_mount_refresh_fingerprints`) at the one point that sees the
+    # CANDIDATE bytes actually about to be installed — install_src is fully
+    # resolved above (snapshot, claimed pool family, or legacy store), and
+    # live_creds_path is still untouched, so raising is a clean no-op for the
+    # mount. Deliberately NOT scoped to independent_logins_enabled and NOT keyed
+    # on target_name — those two scopings ARE the gap. session_aware semantics
+    # match the neighboring guards (an orphan holder refreshes no token; an idle
+    # slot can't clobber). The allow_shared_family hatch applies here exactly as
+    # documented on `shared_family_allowed` — gate-OFF only: an opted-in
+    # gate-off operator keeps the old proceed contract, made LOUD (URGENT +
+    # CRED-AUDIT), while gate-ON always refuses (the operator asked for
+    # independent families; silently sharing one would contradict the stronger
+    # setting — same rationale as the hatchless pool-exhaustion refusal above).
+    # Limits, stated honestly: fingerprints match token BYTES, so a family whose
+    # live copy already ROTATED past the candidate slips this check — that
+    # rotation-blind case is what the name-keyed guards above still catch for
+    # same-name installs. The two layers compose; neither subsumes the other.
+    try:
+        _cand_rt = _credential_refresh_token(read_json(install_src))
+    except (json.JSONDecodeError, OSError):
+        _cand_rt = None  # unreadable source: no family to collide — the #141
+                         # definitive install-point gate just below refuses it
+    if _cand_rt:
+        _cand_fp = _refresh_fingerprint(_cand_rt)
+        _colliders = [f"{m} ({a or '?'})"
+                      for m, a, fp in _live_mount_refresh_fingerprints(state, config,
+                                                                       session_aware=True)
+                      if fp == _cand_fp and m != (slot if slot is not None else "shared-mount")]
+        if _colliders:
+            if not independent_logins_enabled(config) and shared_family_allowed(config):
+                _cred_audit("family-collision-hatch", "urgent-proceed-shared-family",
+                            "install source's refresh-token family is LIVE on another mount "
+                            "(byte-level, name-agnostic) — proceeding only under allow_shared_family (GH #15)",
+                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                            shared=True, token_fp=_cand_fp)
+                click.echo(
+                    f"[URGENT] creds-install: '{target_name}' install source carries refresh-token family "
+                    f"{_cand_fp} ALREADY LIVE on {', '.join(_colliders)} — proceeding only because "
+                    f"independent_logins.allow_shared_family is true; a rotation on either mount can trip "
+                    f"the auth server's reuse detection and revoke the whole family (GH #15)")
+            else:
+                _cred_audit("family-collision-refuse", "refused-name-agnostic-collision",
+                            "install source's refresh-token family is LIVE on another mount "
+                            "(byte-level, name-agnostic) — refused fail-closed (GH #15)",
+                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                            shared=True, token_fp=_cand_fp)
+                raise RuntimeError(
+                    f"refusing to install '{target_name}' onto "
+                    f"{('lane ' + slot) if slot else 'the shared mount'}: the credentials about to be "
+                    f"installed carry OAuth refresh-token family {_cand_fp}, which is ALREADY LIVE on "
+                    f"{', '.join(_colliders)} — account names are only labels; the token family is the "
+                    f"identity, so a copied/renamed account dir or two logical accounts on one Anthropic "
+                    f"login double-book the family even under different names. Two live mounts on one "
+                    f"family rotate it out from under each other, and re-presenting the rotated-away "
+                    f"token trips the auth server's reuse detection, revoking the WHOLE family "
+                    f"server-side (GH #15, the 2026-07-24 sentinel outage). Provision an independent "
+                    f"family (`cus login-mount {target_name}`) or move to a different account. To "
+                    f"consciously accept shared-family risk set independent_logins.allow_shared_family: "
+                    f"true (honored only with use_independent_logins off). Mount left on its prior "
+                    f"account (no creds written).")
 
     # ---- GH #141 root-cause guard (definitive install-point gate) ----
     # This is THE line that writes creds to the live mount; every swap path
