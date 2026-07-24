@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -133,6 +134,12 @@ class _Env:
         d = cus.login_family_dir(account, family_id)
         d.mkdir(parents=True, exist_ok=True)
         cus.login_family_creds_path(account, family_id).write_text(json.dumps(creds))
+
+    def plant_shadow(self, slot: str, creds: dict) -> None:
+        """Write `creds` as the lane's last-valid SHADOW (.credentials.json.lastvalid)
+        — the Fix 3 (2026-07-07) heal source the plain-lane branch consults first."""
+        shadow = cus._lane_lastvalid_path(cus.mount_creds_path(cus.slot_path(slot)))
+        shadow.write_text(json.dumps(creds))
 
     def make_backup(self, name: str, creds: dict) -> None:
         """Write `creds` as a rotated backup generation for `name` via the real
@@ -329,6 +336,59 @@ def test_e_pooled_lane_no_cross_family_fallback_to_snapshot():
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == ""
         conds = _lane_conditions(cus.diagnose())
         assert len(conds) == 1 and conds[0].severity == "urgent"
+    finally:
+        env.restore()
+
+
+# ---------------------------------------------------------------------------
+# (f) freshness ordering between the last-valid SHADOW and the account snapshot
+#     (2026-07-24 slot-9 incident)
+# ---------------------------------------------------------------------------
+
+def test_f_stale_shadow_loses_to_fresher_snapshot():
+    """2026-07-24 slot-9: the shadow held a token that had ALREADY EXPIRED 3h
+    earlier while the account snapshot carried a NEWER generation (the account had
+    refreshed in the meantime, rotating the shadow's refresh token away).
+
+    `_live_mount_creds_invalid` only rejects the blank SHAPE (empty accessToken /
+    expiresAt <= 0) — a positive-but-PAST expiresAt passes it — so the shadow won
+    the unconditional plain-lane preference and cus installed a dead generation.
+    Claude Code's first refresh then failed (invalid_grant on the superseded
+    refresh token), it logged itself out and re-blanked the mount: a
+    heal→blank→heal loop the operator saw as a session on 'API Usage Billing'.
+
+    The heal must install the FRESHEST generation available, not merely the
+    first shape-valid one."""
+    now_ms = int(time.time() * 1000)
+    dead_shadow = _valid("at-stale-shadow", "rt-stale-shadow", expires_at=now_ms - 3 * 3_600_000)
+    fresh_snap = _valid("at-fresh-snap", "rt-fresh-snap", expires_at=now_ms + 3_600_000)
+    env = _Env({"rayi": fresh_snap}, active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.plant_shadow(slot, dead_shadow)
+        healed = cus._auto_heal_live_lanes(cus.load_state(), cus.load_config())
+        assert healed == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-fresh-snap", \
+            "heal installed the STALE shadow over a fresher snapshot (slot-9 regression)"
+        assert _lane_conditions(cus.diagnose()) == []
+    finally:
+        env.restore()
+
+
+def test_f_fresher_shadow_still_wins_over_older_snapshot():
+    """The converse, so the fix is freshness ordering and not "never use the
+    shadow": when the shadow IS the newest generation it must still be preferred
+    (Fix 3's #104-safe same-lineage guarantee)."""
+    now_ms = int(time.time() * 1000)
+    fresh_shadow = _valid("at-fresh-shadow", "rt-fresh-shadow", expires_at=now_ms + 7_200_000)
+    older_snap = _valid("at-older-snap", "rt-older-snap", expires_at=now_ms + 3_600_000)
+    env = _Env({"rayi": older_snap}, active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.plant_shadow(slot, fresh_shadow)
+        healed = cus._auto_heal_live_lanes(cus.load_state(), cus.load_config())
+        assert healed == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-fresh-shadow"
     finally:
         env.restore()
 

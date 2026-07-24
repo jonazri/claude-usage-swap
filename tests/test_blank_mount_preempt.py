@@ -500,6 +500,91 @@ def test_d_pooled_lane_ignores_shadow_uses_family():
         env.restore()
 
 
+# ---------------------------------------------------------------------------
+# (g) STALE-REPAIR — an expired-but-SHAPE-VALID mount was owned by no path
+#     (2026-07-24 slot-9)
+# ---------------------------------------------------------------------------
+
+def test_g_expired_lane_repaired_from_fresher_valid_source():
+    """slot-9: the mount held a well-shaped token that had already EXPIRED. The
+    reactive heal tests only the blank SHAPE (`_live_mount_creds_invalid` passes any
+    expiresAt > 0) and the pre-refresh gate skipped `minutes_left <= 0`, so nothing
+    repaired it — the lane just warned while its session sat logged out, which Claude
+    Code labels 'API Usage Billing'. A strictly fresher, still-valid source must now
+    be reinstalled."""
+    env = _Env({"rayi": _valid("at-fresh-snap", "rt-fresh-snap", _near_expiry_ms(90))},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True,
+                             mount_creds=_valid("at-dead", "rt-dead", _near_expiry_ms(-60)))
+        cus._preempt_live_lane_blanks(cus.load_state(), cus.load_config())
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-fresh-snap", \
+            "expired lane mount was not repaired from the fresher valid snapshot"
+        assert env.audit_lines("stale-repair"), "expected a stale-repair CRED-AUDIT line"
+        # Reversible, same discipline as the reactive heal.
+        assert sorted(cus.slot_path(slot).glob(".credentials.json.bak.*")), "expected a backup"
+    finally:
+        env.restore()
+
+
+def test_g_expired_lane_with_nothing_fresher_is_left_to_escalate():
+    """Conservative bar: with no strictly-fresher, still-valid source the mount must
+    be left exactly as-is so the lane keeps escalating to the relogin SOS. Installing
+    a second dead generation could not log the session back in."""
+    env = _Env({"rayi": _valid("at-older-dead", "rt-older-dead", _near_expiry_ms(-180))},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True,
+                             mount_creds=_valid("at-dead", "rt-dead", _near_expiry_ms(-60)))
+        cus._preempt_live_lane_blanks(cus.load_state(), cus.load_config())
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-dead", \
+            "mount was rewritten from a source that is not fresher-and-valid"
+        assert env.audit_lines("stale-repair") == []
+    finally:
+        env.restore()
+
+
+def test_g_expired_mount_is_never_enshrined_as_lastvalid():
+    """The shadow-poisoning half. `_update_lane_lastvalid` ran BEFORE the expiry gate,
+    so a dead-but-shaped mount became the lane's "last known GOOD" — and
+    `_lane_heal_source` consumes that shadow as a heal source. That is how slot-9's
+    shadow came to hold a 3h-dead generation. An expired mount must never be recorded
+    as last-valid."""
+    env = _Env({"rayi": _valid("at-older-dead", "rt-older-dead", _near_expiry_ms(-180))},
+               active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True,
+                             mount_creds=_valid("at-dead", "rt-dead", _near_expiry_ms(-60)))
+        cus._preempt_live_lane_blanks(cus.load_state(), cus.load_config())
+        shadow = env.shadow_path(slot)
+        if shadow.exists():
+            assert json.loads(shadow.read_text())["claudeAiOauth"]["accessToken"] != "at-dead", \
+                "an EXPIRED mount token was enshrined as .lastvalid (slot-9 shadow poisoning)"
+    finally:
+        env.restore()
+
+
+def test_g_pooled_expired_lane_repairs_only_from_its_own_family():
+    """The repair borrows `_lane_heal_source`, so #104 login-family discipline holds:
+    a pooled lane must repair from its OWN leased family, never the account snapshot
+    (which would cross-contaminate token families)."""
+    cfg = {"mode": "per_session", "independent_logins": {"use_independent_logins": True}}
+    env = _Env({"rayi": _valid("at-snap", "rt-snap", _near_expiry_ms(120))},
+               active="rayi", config=cfg)
+    try:
+        fam_dir = cus.login_family_dir("rayi", "family-1")
+        fam_dir.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path("rayi", "family-1").write_text(
+            json.dumps(_valid("at-fam", "rt-fam", _near_expiry_ms(90))))
+        slot = env.make_slot("rayi", live=True, family_id="family-1",
+                             mount_creds=_valid("at-dead", "rt-dead", _near_expiry_ms(-60)))
+        cus._preempt_live_lane_blanks(cus.load_state(), cus.load_config())
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-fam", \
+            "pooled lane repaired from something other than its leased family (#104)"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     import traceback
 
