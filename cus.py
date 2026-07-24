@@ -14710,7 +14710,15 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
         try:
             if legacy_store.exists():
                 _lc = read_json(legacy_store)
-                if not _live_mount_creds_invalid(_lc):
+                # The usable bar alone is NOT enough here: this branch's whole
+                # safety argument (and the capability gate below) rests on the
+                # store being refresh-CAPABLE, which `has_independent_login`
+                # checked on a DIFFERENT read — a partial write/corruption
+                # between that check and this re-read could hand us a
+                # token-less store and strand the lane at access expiry
+                # (Copilot, PR #17). Re-verify capability on the bytes we will
+                # actually compare/install.
+                if not _live_mount_creds_invalid(_lc) and _cand_refresh(_lc) is not None:
                     legacy_creds = _lc
         except (json.JSONDecodeError, OSError):
             pass  # unreadable/blank legacy store isn't a candidate either

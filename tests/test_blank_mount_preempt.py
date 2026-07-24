@@ -832,6 +832,34 @@ def test_e_legacy_tokenless_shadow_loses_to_store():
         env.restore()
 
 
+def test_e_legacy_store_losing_refresh_between_check_and_read_is_rejected():
+    # Copilot (PR #17): `has_independent_login` verifies the store HAS a
+    # refreshToken on a DIFFERENT read than the branch's own re-read, which
+    # only shape-checked it — a partial write/corruption in that window could
+    # hand the comparison a token-less store, whose installation would strand
+    # the lane at access expiry (the branch's capability gate assumes store
+    # capability). Simulate the race by pinning has_independent_login True
+    # while the on-disk store lacks a refreshToken: the store must NOT be a
+    # candidate, and with no shadow either the lane escalates (None), never
+    # installing the token-less bytes.
+    store_creds = _valid("at-legacy-raced", "rt-legacy", expires_at=2_000_000_000_000)
+    store_creds["claudeAiOauth"].pop("refreshToken")
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_100_000_000_000)},
+               active="rayi",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
+    try:
+        env.patch(cus, "has_independent_login", lambda account, slot: True)
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(store_creds))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == []
+        assert env.slot_creds(slot) == _blank()  # untouched → relogin SOS owns it
+    finally:
+        env.restore()
+
+
 def test_e_mount_refresh_age_routing_parity():
     # Committee round-4 (Claude): the round-3 parity fix to
     # `_mount_refresh_age_days` had no coverage. Pin the routing itself with
