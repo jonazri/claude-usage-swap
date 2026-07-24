@@ -713,6 +713,44 @@ def test_premium_slot_degrades_temporarily_when_no_model_safe_target():
         env.restore()
 
 
+def test_premium_slot_on_disabled_account_escapes_via_standard_degrade():
+    # Fork extension to upstream #188: a PREMIUM lane on an operator-DISABLED
+    # account whose only clean escape is a standard-pool target must take it —
+    # vacating a disabled account is an operator mandate, stronger than pool
+    # preference. Premium view: beta is Fable-dead, so Trigger 0 HOLDs
+    # (disabled_evict_no_target); that gate is in the premium→standard degrade
+    # set, and the standard re-run (model gate off) finds beta clean and evicts.
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        # alpha: DISABLED but usage-HEALTHY — the eviction must key on the
+        # operator flag, not on any usage trigger.
+        state["accounts"]["alpha"].update({"current_5h_pct": 10.0, "current_7d_pct": 15.0,
+                                           "per_model_weekly_pct": {"Fable": 30.0}})
+        # beta: Fable-dead (premium target gate rejects it) but aggregate-clean
+        # (7d=30 < steps[0]=50, so the standard pick is non-DEGRADED).
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 30.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage_pm(10.0, 15.0, fable=30.0),
+                 "beta": _usage_pm(0.0, 30.0, fable=100.0)}
+        cfg = _pool_config(accounts=[{"name": "alpha", "priority": 1, "disabled": True},
+                                     {"name": "beta", "priority": 1}])
+
+        moves = cus.decide_slot_swaps(state, cfg, usage)
+        assert len(moves) == 1, moves
+        assert moves[0]["slot"] == slot
+        assert moves[0]["to"] == "beta"
+        assert moves[0]["pool"] == "standard"
+        assert moves[0]["gate"] == "disabled_evict", moves[0]
+        assert moves[0]["deferrable"] is False, moves[0]
+        assert "premium degraded to standard" in moves[0]["reason"]
+    finally:
+        env.restore()
+
+
 def test_premium_slot_swaps_off_model_exhausted_standard_holds():
     # alpha's Fable week is at 98% (over the 97 cap) but aggregate is low.
     # A PREMIUM slot on alpha must swap off it (hard-cap force-swap); a

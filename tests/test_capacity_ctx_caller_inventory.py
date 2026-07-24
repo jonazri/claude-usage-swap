@@ -179,9 +179,16 @@ EXPECTED: dict[Fingerprint, str] = {
     ("decide_slot_swaps", "decide_swap", 1): "ctx",  # L8369 task-5: per-group shim carries claim-aware stashed ctx
     ("decide_slot_swaps", "decide_swap", 2): "ctx",  # L8383 task-5: std-pool degrade retry reuses same ctx-stashed shim
     ("decide_slot_swaps", "pick_swap_target", 1): "ctx",  # L8461 task-5: fan-out re-pick shim2 carries fresh claim-aware stashed ctx
-    ("decide_swap", "pick_swap_target", 1): "ctx",  # L7708 task-5: threads ctx via caller's stashed state + picker self-build fallback
-    ("decide_swap", "pick_swap_target", 2): "ctx",  # L7986 task-5: threads ctx via caller's stashed state + picker self-build fallback
-    ("decide_swap", "pick_swap_target", 3): "ctx",  # per-model port 2026-07-05: persisted per-model hard-cap force-swap on no-fresh-poll; threads ctx via caller's stashed state + picker self-build fallback
+    # decide_swap's four picks, in textual order (counts are occurrence-order;
+    # descriptions realigned 2026-07-24 when the #188 port added a site ahead
+    # of the other three): 1 = Trigger 0 disabled-account eviction, 2 =
+    # persisted per-model hard-cap on no-fresh-poll, 3 = hard 7d cap trip,
+    # 4 = progressive ladder. All thread ctx the same way — via the caller's
+    # stashed state + the picker's self-build fallback.
+    ("decide_swap", "pick_swap_target", 1): "ctx",  # upstream #188 port 2026-07-24: Trigger 0 disabled-evict pick
+    ("decide_swap", "pick_swap_target", 2): "ctx",  # per-model port 2026-07-05: persisted per-model hard-cap force-swap on no-fresh-poll
+    ("decide_swap", "pick_swap_target", 3): "ctx",  # task-5: hard-cap trip pick
+    ("decide_swap", "pick_swap_target", 4): "ctx",  # task-5: progressive-ladder pick
     ("diagnose", "pick_swap_target", 1): "ctx",  # L11159 task-5: SOS Condition 2b shim carries stashed ctx (G8/formula 2)
     ("diagnose", "pick_swap_target", 2): "ctx",  # L11173 task-5: premium-degrade probe reuses same ctx-stashed shim
     ("one_cycle", "decide_swap", 1): "ctx",  # L15844 task-5: decide_state shim carries stashed ctx

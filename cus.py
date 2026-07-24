@@ -4971,8 +4971,15 @@ def _disabled_accounts(config: dict) -> set:
     Semantics: NEVER a swap/launch target, no degraded-pool fallback (an
     operator mandate outranks "swap somewhere rather than sit on a hot
     active"). Polling continues (so the operator can see when its windows
-    reset) and a lane already ON the account keeps running — the flag only
-    stops NEW placements. Re-enable by deleting the key or setting false."""
+    reset). Re-enable by deleting the key or setting false.
+
+    Annotation 2026-07-21 (upstream #188): the flag no longer ONLY stops new
+    placements. It used to leave a lane already ON the account running until it
+    exited; that stranded a premium lane on a disabled Fable-maxed account (the
+    slot-6/03 incident) with no trigger to move it off. `decide_swap` now has a
+    Trigger 0 that EVICTS a live lane off a disabled account (to a clean target
+    when one exists). So disable is now: never an arrival, AND actively vacated
+    as a current account."""
     return {a.get("name") for a in config.get("accounts", [])
             if isinstance(a, dict) and a.get("disabled")}
 
@@ -11358,6 +11365,54 @@ def decide_swap(
         _note("no_active", "hold", "no active account set")
         return None
 
+    # Trigger 0 — disabled-account eviction (upstream #188, 2026-07-21 slot-6/03
+    # incident). `cus disable` historically governed FUTURE rotation only:
+    # pick_swap_target excludes a disabled account as an ARRIVAL, but nothing
+    # ever swapped a live lane already sitting ON one AWAY — the disable()
+    # docstring spelled this out ("does not move or evict a lane already
+    # mounted … keeps running until it exits"). That stranded a premium lane on
+    # a disabled, Fable-maxed account: account 03 was BOTH disabled AND at
+    # Fable 96%, a scheduled-task burst blew past the 97% per-model gate to
+    # 100% before any usage trigger could fire, and no trigger keys on "current
+    # account is disabled", so the lane walled and sat there. Fix: evict,
+    # FIRST — before the usage-based triggers — because "the operator pulled
+    # this account out of rotation" is a stronger, usage-independent signal
+    # than any cap (a disabled account that still LOOKS healthy must be vacated
+    # too). pick_swap_target already excludes disabled arrivals, so the target
+    # is guaranteed non-disabled — this can never bounce onto another disabled
+    # account. Inert on installs with no disabled accounts (the set is empty).
+    # Guard against evicting onto a DEGRADED/over-cap target: that would just
+    # wall the lane on the NEW account (the exact harm) — better to hold the
+    # lane where it is until a genuinely clean account exists, and let SOS
+    # surface the stuck-on-disabled condition. The moment a clean target
+    # appears, this evicts. Non-deferrable: an operator-disabled account should
+    # be vacated promptly, not held for prompt-cache warmth. Note: this keys on
+    # the RECORDED active account, so a lane DRIFTED onto a disabled account
+    # (state still naming the old account) is evicted only after drift-recovery
+    # reconciles state to reality — the two fixes compose. Fork extension: the
+    # no-clean-target HOLD gate below is in decide_slot_swaps' premium→standard
+    # degrade set, so a premium lane stuck on a disabled account may still
+    # escape via a standard-pool clean target this cycle.
+    if current in _disabled_accounts(config):
+        target = pick_swap_target(state, config)
+        if target is None or "[DEGRADED:" in (target.reason or ""):
+            msg = (f"active account {current} is DISABLED but no CLEAN swap target "
+                   f"to evict onto — holding the lane (SOS surfaces it)")
+            click.echo(f"  {msg}")
+            _note("disabled_evict_no_target", "hold", msg)
+            return None
+        reason = (f"active account {current} is DISABLED — evicting the live lane "
+                  f"off it; target: {target.reason}")
+        click.echo(f"  disabled-evict: {reason}")
+        _note("disabled_evict", "swap", reason)
+        return SwapDecision(
+            target=target.name,
+            reason=reason,
+            tier=determine_tier(state["accounts"].get(current, {}), config),
+            gate="disabled_evict",
+            deferrable=False,
+        )
+
     active_acct = state["accounts"][current]
     cur_usage = usage_by_account.get(current)
     # Per-model weekly cap is a HARD invariant that poll_account_usage persists
@@ -11432,6 +11487,8 @@ def decide_swap(
     # The CORRECT reactive 429 path is `check_rate_limit_reactive` (called
     # at the top of one_cycle), which reads the rate_limit_log populated
     # by the PostToolUseFailure hook from actual user-facing 429s.
+    # (The "Trigger 0" slot is now occupied by the UNRELATED disabled-account
+    # eviction above, upstream #188 — same name, different trigger.)
 
     # Trigger 1: hard 7d cap.
     # Active strategy must support this; smart and headroom do via their
@@ -12223,10 +12280,17 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # Excluded on purpose: `min_improvement_gate` (a real target exists, just
         # marginal — degrading would defeat that anti-churn hold) and the
         # hysteresis/defer holds (transient, not a no-target condition).
+        # `disabled_evict_no_target` (fork extension to upstream #188): a
+        # premium lane STUCK on an operator-disabled account whose only clean
+        # escape is a standard-pool target should take it — vacating a disabled
+        # account is an operator mandate, stronger than pool preference. The
+        # standard re-run hits Trigger 0 again, so the move keeps the
+        # disabled-evict gate/reason and stays non-deferrable.
         if (decision is None and pool == "premium"
                 and trace.get("gate") in {"no_target", "hard_7d_cap_no_target",
                                           "hard_7d_cap_degraded", "hard_cap_pingpong",
-                                          "cap_degraded_target"}):
+                                          "cap_degraded_target",
+                                          "disabled_evict_no_target"}):
             std_trace: dict = {}
             std_cfg = _config_for_pool(config, "standard")
             std_decision = decide_swap(shim, std_cfg, usage_by_account, std_trace)
@@ -20370,11 +20434,20 @@ def disable(account: str, reason: str | None) -> None:
 
     What disabling deliberately does NOT do — it governs FUTURE rotation only:
       - it does not delete the account dir, credentials, or state;
-      - it does not move or evict a lane already mounted on the account (a
-        locked slot especially is left alone) — those keep running until they
-        exit on their own;
       - it does not stop `cus force-poll <account>` (so you can check the
         account after a relogin, before `cus enable`).
+
+    The `disable` COMMAND itself does not synchronously move a live lane — it is
+    a pure config write. But (annotation 2026-07-21, upstream #188) the DAEMON
+    now proactively EVICTS an UNLOCKED live lane off a disabled account on its
+    next `decide_swap` cycle (Trigger 0), moving it to a clean target when one
+    exists. This reverses the prior "a lane already mounted keeps running until
+    it exits" behavior, which stranded a premium lane on a disabled Fable-maxed
+    account (the slot-6/03 incident). A LOCKED slot is still left alone —
+    `decide_slot_swaps` skips locked slots before `decide_swap` runs, so a lock
+    wins over eviction (lock it if you want a disabled account's lane pinned in
+    place). Eviction also holds (does not move) if the only reachable targets
+    are themselves over-cap, rather than wall the lane on a fresh account.
 
     Backward-compatible: absent/false key ⇒ enabled, so existing configs are
     unaffected. Idempotent: disabling an already-disabled account is a friendly
@@ -20420,15 +20493,18 @@ def disable(account: str, reason: str | None) -> None:
         click.echo(f"  reason: {reason}")
     click.echo(f"  The daemon will never swap or launch ONTO '{account}' until you re-enable it.")
     click.echo(f"  Re-enable with: cus enable {account}")
-    # Live-lane warning: disable is future-rotation-only, so a lane already on
-    # the account keeps running — say so, or the operator wonders why a live
-    # session is still using a "disabled" account.
+    # Live-lane warning (updated for upstream #188 eviction): the command itself
+    # moves nothing, but the daemon's next decide_swap cycle EVICTS unlocked
+    # live lanes off this account (to a clean target when one exists; locked
+    # slots stay pinned) — say so, or the operator wonders whether/when a live
+    # session will leave the "disabled" account.
     live = _live_lanes_for_account(account)
     if live:
         click.echo(click.style(
             f"  note: '{account}' is CURRENTLY live on: {', '.join(live)}. "
-            f"These are left running (disable governs future rotation only); "
-            f"they'll release the account when they exit.", fg="yellow"))
+            f"The daemon will evict unlocked lanes to a clean account on its "
+            f"next cycle (locked slots stay pinned; if no clean target exists "
+            f"they hold until one frees).", fg="yellow"))
     # The daemon re-reads config every cycle, but a systemd-managed daemon does
     # not pick up mid-cycle file edits instantly — nudge a restart for immediacy.
     click.echo("  (running daemon picks this up next cycle; `systemctl --user restart cus.service` to apply now.)")
