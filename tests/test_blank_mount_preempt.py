@@ -710,27 +710,78 @@ def test_e_alive_probe_lets_snapshot_win_with_persisted_rotation():
         env.restore()
 
 
-def test_e_legacy_independent_login_lane_keeps_shadow_first():
-    # Committee finding: a lane with a LEGACY per-(slot,account) independent
-    # login (`has_independent_login` — the pre-pool store, distinct from the
-    # pooled leased-family branch section (d) covers) was minted for THIS slot,
-    # never copied from the shared snapshot. Freshest-wins must never silently
-    # re-family it onto the shared account family (provenance isolation), so the
-    # pre-#13 shadow-first pick is preserved: the staler shadow still beats the
-    # strictly-fresher canonical snapshot.
+def test_e_legacy_independent_login_lane_never_heals_from_snapshot():
+    # Committee finding (round-1, refined round-3): a lane with a LEGACY
+    # per-(slot,account) independent login (`has_independent_login` + gate on —
+    # the pre-pool store, distinct from the pooled leased-family branch section
+    # (d) covers) was minted for THIS slot, never copied from the shared
+    # snapshot. The shared snapshot is never a lawful heal source for it — but
+    # WITHIN the lane's own lineage (shadow vs store, the same family) the
+    # freshest wins, and an exact tie keeps the shadow. Here: tie → shadow,
+    # even though the canonical snapshot is strictly fresher than neither/both.
+    # Gate ON: the legacy branch mirrors the installer's gate predicate.
     env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
-               active="rayi", mode="per_session")
+               active="rayi",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
     try:
         slot = env.make_slot("rayi", live=True, mount_creds=_blank())
         store = cus.login_store_creds_path("rayi", slot)
         store.parent.mkdir(parents=True, exist_ok=True)
-        store.write_text(json.dumps(_valid("at-legacy", "rt-legacy-independent")))
+        store.write_text(json.dumps(
+            _valid("at-legacy", "rt-legacy-independent", expires_at=1_700_000_000_000)))
         env.shadow_path(slot).write_text(json.dumps(
             _valid("at-shadow-own-lineage", "rt-own-lineage", expires_at=1_700_000_000_000)))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-own-lineage"
-        # Fixed preference, not a comparison → no pick line.
+        # In-lineage preference, not a shadow-vs-snapshot comparison → no pick line.
         assert env.audit_lines("blank-heal-source") == []
+    finally:
+        env.restore()
+
+
+def test_e_legacy_store_fresher_than_shadow_wins():
+    # Round-3: the shadow and the legacy store are the SAME (slot,account)
+    # lineage (the store is the Phase-3a save-back target of this very mount),
+    # so the #13 stale-generation mechanism applies within the lane too — a
+    # shadow whose generation rotated away days earlier must lose to the
+    # store's fresh generation, or the heal replays the exact incident
+    # ("OAuth access token has been revoked") on legacy lanes.
+    env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_100_000_000_000)},
+               active="rayi",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        store = cus.login_store_creds_path("rayi", slot)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(
+            _valid("at-legacy-fresh", "rt-legacy-current", expires_at=2_000_000_000_000)))
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-rotted", "rt-legacy-rotated-away", expires_at=1_700_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        # The store wins in-lineage; the (even fresher) shared snapshot never competes.
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-legacy-fresh"
+    finally:
+        env.restore()
+
+
+def test_e_tokenless_canonical_never_beats_refresh_capable_shadow():
+    # Committee round-3 (Codex, Important): the refresh-capability safeguard
+    # must apply at ANY freshness, not only on an exact expiry tie — a
+    # STRICTLY-fresher canonical that lacks a refreshToken still strands the
+    # healed lane unable to refresh at access-token expiry, while the (older)
+    # shadow can refresh its way back to fresh. Shorter runway with a working
+    # refresh beats a longer runway with none.
+    snap = _valid("at-snap-tokenless-fresher", "rt-ignored", expires_at=2_000_000_000_000)
+    snap["claudeAiOauth"].pop("refreshToken")
+    env = _Env({"rayi": snap}, active="rayi", mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank())
+        env.shadow_path(slot).write_text(json.dumps(
+            _valid("at-shadow-older-capable", "rt-shadow", expires_at=1_700_000_000_000)))
+        assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
+        assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-older-capable"
     finally:
         env.restore()
 
@@ -905,7 +956,9 @@ def test_e_legacy_lane_no_shadow_heals_from_legacy_store():
     # prevent. With no usable shadow, the lane's own legacy store is the heal
     # source; the shared snapshot never is.
     env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
-               active="rayi", mode="per_session")
+               active="rayi",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
     try:
         slot = env.make_slot("rayi", live=True, mount_creds=_blank())
         store = cus.login_store_creds_path("rayi", slot)
@@ -925,7 +978,9 @@ def test_e_legacy_lane_no_shadow_no_usable_store_escalates():
     # rather than cross-familying onto the shared snapshot (mirrors the pooled
     # branch's no-cross-family rule).
     env = _Env({"rayi": _valid("at-snap-fresh", "rt-snap", expires_at=2_000_000_000_000)},
-               active="rayi", mode="per_session")
+               active="rayi",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
     try:
         slot = env.make_slot("rayi", live=True, mount_creds=_blank())
         store = cus.login_store_creds_path("rayi", slot)
