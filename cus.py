@@ -1560,14 +1560,21 @@ def mount_has_usable_credentials(mount: Path) -> bool:
         return False
 
 
-def _refresh_fingerprint(refresh_token: str) -> str:
+def _refresh_fingerprint(refresh_token: Any) -> str | None:
     """Short, non-reversible fingerprint of a refresh token for provenance.
 
     We record a fingerprint rather than the token itself so provenance.json is
     safe to read/diff/log while still letting us tell two independent login
     families apart (the whole point of #109 is that they MUST differ). Twelve
     hex chars of SHA-256 is ample to distinguish a handful of logins without
-    being a credential."""
+    being a credential. Non-str/empty input returns None — "no family to
+    fingerprint" (GH #15 round 5 finding 2): callers feed this whatever a live
+    mount file held, any process can scribble a number where the token string
+    belongs, and this primitive sits on unconditional swap paths whose daemon
+    wrappers don't catch an .encode() AttributeError — skip the mount, never
+    crash the guard."""
+    if not (isinstance(refresh_token, str) and refresh_token):
+        return None
     return "sha256:" + hashlib.sha256(refresh_token.encode()).hexdigest()[:12]
 
 
@@ -2167,7 +2174,14 @@ def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
         if not (mount_has_live_session(d) if session_aware else mount_in_use(d)):
             continue
         try:
-            rt = read_json(d / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+            # _credential_refresh_token, never a bare .get chain: a valid-JSON
+            # non-dict mount file (null/[]/"str"), a non-dict claudeAiOauth, or
+            # a non-str refreshToken must SKIP the mount, not AttributeError a
+            # primitive that now sits on unconditional swap paths — forward
+            # guard, recovery roll-forward, preview — whose daemon wrappers
+            # don't catch it (GH #15 round 5 finding 2; any process can
+            # scribble the live file).
+            rt = _credential_refresh_token(read_json(d / ".credentials.json"))
         except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             continue
         if rt:
@@ -2180,7 +2194,8 @@ def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
         shared_live = mount_in_use(CLAUDE_DIR)
     if shared_live:
         try:
-            rt = read_json(CLAUDE_DIR / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+            # Shape-safe for the same round-5 reason as the slot loop above.
+            rt = _credential_refresh_token(read_json(CLAUDE_DIR / ".credentials.json"))
         except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             rt = None
         if rt:
@@ -2270,7 +2285,10 @@ def double_booked_live_accounts(state: dict) -> list[dict]:
         if not acct or not mount_in_use(path):
             continue
         try:
-            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+            # Shape-safe extraction — same round-5 rationale as
+            # _live_mount_refresh_fingerprints (identical raw read, identical
+            # AttributeError from one malformed live file).
+            rt = _credential_refresh_token(read_json(path / ".credentials.json"))
         except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             rt = None
         by_account.setdefault(acct, []).append((name, _refresh_fingerprint(rt) if rt else None))
@@ -10058,6 +10076,7 @@ def _recover_pending_swap() -> None:
         installed_note = ""
         note_if_copied = ""
         needs_copy = False
+        copy_skipped = False   # a demoted needs_copy (round 5) — vs "never needed one"
         if live_creds is not None:
             verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
             if verdict == "foreign":
@@ -10068,6 +10087,7 @@ def _recover_pending_swap() -> None:
             note_if_copied = " (slot had no creds yet; completed the install)"
         if needs_copy and not recovery_src.exists():
             needs_copy = False
+            copy_skipped = True
             installed_note = (f" (creds copy SKIPPED: recovery source {recovery_src} is gone"
                               f"{'' if legacy_journal else ' — no snapshot substitution for a journaled source'}; "
                               f"relogin/SOS owns the mount from here)")
@@ -10083,8 +10103,9 @@ def _recover_pending_swap() -> None:
             # gate ever validated, and copying it here would blank a live mount
             # (the exact GH #141 incident, arriving via recovery). Same detector,
             # same verdict as the forward gate; a blank/unreadable source skips
-            # the copy exactly like a vanished one — journal handling and state
-            # reconciliation proceed below, relogin/SOS owns the mount.
+            # the copy exactly like a vanished one — journal handling proceeds
+            # below, slot state stays UNTOUCHED (round 5 finding 1), relogin/SOS
+            # owns the mount.
             _rec_creds: Any = None
             try:
                 _rec_creds = read_json(recovery_src)
@@ -10095,6 +10116,7 @@ def _recover_pending_swap() -> None:
                             if _live_mount_creds_invalid(_rec_creds) else None)
             if _rec_bad:
                 needs_copy = False
+                copy_skipped = True
                 _cred_audit("blank-source-refuse", "refused-recovery-roll-forward",
                             f"crash-recovery roll-forward source is {_rec_bad} — copy skipped; "
                             f"installing it would blank the live mount (GH #141)",
@@ -10152,7 +10174,24 @@ def _recover_pending_swap() -> None:
                 backup_credentials_file(live_creds_path)   # GH #79 choke point
             atomic_copy(recovery_src, live_creds_path, mode=0o600)
             installed_note = note_if_copied
-        if slot:
+        if copy_skipped:
+            # ---- GH #15 round 5 (finding 1): a SKIPPED copy leaves state alone.
+            # The mount physically still holds the OUTGOING account's tokens (or
+            # none at all) — recording account=to, and worse the journaled family
+            # LEASE, would redirect the NEXT swap-out's save-back: the
+            # leased-family path (`_lease[0] == current`) routes straight to
+            # saveback_to_login_store with no classify_live_creds_owner check, so
+            # the FOREIGN live bytes would land in `to`'s family store and poison
+            # the family. State keeps naming what the mount actually holds; the
+            # identity drift the already-merged .claude.json creates is the
+            # relogin/SOS machinery's detection surface, exactly like the
+            # collision refusal above.
+            where = f"slots.{slot}" if slot else "state.json active"
+            msg = (f"crashed swap {frm!r} -> {to!r} had merged the live identity, but its creds "
+                   f"copy was skipped; {where} left untouched — the mount never received "
+                   f"{to!r}'s tokens, so recording {to!r} would misroute the next "
+                   f"save-back{installed_note}")
+        elif slot:
             entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
             dirty = False
             if entry.get("account") != to:
@@ -10184,11 +10223,14 @@ def _recover_pending_swap() -> None:
                 })
                 save_state(state)
             where = "state.json active"
-        msg = (f"crashed swap {frm!r} -> {to!r} had completed its live mutation; "
-               f"reconciled {where} -> {to!r}{installed_note}")
+        if not copy_skipped:
+            msg = (f"crashed swap {frm!r} -> {to!r} had completed its live mutation; "
+                   f"reconciled {where} -> {to!r}{installed_note}")
         click.echo(f"swap-journal: {msg}")
         try:
-            append_inbox("crash-recovery", "crashed swap reconciled (live had moved)", msg)
+            append_inbox("crash-recovery",
+                         "crashed swap: creds copy skipped — state left untouched" if copy_skipped
+                         else "crashed swap reconciled (live had moved)", msg)
         except OSError:
             pass
         _clear_swap_journal()

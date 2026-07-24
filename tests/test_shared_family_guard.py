@@ -57,6 +57,18 @@ which recovery never re-enters; a crash in the journal-write → late-gate
 window (the save-back section is real I/O) journals an UNVALIDATED
 install_src, and pre-fix recovery installed its blank bytes onto a live mount.
 
+Committee ROUND 5 (2026-07-24): a SKIPPED roll-forward copy (vanished or
+blank source) used to fall through to the UNCONDITIONAL state/lease
+reconciliation — state recorded account=to plus the journaled family lease
+while the mount still held the OUTGOING account's tokens, so the next
+swap-out's leased-family save-back (no classify_live_creds_owner on that
+path) poisoned the family store with the foreign live bytes. The
+`*_leaves_state_untouched` assertions (blank / vanished / collision shapes)
+pin that a skipped copy leaves state.slots[slot] entirely alone (finding 1);
+`test_fingerprints_skip_malformed_mount_files` pins the shape-safe
+fingerprint primitive (finding 2 — one malformed live mount file used to
+AttributeError the unconditional guard paths).
+
 Run standalone:  python3 tests/test_shared_family_guard.py
 Run under pytest: pytest tests/test_shared_family_guard.py
 """
@@ -630,8 +642,11 @@ def test_recovery_roll_forward_collision_refuses_no_copy():
         assert cus._credential_refresh_token(
             cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha", \
             "collision must mean NO copy — the mount keeps its current creds"
-        assert cus.load_state()["slots"][mover]["account"] == "alpha", \
+        st = cus.load_state()
+        assert st["slots"][mover]["account"] == "alpha", \
             "a refused completion must not half-complete the bookkeeping"
+        assert "login_family" not in st["slots"][mover], \
+            "a refused completion must not record a family lease either (round 5)"
         assert any("op=family-collision-refuse" in e
                    and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
         assert any("[URGENT]" in e for e in env.echoes), env.echoes
@@ -646,10 +661,10 @@ def test_recovery_roll_forward_blank_source_skips_copy():
     write and the save-back's real I/O — so a crash in that window journals an
     unvalidated source; pre-fix recovery atomic_copy'd its blank bytes onto the
     live mount (the exact blanked-live-mount incident, arriving via recovery).
-    Post-fix: NO copy (the mount keeps its current creds), vanished-source
-    semantics otherwise — bookkeeping reconciles (the identity had already
-    merged), a SKIPPED note + CRED-AUDIT fire, journal cleared, relogin/SOS
-    owns the lane."""
+    Post-fix: NO copy (the mount keeps its current creds), a SKIPPED note +
+    CRED-AUDIT fire, journal cleared, relogin/SOS owns the lane — and (ROUND
+    5, finding 1) the skipped copy leaves state.slots[slot] UNTOUCHED: no
+    account flip, no family lease."""
     env = _Env()
     try:
         env.set_config({"independent_logins": {"use_independent_logins": True}})
@@ -674,12 +689,108 @@ def test_recovery_roll_forward_blank_source_skips_copy():
         assert cus._credential_refresh_token(
             cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha", \
             "a blank journaled source must mean NO copy — the mount keeps its current creds"
-        # Vanished-source semantics: state reconciles to the journal's `to`
-        # (the identity merge had already happened) with the copy skipped.
-        assert cus.load_state()["slots"][mover]["account"] == "beta"
+        # ROUND 5 (finding 1): the skipped copy must leave slot state UNTOUCHED.
+        # Pre-fix it reconciled account=beta + login_family=beta/family-1 while
+        # the mount still held alpha's tokens — and the next swap-out's
+        # leased-family save-back (`_lease[0] == current`, no
+        # classify_live_creds_owner) would have written alpha's live bytes into
+        # beta's family store, poisoning the family.
+        st = cus.load_state()
+        assert st["slots"][mover]["account"] == "alpha", \
+            "a skipped copy must not record the target account"
+        assert "login_family" not in st["slots"][mover], \
+            "a skipped copy must not record the family lease"
         assert any("op=blank-source-refuse" in e
                    and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
         assert any("SKIPPED" in e and "GH #141" in e for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_recovery_roll_forward_vanished_source_leaves_state_untouched():
+    """Committee ROUND 5, finding 1 — the vanished-source shape. Pre-fix,
+    EVERY skipped roll-forward copy still ran the unconditional state/lease
+    reconciliation: state recorded account=to plus the journaled family lease
+    while the mount physically kept the OUTGOING account's tokens. On the next
+    swap-out the leased-family save-back (`_lease[0] == current` routes to
+    saveback_to_login_store, which runs no classify_live_creds_owner) would
+    write those FOREIGN live bytes into the target's family store — poisoning
+    the family. Post-fix a skipped copy leaves state.slots[slot] untouched
+    entirely (no account flip, no lease): state keeps naming what the mount
+    holds, and the identity drift the merged .claude.json creates belongs to
+    the relogin/SOS machinery."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        # Crash simulation: journal written with an approved family source that
+        # VANISHES before recovery runs (family dir deleted in the window) +
+        # identity merged; the creds copy never happened.
+        cus._write_swap_journal("alpha", "beta", "auto-ladder", slot=mover,
+                                install_src=cus.login_family_creds_path("beta", "family-1"),
+                                used_independent=True, login_family="beta/family-1")
+        (cus.slot_path(mover) / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "beta@x"}}))
+        cus._recover_pending_swap()
+        assert not cus._swap_journal_path().exists()
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha", \
+            "a vanished journaled source must mean NO copy — no snapshot substitution"
+        st = cus.load_state()
+        assert st["slots"][mover]["account"] == "alpha", \
+            "a skipped copy must not record the target account"
+        assert "login_family" not in st["slots"][mover], \
+            "a skipped copy must not record the family lease"
+        assert any("SKIPPED" in e and "is gone" in e for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_fingerprints_skip_malformed_mount_files():
+    """Committee ROUND 5, finding 2: _live_mount_refresh_fingerprints read the
+    mount files with a bare .get chain — a valid-JSON non-dict file (null), a
+    non-dict claudeAiOauth, or a non-str refreshToken raised AttributeError
+    (or .encode() TypeError inside _refresh_fingerprint) from a primitive that
+    now sits on UNCONDITIONAL swap paths (forward guard, recovery roll-forward,
+    preview) whose daemon wrappers catch none of those — one malformed live
+    file crashed the daemon. Post-fix the shape-safe _credential_refresh_token
+    extraction SKIPS the malformed mounts, the well-shaped ones still
+    fingerprint, and the byte guard still refuses off them."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        s_null = env.make_slot("alpha", live=True)
+        (cus.slot_path(s_null) / ".credentials.json").write_text("null")
+        s_num = env.make_slot("alpha", live=True)
+        (cus.slot_path(s_num) / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at", "refreshToken": 12345,
+                               "expiresAt": 2_000_000_000_000}}))
+        s_good = env.make_slot("beta", live=True)      # well-shaped: rt-beta
+        # The shared ~/.claude pair is the OTHER raw-read site — make it
+        # malformed too for the direct call (restored below for the swap).
+        cus.CREDS_JSON.write_text("null")
+        fps = cus._live_mount_refresh_fingerprints(cus.load_state(), session_aware=True)
+        names = [m for m, _, _ in fps]
+        assert s_null not in names and s_num not in names, fps
+        assert "shared-mount" not in names, fps
+        assert names == [s_good], fps
+        # Non-str input to the fingerprint primitive is None, never a crash.
+        assert cus._refresh_fingerprint(12345) is None
+        assert cus._refresh_fingerprint(None) is None
+        assert cus._refresh_fingerprint("") is None
+        # The byte guard still works ACROSS the malformed neighbors: gamma is a
+        # renamed copy of beta, whose family is live on s_good — the collision
+        # walk traverses s_null/s_num (pre-fix: AttributeError) and refuses.
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-bare")))
+        mover = env.make_slot("alpha", live=True)
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        raised_msg = ""
+        try:
+            cus.execute_swap("gamma", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert cus._refresh_fingerprint("rt-beta") in raised_msg, raised_msg
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
     finally:
         env.restore()
 
