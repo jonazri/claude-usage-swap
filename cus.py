@@ -2149,7 +2149,7 @@ def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
             continue
         try:
             rt = read_json(d / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             continue
         if rt:
             out.append((d.name, state.get("slots", {}).get(d.name, {}).get("account"),
@@ -2162,7 +2162,7 @@ def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
     if shared_live:
         try:
             rt = read_json(CLAUDE_DIR / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             rt = None
         if rt:
             out.append(("shared-mount", state.get("active"), _refresh_fingerprint(rt)))
@@ -2220,7 +2220,7 @@ def double_booked_live_accounts(state: dict) -> list[dict]:
             continue
         try:
             rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             rt = None
         by_account.setdefault(acct, []).append((name, _refresh_fingerprint(rt) if rt else None))
     out: list[dict] = []
@@ -10327,9 +10327,334 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"{live_cj_path} missing — cannot save the outgoing account's identity back to "
             f"storage (occupied slot with no live .claude.json; run `cus doctor --fix-dirs`)")
 
-    # GH #76: write the intent journal BEFORE the first mutating step. From
-    # here to the post-save_state clear, a crash leaves the journal on disk
-    # and _recover_pending_swap reconciles on the next swap / daemon start.
+    # ---- 2026-07-24 install-source resolution + refusal guards (HOISTED
+    # pre-journal — committee round 2, finding 1) ----
+    # INVARIANT: a REFUSED swap leaves the world exactly as before the call —
+    # no swap journal on disk, no live-mount byte changed — so a refusal leaves
+    # NOTHING for _recover_pending_swap to "complete". These checks are
+    # read-only w.r.t. the live mount and the journal, so they run HERE,
+    # before _write_swap_journal and before the .claude.json identity merge
+    # further down. Pre-hoist they ran between that merge and the creds
+    # install: a refusal left the journal + the merged TARGET identity behind,
+    # the daemon logged "lane move FAILED" and carried on — and the NEXT
+    # execute_swap's unconditional _recover_pending_swap read live
+    # identity==target with foreign creds, whose roll-forward branch then
+    # atomic_copy'd the REFUSED target's creds onto the mount, guard-free, as
+    # "crash recovery": completing the exact clobber the guard had refused.
+    # (claim_verified_login_family below does maintain the login-family STORES
+    # — rotation persistence, dead-store retirement — but never touches the
+    # live mount or the journal; after a refusal the unleased family simply
+    # returns to the free pool, so there is still nothing to roll forward.)
+    #
+    # Install source. Pool model (2026-07-03): if the gate is on and the target
+    # is ALREADY live on another mount, a plain snapshot copy would clobber its
+    # shared token family (#104) — so CLAIM a free pooled family (a distinct
+    # family) instead. If the pool is exhausted (no free family AND no legacy
+    # per-slot login), REFUSE rather than clobber: raise, and _execute_slot_moves
+    # logs it as a failed move (SOS surfaces the exhaustion). When the target is
+    # NOT double-booked, fall through to swap_install_source — the shared
+    # snapshot (today's copy path) or a legacy per-slot login. Gate off ⇒ the
+    # whole claim block is skipped, so behavior is bit-for-bit unchanged.
+    claimed_family = None
+    install_src = None
+    used_independent = False
+    if (slot is not None and independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)):
+        # session_aware=True (orphan-holds-slot bug, 2026-07-10): only a slot with
+        # a LIVE claude session counts as double-booking the account here. An
+        # orphaned dev-server that inherited CLAUDE_CONFIG_DIR after its session
+        # closed refreshes no token, so it must not force a needless family claim /
+        # pool-exhaustion refuse onto an account whose family is actually free.
+        # #127: liveness-verified claim — probes each free family's refresh
+        # token, retires dead stores (the pre-PR#126 poisoning landmines), and
+        # persists the rotation into the store this install copies from.
+        claimed_family = claim_verified_login_family(target_name, state, config)
+        if claimed_family is not None:
+            install_src = login_family_creds_path(target_name, claimed_family)
+            used_independent = True
+        elif has_independent_login(target_name, slot):
+            # Legacy per-slot family (superseded; retained until P5).
+            install_src = login_store_creds_path(target_name, slot)
+            used_independent = True
+        else:
+            raise RuntimeError(
+                f"pool exhausted for '{target_name}': it is live on another mount and has no free "
+                f"independent login family to claim — refusing to install a clobbering copy. "
+                f"Provision another: `cus login-mount {target_name}`.")
+    if install_src is None:
+        install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # ---- 2026-07-07 dead-snapshot family-seed (merkos incident) ----
+    # At this point, if neither the claimed-pool-family block above nor
+    # swap_install_source picked a distinct login family, install_src is the account
+    # SNAPSHOT (target_creds) — the default copy path. That snapshot can be DEAD: its
+    # refresh token fails the OAuth refresh grant with invalid_grant even though the
+    # account is perfectly usable through a live login family. merkos was exactly this
+    # (the un-stale sweep logs `op=unstale-refresh account=merkos decision=failed
+    # reason="refresh grant dead"` while lane tabby-2 ran on merkos via a valid
+    # family). Installing the dead snapshot blanks the mount on Claude Code's first
+    # refresh — the "not logged in" that blanked chats1a when it was swapped onto
+    # merkos. The #141 blank-SHAPE guards below do NOT catch it: a dead snapshot can
+    # be well-shaped (an expired-but-present access token, a positive-but-past
+    # expiresAt) yet still be dead.
+    #
+    # So: when we're about to install the snapshot and it probes DEAD, seed the lane
+    # from a VALID login family instead — claim a FREE family (its own distinct
+    # family, #104-safe, recorded as the slot's login_family lease below, exactly the
+    # supported rescue path). claim_verified_login_family (#127) proves each family
+    # alive via the refresh grant, retires dead stores, and persists the rotation
+    # into the store this install copies from. If NO valid family can be claimed
+    # (snapshot dead AND pool empty/all-dead), REFUSE rather than blank the mount:
+    # raise (a clean no-op — live_creds_path is still untouched until the atomic_copy
+    # below), which _execute_slot_moves logs as a failed move; the picker's dead-
+    # snapshot exclusion keeps it from being re-picked and the SOS points at relogin.
+    # Scoped to the SLOT + gate-on path (claiming/leasing a family is only meaningful
+    # for a lane in the pool model); a gate-off dead snapshot still hits the #141
+    # blank guards / picker exclusion. Degrade-to-safe: refusing a swap never logs
+    # anyone out; installing a dead snapshot does.
+    if (claimed_family is None and not used_independent
+            and slot is not None and independent_logins_enabled(config)
+            and _account_snapshot_dead(target_name, config)):
+        _seed_fam = claim_verified_login_family(target_name, state, config)
+        if _seed_fam is not None:
+            claimed_family = _seed_fam
+            install_src = login_family_creds_path(target_name, _seed_fam)
+            used_independent = True
+            try:
+                _seed_fp = _audit_token_fp(read_json(install_src))
+            except (json.JSONDecodeError, OSError):
+                _seed_fp = "unreadable"
+            _cred_audit("snapshot-dead-family-fallback", "seeded-from-family",
+                        "account snapshot is DEAD (refresh invalid_grant) — seeded the lane from a "
+                        "valid login family instead of blanking the mount (merkos incident)",
+                        slot=slot, mount=slot, account=target_name,
+                        login_family=f"{target_name}/{_seed_fam}", token_fp=_seed_fp)
+            click.echo(f"creds-install: '{target_name}' snapshot is DEAD — seeded {slot} from valid "
+                       f"login family {target_name}/{_seed_fam} instead (no dead-snapshot blank)")
+        else:
+            _cred_audit("snapshot-dead-family-fallback", "refused-no-source",
+                        "account snapshot is DEAD and no valid login family could be claimed — "
+                        "refusing to install dead creds (would blank the mount)",
+                        slot=slot, mount=slot, account=target_name)
+            raise RuntimeError(
+                f"refusing to install '{target_name}' onto lane {slot}: its canonical snapshot "
+                f"credentials are DEAD (the OAuth refresh grant returns invalid_grant) and no valid "
+                f"login family remains to seed from — installing the dead snapshot would blank the mount "
+                f"and log the session out (the 2026-07-07 merkos dead-snapshot incident, which blanked "
+                f"chats1a). Re-login the account first: `cus relogin {target_name}`. Lane left on its "
+                f"prior account (no creds written).")
+    # ---- 2026-07-07 divergence-logout guard (GH #104 lane invariant) ----
+    # INVARIANT: a SLOT swap that lands on an account ALSO held by the shared
+    # ~/.claude mount or by another live lane MUST run a DISTINCT login family —
+    # a freshly CLAIMED pooled family, recorded as state.slots[slot].login_family
+    # (claimed_family is not None). Any other source (the shared account snapshot,
+    # OR a legacy per-(account, slot) store) shares ONE OAuth refresh-token family
+    # across two live mounts; each mount rotates it independently on refresh, the
+    # old refresh token dies, and the loser is logged out with
+    # `401 Invalid authentication credentials` (#104).
+    #
+    # The incident (chats1a, verified live 2026-07-07): `cus slot move slot-2
+    # merkos` printed "installed independent login for (slot-2, merkos)" via the
+    # LEGACY fallback below — `claim_verified_login_family` returned None (merkos's
+    # only pooled family was already leased to slot-1, which was ALSO on merkos),
+    # so the code fell to `has_independent_login` / `swap_install_source` and
+    # installed a per-slot store WITHOUT recording a family lease. login_family
+    # stayed None while merkos was simultaneously the shared-mount account AND on
+    # slot-1. ~5 min later the shared mount's token rotation clobbered slot-2's
+    # copy → the live session hit `401 · Please run /login` for an hour. The
+    # printed "installed independent login" line was a lie: no distinct family
+    # persisted, and the legacy store's token was not a genuinely-independent
+    # family (a stale snapshot copy).
+    #
+    # Fix: for a DOUBLE-BOOKED account, refuse to install a source whose
+    # refresh-token FAMILY already runs on another live mount of that account —
+    # option (b) from the task: fail with a clear error, leaving the lane on its
+    # PRIOR good account (nothing is written to live_creds_path until the
+    # atomic_copy further down, so raising here is a clean no-op for the mount).
+    # The check reads actual token bytes (`_live_family_would_collide`), so it
+    # REFUSES the incident's stale-copy legacy store (same family as the shared
+    # mount) while still ALLOWING a genuinely-independent legacy login (distinct
+    # family — the supported Track-B case, whose own tests must keep passing).
+    # A claimed pooled family installs a distinct family by construction, so this
+    # is a no-op on the normal rescue path; it is defense-in-depth that also
+    # catches a mis-provisioned pool family that happens to share the snapshot's
+    # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
+    # does. The login-free remedy is another pooled family (`cus login-mount`).
+    #
+    # 2026-07-10 (heal-from-family follow-up): the guard now ALSO covers the
+    # SHARED-mount install (slot is None) — previously slot-scoped. A snapshot
+    # reseeded from a live family (heal-from-family) or a `--from-existing`
+    # bootstrap carries a family that may be LIVE on a lane; installing that copy
+    # into ~/.claude while the lane runs is the same #104 double-book, just with
+    # the shared mount as the second holder. `_account_held_by_other_live_mount` /
+    # `_live_family_would_collide` both accept this_slot=None (they then compare
+    # against every live lane of the target), so the same bytes-level check
+    # applies unchanged; a non-aliased snapshot (its own family, live nowhere)
+    # still installs exactly as before.
+    #
+    # session_aware=True (orphan-holds-slot bug, 2026-07-10): an orphaned holder
+    # on another slot is not a live mount that could rotate the token out from
+    # under this one, so it must not trigger the family-collision refuse. Keeps
+    # this execute-time guard consistent with the slot-move preview, which also
+    # judges occupancy session-aware.
+    if (independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)
+            and _live_family_would_collide(target_name, install_src, slot, state, config,
+                                           session_aware=True)):
+        # The refusal that prevents the divergence-logout: this install source's
+        # token family is already live on another mount of `target_name`. shared=true
+        # is the whole reason we refuse; token_fp names the colliding family.
+        try:
+            _collide_fp = _audit_token_fp(read_json(install_src))
+        except (json.JSONDecodeError, OSError):
+            _collide_fp = "unreadable"
+        _cred_audit("family-collision-refuse", "refused-collision",
+                    "install source shares a live family on another mount (#104)",
+                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                    login_family=(claimed_family or "legacy/snapshot"),
+                    shared=True, token_fp=_collide_fp)
+        raise RuntimeError(
+            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
+            f"the credentials about to be "
+            f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
+            f"or another lane of '{target_name}'. Two live mounts on one token family log one of "
+            f"them out on the next rotation (GH #104 divergence — the 2026-07-07 chats1a logout). "
+            f"No distinct login family could be claimed (pool empty, all families leased, or the "
+            f"source is a stale snapshot copy). Provision another independent login "
+            f"(`cus login-mount {target_name}`) and retry, or move the lane to a different "
+            f"account. Lane left on its prior account (no creds written).")
+    # ---- 2026-07-24 shared-family fail-closed guard (GH #15) ----
+    # INVARIANT (gate-INDEPENDENT, unlike every guard above and below): making
+    # an account live on a SECOND mount from a source that is NOT a distinct
+    # independent login family (used_independent False ⇒ the shared snapshot
+    # copy) REFUSES, fail closed. WHY this exists on top of the #104/#109
+    # machinery above: every execute-time double-book refusal so far (the pool
+    # claim/exhaustion block and the byte-level family-collision guard) is scoped
+    # to independent_logins_enabled(config) — so with the gate OFF (the
+    # default), swap_install_source's deliberate "lazy fallback" installed the
+    # clobbering copy with NO refusal anywhere, and _slot_move_plan even
+    # previewed "refuse" while execution proceeded. The daemon's
+    # "[URGENT] <account> is live on 2 mounts without independent logins" SOS
+    # detected the result but only logged it. That warn-and-proceed gap is the
+    # 2026-07-24 sentinel outage: lane_sharing put one account live on two
+    # mounts, both refreshed the ONE OAuth refresh-token family, and
+    # re-presenting the rotated-away token tripped the auth server's REUSE
+    # DETECTION — which revoked the whole family SERVER-SIDE (strictly worse
+    # than the classic #104 single-logout: no mount survives). Degrade-to-safe:
+    # refusing leaves the lane on its prior working account; proceeding risks
+    # every session on the account. independent_logins.allow_shared_family:
+    # true is the conscious operator opt-out (old behavior; the URGENT SOS
+    # still fires). session_aware=True for the same orphan-holds-slot reason as
+    # the neighboring guards: an orphaned dev-server refreshes no token, so it
+    # must not manufacture a phantom second mount. There is deliberately NO
+    # --force path through this, mirroring the pool-exhaustion refusal above
+    # ("inventing one would defeat GH #104") — the config knob is the only door.
+    if (not used_independent
+            and not shared_family_allowed(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)):
+        try:
+            _shared_fp = _audit_token_fp(read_json(install_src))
+        except (json.JSONDecodeError, OSError):
+            _shared_fp = "unreadable"
+        _cred_audit("shared-family-refuse", "refused-shared-family",
+                    "second live mount would run a shared-family copy (#104/GH #15) — refused fail-closed",
+                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                    shared=True, token_fp=_shared_fp)
+        raise RuntimeError(
+            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
+            f"'{target_name}' is already live on another mount and this install would be a shared-family "
+            f"copy, not an independent login family. Two live mounts on one OAuth refresh-token family "
+            f"rotate it out from under each other, and re-presenting the rotated-away token trips the "
+            f"auth server's reuse detection, revoking the WHOLE family server-side (GH #15, the "
+            f"2026-07-24 sentinel outage). Provision an independent family (`cus login-mount "
+            f"{target_name}`, with independent_logins.use_independent_logins: true) and retry, or move "
+            f"to a different account. To consciously accept the old shared-copy behavior set "
+            f"independent_logins.allow_shared_family: true. Mount left on its prior account "
+            f"(no creds written).")
+
+    # ---- 2026-07-24 byte-level name-AGNOSTIC family collision guard (GH #15,
+    # committee finding 1) ----
+    # Every refusal above keys on the ACCOUNT NAME: `_account_held_by_other_live_mount`
+    # resolves state['slots'][s]['account'] LABELS, and the one byte-level check
+    # (`_live_family_would_collide`) is gate-scoped AND scoped to other mounts OF
+    # target_name. So two DIFFERENTLY-NAMED account snapshots carrying ONE OAuth
+    # refresh-token family — an account dir copied/renamed, or two logical
+    # accounts logged into the same Anthropic login — each pass under their own
+    # name, and the install double-books the family across labels: the exact
+    # reuse-detection revocation GH #15 exists to prevent, just spelled with two
+    # names. The detector half already measured this
+    # (`duplicate_live_mount_families` groups live mounts by fingerprint
+    # regardless of name) but was passive; this enforces the same primitive
+    # (`_live_mount_refresh_fingerprints`) at the one point that sees the
+    # CANDIDATE bytes actually about to be installed — install_src is fully
+    # resolved above (snapshot, claimed pool family, or legacy store), and
+    # live_creds_path is still untouched, so raising is a clean no-op for the
+    # mount. Deliberately NOT scoped to independent_logins_enabled and NOT keyed
+    # on target_name — those two scopings ARE the gap. session_aware semantics
+    # match the neighboring guards (an orphan holder refreshes no token; an idle
+    # slot can't clobber). The allow_shared_family hatch applies here exactly as
+    # documented on `shared_family_allowed` — gate-OFF only: an opted-in
+    # gate-off operator keeps the old proceed contract, made LOUD (URGENT +
+    # CRED-AUDIT), while gate-ON always refuses (the operator asked for
+    # independent families; silently sharing one would contradict the stronger
+    # setting — same rationale as the hatchless pool-exhaustion refusal above).
+    # Limits, stated honestly: fingerprints match token BYTES, so a family whose
+    # live copy already ROTATED past the candidate slips this check — that
+    # rotation-blind case is what the name-keyed guards above still catch for
+    # same-name installs. The two layers compose; neither subsumes the other.
+    try:
+        _cand_rt = _credential_refresh_token(read_json(install_src))
+    except (json.JSONDecodeError, OSError):
+        _cand_rt = None  # unreadable source: no family to collide — the #141
+                         # definitive install-point gate (at the write, below)
+                         # refuses it
+    if _cand_rt:
+        _cand_fp = _refresh_fingerprint(_cand_rt)
+        _colliders = [f"{m} ({a or '?'})"
+                      for m, a, fp in _live_mount_refresh_fingerprints(state, config,
+                                                                       session_aware=True)
+                      if fp == _cand_fp and m != (slot if slot is not None else "shared-mount")]
+        if _colliders:
+            if not independent_logins_enabled(config) and shared_family_allowed(config):
+                _cred_audit("family-collision-hatch", "urgent-proceed-shared-family",
+                            "install source's refresh-token family is LIVE on another mount "
+                            "(byte-level, name-agnostic) — proceeding only under allow_shared_family (GH #15)",
+                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                            shared=True, token_fp=_cand_fp)
+                click.echo(
+                    f"[URGENT] creds-install: '{target_name}' install source carries refresh-token family "
+                    f"{_cand_fp} ALREADY LIVE on {', '.join(_colliders)} — proceeding only because "
+                    f"independent_logins.allow_shared_family is true; a rotation on either mount can trip "
+                    f"the auth server's reuse detection and revoke the whole family (GH #15)")
+            else:
+                _cred_audit("family-collision-refuse", "refused-name-agnostic-collision",
+                            "install source's refresh-token family is LIVE on another mount "
+                            "(byte-level, name-agnostic) — refused fail-closed (GH #15)",
+                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                            shared=True, token_fp=_cand_fp)
+                raise RuntimeError(
+                    f"refusing to install '{target_name}' onto "
+                    f"{('lane ' + slot) if slot else 'the shared mount'}: the credentials about to be "
+                    f"installed carry OAuth refresh-token family {_cand_fp}, which is ALREADY LIVE on "
+                    f"{', '.join(_colliders)} — account names are only labels; the token family is the "
+                    f"identity, so a copied/renamed account dir or two logical accounts on one Anthropic "
+                    f"login double-book the family even under different names. Two live mounts on one "
+                    f"family rotate it out from under each other, and re-presenting the rotated-away "
+                    f"token trips the auth server's reuse detection, revoking the WHOLE family "
+                    f"server-side (GH #15, the 2026-07-24 sentinel outage). Provision an independent "
+                    f"family (`cus login-mount {target_name}`) or move to a different account. To "
+                    f"consciously accept shared-family risk set independent_logins.allow_shared_family: "
+                    f"true (honored only with use_independent_logins off). Mount left on its prior "
+                    f"account (no creds written).")
+
+    # GH #76: write the intent journal BEFORE the first step that mutates the
+    # live mount or account storage (the login-family store maintenance inside
+    # the hoisted claim above is the one deliberate exception — journal-free by
+    # design, see the hoist comment). From here to the post-save_state clear, a
+    # crash leaves the journal on disk and _recover_pending_swap reconciles on
+    # the next swap / daemon start.
     _write_swap_journal(current, target_name, trigger, slot=slot)
 
     # Save current identity + creds back to current's storage — skipped
@@ -10621,355 +10946,87 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
     for k, v in target_identity.items():
         live_cj[k] = v
-    write_json(live_cj_path, live_cj)
-    # GH #79: the live file's content was (normally) just saved back into the
-    # outgoing snapshot — but the clobber bug class exists precisely because
-    # the save-back sometimes goes to the wrong place or is skipped. A rotated
-    # backup of the live file itself makes the install step independently
-    # recoverable.
-    backup_credentials_file(live_creds_path)
-    # Install source. Pool model (2026-07-03): if the gate is on and the target
-    # is ALREADY live on another mount, a plain snapshot copy would clobber its
-    # shared token family (#104) — so CLAIM a free pooled family (a distinct
-    # family) instead. If the pool is exhausted (no free family AND no legacy
-    # per-slot login), REFUSE rather than clobber: raise, and _execute_slot_moves
-    # logs it as a failed move (SOS surfaces the exhaustion). When the target is
-    # NOT double-booked, fall through to swap_install_source — the shared
-    # snapshot (today's copy path) or a legacy per-slot login. Gate off ⇒ the
-    # whole claim block is skipped, so behavior is bit-for-bit unchanged.
-    claimed_family = None
-    install_src = None
-    used_independent = False
-    if (slot is not None and independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config,
-                                                  session_aware=True)):
-        # session_aware=True (orphan-holds-slot bug, 2026-07-10): only a slot with
-        # a LIVE claude session counts as double-booking the account here. An
-        # orphaned dev-server that inherited CLAUDE_CONFIG_DIR after its session
-        # closed refreshes no token, so it must not force a needless family claim /
-        # pool-exhaustion refuse onto an account whose family is actually free.
-        # #127: liveness-verified claim — probes each free family's refresh
-        # token, retires dead stores (the pre-PR#126 poisoning landmines), and
-        # persists the rotation into the store this install copies from.
-        claimed_family = claim_verified_login_family(target_name, state, config)
-        if claimed_family is not None:
-            install_src = login_family_creds_path(target_name, claimed_family)
-            used_independent = True
-        elif has_independent_login(target_name, slot):
-            # Legacy per-slot family (superseded; retained until P5).
-            install_src = login_store_creds_path(target_name, slot)
-            used_independent = True
-        else:
+    # ---- 2026-07-24 refusal-unwind backstop (committee round 2, finding 1) ----
+    # Same invariant as the hoisted guards above: a REFUSED swap leaves no
+    # journal/identity residue for crash recovery to roll forward. Every
+    # install-source refusal now raises pre-journal, but one refusal
+    # legitimately remains on this side of it — the #141 definitive
+    # install-point gate below, which must validate the bytes at THE write —
+    # and an unexpected error (OSError mid-backup, ...) can fire here too.
+    # In this window the identity merge is the ONLY live-mount byte that
+    # changes, so any raise can be unwound EXACTLY: restore the pre-merge live
+    # .claude.json bytes (or un-create the file the merge created), retire the
+    # journal, re-raise. A genuine process CRASH here still leaves the journal
+    # and rolls forward — that is GH #76's designed completion semantics for
+    # crashes; the unwind is for in-process refusals, where "refused" must
+    # mean "never happened". (BaseException, not Exception: a KeyboardInterrupt
+    # landing in this window is best-effort unwound the same way rather than
+    # left as roll-forward bait.)
+    _pre_merge_cj_bytes = live_cj_path.read_bytes() if live_cj_path.exists() else None
+    try:
+        write_json(live_cj_path, live_cj)
+        # GH #79: the live file's content was (normally) just saved back into the
+        # outgoing snapshot — but the clobber bug class exists precisely because
+        # the save-back sometimes goes to the wrong place or is skipped. A rotated
+        # backup of the live file itself makes the install step independently
+        # recoverable.
+        backup_credentials_file(live_creds_path)
+        # ---- GH #141 root-cause guard (definitive install-point gate) ----
+        # This validates the bytes at THE write that puts creds on the live
+        # mount; every swap path (snapshot copy, claimed pool family, legacy
+        # per-slot login) funnels through it. Validate the actual bytes about
+        # to be installed and REFUSE to write a blank/expired payload, so no
+        # swap can ever leave the live mount logged out (GH #141). The early
+        # guard above already covers the default snapshot path; this backstops
+        # the pool paths (independent-login families), reading the source
+        # AFTER the save-back so a GH #3 owner-heal that just refreshed it is
+        # what actually installs. `live_creds_path` is still untouched at this
+        # point — the atomic_copy below is its first and only write — and the
+        # refusal-unwind wrapper around this window restores the merged
+        # identity + retires the journal, so even this late refusal leaves the
+        # mount and the recovery state exactly as before the call.
+        try:
+            _install_src_creds = read_json(install_src)
+        except (json.JSONDecodeError, OSError) as e:
             raise RuntimeError(
-                f"pool exhausted for '{target_name}': it is live on another mount and has no free "
-                f"independent login family to claim — refusing to install a clobbering copy. "
-                f"Provision another: `cus login-mount {target_name}`.")
-    if install_src is None:
-        install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
-    # ---- 2026-07-07 dead-snapshot family-seed (merkos incident) ----
-    # At this point, if neither the claimed-pool-family block above nor
-    # swap_install_source picked a distinct login family, install_src is the account
-    # SNAPSHOT (target_creds) — the default copy path. That snapshot can be DEAD: its
-    # refresh token fails the OAuth refresh grant with invalid_grant even though the
-    # account is perfectly usable through a live login family. merkos was exactly this
-    # (the un-stale sweep logs `op=unstale-refresh account=merkos decision=failed
-    # reason="refresh grant dead"` while lane tabby-2 ran on merkos via a valid
-    # family). Installing the dead snapshot blanks the mount on Claude Code's first
-    # refresh — the "not logged in" that blanked chats1a when it was swapped onto
-    # merkos. The #141 blank-SHAPE guards below do NOT catch it: a dead snapshot can
-    # be well-shaped (an expired-but-present access token, a positive-but-past
-    # expiresAt) yet still be dead.
-    #
-    # So: when we're about to install the snapshot and it probes DEAD, seed the lane
-    # from a VALID login family instead — claim a FREE family (its own distinct
-    # family, #104-safe, recorded as the slot's login_family lease below, exactly the
-    # supported rescue path). claim_verified_login_family (#127) proves each family
-    # alive via the refresh grant, retires dead stores, and persists the rotation
-    # into the store this install copies from. If NO valid family can be claimed
-    # (snapshot dead AND pool empty/all-dead), REFUSE rather than blank the mount:
-    # raise (a clean no-op — live_creds_path is still untouched until the atomic_copy
-    # below), which _execute_slot_moves logs as a failed move; the picker's dead-
-    # snapshot exclusion keeps it from being re-picked and the SOS points at relogin.
-    # Scoped to the SLOT + gate-on path (claiming/leasing a family is only meaningful
-    # for a lane in the pool model); a gate-off dead snapshot still hits the #141
-    # blank guards / picker exclusion. Degrade-to-safe: refusing a swap never logs
-    # anyone out; installing a dead snapshot does.
-    if (claimed_family is None and not used_independent
-            and slot is not None and independent_logins_enabled(config)
-            and _account_snapshot_dead(target_name, config)):
-        _seed_fam = claim_verified_login_family(target_name, state, config)
-        if _seed_fam is not None:
-            claimed_family = _seed_fam
-            install_src = login_family_creds_path(target_name, _seed_fam)
-            used_independent = True
+                f"refusing to install '{target_name}' creds: source {install_src} is unreadable "
+                f"({e}) — writing it would blank the live mount (GH #141).")
+        if _live_mount_creds_invalid(_install_src_creds):
+            raise RuntimeError(
+                f"refusing to install '{target_name}' creds: source {install_src.name} is blank/expired "
+                f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
+                f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
+                f"backup (`cus restore-creds {target_name}`).")
+        # ---- MCP OAuth carry-over (2026-07-10) ----
+        # This wholesale install is exactly the write that used to clobber the
+        # mount's MCP-server tokens (mcpOAuth rides in the same file as
+        # claudeAiOauth). Harvest the outgoing live file's tokens into the
+        # canonical store first, then install the source WITH the canonical
+        # tokens merged in — so a swap never downgrades a mount's MCP auth, and
+        # an MCP authentication done on any mount survives onto whichever
+        # account lands here next. Both steps are best-effort: MCP carry-over
+        # must never block or fail an account swap.
+        try:
+            if live_creds_path.exists():
+                harvest_mcp_oauth(read_json(live_creds_path))
+        except (json.JSONDecodeError, OSError):
+            pass  # unreadable outgoing file: nothing to harvest
+        try:
+            _mcp_injected = inject_mcp_oauth(_install_src_creds)
+        except (json.JSONDecodeError, OSError):
+            _mcp_injected = 0
+    except BaseException:
+        if _pre_merge_cj_bytes is None:
+            # The merge CREATED the live .claude.json (empty-slot install path);
+            # a refusal un-creates it.
             try:
-                _seed_fp = _audit_token_fp(read_json(install_src))
-            except (json.JSONDecodeError, OSError):
-                _seed_fp = "unreadable"
-            _cred_audit("snapshot-dead-family-fallback", "seeded-from-family",
-                        "account snapshot is DEAD (refresh invalid_grant) — seeded the lane from a "
-                        "valid login family instead of blanking the mount (merkos incident)",
-                        slot=slot, mount=slot, account=target_name,
-                        login_family=f"{target_name}/{_seed_fam}", token_fp=_seed_fp)
-            click.echo(f"creds-install: '{target_name}' snapshot is DEAD — seeded {slot} from valid "
-                       f"login family {target_name}/{_seed_fam} instead (no dead-snapshot blank)")
+                live_cj_path.unlink()
+            except FileNotFoundError:
+                pass
         else:
-            _cred_audit("snapshot-dead-family-fallback", "refused-no-source",
-                        "account snapshot is DEAD and no valid login family could be claimed — "
-                        "refusing to install dead creds (would blank the mount)",
-                        slot=slot, mount=slot, account=target_name)
-            raise RuntimeError(
-                f"refusing to install '{target_name}' onto lane {slot}: its canonical snapshot "
-                f"credentials are DEAD (the OAuth refresh grant returns invalid_grant) and no valid "
-                f"login family remains to seed from — installing the dead snapshot would blank the mount "
-                f"and log the session out (the 2026-07-07 merkos dead-snapshot incident, which blanked "
-                f"chats1a). Re-login the account first: `cus relogin {target_name}`. Lane left on its "
-                f"prior account (no creds written).")
-    # ---- 2026-07-07 divergence-logout guard (GH #104 lane invariant) ----
-    # INVARIANT: a SLOT swap that lands on an account ALSO held by the shared
-    # ~/.claude mount or by another live lane MUST run a DISTINCT login family —
-    # a freshly CLAIMED pooled family, recorded as state.slots[slot].login_family
-    # (claimed_family is not None). Any other source (the shared account snapshot,
-    # OR a legacy per-(account, slot) store) shares ONE OAuth refresh-token family
-    # across two live mounts; each mount rotates it independently on refresh, the
-    # old refresh token dies, and the loser is logged out with
-    # `401 Invalid authentication credentials` (#104).
-    #
-    # The incident (chats1a, verified live 2026-07-07): `cus slot move slot-2
-    # merkos` printed "installed independent login for (slot-2, merkos)" via the
-    # LEGACY fallback below — `claim_verified_login_family` returned None (merkos's
-    # only pooled family was already leased to slot-1, which was ALSO on merkos),
-    # so the code fell to `has_independent_login` / `swap_install_source` and
-    # installed a per-slot store WITHOUT recording a family lease. login_family
-    # stayed None while merkos was simultaneously the shared-mount account AND on
-    # slot-1. ~5 min later the shared mount's token rotation clobbered slot-2's
-    # copy → the live session hit `401 · Please run /login` for an hour. The
-    # printed "installed independent login" line was a lie: no distinct family
-    # persisted, and the legacy store's token was not a genuinely-independent
-    # family (a stale snapshot copy).
-    #
-    # Fix: for a DOUBLE-BOOKED account, refuse to install a source whose
-    # refresh-token FAMILY already runs on another live mount of that account —
-    # option (b) from the task: fail with a clear error, leaving the lane on its
-    # PRIOR good account (nothing is written to live_creds_path until the
-    # atomic_copy further down, so raising here is a clean no-op for the mount).
-    # The check reads actual token bytes (`_live_family_would_collide`), so it
-    # REFUSES the incident's stale-copy legacy store (same family as the shared
-    # mount) while still ALLOWING a genuinely-independent legacy login (distinct
-    # family — the supported Track-B case, whose own tests must keep passing).
-    # A claimed pooled family installs a distinct family by construction, so this
-    # is a no-op on the normal rescue path; it is defense-in-depth that also
-    # catches a mis-provisioned pool family that happens to share the snapshot's
-    # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
-    # does. The login-free remedy is another pooled family (`cus login-mount`).
-    #
-    # 2026-07-10 (heal-from-family follow-up): the guard now ALSO covers the
-    # SHARED-mount install (slot is None) — previously slot-scoped. A snapshot
-    # reseeded from a live family (heal-from-family) or a `--from-existing`
-    # bootstrap carries a family that may be LIVE on a lane; installing that copy
-    # into ~/.claude while the lane runs is the same #104 double-book, just with
-    # the shared mount as the second holder. `_account_held_by_other_live_mount` /
-    # `_live_family_would_collide` both accept this_slot=None (they then compare
-    # against every live lane of the target), so the same bytes-level check
-    # applies unchanged; a non-aliased snapshot (its own family, live nowhere)
-    # still installs exactly as before.
-    #
-    # session_aware=True (orphan-holds-slot bug, 2026-07-10): an orphaned holder
-    # on another slot is not a live mount that could rotate the token out from
-    # under this one, so it must not trigger the family-collision refuse. Keeps
-    # this execute-time guard consistent with the slot-move preview, which also
-    # judges occupancy session-aware.
-    if (independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config,
-                                                  session_aware=True)
-            and _live_family_would_collide(target_name, install_src, slot, state, config,
-                                           session_aware=True)):
-        # The refusal that prevents the divergence-logout: this install source's
-        # token family is already live on another mount of `target_name`. shared=true
-        # is the whole reason we refuse; token_fp names the colliding family.
-        try:
-            _collide_fp = _audit_token_fp(read_json(install_src))
-        except (json.JSONDecodeError, OSError):
-            _collide_fp = "unreadable"
-        _cred_audit("family-collision-refuse", "refused-collision",
-                    "install source shares a live family on another mount (#104)",
-                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
-                    login_family=(claimed_family or "legacy/snapshot"),
-                    shared=True, token_fp=_collide_fp)
-        raise RuntimeError(
-            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
-            f"the credentials about to be "
-            f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
-            f"or another lane of '{target_name}'. Two live mounts on one token family log one of "
-            f"them out on the next rotation (GH #104 divergence — the 2026-07-07 chats1a logout). "
-            f"No distinct login family could be claimed (pool empty, all families leased, or the "
-            f"source is a stale snapshot copy). Provision another independent login "
-            f"(`cus login-mount {target_name}`) and retry, or move the lane to a different "
-            f"account. Lane left on its prior account (no creds written).")
-    # ---- 2026-07-24 shared-family fail-closed guard (GH #15) ----
-    # INVARIANT (gate-INDEPENDENT, unlike every guard above and below): making
-    # an account live on a SECOND mount from a source that is NOT a distinct
-    # independent login family (used_independent False ⇒ the shared snapshot
-    # copy) REFUSES, fail closed. WHY this exists on top of the #104/#109
-    # machinery above: every execute-time double-book refusal so far (the pool
-    # claim/exhaustion block and the byte-level family-collision guard) is scoped
-    # to independent_logins_enabled(config) — so with the gate OFF (the
-    # default), swap_install_source's deliberate "lazy fallback" installed the
-    # clobbering copy with NO refusal anywhere, and _slot_move_plan even
-    # previewed "refuse" while execution proceeded. The daemon's
-    # "[URGENT] <account> is live on 2 mounts without independent logins" SOS
-    # detected the result but only logged it. That warn-and-proceed gap is the
-    # 2026-07-24 sentinel outage: lane_sharing put one account live on two
-    # mounts, both refreshed the ONE OAuth refresh-token family, and
-    # re-presenting the rotated-away token tripped the auth server's REUSE
-    # DETECTION — which revoked the whole family SERVER-SIDE (strictly worse
-    # than the classic #104 single-logout: no mount survives). Degrade-to-safe:
-    # refusing leaves the lane on its prior working account; proceeding risks
-    # every session on the account. independent_logins.allow_shared_family:
-    # true is the conscious operator opt-out (old behavior; the URGENT SOS
-    # still fires). session_aware=True for the same orphan-holds-slot reason as
-    # the neighboring guards: an orphaned dev-server refreshes no token, so it
-    # must not manufacture a phantom second mount. There is deliberately NO
-    # --force path through this, mirroring the pool-exhaustion refusal above
-    # ("inventing one would defeat GH #104") — the config knob is the only door.
-    if (not used_independent
-            and not shared_family_allowed(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config,
-                                                  session_aware=True)):
-        try:
-            _shared_fp = _audit_token_fp(read_json(install_src))
-        except (json.JSONDecodeError, OSError):
-            _shared_fp = "unreadable"
-        _cred_audit("shared-family-refuse", "refused-shared-family",
-                    "second live mount would run a shared-family copy (#104/GH #15) — refused fail-closed",
-                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
-                    shared=True, token_fp=_shared_fp)
-        raise RuntimeError(
-            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
-            f"'{target_name}' is already live on another mount and this install would be a shared-family "
-            f"copy, not an independent login family. Two live mounts on one OAuth refresh-token family "
-            f"rotate it out from under each other, and re-presenting the rotated-away token trips the "
-            f"auth server's reuse detection, revoking the WHOLE family server-side (GH #15, the "
-            f"2026-07-24 sentinel outage). Provision an independent family (`cus login-mount "
-            f"{target_name}`, with independent_logins.use_independent_logins: true) and retry, or move "
-            f"to a different account. To consciously accept the old shared-copy behavior set "
-            f"independent_logins.allow_shared_family: true. Mount left on its prior account "
-            f"(no creds written).")
-
-    # ---- 2026-07-24 byte-level name-AGNOSTIC family collision guard (GH #15,
-    # committee finding 1) ----
-    # Every refusal above keys on the ACCOUNT NAME: `_account_held_by_other_live_mount`
-    # resolves state['slots'][s]['account'] LABELS, and the one byte-level check
-    # (`_live_family_would_collide`) is gate-scoped AND scoped to other mounts OF
-    # target_name. So two DIFFERENTLY-NAMED account snapshots carrying ONE OAuth
-    # refresh-token family — an account dir copied/renamed, or two logical
-    # accounts logged into the same Anthropic login — each pass under their own
-    # name, and the install double-books the family across labels: the exact
-    # reuse-detection revocation GH #15 exists to prevent, just spelled with two
-    # names. The detector half already measured this
-    # (`duplicate_live_mount_families` groups live mounts by fingerprint
-    # regardless of name) but was passive; this enforces the same primitive
-    # (`_live_mount_refresh_fingerprints`) at the one point that sees the
-    # CANDIDATE bytes actually about to be installed — install_src is fully
-    # resolved above (snapshot, claimed pool family, or legacy store), and
-    # live_creds_path is still untouched, so raising is a clean no-op for the
-    # mount. Deliberately NOT scoped to independent_logins_enabled and NOT keyed
-    # on target_name — those two scopings ARE the gap. session_aware semantics
-    # match the neighboring guards (an orphan holder refreshes no token; an idle
-    # slot can't clobber). The allow_shared_family hatch applies here exactly as
-    # documented on `shared_family_allowed` — gate-OFF only: an opted-in
-    # gate-off operator keeps the old proceed contract, made LOUD (URGENT +
-    # CRED-AUDIT), while gate-ON always refuses (the operator asked for
-    # independent families; silently sharing one would contradict the stronger
-    # setting — same rationale as the hatchless pool-exhaustion refusal above).
-    # Limits, stated honestly: fingerprints match token BYTES, so a family whose
-    # live copy already ROTATED past the candidate slips this check — that
-    # rotation-blind case is what the name-keyed guards above still catch for
-    # same-name installs. The two layers compose; neither subsumes the other.
-    try:
-        _cand_rt = _credential_refresh_token(read_json(install_src))
-    except (json.JSONDecodeError, OSError):
-        _cand_rt = None  # unreadable source: no family to collide — the #141
-                         # definitive install-point gate just below refuses it
-    if _cand_rt:
-        _cand_fp = _refresh_fingerprint(_cand_rt)
-        _colliders = [f"{m} ({a or '?'})"
-                      for m, a, fp in _live_mount_refresh_fingerprints(state, config,
-                                                                       session_aware=True)
-                      if fp == _cand_fp and m != (slot if slot is not None else "shared-mount")]
-        if _colliders:
-            if not independent_logins_enabled(config) and shared_family_allowed(config):
-                _cred_audit("family-collision-hatch", "urgent-proceed-shared-family",
-                            "install source's refresh-token family is LIVE on another mount "
-                            "(byte-level, name-agnostic) — proceeding only under allow_shared_family (GH #15)",
-                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
-                            shared=True, token_fp=_cand_fp)
-                click.echo(
-                    f"[URGENT] creds-install: '{target_name}' install source carries refresh-token family "
-                    f"{_cand_fp} ALREADY LIVE on {', '.join(_colliders)} — proceeding only because "
-                    f"independent_logins.allow_shared_family is true; a rotation on either mount can trip "
-                    f"the auth server's reuse detection and revoke the whole family (GH #15)")
-            else:
-                _cred_audit("family-collision-refuse", "refused-name-agnostic-collision",
-                            "install source's refresh-token family is LIVE on another mount "
-                            "(byte-level, name-agnostic) — refused fail-closed (GH #15)",
-                            slot=slot, mount=(slot or "shared-mount"), account=target_name,
-                            shared=True, token_fp=_cand_fp)
-                raise RuntimeError(
-                    f"refusing to install '{target_name}' onto "
-                    f"{('lane ' + slot) if slot else 'the shared mount'}: the credentials about to be "
-                    f"installed carry OAuth refresh-token family {_cand_fp}, which is ALREADY LIVE on "
-                    f"{', '.join(_colliders)} — account names are only labels; the token family is the "
-                    f"identity, so a copied/renamed account dir or two logical accounts on one Anthropic "
-                    f"login double-book the family even under different names. Two live mounts on one "
-                    f"family rotate it out from under each other, and re-presenting the rotated-away "
-                    f"token trips the auth server's reuse detection, revoking the WHOLE family "
-                    f"server-side (GH #15, the 2026-07-24 sentinel outage). Provision an independent "
-                    f"family (`cus login-mount {target_name}`) or move to a different account. To "
-                    f"consciously accept shared-family risk set independent_logins.allow_shared_family: "
-                    f"true (honored only with use_independent_logins off). Mount left on its prior "
-                    f"account (no creds written).")
-
-    # ---- GH #141 root-cause guard (definitive install-point gate) ----
-    # This is THE line that writes creds to the live mount; every swap path
-    # (snapshot copy, claimed pool family, legacy per-slot login) funnels through
-    # it. Validate the actual bytes about to be installed and REFUSE to write a
-    # blank/expired payload, so no swap can ever leave the live mount logged out
-    # (GH #141). The early guard above already covers the default snapshot path
-    # with zero partial state; this backstops the pool paths (independent-login
-    # families) whose source is resolved only here. `live_creds_path` is still
-    # untouched at this point — the atomic_copy below is its first and only write
-    # — so raising keeps the mount's current, valid creds intact.
-    try:
-        _install_src_creds = read_json(install_src)
-    except (json.JSONDecodeError, OSError) as e:
-        raise RuntimeError(
-            f"refusing to install '{target_name}' creds: source {install_src} is unreadable "
-            f"({e}) — writing it would blank the live mount (GH #141).")
-    if _live_mount_creds_invalid(_install_src_creds):
-        raise RuntimeError(
-            f"refusing to install '{target_name}' creds: source {install_src.name} is blank/expired "
-            f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
-            f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
-            f"backup (`cus restore-creds {target_name}`).")
-    # ---- MCP OAuth carry-over (2026-07-10) ----
-    # This wholesale install is exactly the write that used to clobber the
-    # mount's MCP-server tokens (mcpOAuth rides in the same file as
-    # claudeAiOauth). Harvest the outgoing live file's tokens into the
-    # canonical store first, then install the source WITH the canonical
-    # tokens merged in — so a swap never downgrades a mount's MCP auth, and
-    # an MCP authentication done on any mount survives onto whichever
-    # account lands here next. Both steps are best-effort: MCP carry-over
-    # must never block or fail an account swap.
-    try:
-        if live_creds_path.exists():
-            harvest_mcp_oauth(read_json(live_creds_path))
-    except (json.JSONDecodeError, OSError):
-        pass  # unreadable outgoing file: nothing to harvest
-    try:
-        _mcp_injected = inject_mcp_oauth(_install_src_creds)
-    except (json.JSONDecodeError, OSError):
-        _mcp_injected = 0
+            atomic_write_bytes(live_cj_path, _pre_merge_cj_bytes)
+        _clear_swap_journal()
+        raise
     if _mcp_injected:
         # Write the merged payload instead of the raw source bytes. Only the
         # mcpOAuth key differs from install_src; claudeAiOauth is byte-for-
@@ -26856,6 +26913,25 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
                    invalidates the other mount's token and logs that session out
                    (GH #104). The move is refused rather than clobber.
 
+    Byte-level overlay (2026-07-24, GH #15 committee round 2 finding 2): the
+    verdicts above are NAME-keyed, but execute_swap's name-AGNOSTIC guard
+    fingerprints the CANDIDATE BYTES against every live mount regardless of
+    account label — so a cross-name collision (a copied/renamed account dir,
+    two logical accounts on one Anthropic login) used to preview "snapshot —
+    installs cleanly" while execution refused, violating this helper's whole
+    contract. The overlay below resolves the same candidate source the execute
+    path would install (purely — no probes, no writes), fingerprints it via
+    `_live_mount_refresh_fingerprints`, and rewrites the verdict: a collision
+    previews "refuse" (naming family + colliding mounts), or — gate-off with
+    allow_shared_family, the same asymmetry as `shared_family_allowed` — stays
+    on its plan with a would-proceed-LOUDLY caution, matching execution's
+    [URGENT] hatch path. One knowable gap, stated honestly: a "claim" backed
+    by a FREE pooled family previews without the byte check (execute_swap
+    picks the family at claim time with a side-effectful liveness probe this
+    pure helper must not run); a freshly claimed family is distinct by
+    construction, so the execute-time byte guard is a defense-in-depth no-op
+    there.
+
     Returns {current, target, plan, held_by, gate, detail}. `held_by` is a
     human-readable list of the OTHER live mounts already on `target` (live slots
     plus the shared ~/.claude mount), for the operator-facing message.
@@ -26915,6 +26991,52 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
             f"would clobber the shared token family and log a session out (GH #104). "
             f"Provision another family with `cus login-mount {target}`"
             + ("" if gate else " (and enable the login pool: independent_logins.use_independent_logins)"))
+    # ---- byte-level name-AGNOSTIC overlay (GH #15, committee round 2
+    # finding 2 — see the docstring) ----
+    # Mirror execute_swap's byte-level guard on any plan that would INSTALL:
+    # resolve the same candidate the execute path would (pure), fingerprint it
+    # against every live mount whatever its account label, and rewrite the
+    # verdict so preview and execution cannot diverge on a cross-name
+    # collision. session_aware=True and the this-mount exclusion match the
+    # execute-time guard exactly.
+    if plan in ("snapshot", "claim"):
+        candidate: Path | None = None
+        if plan == "snapshot":
+            candidate, _ = swap_install_source(
+                target, slot_name, ACCOUNTS_DIR / f"account-{target}" / ".credentials.json", config)
+        elif not has_free_login_family(target, state):
+            # "claim" via the legacy per-slot login — the only claim source
+            # resolvable without execute-time side effects (a free-pool claim's
+            # family is picked by the liveness probe; distinct by construction).
+            candidate = login_store_creds_path(target, slot_name)
+        cand_rt = None
+        if candidate is not None:
+            try:
+                cand_rt = _credential_refresh_token(read_json(candidate))
+            except (json.JSONDecodeError, OSError):
+                cand_rt = None  # unreadable candidate: execute's #141 gate owns that refusal
+        if cand_rt:
+            cand_fp = _refresh_fingerprint(cand_rt)
+            colliders = [f"{m} ({a or '?'})"
+                         for m, a, fp in _live_mount_refresh_fingerprints(state, config,
+                                                                          session_aware=True)
+                         if fp == cand_fp and m != slot_name]
+            if colliders:
+                if not gate and shared_family_allowed(config):
+                    # Execution's hatch path proceeds LOUDLY — the preview must
+                    # say would-proceed, not pretend the install is clean.
+                    detail += (
+                        f" — CAUTION: the install bytes carry refresh-token family {cand_fp} ALREADY "
+                        f"LIVE on {', '.join(colliders)}; execute_swap will proceed only because "
+                        f"independent_logins.allow_shared_family is true, and LOUDLY ([URGENT] + "
+                        f"CRED-AUDIT — GH #15)")
+                else:
+                    plan, detail = "refuse", (
+                        f"the credentials that would be installed carry OAuth refresh-token family "
+                        f"{cand_fp}, ALREADY LIVE on {', '.join(colliders)} — account names are only "
+                        f"labels; the token family is the identity, so execute_swap's byte-level "
+                        f"name-agnostic guard refuses this install (GH #15). Provision an independent "
+                        f"family with `cus login-mount {target}` or pick a different account")
     return {"current": current, "target": target, "plan": plan, "held_by": held_by, "gate": gate, "detail": detail}
 
 

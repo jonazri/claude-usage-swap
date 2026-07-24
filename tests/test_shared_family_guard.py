@@ -29,6 +29,15 @@ each passed under their own name. The `test_cross_name_*` /
 closes this: candidate install bytes fingerprint-matched against EVERY other
 live mount regardless of account name, hatch honored gate-off only.
 
+Committee ROUND 2 (2026-07-24): `test_refused_swap_leaves_no_residue_*` /
+`test_late_install_gate_refusal_unwinds_*` pin the no-residue invariant — a
+REFUSED swap must leave no swap journal and no merged identity behind, else
+the next swap's _recover_pending_swap "completes" the refused install as
+crash recovery (guard-free roll-forward — the round-2 critical finding).
+`test_slot_move_preview_names_cross_name_byte_collision` pins the preview's
+byte-level overlay (finding 2); the slot=None / per_session tests close the
+coverage gaps of finding 4.
+
 Run standalone:  python3 tests/test_shared_family_guard.py
 Run under pytest: pytest tests/test_shared_family_guard.py
 """
@@ -59,6 +68,11 @@ class _Env:
         self.accounts_dir = root / "claude-accounts"
         (self.claude_dir / "projects").mkdir(parents=True)
         (self.claude_dir / ".credentials.json").write_text(json.dumps(_creds("rt-bare")))
+        # Shared-mount live .claude.json — required for a slot=None (global
+        # `cus switch`) swap: an occupied shared mount with no live .claude.json
+        # refuses before the guards under test are even reached.
+        (root / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": f"{accounts[0]}@x"}}))
         for name in accounts:
             d = self.accounts_dir / f"account-{name}"
             d.mkdir(parents=True)
@@ -71,9 +85,11 @@ class _Env:
             "swap_history": [],
         })
         self._saved = {k: getattr(cus, k) for k in
-                       ("HOME", "CLAUDE_DIR", "CREDS_JSON", "ACCOUNTS_DIR", "STATE_JSON", "CONFIG_YAML")}
+                       ("HOME", "CLAUDE_DIR", "CLAUDE_JSON", "CREDS_JSON", "ACCOUNTS_DIR",
+                        "STATE_JSON", "CONFIG_YAML")}
         cus.HOME = root
         cus.CLAUDE_DIR = self.claude_dir
+        cus.CLAUDE_JSON = root / ".claude.json"
         cus.CREDS_JSON = self.claude_dir / ".credentials.json"
         cus.ACCOUNTS_DIR = self.accounts_dir
         cus.STATE_JSON = self.accounts_dir / "state.json"
@@ -155,7 +171,7 @@ def test_gate_off_second_mount_refuses_shared_family_copy():
         except RuntimeError as e:
             raised_msg = str(e)
         assert raised_msg, "second live mount on beta's shared family must refuse, not clobber (GH #15)"
-        assert f"cus login-mount beta" in raised_msg, raised_msg
+        assert "cus login-mount beta" in raised_msg, raised_msg
         assert "allow_shared_family" in raised_msg, raised_msg
         # The refused lane held: still on alpha, live creds untouched.
         assert cus.load_state()["slots"][s2]["account"] == "alpha"
@@ -360,6 +376,179 @@ def test_candidate_matching_shared_mount_family_refuses():
         assert "shared-mount" in raised_msg, raised_msg
         assert cus._refresh_fingerprint("rt-bare") in raised_msg, raised_msg
         assert cus.load_state()["slots"][mover]["account"] == "alpha"
+    finally:
+        env.restore()
+
+
+def test_shared_mount_destination_refuses_shared_family_copy():
+    """slot=None — the SHARED ~/.claude mount as the swap DESTINATION (a global
+    `cus switch`), previously never driven by these tests (committee round 2,
+    finding 4): with beta live on a lane, switching the shared mount onto beta
+    would double-book beta's family, and slot=None has no pool to claim from —
+    the fail-closed guard must refuse and name the shared mount, leaving
+    state.active and the live creds untouched."""
+    env = _Env()
+    try:
+        env.make_slot("beta", live=True)              # beta live on a lane
+        raised_msg = ""
+        try:
+            cus.execute_swap("beta", trigger="manual")
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert raised_msg, "shared-mount destination double-book must refuse (GH #15)"
+        assert "the shared mount" in raised_msg, raised_msg
+        assert "cus login-mount beta" in raised_msg, raised_msg
+        assert cus.load_state()["active"] == "alpha"
+        assert cus._credential_refresh_token(cus.read_json(cus.CREDS_JSON)) == "rt-bare"
+        assert not cus._swap_journal_path().exists()
+    finally:
+        env.restore()
+
+
+def test_per_session_mode_second_lane_refuses_shared_family_copy():
+    """mode: per_session — the lane-only mode the sentinel actually runs,
+    previously never driven by these tests (committee round 2, finding 4). The
+    guard's occupancy read is mode-aware (the shared mount is detectable-only
+    in per_session), but a SECOND LANE on one account must refuse exactly as
+    in global mode: the holder here is a live lane, not the shared mount."""
+    env = _Env()
+    try:
+        env.set_config({"mode": "per_session"})
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        cus.execute_swap("beta", trigger="auto-ladder", slot=s1)   # first mount: legal
+        raised_msg = ""
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=s2)
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert raised_msg, "per_session second lane on one family must refuse (GH #15)"
+        assert cus.load_state()["slots"][s2]["account"] == "alpha"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(s2) / ".credentials.json")) == "rt-alpha"
+    finally:
+        env.restore()
+
+
+def test_refused_swap_leaves_no_residue_name_keyed_guard():
+    """Committee round 2, finding 1 (CRITICAL): pre-fix the GH #15 refusals
+    fired AFTER _write_swap_journal + the live .claude.json identity merge, so
+    a refusal left a journal + a merged TARGET identity behind — and the NEXT
+    execute_swap's unconditional _recover_pending_swap read live==target with
+    foreign creds and atomic_copy'd the REFUSED target's creds onto the mount
+    as 'crash recovery', completing the exact clobber that was refused.
+    Post-fix the guards run pre-journal/pre-merge: a refused swap leaves the
+    world exactly as before the call. Shape: the name-keyed refusal."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        cus.execute_swap("beta", trigger="auto-ladder", slot=s1)
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=s2)   # refused
+        except RuntimeError:
+            pass
+        # No residue: no journal, live identity still the pre-swap occupant's.
+        assert not cus._swap_journal_path().exists(), "refusal must not leave a swap journal"
+        assert cus.read_json(cus.slot_path(s2) / ".claude.json")[
+            "oauthAccount"]["emailAddress"] == "alpha@x"
+        # A direct recovery pass finds nothing to roll forward...
+        cus._recover_pending_swap()
+        assert cus.load_state()["slots"][s2]["account"] == "alpha"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(s2) / ".credentials.json")) == "rt-alpha"
+        # ...and the next real swap (unrelated, legit target) is unpoisoned —
+        # pre-fix, THIS call's recovery step installed beta's refused creds.
+        cus.execute_swap("gamma", trigger="auto-ladder", slot=s2)
+        assert cus.load_state()["slots"][s2]["account"] == "gamma"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(s2) / ".credentials.json")) == "rt-gamma"
+    finally:
+        env.restore()
+
+
+def test_refused_swap_leaves_no_residue_byte_level_guard():
+    """Same invariant, driven through the byte-level name-AGNOSTIC refusal —
+    the committee's exact trace shape (gamma = renamed copy of beta). After the
+    refusal: journal clear, pre-swap identity intact, and a direct
+    _recover_pending_swap() pass installs nothing."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        env.make_slot("beta", live=True)
+        mover = env.make_slot("alpha", live=True)
+        try:
+            cus.execute_swap("gamma", trigger="auto-ladder", slot=mover)   # refused
+        except RuntimeError:
+            pass
+        assert not cus._swap_journal_path().exists(), "byte-level refusal must not leave a swap journal"
+        assert cus.read_json(cus.slot_path(mover) / ".claude.json")[
+            "oauthAccount"]["emailAddress"] == "alpha@x"
+        cus._recover_pending_swap()
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha"
+    finally:
+        env.restore()
+
+
+def test_late_install_gate_refusal_unwinds_journal_and_identity():
+    """The one refusal that legitimately remains PAST the journal write is the
+    GH #141 definitive install-point gate (it must validate the bytes at THE
+    write). Drive it via the gate-on pool path — a claimed family whose store
+    is BLANK-shaped (claimable fail-open under an unverifiable probe, colliding
+    with nothing) — and pin the refusal-unwind backstop: journal retired,
+    pre-merge identity restored, creds untouched, recovery a no-op."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        env.make_slot("beta", live=True)              # beta held → pool-claim path
+        mover = env.make_slot("alpha", live=True)
+        d = cus.login_family_dir("beta", "family-1")
+        d.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path("beta", "family-1").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "", "refreshToken": "rt-beta-fam1",
+                               "expiresAt": 2_000_000_000_000}}))
+        raised_msg = ""
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised_msg = str(e)
+        assert "blank/expired" in raised_msg, raised_msg
+        assert not cus._swap_journal_path().exists(), "late-gate refusal must retire the journal"
+        assert cus.read_json(cus.slot_path(mover) / ".claude.json")[
+            "oauthAccount"]["emailAddress"] == "alpha@x"
+        cus._recover_pending_swap()
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-alpha"
+    finally:
+        env.restore()
+
+
+def test_slot_move_preview_names_cross_name_byte_collision():
+    """Committee round 2, finding 2: _slot_move_plan was name-keyed only — for
+    a cross-name byte collision it previewed 'snapshot — installs cleanly'
+    while execution refused, violating its own preview/reality contract.
+    Post-fix the preview runs the same fingerprint comparison: default
+    previews the refusal (naming the family + colliding mount), hatch-on
+    (gate off) previews would-proceed-with-URGENT."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        (env.accounts_dir / "account-gamma" / ".credentials.json").write_text(
+            json.dumps(_creds("rt-beta")))
+        env.make_slot("beta", live=True)
+        mover = env.make_slot("alpha", live=True)
+        plan = cus._slot_move_plan(cus.load_state(), cus.load_config(), mover, "gamma")
+        assert plan["plan"] == "refuse", plan
+        assert cus._refresh_fingerprint("rt-beta") in plan["detail"], plan
+        assert "login-mount gamma" in plan["detail"], plan
+        # Hatch on (gate off): execution proceeds LOUDLY — preview must agree.
+        env.set_config({"independent_logins": {"allow_shared_family": True}})
+        plan2 = cus._slot_move_plan(cus.load_state(), cus.load_config(), mover, "gamma")
+        assert plan2["plan"] == "snapshot", plan2
+        assert "URGENT" in plan2["detail"], plan2
     finally:
         env.restore()
 
