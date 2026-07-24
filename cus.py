@@ -11397,12 +11397,36 @@ def decide_swap(
     # escape via a standard-pool clean target this cycle.
     if current in _disabled_accounts(config):
         target = pick_swap_target(state, config)
-        if target is None or "[DEGRADED:" in (target.reason or ""):
-            msg = (f"active account {current} is DISABLED but no CLEAN swap target "
-                   f"to evict onto — holding the lane (SOS surfaces it)")
-            click.echo(f"  {msg}")
-            _note("disabled_evict_no_target", "hold", msg)
-            return None
+        _t_reason = (target.reason or "") if target is not None else ""
+        if target is None or "[DEGRADED:" in _t_reason:
+            # HOT-lane carve-out (final review 2026-07-24): Trigger 0 short-
+            # circuits the ladder/hard-cap triggers below, which deliberately
+            # ACCEPT a headroom-degraded target ("all candidates would re-trip
+            # own ladder" — "swap somewhere beats sitting on a hot active") and
+            # hold only on the cap flavor ("no targets below 7d cap"). Holding
+            # a disabled lane that is ITSELF hot (at/over its own ladder step)
+            # on ANY degraded flavor would REGRESS pre-#188 behavior — disabled
+            # never blocked swap-AWAY, so the old ladder trip moved that lane;
+            # short-circuiting into a hold would ride it to the 429 wall
+            # instead. So: HOT lane + degraded-but-not-cap-flavor target ⇒
+            # evict anyway; only no-target / cap-flavor holds it. Persisted
+            # percents, same shape as SOS 2b's lane_pct/lane_thr (this trigger
+            # runs before any fresh-poll lookup).
+            _rec = state.get("accounts", {}).get(current, {}) or {}
+            _thr0 = config.get("thresholds", {})
+            _cand0 = []
+            if _thr0.get("five_hour", True):
+                _cand0.append(_rec.get("current_5h_pct", 0))
+            if _thr0.get("seven_day", True):
+                _cand0.append(_rec.get("current_7d_pct", 0))
+            _lane_hot = (max(_cand0) if _cand0 else 0) >= _rec.get("next_swap_at_pct", 50)
+            if not (_lane_hot and target is not None
+                    and "no targets below 7d cap" not in _t_reason):
+                msg = (f"active account {current} is DISABLED but no CLEAN swap target "
+                       f"to evict onto — holding the lane (SOS surfaces it)")
+                click.echo(f"  {msg}")
+                _note("disabled_evict_no_target", "hold", msg)
+                return None
         reason = (f"active account {current} is DISABLED — evicting the live lane "
                   f"off it; target: {target.reason}")
         click.echo(f"  disabled-evict: {reason}")
@@ -12386,6 +12410,33 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 target_lane_load = base_lane_load.get(target, 0) + round_claims.get(target, 0)
                 cluster_hold = (spread_on and decision.gate == "burn_before_reset"
                                 and target_lane_load >= max_stack)
+                # Disabled-evict fan-out guard (final review 2026-07-24):
+                # Trigger 0's contract — never evict onto a degraded/over-cap
+                # landing — must hold for slot 2+ of a multi-lane disabled
+                # group too. The generic acceptance below takes ANY re-pick
+                # when the pool hatch can't (`not can_pool`), which would wall
+                # a second lane on the degraded landing the first slot's clean
+                # pick masked. A clean re-pick proceeds — as does a headroom-
+                # degraded one when the PRIMARY decision itself took one (the
+                # hot-lane carve-out; its accepted [DEGRADED: annotation rides
+                # in decision.reason). Otherwise prefer pool-double-booking the
+                # ORIGINAL clean target (distinct family, clean account —
+                # execution re-verifies the claim); else HOLD (the SOS
+                # disabled-lane probe surfaces the stuck lane).
+                if decision.gate == "disabled_evict":
+                    _hot_carveout = "[DEGRADED:" in (decision.reason or "")
+                    _retry_ok = retry is not None and (
+                        "[DEGRADED:" not in (retry.reason or "")
+                        or (_hot_carveout
+                            and "no targets below 7d cap" not in (retry.reason or "")))
+                    if not _retry_ok:
+                        if not can_pool:
+                            click.echo(f"  {slot_name}: holding on '{acct_name}' — account is "
+                                       f"DISABLED but no CLEAN distinct target for this lane "
+                                       f"(won't evict onto a degraded landing, and won't "
+                                       f"double-book '{target}' — GH #104)")
+                            continue
+                        retry = None  # fall through to pool-double-book the clean original
                 if retry is not None and (retry_healthy or not can_pool):
                     # Re-pick reasons were silently dropped pre-2026-07-03 —
                     # decisions.jsonl showed the ORIGINAL pick's stats next to
@@ -15870,10 +15921,15 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             pool = _slot_pool(state, evictable[0], config)
             tgt = pick_swap_target(shim, _config_for_pool(config, pool))
             if lane_disabled:
-                # Mirror Trigger 0's HOLD predicate exactly: ANY degraded reason
-                # holds (never evict onto a degraded target) — deliberately
-                # broader than 2b's "no targets below" check underneath.
+                # Mirror Trigger 0's HOLD predicate exactly, including its
+                # HOT-lane carve-out: ANY degraded reason holds a usage-healthy
+                # lane, but a HOT lane (at/over its own ladder step) still takes
+                # a headroom-degraded target — only the cap flavor holds it —
+                # so it is NOT stuck (the daemon moves it next cycle).
                 starved = tgt is None or "[DEGRADED:" in (tgt.reason or "")
+                if (starved and tgt is not None and lane_pct >= lane_thr
+                        and "no targets below 7d cap" not in (tgt.reason or "")):
+                    starved = False
             else:
                 starved = tgt is None or (
                     "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)

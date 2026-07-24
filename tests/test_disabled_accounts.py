@@ -15,6 +15,11 @@ Semantics pinned here:
     exists, else HOLD (never evict onto a degraded/over-cap target). Reverses
     the prior pick-side-only behavior after the slot-6/03 incident (a premium
     lane stranded+walled on a disabled Fable-maxed account).
+  - (2026-07-24 fork) HOT-lane carve-out: a disabled lane at/over its OWN
+    ladder step still takes a headroom-degraded target ("all candidates would
+    re-trip own ladder") — only the cap flavor ("no targets below 7d cap")
+    holds it. Mirrors the ladder/hard-cap triggers Trigger 0 short-circuits,
+    which accept exactly that flavor ("swap somewhere beats sitting hot").
 
 Run standalone:  python3 tests/test_disabled_accounts.py
 Or under pytest: pytest tests/test_disabled_accounts.py
@@ -136,11 +141,40 @@ def test_disabled_active_holds_when_only_target_over_cap():
     assert d is None, d
 
 
+def test_disabled_active_hot_lane_takes_headroom_degraded_target():
+    """HOT disabled lane (at/over its own ladder step) must still evict onto a
+    headroom-degraded target ('all candidates would re-trip own ladder') — only
+    the cap flavor ('no targets below 7d cap') holds it. Pre-#188 the ladder /
+    hard-cap triggers moved exactly this lane ('swap somewhere beats sitting on
+    a hot active'); Trigger 0 short-circuits them, so without the carve-out a
+    hot disabled lane would ride to the 429 wall (final review 2026-07-24)."""
+    # beta: active, disabled, HOT (95 ≥ its 80 step). alpha/gamma: under the
+    # 80% 7d cap but at/over their own steps → headroom-degraded flavor only.
+    accts = {"alpha": _a(85, 20), "beta": _a(95, 10), "gamma": _a(90, 30)}
+    state = {"active": "beta", "accounts": accts}
+    d = cus.decide_swap(state, _cfg(disabled=("beta",)), {})
+    assert d is not None, "hot disabled lane must take the headroom-degraded target"
+    assert d.gate == "disabled_evict", d.gate
+    assert d.target in ("alpha", "gamma"), d.target
+
+
+def test_disabled_active_healthy_lane_holds_on_headroom_degraded_target():
+    """A usage-HEALTHY disabled lane holds on the same headroom-degraded pool:
+    it is near no wall, so parking beats landing on a would-re-trip account
+    (Trigger 0's broad hold, unchanged for the healthy case)."""
+    accts = {"alpha": _a(85, 20), "beta": _a(10, 5), "gamma": _a(90, 30)}
+    state = {"active": "beta", "accounts": accts}
+    d = cus.decide_swap(state, _cfg(disabled=("beta",)), {})
+    assert d is None, d
+
+
 if __name__ == "__main__":
     test_disabled_account_never_picked_even_when_best()
     test_disabled_only_candidate_means_no_target()
     test_disabled_active_evicted_to_clean_target()
     test_disabled_active_holds_when_no_target()
     test_disabled_active_holds_when_only_target_over_cap()
+    test_disabled_active_hot_lane_takes_headroom_degraded_target()
+    test_disabled_active_healthy_lane_holds_on_headroom_degraded_target()
     # monkeypatch-dependent test runs under pytest only
     print("ok")

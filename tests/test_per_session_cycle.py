@@ -751,6 +751,36 @@ def test_premium_slot_on_disabled_account_escapes_via_standard_degrade():
         env.restore()
 
 
+def test_disabled_evict_fanout_second_slot_holds_without_clean_target():
+    # Final-review regression (2026-07-24): Trigger 0's "never evict onto a
+    # degraded landing" contract must survive fan-out. Two unlocked lanes on
+    # disabled alpha, ONE clean target (beta), the only remaining candidate
+    # (gamma) over the 7d cap: slot 1 takes beta; slot 2's re-pick returns
+    # cap-degraded gamma, which the generic `not can_pool` acceptance used to
+    # take — walling lane 2 on an over-cap account. It must HOLD instead.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 10.0, "current_7d_pct": 15.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 92.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage(10.0, 15.0), "beta": _usage(5.0, 10.0),
+                 "gamma": _usage(0.0, 92.0)}
+        cfg = _config(accounts=[{"name": "alpha", "priority": 1, "disabled": True},
+                                {"name": "beta", "priority": 1},
+                                {"name": "gamma", "priority": 1}])
+        moves = cus.decide_slot_swaps(state, cfg, usage)
+        assert len(moves) == 1, f"only the clean-target eviction may move: {moves}"
+        assert moves[0]["to"] == "beta" and moves[0]["gate"] == "disabled_evict", moves
+        assert moves[0]["slot"] in (s1, s2), moves
+    finally:
+        env.restore()
+
+
 def test_premium_slot_swaps_off_model_exhausted_standard_holds():
     # alpha's Fable week is at 98% (over the 97 cap) but aggregate is low.
     # A PREMIUM slot on alpha must swap off it (hard-cap force-swap); a
