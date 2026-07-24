@@ -875,6 +875,61 @@ def test_premium_lane_that_degrades_to_standard_is_not_flagged_starved():
         env.restore()
 
 
+def test_sos_stuck_lane_on_disabled_account_survives_suppression():
+    """Upstream #188 companion: a lane on an operator-DISABLED account that
+    decide_swap's Trigger 0 cannot evict (no clean target) must surface in SOS
+    even when the lane is usage-HEALTHY (below its ladder step — the ordinary
+    2b gate would skip it), and must SURVIVE the disabled-account suppression
+    pass (which drops urgent/warning conditions affected=<disabled account> —
+    hence the condition is lane-scoped). Gone when a clean target appears
+    (daemon evicts next cycle) or the slot is locked (operator pinned it)."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        # alpha: disabled, usage-healthy (below ladder), AND token-expired — the
+        # expiry makes the suppression pass actually fire for alpha (Condition 1
+        # is urgent+affected=alpha), pinning that the lane alarm outlives it.
+        state["accounts"]["alpha"].update({"next_swap_at_pct": 50, "current_5h_pct": 10.0,
+                                           "current_7d_pct": 15.0, "token_expired": True})
+        # beta: over the 80% 7d hard cap → no clean eviction target.
+        state["accounts"]["beta"].update({"next_swap_at_pct": 50, "current_5h_pct": 0.0,
+                                          "current_7d_pct": 85.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "lowest_usage",
+            "accounts": [{"name": "alpha", "priority": 1, "disabled": True},
+                         {"name": "beta", "priority": 1}]})
+
+        conds = cus.diagnose(state, cfg)
+        stuck = [c for c in conds if "STUCK on disabled account" in c.summary]
+        assert stuck, [c.summary for c in conds]
+        assert stuck[0].severity == "warning", stuck[0]
+        assert stuck[0].affected == s1, stuck[0].affected  # lane-scoped, not account
+        # The suppression pass DID fire for alpha (its own alarms are parked)...
+        assert not [c for c in conds if c.affected == "alpha"
+                    and c.severity in ("urgent", "warning")], conds
+        # ...yet the lane alarm survived it.
+
+        # Clean target appears → daemon evicts next cycle → no SOS.
+        state["accounts"]["beta"].update({"current_7d_pct": 10.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        assert not [c for c in cus.diagnose(state, cfg)
+                    if "STUCK on disabled" in c.summary]
+
+        # Locked slot → operator pinned the lane deliberately → no SOS.
+        state["accounts"]["beta"].update({"current_7d_pct": 85.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        cfg_locked = cus.deep_merge(cfg, {"session_locks": {"locked_slots": [s1]}})
+        assert not [c for c in cus.diagnose(state, cfg_locked)
+                    if "STUCK on disabled" in c.summary]
+    finally:
+        env.restore()
+
+
 def test_sos_starvation_not_mislabeled_per_model_when_aggregate_saturated():
     """REQUIRED-FIX regression (reviewer 2026-07-06): with the per-model gate ON,
     a lane starved because every target is over the 7d hard cap (aggregate

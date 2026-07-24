@@ -11384,7 +11384,9 @@ def decide_swap(
     # Guard against evicting onto a DEGRADED/over-cap target: that would just
     # wall the lane on the NEW account (the exact harm) — better to hold the
     # lane where it is until a genuinely clean account exists, and let SOS
-    # surface the stuck-on-disabled condition. The moment a clean target
+    # surface the stuck-on-disabled condition (diagnose Condition 2b's
+    # disabled-lane probe, lane-scoped so the disabled-account suppression pass
+    # can't swallow it). The moment a clean target
     # appears, this evicts. Non-deferrable: an operator-disabled account should
     # be vacated promptly, not held for prompt-cache warmth. Note: this keys on
     # the RECORDED active account, so a lane DRIFTED onto a disabled account
@@ -15804,10 +15806,29 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         # shims (formula 2). Gate-off: None → percent path, bit-for-bit.
         _cap_ctx_2b = _capacity_ctx(state, config) if _capacity_gate_on(config) else None
         _steps_2b = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS
+        locked_2b = _locked_slots(config)
+        disabled_2b = _disabled_accounts(config)
         for acct_name, slots in sorted(occupied.items()):
             acct = accounts.get(acct_name, {})
-            if not is_valid(acct):
+            # Stuck-on-DISABLED lane (upstream #188 companion, 2026-07-24): a
+            # lane whose account the operator disabled is probed for eviction
+            # REGARDLESS of usage — decide_swap's Trigger 0 wants it off at any
+            # percent, and its no-clean-target HOLD is otherwise invisible
+            # outside daemon.log (the 2b ladder gate below would skip a
+            # usage-healthy lane entirely). An invalid (token-expired, ...)
+            # disabled account still gets the probe: eviction doesn't need the
+            # account's own credentials, and its Conditions 1/3 are suppressed
+            # to INFO by the disabled-account pass further down.
+            lane_disabled = acct_name in disabled_2b
+            if not is_valid(acct) and not lane_disabled:
                 continue  # blocked accounts are already covered by Conditions 1/3
+            evictable = sorted(slots)
+            if lane_disabled:
+                # Locked slots are deliberately pinned — lock outranks eviction
+                # (decide_slot_swaps never routes them through decide_swap).
+                evictable = [s for s in evictable if s not in locked_2b]
+                if not evictable:
+                    continue
             lane_thr = acct.get("next_swap_at_pct", 50)
             cand = []
             if thr_cfg.get("five_hour", True):
@@ -15819,7 +15840,10 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             # lane over its ladder step?" is formula 3 gate-on (G4's form), using
             # the SAME sentinel-clamped next_swap_at G4 uses (≥100 → steps[-1]),
             # so a healthy big-tier lane isn't falsely reported unable to rotate.
-            if _cap_ctx_2b is not None:
+            # Skipped for a disabled lane: Trigger 0 evicts usage-independently.
+            if lane_disabled:
+                pass
+            elif _cap_ctx_2b is not None:
                 _clamped_lane_thr = _steps_2b[-1] if lane_thr >= 100 else lane_thr
                 if _remaining_units(lane_pct, acct_name, _cap_ctx_2b, config) > (100.0 - _clamped_lane_thr) / 100.0:
                     continue  # lane still has unit headroom — nothing to rotate
@@ -15843,10 +15867,16 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             if _cap_ctx_2b is not None:
                 # Target-side (formula 2): the picker ranks in reference units.
                 shim["_capacity_ctx"] = _cap_ctx_2b
-            pool = _slot_pool(state, sorted(slots)[0], config)
+            pool = _slot_pool(state, evictable[0], config)
             tgt = pick_swap_target(shim, _config_for_pool(config, pool))
-            starved = tgt is None or (
-                "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
+            if lane_disabled:
+                # Mirror Trigger 0's HOLD predicate exactly: ANY degraded reason
+                # holds (never evict onto a degraded target) — deliberately
+                # broader than 2b's "no targets below" check underneath.
+                starved = tgt is None or "[DEGRADED:" in (tgt.reason or "")
+            else:
+                starved = tgt is None or (
+                    "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
             if not starved:
                 continue
             # A premium lane that would DEGRADE to standard is NOT starved: the
@@ -15861,6 +15891,25 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 _std = pick_swap_target(shim, _config_for_pool(config, "standard"))
                 if _std is not None and "[DEGRADED:" not in _std.reason:
                     continue
+            if lane_disabled:
+                out.append(SOSCondition(
+                    severity="urgent" if lane_pct >= sat_pct else "warning",
+                    summary=(f"lane {', '.join(evictable)} STUCK on disabled account "
+                             f"'{acct_name}' — no clean eviction target"),
+                    action=(f"'{acct_name}' is operator-disabled and the daemon wants to "
+                            f"evict this lane (decide_swap Trigger 0), but every candidate "
+                            f"is saturated, degraded, or held by another live mount, so it "
+                            f"holds. Add an account (`cus add <name>`), free a live lane, or "
+                            f"wait for a window reset — or `cus enable {acct_name}` to put "
+                            f"the account back in rotation. To pin the lane on purpose, lock "
+                            f"the slot (session_locks.locked_slots)."),
+                    # Lane-scoped ON PURPOSE: the disabled-account suppression pass
+                    # below drops urgent/warning conditions whose `affected` IS the
+                    # disabled account — a trapped LIVE lane must keep screaming even
+                    # though its account's own alarms are parked.
+                    affected=", ".join(evictable),
+                ))
+                continue
             # Name the ACTUAL blocker so the remedy fits (2026-07-06). `drop` holds
             # only accounts withheld because another live mount holds them AND no
             # free pooled family exists — a genuine #104 double-book wall, which
@@ -16270,7 +16319,10 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # or nothing) are left untouched — no new noise. SYSTEM-scoped conditions
     # (affected="system"/"daemon": all-accounts-blocked, premium-headroom
     # scarcity, ...) are never account-matched here, so a REAL capacity problem
-    # that disabling this account causes still fires at full severity.
+    # that disabling this account causes still fires at full severity. Likewise
+    # Condition 2b's stuck-on-disabled LANE alarm is affected=<slot names> —
+    # deliberately out of this pass's reach: a trapped live lane must keep
+    # screaming even though its account's own alarms are parked.
     disabled = _disabled_accounts(config)
     if disabled:
         loud = {c.affected for c in out
