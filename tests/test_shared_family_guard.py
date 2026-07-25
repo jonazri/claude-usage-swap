@@ -69,6 +69,14 @@ pin that a skipped copy leaves state.slots[slot] entirely alone (finding 1);
 fingerprint primitive (finding 2 — one malformed live mount file used to
 AttributeError the unconditional guard paths).
 
+Committee ROUND 6 (2026-07-24): CLEAN (zero critical/important); two minors.
+`test_recovery_roll_forward_blank_source_shared_mount_leaves_active_untouched`
+pins the round-5 copy_skipped gate's slot=None branch — a skipped roll-forward
+copy against the SHARED ~/.claude mount leaves the state["active"]
+reconciliation untouched, not just slots[slot]. (The sibling minor made
+_live_mount_refresh_fingerprints' slots read null-tolerant — `(... or {})` —
+matching its three sibling readers.)
+
 Run standalone:  python3 tests/test_shared_family_guard.py
 Run under pytest: pytest tests/test_shared_family_guard.py
 """
@@ -742,6 +750,54 @@ def test_recovery_roll_forward_vanished_source_leaves_state_untouched():
         assert "login_family" not in st["slots"][mover], \
             "a skipped copy must not record the family lease"
         assert any("SKIPPED" in e and "is gone" in e for e in env.echoes), env.echoes
+    finally:
+        env.restore()
+
+
+def test_recovery_roll_forward_blank_source_shared_mount_leaves_active_untouched():
+    """Committee ROUND 6 (coverage): the round-5 copy_skipped gate's slot=None
+    branch — a crashed GLOBAL swap (`cus switch`; journal slot=None targets the
+    SHARED ~/.claude pair) whose blank journaled source skips the roll-forward
+    copy must leave the state["active"] reconciliation alone too: the shared
+    mount never received beta's tokens, so recording active=beta would misroute
+    the next global swap-out's save-back exactly like the slot-shaped round-5
+    cases. Post-recovery: active still names what the shared mount holds, the
+    shared creds bytes are untouched, no slot/lease residue, journal cleared."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        # The shared mount must hold a PROVABLY-FOREIGN family (alpha's) so the
+        # roll-forward genuinely needs the copy: the harness default rt-bare
+        # matches no snapshot, classifies "unknown", and would skip the copy
+        # for the wrong reason (never reaching the gate under test).
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-alpha")))
+        # Blank-shaped family store — the same round-4 crash shape: journaled
+        # before the late #141 gate ever validated it.
+        d = cus.login_family_dir("beta", "family-1")
+        d.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path("beta", "family-1").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "", "refreshToken": "rt-beta-fam1",
+                               "expiresAt": 2_000_000_000_000}}))
+        # Crash simulation: journal (slot=None = the shared mount) + the live
+        # ~/.claude.json identity merged to beta; the creds copy never happened.
+        cus._write_swap_journal("alpha", "beta", "manual",
+                                install_src=cus.login_family_creds_path("beta", "family-1"),
+                                used_independent=True, login_family="beta/family-1")
+        cus.CLAUDE_JSON.write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "beta@x"}}))
+        cus._recover_pending_swap()
+        assert not cus._swap_journal_path().exists()
+        assert cus._credential_refresh_token(cus.read_json(cus.CREDS_JSON)) == "rt-alpha", \
+            "a blank journaled source must mean NO copy onto the shared mount"
+        st = cus.load_state()
+        assert st["active"] == "alpha", \
+            "a skipped copy must not reconcile state.json active to the target"
+        assert st.get("slots", {}) == {}, \
+            "a slot=None skipped copy must not manufacture slot/lease residue"
+        assert any("op=blank-source-refuse" in e and "mount=shared-mount" in e
+                   and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
+        assert any("SKIPPED" in e and "GH #141" in e for e in env.echoes), env.echoes
+        assert any("state.json active left untouched" in e for e in env.echoes), env.echoes
     finally:
         env.restore()
 

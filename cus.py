@@ -2185,7 +2185,8 @@ def _live_mount_refresh_fingerprints(state: dict, config: dict | None = None,
         except (json.JSONDecodeError, OSError):  # FileNotFoundError ⊂ OSError
             continue
         if rt:
-            out.append((d.name, state.get("slots", {}).get(d.name, {}).get("account"),
+            out.append((d.name,
+                        (state.get("slots", {}).get(d.name, {}) or {}).get("account"),
                         _refresh_fingerprint(rt)))
     if session_aware:
         mode = (config if config is not None else load_config()).get("mode", "global")
