@@ -2117,7 +2117,9 @@ def _legacy_login_lease_verdict(account: str, slot: str, config: dict | None = N
     live independent family). Returns one of:
 
       "collision" — the store's CURRENT (pre-probe) bytes carry a refresh-token
-                    family that is LIVE on another mount of `account` (#104).
+                    family that is LIVE on another mount of `account` (#104) OR
+                    on any live mount under a DIFFERENT account label (#15 —
+                    names are labels; the token family is the identity).
                     Refused before anything else ran: no probe, no rotation,
                     grant preserved.
       "ok"        — collision-free and rot-vetted; safe to install.
@@ -2167,7 +2169,8 @@ def _legacy_login_lease_verdict(account: str, slot: str, config: dict | None = N
     except (json.JSONDecodeError, OSError):
         return "refused"  # racing rewrite since has_independent_login said usable
     store = f"{account}/{slot}(legacy)"
-    # ---- Collision check FIRST, on the pre-probe bytes (see ORDERING above) ----
+    # ---- Collision checks FIRST, on the pre-probe bytes (see ORDERING above):
+    # name-scoped #104, then name-agnostic #15 ----
     st = state if state is not None else load_state()
     if _live_family_would_collide(account, path, slot, st, cfg, session_aware=True):
         _cred_audit("legacy-login-install", "refused-collision",
@@ -2179,6 +2182,30 @@ def _legacy_login_lease_verdict(account: str, slot: str, config: dict | None = N
         click.echo(f"claim-verify: {store} carries a token family already live on another "
                    f"mount of '{account}' — refusing the legacy install before any probe "
                    f"could rotate it (#104)")
+        return "collision"
+    # Cross-NAME aliasing (#14 x #15 merge seam): the guard above is scoped to
+    # other mounts OF `account`, so a legacy store that byte-aliases a family
+    # live under a DIFFERENT account label (a copied/renamed account dir, two
+    # logical accounts on one Anthropic login — the #15 threat) sails past it.
+    # With the verify gate ON the probe below would then rotate: the alive
+    # rescue's _persist_rotated_grant burns the victim mount's current token
+    # (the grant is single-use) AND re-fingerprints the store, so
+    # _execute_swap_locked's downstream name-agnostic byte guard compares
+    # POST-rotation bytes and misses the very collision it exists to refuse.
+    # Same ORDERING rule as above, name-agnostic primitive: any cross-name
+    # collider refuses HERE, on the pre-probe bytes, with zero probes.
+    _fp, colliders = _candidate_family_colliders(path, slot, st, cfg)
+    if colliders:
+        _cred_audit("legacy-login-install", "refused-collision-cross-name",
+                    "legacy store's refresh-token family is LIVE on a mount under a DIFFERENT "
+                    "account label — refused BEFORE any rotating probe could burn the live "
+                    "holder's token and re-fingerprint the store past the name-agnostic byte "
+                    "guard (#15 collision-before-probe ordering)",
+                    account=account, login_family=store, shared=True,
+                    token_fp=_audit_token_fp(creds))
+        click.echo(f"claim-verify: {store} carries a token family already live on "
+                   f"{', '.join(colliders)} — a different account label, but names are only "
+                   f"labels; refusing the legacy install before any probe could rotate it (#15)")
         return "collision"
     # rt check BEFORE the gate branch (committee round-3): pre-fix it sat on
     # the gate-ON path only, so gate-off + fresh returned "ok" for a store no
@@ -2846,8 +2873,9 @@ def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path
     works (as a copy), it just isn't clobber-safe until `cus login-mount` runs.
 
     #14/#104 (committee round-2 finding 2): the legacy branch is GATED through
-    _legacy_login_lease_verdict — the #104 collision check against the store's
-    pre-probe bytes first, then the rot/probe ladder with pooled-claim parity.
+    _legacy_login_lease_verdict — the #104/#15 collision checks against the
+    store's pre-probe bytes first, then the rot/probe ladder with pooled-claim
+    parity.
     It used to return the store on has_independent_login alone (exists/parses/
     has-refresh), installing a possibly-rotten or colliding legacy store blind
     on the NON-double-booked path — and its used_independent=True then skipped
@@ -10991,7 +11019,8 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             # has-refresh-token, so ungated it bypassed BOTH the rot check and
             # the #127 probe that the pooled claim above enforces.
             # _legacy_login_lease_verdict runs the whole discipline in the one
-            # order that is safe: the #104 collision check FIRST, on the store's
+            # order that is safe: the #104/#15 collision checks (name-scoped
+            # AND name-agnostic) FIRST, on the store's
             # PRE-probe bytes — collision validation MUST precede any
             # credential-rotating probe, because an alive probe persists a
             # ROTATED refresh token into the store and would un-match the very
@@ -28032,11 +28061,18 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     previews without the byte check — execute_swap picks the family at claim
     time with a side-effectful liveness probe this pure helper must not run,
     so the preview cannot know which bytes will install. The execute-time
-    byte guard deliberately DOES check the claimed family's bytes, so a
+    byte guard does fingerprint the claimed family's bytes, but it catches a
     mis-provisioned pool family that aliases a live mount's family (e.g. a
-    snapshot copied into the pool) previews "claim" here yet REFUSES at
-    execute. A correctly-minted family is distinct and installs as previewed;
-    the divergence is confined to that mis-provisioned-family case.
+    snapshot copied into the pool) only on the PROBE-FREE claim paths
+    (verify_family_on_claim off, or an unknown-verdict fail-open):
+    claim_verified_login_family has NO pre-probe collision check (pre-existing
+    #127 behavior — unlike the legacy verdict, whose collision checks precede
+    its probe), so with verify ON an ALIVE aliased family is probe-rotated
+    BEFORE the guard fingerprints it — the rotated bytes no longer match the
+    victim mount's copy, the install proceeds, and the single-use grant has
+    already burned the victim's current token. A correctly-minted family is
+    distinct and installs as previewed; that residual aliased-pool-family +
+    verify-on hole is #127 territory, not closed here.
 
     Returns {current, target, plan, held_by, gate, detail}. `held_by` is a
     human-readable list of the OTHER live mounts already on `target` (live slots
