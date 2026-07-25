@@ -111,17 +111,21 @@ def test_occupied_slot_missing_claude_json_raises_not_corrupts():
     try:
         state = cus.load_state()
         name, d = cus.create_slot(state)
-        cus.execute_swap("alpha", trigger="launch", slot=name)  # current now alpha
-        # Corruption: slot's live .claude.json vanishes while state says alpha.
+        # beta, NOT alpha: alpha is state["active"], and in global mode the
+        # shared mount unconditionally counts as its live holder (#141), so the
+        # GH #15 shared-family guard would (correctly) refuse installing it
+        # onto a lane. This test is about .claude.json handling, not holding.
+        cus.execute_swap("beta", trigger="launch", slot=name)  # current now beta
+        # Corruption: slot's live .claude.json vanishes while state says beta.
         cus.mount_claude_json_path(d).unlink()
-        snap = env.accounts_dir / "account-alpha" / ".claude.json"
+        snap = env.accounts_dir / "account-beta" / ".claude.json"
         snap_before = snap.read_text()
         try:
-            cus.execute_swap("beta", trigger="threshold", slot=name)
+            cus.execute_swap("gamma", trigger="threshold", slot=name)
             raise AssertionError("expected FileNotFoundError, not a silent {} save-back")
         except FileNotFoundError:
             pass
-        assert snap.read_text() == snap_before, "alpha snapshot must NOT be clobbered with {}"
+        assert snap.read_text() == snap_before, "beta snapshot must NOT be clobbered with {}"
     finally:
         env.restore()
 
@@ -133,10 +137,12 @@ def test_empty_slot_install_preserves_existing_nonaccount_keys():
         name, d = cus.create_slot(state)
         # Slot seeded with synced non-account keys, no identity yet (current None).
         cus.write_json(cus.mount_claude_json_path(d), {"mcpServers": {"x": {}}, "numStartups": 5})
-        cus.execute_swap("alpha", trigger="launch", slot=name)
+        # beta, NOT alpha (the global-mode active — its shared mount counts as
+        # a live holder, so the GH #15 guard would refuse; see the test above).
+        cus.execute_swap("beta", trigger="launch", slot=name)
         cj = json.loads(cus.mount_claude_json_path(d).read_text())
         assert cj["mcpServers"] == {"x": {}}, "empty-slot install must keep synced keys"
-        assert cj["userID"] == "uid-alpha"
+        assert cj["userID"] == "uid-beta"
     finally:
         env.restore()
 

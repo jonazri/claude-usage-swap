@@ -836,6 +836,12 @@ def test_launch_prepare_records_pool():
     try:
         state = cus.load_state()
         cfg = _config()
+        # execute_swap reloads config from DISK; without this the on-disk view
+        # is the default (mode: global), where the shared mount unconditionally
+        # holds state["active"]=="alpha" (#141) and the GH #15 shared-family
+        # guard would refuse the alpha launch below. Align disk with the
+        # per_session mode this test already passes in memory.
+        cus.write_yaml(cus.CONFIG_YAML, {"mode": "per_session"})
         slot_name, _, acct = cus._launch_prepare("alpha", state, cfg, pool="standard")
         fresh = cus.load_state()
         assert fresh["slots"][slot_name]["pool"] == "standard"

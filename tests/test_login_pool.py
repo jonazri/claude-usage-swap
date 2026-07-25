@@ -2127,6 +2127,83 @@ def test_null_independent_logins_config_tolerated_on_both_lease_paths():
         env.restore()
 
 
+# ---------------------------------------------------------------------------
+# #14 x #15 merge-gate seam (2026-07-24): the legacy verdict's pre-probe
+# collision check must be name-AGNOSTIC too, not just #104 name-scoped.
+# ---------------------------------------------------------------------------
+
+def test_legacy_cross_name_alias_collision_refused_before_any_probe():
+    """Merge-gate finding: the verdict's collision-before-probe check used only
+    the NAME-scoped _live_family_would_collide (other mounts OF the account),
+    so a legacy store byte-aliasing a family live under a DIFFERENT account
+    label (a copied/renamed account dir — the #15 cross-name threat) passed
+    it. With verify ON the probe then fired, and an alive grant
+    _persist_rotated_grant()ed: the single-use grant burned the victim mount's
+    current token AND re-fingerprinted the store, so _execute_swap_locked's
+    downstream name-agnostic byte guard compared POST-rotation bytes and
+    missed the collision — violating the verdict's own ORDERING invariant,
+    which the merge enforced only name-scoped. Post-fix: the name-agnostic
+    _candidate_family_colliders runs pre-probe too → "collision" with ZERO
+    probe calls (any probe here raises), store and victim bytes untouched."""
+    env = _Env()
+    def _boom(rt):  # noqa: E306 — any probe call is an ordering violation
+        raise AssertionError("probe fired before cross-name collision validation (#15 ordering)")
+    cus._oauth_refresh_grant = _boom   # the next _Env() reinstates the stub
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        victim = env.make_slot("beta", live=True)   # beta's family live on a lane
+        mover = env.make_slot("alpha", live=True)   # the install destination
+        # "gamma" is a renamed/copied dir shape: held NOWHERE under its own
+        # name (every name-keyed check passes), but its legacy store carries
+        # beta's live token bytes — the cross-name alias.
+        _plant_legacy_store("gamma", mover, "rt-beta")
+        store_path = cus.login_store_creds_path("gamma", mover)
+        pre_store = store_path.read_bytes()
+        victim_creds = cus.slot_path(victim) / ".credentials.json"
+        pre_victim = victim_creds.read_bytes()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = cus._legacy_login_lease_verdict(
+                "gamma", mover, {"independent_logins": {}}, cus.load_state())
+        assert got == "collision", got
+        assert store_path.read_bytes() == pre_store, "pre-probe store bytes must be preserved"
+        assert victim_creds.read_bytes() == pre_victim, "victim mount's bytes must be untouched"
+        audit = [l for l in buf.getvalue().splitlines()
+                 if "CRED-AUDIT" in l and "op=legacy-login-install" in l
+                 and "refused-collision-cross-name" in l]
+        assert audit and "gamma" in audit[0], buf.getvalue()
+    finally:
+        env.restore()
+
+
+def test_legacy_same_name_collision_audit_unchanged():
+    """No-regression leg of the seam fix: a SAME-name collision (the chats1a
+    stale-copy shape) still refuses via the name-scoped #104 check FIRST —
+    same "refused-collision" audit decision, still zero probes — so the
+    cross-name check layered after it changes nothing for the existing
+    shape (test_legacy_collision_refused_before_any_probe pins the e2e)."""
+    env = _Env()
+    def _boom(rt):  # noqa: E306
+        raise AssertionError("probe fired before collision validation (#104/#14 ordering)")
+    cus._oauth_refresh_grant = _boom
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-alpha")))   # shared mount live on alpha
+        mover = env.make_slot("beta", live=True)
+        _plant_legacy_store("alpha", mover, "rt-alpha")   # same family, same name
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = cus._legacy_login_lease_verdict(
+                "alpha", mover, {"mode": "hybrid", "independent_logins": {}}, cus.load_state())
+        assert got == "collision", got
+        audit = [l for l in buf.getvalue().splitlines()
+                 if "CRED-AUDIT" in l and "op=legacy-login-install" in l]
+        assert audit and "refused-collision" in audit[0], buf.getvalue()
+        assert "refused-collision-cross-name" not in audit[0], audit[0]
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
