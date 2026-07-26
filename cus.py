@@ -15598,6 +15598,17 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
         pick is logged as a `op=blank-heal-source` CRED-AUDIT line naming
         winner, loser, and both expiries.
 
+    The same stale-generation signature replayed WRITER-side on slot-9
+    (2026-07-24): its shadow held a generation that had expired 3h07m earlier
+    while the account snapshot carried a live one, because an already-EXPIRED
+    mount had been enshrined as the `.lastvalid` shadow this pick consumes —
+    the session surfaced as 'API Usage Billing' (Claude Code's fallback label
+    when firstParty OAuth carries no subscription entitlement). That half is
+    fixed upstream of this pick: `_preempt_live_lane_blanks` refuses to shadow
+    an expired mount, and `_repair_stale_lane_mount` reinstalls a strictly
+    fresher still-valid source over an expired-but-shaped mount no heal path
+    owned (both route their source selection back through this function).
+
     `no_execute` (threaded from the daemon's `--no-execute` dry run) suppresses
     the dead-snapshot probe: the probe is NOT read-only — it is a network
     refresh grant, and an alive verdict PERSISTS the rotated token pair to disk
@@ -15606,7 +15617,9 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict, *,
 
     "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
     swap install-point guard and the shared-mount heal apply — so whatever this
-    returns is safe to atomic-copy into the mount without re-blanking it.
+    returns is safe to atomic-copy into the mount without re-blanking it. That bar
+    is shape-only, which is exactly why the freshness tie-break below is needed on
+    top of it: two shape-valid sources can differ by a whole rotated generation.
     """
     lease = slot_leased_family(state, slot)
     # The lease RECORD alone decides — deliberately NOT conjoined with
@@ -16441,6 +16454,83 @@ def _diagnose_live_mounts_creds_health(state: dict, config: dict) -> list[SOSCon
 # tabby-5/slot-7 (rayi6) sat "not logged in" until a human noticed.
 
 
+def _repair_stale_lane_mount(slot: str, account: str, mount: Path, creds: Any,
+                             mount_exp: int | float, now_ms: int,
+                             state: dict, config: dict) -> bool:
+    """Reinstall a STRICTLY FRESHER, still-valid credential over a live lane mount
+    whose access token has ALREADY expired (2026-07-24 slot-9 incident). Returns
+    whether the mount was rewritten.
+
+    THE GAP THIS CLOSES: an expired-but-well-SHAPED mount was owned by nobody.
+    `_blanked_live_lanes` (and so the reactive `_auto_heal_live_lanes`) tests only
+    the blank SHAPE via `_live_mount_creds_invalid`, which passes any `expiresAt > 0`
+    — including one long in the past. The pre-refresh gate in
+    `_preempt_live_lane_blanks` likewise skips `minutes_left <= 0`, deferring to "the
+    warn/heal path" that never actually heals it. So the lane just WARNED, cycle after
+    cycle, while its session sat logged out — which Claude Code renders as
+    'API Usage Billing' (its fallback label when firstParty OAuth carries no
+    subscription entitlement), not as 'not logged in'.
+
+    Source selection is `_lane_heal_source`, so this inherits the #104 login-family
+    discipline verbatim: a pooled lane repairs only from its OWN leased family, and a
+    plain lane from the fresher of its last-valid shadow / the account snapshot.
+
+    Deliberately conservative — it acts only when the source is BOTH strictly fresher
+    than what the mount holds AND not itself already expired:
+      * strictly fresher, because equal expiry is the same generation (copying it
+        changes nothing but the mtime, which would suppress the warn scan's
+        `recently_refreshed` check and hide a real problem);
+      * not itself expired, because installing a second dead generation cannot log
+        the session back in — a lane with nothing live left is a genuine relogin
+        case and must keep falling through to the SOS.
+    No network: this is a local file copy, so unlike the pre-refresh it needs no
+    poll-burnout cooldown. It converges — after the copy the mount holds the fresher
+    expiry, so the `minutes_left <= 0` branch stops selecting it."""
+    source = _lane_heal_source(slot, account, state, config)
+    if source is None:
+        return False
+    try:
+        src_creds = read_json(source)
+    except (json.JSONDecodeError, OSError):
+        return False
+    # Re-apply the shape bar at the install point (mirrors _auto_heal_live_lanes):
+    # a source that went bad between pick and copy must not re-blank the mount.
+    if _live_mount_creds_invalid(src_creds):
+        return False
+    src_exp = _creds_expires_at(src_creds)
+    if src_exp is None or src_exp <= mount_exp or src_exp <= now_ms:
+        return False
+    backup_credentials_file(mount)
+    atomic_copy(source, mount, mode=0o600)
+    try:
+        fresh = read_json(mount)
+    except (json.JSONDecodeError, OSError):
+        fresh = None
+    _cred_audit(
+        "stale-repair", "wrote",
+        f"reinstalled a fresher still-valid credential over an EXPIRED lane mount from {source.name}",
+        slot=slot, account=account, token_fp=_audit_token_fp(fresh),
+        extra=(f"source={source} prev_token_fp={_audit_token_fp(creds)} "
+               f"prev_expiry={_expiry_repr(creds)} restored_expiry={_expiry_repr(fresh)}"))
+    # A repair is heal-shaped, so record it for the Fix 2 heal→blank→heal detector —
+    # a repair→blank→repair loop must be just as visible as a heal one.
+    _record_lane_heal(slot, account)
+    _update_lane_lastvalid(mount, fresh)
+    msg = (f"live lane {slot} ({account}) mount access token had already EXPIRED "
+           f"({_expiry_repr(creds)}) while a fresher valid credential existed — reinstalled it "
+           f"from {source} ({_expiry_repr(fresh)}). Nothing owned this state before "
+           f"2026-07-24 (slot-9): the reactive heal only fires on a blank SHAPE and the "
+           f"pre-refresh gate skips an expired token, so the lane only warned while its "
+           f"session sat logged out on 'API Usage Billing'.")
+    click.echo(f"  STALE-REPAIR: {msg}")
+    try:
+        append_inbox("stale-repair",
+                     f"expired live lane {slot} mount repaired from a fresher credential", msg)
+    except OSError:
+        pass  # inbox is best-effort observability; never fail the repair over it
+    return True
+
+
 def _preempt_live_lane_blanks(state: dict, config: dict, no_execute: bool = False) -> list[str]:
     """Proactively refresh live lane mounts that are near-expiry-AND-idle, BEFORE
     Claude Code's failure-prone in-place refresh can blank them (Fix 1).
@@ -16496,18 +16586,37 @@ def _preempt_live_lane_blanks(state: dict, config: dict, no_execute: bool = Fals
             # — the whole point of preempt is to act while the mount is still valid.
             if _live_mount_creds_invalid(creds):
                 continue
-            # Fix 3: the mount is valid → refresh its last-known-good shadow. Doing
-            # it here (every cycle, on every live valid lane) keeps the shadow
-            # current for instant heal + blank-vs-lastvalid forensic diffing.
-            _update_lane_lastvalid(mount, creds)
-            # Near-expiry gate. Skip the healthy (plenty of runway) and the already
-            # -stale (minutes_left<=0 — that's the warn/heal path, not a token we
-            # can safely pre-refresh: a stale mount may already be mid-fail).
             exp = _creds_expires_at(creds)
             if exp is None:
                 continue
             minutes_left = (exp - now_ms) / 60_000.0
-            if minutes_left <= 0 or minutes_left > window:
+            # Fix 3: the mount is valid → refresh its last-known-good shadow. Doing
+            # it here (every cycle, on every live valid lane) keeps the shadow
+            # current for instant heal + blank-vs-lastvalid forensic diffing.
+            # NOT for an already-EXPIRED mount (2026-07-24 slot-9): the shadow is
+            # consumed as a heal SOURCE, and the `_live_mount_creds_invalid` bar here
+            # is shape-only, so enshrining a dead-but-shaped token as "last known
+            # GOOD" is precisely what poisoned slot-9's shadow — which
+            # `_lane_heal_source` then preferred over a fresher snapshot and
+            # installed, feeding the heal→blank→heal loop this layer exists to break.
+            if minutes_left > 0:
+                _update_lane_lastvalid(mount, creds)
+            # Already EXPIRED. This used to `continue` as "the warn/heal path's job",
+            # but no path owned it: the reactive heal fires only on a blank SHAPE, so
+            # the lane warned forever while its session sat logged out. Repair it from
+            # a strictly fresher, still-valid source when one exists; a lane with
+            # nothing live left is a genuine relogin case and still falls through to
+            # the warning + SOS.
+            if minutes_left <= 0:
+                if no_execute:
+                    click.echo(f"  stale-repair (--no-execute): WOULD reinstall a fresher valid "
+                               f"credential over live lane {slot} ({account}) whose mount token "
+                               f"already expired ({_expiry_repr(creds)})")
+                else:
+                    _repair_stale_lane_mount(slot, account, mount, creds, exp, now_ms, state, config)
+                continue
+            # Near-expiry gate: skip the healthy (plenty of runway).
+            if minutes_left > window:
                 continue
             # Self-maintaining? A mount rewritten within recent_min is actively
             # rotating its own token — leave it alone (matches the warn scan's
