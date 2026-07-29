@@ -27730,7 +27730,19 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
 
     # --probe takes an ACCOUNT or nothing (every pool) — never a slot, since
     # families are account-keyed. Checked before the slot/account arity rules.
+    #
+    # A slot-shaped positional must REFUSE, not fall through: the swap above only
+    # promotes a non-slot name to ACCOUNT, so `login-mount slot-3 --probe` would
+    # otherwise arrive here as account=None — indistinguishable from "no argument"
+    # and therefore probing EVERY pool. That silently rotates every family's
+    # single-use token and retires the dead ones, which is far too broad to infer
+    # from a mistyped argument (PR #22 review).
     if probe_flag:
+        if slot is not None:
+            raise click.UsageError(
+                "--probe is account-keyed — login families belong to accounts, not slots. "
+                f"Use `cus login-mount <account> --probe` (got slot '{slot}'), or pass no "
+                "positional argument to probe every pool.")
         _login_mount_probe(account, config)
         return
 

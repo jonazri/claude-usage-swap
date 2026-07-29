@@ -2403,6 +2403,30 @@ def test_login_mount_probe_skips_leased_families():
         env.restore()
 
 
+def test_login_mount_probe_refuses_a_slot_positional():
+    """`cus login-mount slot-3 --probe` must not silently probe EVERY pool.
+
+    The positional-swap that turns a lone non-slot argument into ACCOUNT is
+    skipped for slot-shaped names, so `slot` stays set and `account` stays None —
+    which reached the probe as "no account given", i.e. probe everything. On a
+    command that rotates every family's single-use token and retires the dead
+    ones, guessing that broadly from a mistyped argument is the wrong default
+    (Copilot review, PR #22). Families are account-keyed; a slot positional is
+    meaningless here and is refused rather than reinterpreted."""
+    env = _Env()
+    probe = _Probe({"rt-a1": ("alive", {"access_token": "at", "refresh_token": "rt-a1-rot",
+                                        "expires_in": 28800})})
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        r = CliRunner().invoke(cus.cli, ["login-mount", "slot-3", "--probe"])
+        assert r.exit_code != 0, r.output
+        assert probe.calls == [], f"probed despite the bad invocation: {probe.calls}"
+        assert "account" in r.output.lower(), r.output
+    finally:
+        probe.restore()
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
