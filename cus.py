@@ -9960,8 +9960,12 @@ def _identity_fields(cj: Any) -> dict:
     accountUuid `b9c92e39…` + email `rayi3@trisso.com` but differed on `userID`
     `93e1fc34…` vs `5d3df3e8…`). Comparing it made `_identities_match` FALSE-
     reject a correct same-account login (the independent-login-pool onboarding
-    error). The authoritative account identity is `oauthAccount.accountUuid`
-    (globally unique per account) plus `emailAddress`.
+    error). The authoritative identity lives in `oauthAccount`, not at top level.
+
+    Terminology, made precise 2026-07-28: `accountUuid` is globally unique per
+    LOGIN IDENTITY (the person) — it is NOT unique per quota-bearing account, as
+    an earlier revision of this docstring claimed. The account an API call is
+    billed and rate-limited against is the (accountUuid, organizationUuid) pair.
 
     Addition 2026-07-28: `organizationUuid` JOINS the facets. accountUuid+email
     alone are NOT sufficient to name an account, because Anthropic's login has an
