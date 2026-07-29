@@ -22,6 +22,7 @@ import json
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -2265,6 +2266,140 @@ def test_legacy_same_name_collision_audit_unchanged():
         assert audit and "refused-collision" in audit[0], buf.getvalue()
         assert "refused-collision-cross-name" not in audit[0], audit[0]
     finally:
+        env.restore()
+
+
+# --- Provenance lifecycle + operator probe (2026-07-28) ---------------------
+
+def test_persist_rotated_grant_stamps_last_rotated_ts():
+    """A successful refresh grant mints a BRAND-NEW refresh token, but provenance
+    only ever recorded `minted_ts` (set once, at /login). Dating a just-rotated
+    token by its original mint makes the assumed-TTL clock run against a token
+    that no longer exists, so SOS eventually demands a browser re-login for a
+    family it rotated minutes earlier."""
+    env = _Env()
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        cus.write_json(cus.login_family_provenance_path("alpha", "family-1"),
+                       {"account": "alpha", "family_id": "family-1",
+                        "minted_ts": "2026-06-01T00:00:00Z", "refresh_fp": "sha256:old"})
+        path = cus.login_family_creds_path("alpha", "family-1")
+        cus._persist_rotated_grant(path, cus.read_json(path), "rt-a1",
+                                   {"access_token": "at-new", "refresh_token": "rt-a1-rotated",
+                                    "expires_in": 28800})
+        prov = cus.read_json(cus.login_family_provenance_path("alpha", "family-1"))
+        assert prov.get("last_rotated_ts"), prov
+        assert prov["minted_ts"] == "2026-06-01T00:00:00Z", "minted_ts is history — never rewritten"
+        assert prov["refresh_fp"] == cus._refresh_fingerprint("rt-a1-rotated"), prov
+    finally:
+        env.restore()
+
+
+def test_login_age_days_prefers_last_rotated_ts():
+    """Refresh-token age is measured from the newest token on disk, not the
+    original login."""
+    env = _Env()
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        recent = datetime.fromtimestamp(time.time() - 3600, timezone.utc).isoformat().replace("+00:00", "Z")
+        cus.write_json(cus.login_family_provenance_path("alpha", "family-1"),
+                       {"account": "alpha", "family_id": "family-1",
+                        "minted_ts": "2026-01-01T00:00:00Z", "last_rotated_ts": recent})
+        age = cus.login_age_days("alpha", "family-1")
+        assert age is not None and age < 1.0, age
+    finally:
+        env.restore()
+
+
+def test_login_age_days_falls_back_to_minted_ts():
+    """Legacy provenance with no `last_rotated_ts` still ages off `minted_ts`."""
+    env = _Env()
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        old = datetime.fromtimestamp(time.time() - 10 * 86400, timezone.utc).isoformat().replace("+00:00", "Z")
+        cus.write_json(cus.login_family_provenance_path("alpha", "family-1"),
+                       {"account": "alpha", "family_id": "family-1", "minted_ts": old})
+        age = cus.login_age_days("alpha", "family-1")
+        assert age is not None and 9.5 < age < 10.5, age
+    finally:
+        env.restore()
+
+
+def test_login_mount_finish_targets_the_family_you_logged_into():
+    """`--finish` resolved latest_family_id() — the highest-numbered DIRECTORY,
+    including an empty scaffold. Provisioning again before finishing therefore
+    pointed --finish at the empty dir and errored, leaving the family you
+    actually logged into permanently without provenance (observed live
+    2026-07-28: yaz-tefillinconnection-org-max/family-8)."""
+    env = _Env()
+    try:
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])          # scaffolds family-1
+        env.plant_family("alpha", "family-1", "rt-a-fam1")             # the real /login
+        (cus.login_family_dir("alpha", "family-1") / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "alpha@x"}}))
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])          # scaffolds EMPTY family-2
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish"])
+        assert r.exit_code == 0, r.output
+        assert "family-1" in r.output, r.output
+        assert cus.login_family_provenance_path("alpha", "family-1").exists(), \
+            "the family that was actually logged into must get provenance"
+    finally:
+        env.restore()
+
+
+def test_login_mount_finish_instructions_use_the_cus_shim():
+    """The printed follow-up command referenced python3 ~/repos/claude-usage-swap/
+    — a path that only exists if you cloned to exactly that location."""
+    env = _Env()
+    try:
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha"])
+        assert r.exit_code == 0, r.output
+        assert "~/repos/claude-usage-swap" not in r.output, r.output
+        assert "cus login-mount alpha --finish" in r.output, r.output
+    finally:
+        env.restore()
+
+
+def test_login_mount_probe_revives_alive_and_retires_dead():
+    """`--probe` is the operator-facing form of the claim-time liveness check:
+    prove each family's refresh token, persist the rotation on alive, retire the
+    store on invalid_grant. Without it the only way to learn whether a STALE pool
+    is idle-but-healthy or genuinely dead is to trigger real swaps."""
+    env = _Env()
+    probe = _Probe({"rt-a1": ("alive", {"access_token": "at-new", "refresh_token": "rt-a1-rot",
+                                        "expires_in": 28800}),
+                    "rt-a2": ("dead", None)})
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        env.plant_family("alpha", "family-2", "rt-a2")
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--probe"])
+        assert r.exit_code == 0, r.output
+        assert "alive" in r.output.lower() and "dead" in r.output.lower(), r.output
+        # Alive family: rotation persisted (else we'd install an already-spent token).
+        rt = cus._credential_refresh_token(cus.read_json(cus.login_family_creds_path("alpha", "family-1")))
+        assert rt == "rt-a1-rot", rt
+        # Dead family: retired out of the pool, exactly as the claim path does.
+        assert "family-2" not in cus.list_login_families("alpha"), cus.list_login_families("alpha")
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_login_mount_probe_skips_leased_families():
+    """A family leased by a LIVE slot must never be probed: the live mount holds a
+    copy, so the store's refresh token is an already-rotated dead branch. Probing
+    it would report a false DEAD and retire a perfectly good family (#104)."""
+    env = _Env()
+    probe = _Probe({"rt-a1": ("dead", None)})
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        env.make_slot("alpha", live=True, family_id="family-1")
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--probe"])
+        assert r.exit_code == 0, r.output
+        assert probe.calls == [], f"leased family was probed: {probe.calls}"
+        assert "family-1" in cus.list_login_families("alpha"), "leased family must not be retired"
+    finally:
+        probe.restore()
         env.restore()
 
 

@@ -1837,7 +1837,53 @@ def _persist_rotated_grant(path: Path, creds: dict, rt: str, tok: dict) -> dict:
     creds["claudeAiOauth"] = oauth
     backup_credentials_file(path)
     atomic_write_bytes(path, json.dumps(creds, indent=2).encode(), mode=0o600)
+    _stamp_rotation_provenance(path, oauth.get("refreshToken"))
     return creds
+
+
+def _stamp_rotation_provenance(creds_path: Path, new_rt: Any) -> None:
+    """Record a completed rotation in the login store's provenance sidecar.
+
+    WHY (2026-07-28): provenance carried only `minted_ts`, written once by
+    `login-mount --finish`. But every successful refresh grant issues a BRAND-NEW
+    refresh token, so dating the store by its original `/login` runs the assumed
+    30-day TTL clock against a token that no longer exists. The visible symptom is
+    inverted-but-loud: `login_expiry_state` eventually reports `near`/`expired`,
+    and creds_warn (see the SOS condition keyed on refresh_age_days) tells the
+    operator to run a browser re-login for a family cus itself rotated minutes
+    earlier. Leasing was never affected — the claim path judges families on the
+    MEASURED rot check plus a live probe (#14/#127) — but the noise trains the
+    operator to ignore a warning that also fires for real expiries.
+
+    `minted_ts` is deliberately NOT rewritten: it is the login's provenance (which
+    browser session created this family), and the 2026-07-01 duplicate-identity
+    work depends on it staying immutable. Age moves to `last_rotated_ts`; readers
+    prefer it and fall back to `minted_ts` (see `login_age_days`).
+
+    `refresh_fp` is re-stamped so `--list`'s fingerprint identifies the token
+    actually on disk rather than a spent one.
+
+    Filename note: pooled families (`login_family_provenance_path`) and legacy
+    per-slot stores (`login_store_provenance_path`) both use `provenance.json`
+    beside the credentials, so resolving it from `creds_path` serves both.
+
+    Best-effort by contract: this runs inside the swap/claim path, and a
+    provenance sidecar is metadata. A missing file (never `--finish`ed) or an
+    unreadable one is a no-op — never raise into a caller mid-rotation."""
+    prov_path = creds_path.with_name("provenance.json")
+    if not prov_path.exists():
+        return
+    try:
+        prov = read_json(prov_path)
+        if not isinstance(prov, dict):
+            return
+        prov["last_rotated_ts"] = now_iso()
+        fp = _refresh_fingerprint(new_rt) if new_rt else None
+        if fp:
+            prov["refresh_fp"] = fp
+        write_json(prov_path, prov)
+    except (json.JSONDecodeError, OSError):
+        return
 
 
 def list_login_families(account: str) -> list[str]:
@@ -2705,9 +2751,21 @@ def double_booked_live_accounts(state: dict) -> list[dict]:
 
 
 def login_age_days(account: str, slot: str) -> float | None:
-    """Days since this login was minted (per provenance), or None if unknown."""
+    """Age of the refresh token currently on disk, in days, or None if unknown.
+
+    Prefers `last_rotated_ts` over `minted_ts` (2026-07-28). The assumed-TTL
+    classifiers downstream (`_expiry_state_from_age`, and the creds_warn SOS
+    condition) are asking "how close is THIS refresh token to expiring" — and a
+    rotation replaces the token outright, so its clock restarts. Ageing a
+    just-rotated store from its original `/login` produced re-login warnings for
+    families that had been refreshed minutes before; see
+    `_stamp_rotation_provenance`.
+
+    Falls back to `minted_ts` so provenance written before rotation stamping
+    existed (and `--from-existing` bootstraps, which never rotate through this
+    path) keeps its current behavior."""
     prov = read_login_provenance(account, slot)
-    minted = prov.get("minted_ts") if prov else None
+    minted = (prov.get("last_rotated_ts") or prov.get("minted_ts")) if prov else None
     if not minted:
         return None
     try:
@@ -17224,10 +17282,10 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             if state.get("active") == name and _snapshot_fresher_than_live(name):
                 action = (f"The '{name}' snapshot holds FRESHER tokens than the live file — a storage-dir "
                           f"re-login already happened (GH #77). Install it live:\n"
-                          f"      python3 ~/repos/claude-usage-swap/cus.py relogin {name} --finish\n"
-                          f"    then verify:\n      python3 ~/repos/claude-usage-swap/cus.py poll")
+                          f"      cus relogin {name} --finish\n"
+                          f"    then verify:\n      cus poll")
             else:
-                action = f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll"
+                action = f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      cus poll"
             # GH #79: if a rotated credential backup exists, mention its age —
             # a token that "expired" because a clobber bug replaced it can be
             # brought back with one command (refresh tokens live ~30 days), no
@@ -17533,7 +17591,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         out.append(SOSCondition(
             severity="warning",
             summary=f"Stale usage data for: {', '.join(stale_accounts)} (no fresh poll within 4x each account's poll cadence; worst allowance {stale_worst_minutes} min)",
-            action="Daemon may be down. Check: `systemctl --user status cus.service` or restart `python3 ~/repos/claude-usage-swap/cus.py daemon`.",
+            action="Daemon may be down. Check: `systemctl --user status cus.service` or restart `cus daemon`.",
             affected="daemon",
         ))
 
@@ -17547,7 +17605,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 out.append(SOSCondition(
                     severity="warning",
                     summary=f"Daemon pid {pid} recorded but process is gone",
-                    action="Restart: `systemctl --user restart cus.service` or `python3 ~/repos/claude-usage-swap/cus.py daemon`. Then `rm ~/claude-accounts/daemon.pid` if stale.",
+                    action="Restart: `systemctl --user restart cus.service` or `cus daemon`. Then `rm ~/claude-accounts/daemon.pid` if stale.",
                     affected="daemon",
                 ))
         except (ValueError, OSError):
@@ -17577,7 +17635,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 severity="urgent",
                 summary=f"{slot_name} identity does not match its assigned account '{acct}' (slot↔state drift, GH #2 class)",
                 action=(f"The slot's live files hold a different account than state.json claims. "
-                        f"Check `python3 ~/repos/claude-usage-swap/cus.py slot list` and the slot's .claude.json oauthAccount; "
+                        f"Check `cus slot list` and the slot's .claude.json oauthAccount; "
                         f"fix state.json slots.{slot_name}.account to match reality (record reality — do NOT swap first)."),
                 affected=slot_name,
             ))
@@ -17609,7 +17667,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             out.append(SOSCondition(
                 severity="warning",
                 summary=f"Orphan slot dir {d.name} holds credentials but has no state entry",
-                action=f"Reap it (saves creds back first): `python3 ~/repos/claude-usage-swap/cus.py slot gc --slot {d.name}`",
+                action=f"Reap it (saves creds back first): `cus slot gc --slot {d.name}`",
                 affected=d.name,
             ))
 
@@ -27195,7 +27253,7 @@ def add_cmd(name: str, exec_flag: bool) -> None:
     click.echo(f"  {cmd}")
     click.echo()
     click.echo(f"After logging in, register it in state.json:")
-    click.echo(f"  python3 ~/repos/claude-usage-swap/cus.py init --force && python3 ~/repos/claude-usage-swap/cus.py poll")
+    click.echo(f"  cus init --force && cus poll")
 
     if exec_flag:
         click.echo()
@@ -27236,7 +27294,7 @@ def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
             click.echo(f"ERROR: {e}")
             sys.exit(1)
         click.echo(f"✓ Installed '{name}' snapshot into the live files ({CREDS_JSON}).")
-        click.echo(f"  Verify with: python3 ~/repos/claude-usage-swap/cus.py poll --account {name}")
+        click.echo(f"  Verify with: cus poll --account {name}")
         return
 
     try:
@@ -27252,7 +27310,7 @@ def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
         click.echo(f"  (Already logged in under {dst}/ instead? Run: cus relogin {name} --finish)")
     click.echo()
     click.echo(f"After logging in:")
-    click.echo(f"  python3 ~/repos/claude-usage-swap/cus.py poll")
+    click.echo(f"  cus poll")
     if exec_flag:
         click.echo()
         click.echo("Launching claude now...")
@@ -27366,6 +27424,117 @@ def _write_family_provenance(account: str, family_id: str, email: str | None,
     return prov
 
 
+def _family_awaiting_finish(account: str) -> str | None:
+    """The family `cus login-mount <account> --finish` should verify and record.
+
+    Was `latest_family_id` — the highest-numbered family DIRECTORY, scaffolded or
+    not. That is only correct when provision → /login → --finish runs strictly in
+    order. Provision twice before finishing (easy to do: the scaffold prints its
+    command and returns immediately) and `--finish` pointed at the EMPTY newer
+    dir, failed "No usable freshly-logged-in family", and left the family you
+    actually logged into with no provenance at all — permanently, since the next
+    `--finish` targets a still-higher directory. Observed live 2026-07-28 on
+    yaz-tefillinconnection-org-max/family-8, which held a valid login on the right
+    org but showed `[unknown]` age and a `?` fingerprint forever after.
+
+    So: pick the highest-index family that carries a USABLE login and has not been
+    recorded yet — the one a just-completed `/login` actually landed in. Falls
+    back to `latest_family_id` when every usable family is already recorded, which
+    preserves the previous behavior for a re-run `--finish` (including the
+    wrong-account refusal path, where the first attempt records nothing)."""
+    unrecorded = [f for f in list_login_families(account)
+                  if not login_family_provenance_path(account, f).exists()]
+    if unrecorded:
+        return max(unrecorded, key=_family_index)
+    return latest_family_id(account)
+
+
+def _login_mount_probe(account: str | None, config: dict) -> None:
+    """`cus login-mount [<account>] --probe` — prove pooled families alive/dead.
+
+    The operator-facing form of the claim-time liveness check (#127). A family's
+    `STALE` label in `--list` is an OFFLINE verdict: it means the stored ACCESS
+    token expired past the rot grace, which happens to any family that simply sat
+    unclaimed. It says nothing about the refresh token. Before this, the only way
+    to find out was to trigger real swaps and read the claim audit — so an idle
+    pool was indistinguishable from a dead one, and the safe reading ("re-login
+    everything") costs a browser round-trip per family. Live 2026-07-28: 17 of 17
+    families flagged STALE probed ALIVE.
+
+    Semantics mirror `claim_verified_login_family` exactly, deliberately:
+      - alive   → persist the rotation (the grant is single-use, so the pre-grant
+                  token is a dead branch the moment it succeeds) and the family is
+                  usable again — the probe CURES idle staleness.
+      - dead    → retire the store to `.dead-<date>`, same as the claim path would
+                  on next lease. Reversible (a rename), and it is what stops
+                  `--list` from showing a known-dead family forever.
+      - unknown → touch nothing and say so; a network blip is not a death
+                  certificate.
+
+    LEASED families are skipped, never probed. A live slot holds a COPY of the
+    family's credentials and rotates them itself, so the store's refresh token is
+    an already-rotated dead branch — probing it would return invalid_grant and
+    retire a perfectly healthy family out from under a running session (#104).
+    `leased_families` counts only LIVE slots, matching the claim path's own rule
+    that an idle slot's lease is reclaimable."""
+    root = login_store_root()
+    if account is not None:
+        if not (ACCOUNTS_DIR / f"account-{account}").exists():
+            raise click.ClickException(
+                f"Unknown account '{account}' — no {ACCOUNTS_DIR / f'account-{account}'}. Run `cus list`.")
+        accounts = [account]
+    else:
+        accounts = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    state = load_state()
+    alive = dead = unknown = skipped = 0
+    for acct in accounts:
+        fams = list_login_families(acct)
+        if not fams:
+            continue
+        click.echo(f"{acct}:")
+        leased = leased_families(acct, state)
+        for fam in fams:
+            ref = f"{acct}/{fam}"
+            if fam in leased:
+                click.echo(f"  SKIP    {ref} — leased by a live slot (store token is an "
+                           f"already-rotated dead branch; probing it would report a false DEAD, #104)")
+                skipped += 1
+                continue
+            path = login_family_creds_path(acct, fam)
+            try:
+                creds = read_json(path)
+            except (json.JSONDecodeError, OSError):
+                click.echo(f"  SKIP    {ref} — unreadable credential store")
+                skipped += 1
+                continue
+            rt = _credential_refresh_token(creds)
+            if not rt:
+                click.echo(f"  SKIP    {ref} — no refresh token in store")
+                skipped += 1
+                continue
+            verdict, tok = _oauth_refresh_grant(rt)
+            if verdict == "alive" and isinstance(tok, dict):
+                _persist_rotated_grant(path, creds, rt, tok)
+                click.echo(click.style(
+                    f"  ALIVE   {ref} — refresh grant OK; rotation persisted", fg="green"))
+                alive += 1
+            elif verdict == "dead":
+                dead_name = f"{path.name}.dead-{datetime.now(timezone.utc):%Y%m%d}"
+                path.rename(path.with_name(dead_name))
+                click.echo(click.style(
+                    f"  DEAD    {ref} — invalid_grant; retired store to {dead_name}. "
+                    f"Re-login with `cus login-mount {acct}`", fg="red"))
+                dead += 1
+            else:
+                click.echo(click.style(
+                    f"  UNKNOWN {ref} — probe unverifiable (network/endpoint); nothing changed, "
+                    f"retry later", fg="yellow"))
+                unknown += 1
+    click.echo(f"probe: {alive} alive, {dead} dead, {unknown} unknown, {skipped} skipped")
+    if dead:
+        click.echo("Re-login each DEAD family's account, then `cus login-mount <account> --finish`.")
+
+
 def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: bool,
                       force: bool, from_existing: bool) -> None:
     """Account-keyed pool provisioning for `cus login-mount <account>` (2026-07-03).
@@ -27407,7 +27576,7 @@ def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: 
         return
 
     if finish_flag:
-        fam = latest_family_id(account)
+        fam = _family_awaiting_finish(account)
         if fam is None or not _family_creds_usable(account, fam):
             raise click.ClickException(
                 f"No usable freshly-logged-in family for '{account}'. Did the /login complete? "
@@ -27445,7 +27614,7 @@ def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: 
     click.echo(f"1. Run this and log in AS '{account}' (a NEW independent session for the same account):")
     click.echo(f"     {login_cmd}")
     click.echo("2. After the login completes and you /exit, record it:")
-    click.echo(f"     python3 ~/repos/claude-usage-swap/cus.py login-mount {account} --finish")
+    click.echo(f"     cus login-mount {account} --finish")
     if exec_flag:
         click.echo()
         click.echo(f"(--exec) launching claude under {dst} …")
@@ -27461,13 +27630,18 @@ def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: 
               help="After the /login completes, verify it landed on the right account and record provenance.")
 @click.option("--list", "list_flag", is_flag=True,
               help="List every provisioned independent login and exit.")
+@click.option("--probe", "probe_flag", is_flag=True,
+              help="Prove each pooled family's refresh token alive/dead (skipping any leased by a "
+                   "live slot). Revives idle-stale families in place; retires dead ones. "
+                   "Omit ACCOUNT to probe every pool.")
 @click.option("--force", is_flag=True,
               help="With --finish: record provenance even if the login's identity does not match the account.")
 @click.option("--from-existing", "from_existing", is_flag=True,
               help="Seed the store from the account's on-disk snapshot instead of an interactive /login. "
                    "No browser needed, but only clobber-safe as the SOLE live mount for that account.")
 def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
-                    finish_flag: bool, list_flag: bool, force: bool, from_existing: bool) -> None:
+                    finish_flag: bool, list_flag: bool, probe_flag: bool, force: bool,
+                    from_existing: bool) -> None:
     """Provision an INDEPENDENT `/login` for an account into one slot (GH #109).
 
     Today a slot's live credentials are a COPY of one account snapshot; two
@@ -27552,6 +27726,12 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
         if not pool_accts and not recs:
             click.echo("No independent logins provisioned yet.")
             click.echo("Provision a pool with: cus login-mount <account>   (run pool_size times)")
+        return
+
+    # --probe takes an ACCOUNT or nothing (every pool) — never a slot, since
+    # families are account-keyed. Checked before the slot/account arity rules.
+    if probe_flag:
+        _login_mount_probe(account, config)
         return
 
     if pool_mode:
@@ -27657,7 +27837,7 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
     click.echo(f"1. Run this and log in AS '{account}' (the same Anthropic account this slot will host):")
     click.echo(f"     {login_cmd}")
     click.echo("2. After the login completes and you /exit, record it:")
-    click.echo(f"     python3 ~/repos/claude-usage-swap/cus.py login-mount {slot} {account} --finish")
+    click.echo(f"     cus login-mount {slot} {account} --finish")
     click.echo()
     click.echo("Logging in as a DIFFERENT account than '" + account + "' will be refused at --finish "
                "(wrong-account trap, 2026-07-01).")
