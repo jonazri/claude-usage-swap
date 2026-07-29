@@ -9960,8 +9960,31 @@ def _identity_fields(cj: Any) -> dict:
     accountUuid `b9c92e39…` + email `rayi3@trisso.com` but differed on `userID`
     `93e1fc34…` vs `5d3df3e8…`). Comparing it made `_identities_match` FALSE-
     reject a correct same-account login (the independent-login-pool onboarding
-    error). The authoritative account identity is `oauthAccount.accountUuid`
-    (globally unique per account) plus `emailAddress`; those are what we compare.
+    error). The authoritative identity lives in `oauthAccount`, not at top level.
+
+    Terminology, made precise 2026-07-28: `accountUuid` is globally unique per
+    LOGIN IDENTITY (the person) — it is NOT unique per quota-bearing account, as
+    an earlier revision of this docstring claimed. The account an API call is
+    billed and rate-limited against is the (accountUuid, organizationUuid) pair.
+
+    Addition 2026-07-28: `organizationUuid` JOINS the facets. accountUuid+email
+    alone are NOT sufficient to name an account, because Anthropic's login has an
+    ACCOUNT SWITCHER — one email+password reaches several accounts, each with its
+    own billing and its own 5h/7d quota. Proven live on this deployment:
+    `yaz-tefillinconnection-org` and `yaz-tefillinconnection-org-max` share
+    accountUuid `e2a6eec3…` + email, and differ only on organizationUuid
+    (`201b0d79…` team/5x vs `9339c366…` max/20x). Without this facet,
+    `login-mount --finish` green-lights a `/login` that landed on the wrong org
+    and silently seeds a 20x pool with 5x-quota families.
+
+    Why this is NOT the `userID` mistake: userID varies across `/login`s of the
+    SAME account (per-session client id), so comparing it false-rejected correct
+    logins. organizationUuid is stable per account across independent logins —
+    it varies only when the login genuinely landed on a DIFFERENT account, which
+    is exactly the case we want to reject. And because only facets present on
+    BOTH sides are compared (`_identities_match` intersects keys), a legacy store
+    that never recorded an organizationUuid still verifies on accountUuid+email
+    alone — the addition is strictly non-breaking for existing pools.
     """
     if not isinstance(cj, dict):
         return {}
@@ -9969,7 +9992,8 @@ def _identity_fields(cj: Any) -> dict:
     oa = oa if isinstance(oa, dict) else {}
     out: dict = {}
     for key, val in (("accountUuid", oa.get("accountUuid")),
-                     ("emailAddress", oa.get("emailAddress"))):
+                     ("emailAddress", oa.get("emailAddress")),
+                     ("organizationUuid", oa.get("organizationUuid"))):
         if val:
             out[key] = val
     return out
