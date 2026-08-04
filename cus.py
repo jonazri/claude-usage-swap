@@ -13951,7 +13951,7 @@ def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
     """Dismiss Claude's quota modal on one pane (double-Escape) and submit a
     context-preserving continuation. Best-effort; returns True on a sent
     continuation. Shared by the reactive resume path and the escalation fallback."""
-    if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
+    if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
         click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
         return False
     if tmux_send_text(pane, message, tmux_socket=tmux_socket):
@@ -18513,6 +18513,46 @@ def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> boo
         return False
 
 
+# An ESC byte is ambiguous until the next byte arrives: a keypress parser reads
+# ESC followed by another byte, within its escape-code timeout, as Alt+<byte>.
+# Claude Code's Ink TUI inherits node readline's 500ms `escapeCodeTimeout`, so
+# ANYTHING we send within 500ms of an Escape is absorbed into the escape
+# sequence instead of landing in the input box.
+ESCAPE_CODE_TIMEOUT_SECONDS = 0.5
+ESCAPE_SETTLE_SECONDS = 0.75  # the timeout plus margin
+
+
+def tmux_escape_prefix(pane: str, count: int = 2, tmux_socket: str | None = None) -> bool:
+    """Send the `count`-Escape safety prefix (GH #24), settling after each one.
+
+    Two properties, both measured against a node-readline keypress logger in a
+    real tmux pane (2026-08-04) because both were silently broken:
+
+    1. **Each Escape is its own send-keys.** `send-keys Escape Escape` writes
+       `\\x1b\\x1b` in one burst, which parses as ONE meta-escape keypress — so
+       "two Escapes to cover nested UI state (autocomplete inside a prompt)"
+       was only ever delivering one.
+    2. **The caller's payload is never swallowed.** After the last Escape we
+       wait out ESCAPE_CODE_TIMEOUT_SECONDS (see above) so the next thing sent
+       is parsed on its own. Without the wait, the byte after the prefix is
+       eaten as Alt+<byte>:
+         - `Escape Escape` + `-l "The quota-limited…"` with no gap arrived as
+           meta-t + "he quota-limited…" — the 2026-08-04 report of the reactive
+           resume message losing its first character.
+         - `Escape Escape` + Enter arrived as meta+return, i.e. no submit —
+           which is how `/exit` ends up appended to a leftover draft and sent
+           as a chat message (the 2026-05-20 GH #11 symptom).
+
+    Returns True when every Escape was delivered; False on the first send
+    failure (callers treat that as "leave the pane alone").
+    """
+    for _ in range(count):
+        if not tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket):
+            return False
+        time.sleep(ESCAPE_SETTLE_SECONDS)
+    return True
+
+
 def tmux_capture_pane(pane: str, tmux_socket: str | None = None, lines: int = 30) -> str | None:
     """Best-effort capture of a tmux pane's visible tail (last `lines` lines).
 
@@ -19524,10 +19564,11 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     # prompt. Escape dismisses any modal/picker/prompt without
     # submitting anything. Two Escapes to cover nested UI state
     # (autocomplete inside a prompt, etc.).
-    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
-    time.sleep(0.15)
-    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
-    time.sleep(0.15)
+    # tmux_escape_prefix settles after each Escape: the old 0.15s gaps left the
+    # C-u / Enter below inside the parser's escape-code window, where they
+    # arrived as meta+C-u / meta+return — an unsubmitted draft that `/exit`
+    # then appended to (the 2026-05-20 symptom described above).
+    tmux_escape_prefix(pane, tmux_socket=tmux_socket)
 
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
@@ -19875,10 +19916,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     # apparently didn't land (session stuck in tool call);
                     # force interrupt is the right next step.
                     click.echo(f"      pause_message timed out; escalating to tier 3 (force double-Escape)")
-                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                    time.sleep(0.3)
-                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                    time.sleep(0.5)
+                    tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket)
         elif tier == 3:
             if is_idle:
                 # Idle — no running tool to interrupt; skip Escape.
@@ -19886,11 +19924,10 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             else:
                 click.echo(f"    pane {s.pane}: mid-turn — force interrupt (double Escape)")
                 # Single Escape may not interrupt — Claude's TUI sometimes
-                # needs two to dismiss running tool calls.
-                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                time.sleep(0.3)
-                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                time.sleep(0.5)
+                # needs two to dismiss running tool calls. The old 0.3s gap was
+                # inside the parser's escape-code window, so the pair arrived as
+                # ONE meta-escape: this never actually sent two Escapes.
+                tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket)
                 shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                 if shell_note:
                     append_inbox(
@@ -19929,10 +19966,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     if not ok2:
                         # Escalate to tier 3: double-Escape force interrupt.
                         click.echo(f"      tier 2 timed out; escalating to tier 3 (force double-Escape)")
-                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                        time.sleep(0.3)
-                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                        time.sleep(0.5)
+                        tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket)
                         shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                         if shell_note:
                             append_inbox(

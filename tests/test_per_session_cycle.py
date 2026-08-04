@@ -374,17 +374,24 @@ def test_reactive_resume_targets_each_pane_once():
     original_live = cus.live_sessions_on_slot
     original_keys = cus.tmux_send_keys
     original_text = cus.tmux_send_text
+    original_sleep = cus.time.sleep
     keys: list[tuple] = []
     texts: list[tuple] = []
     cus.live_sessions_on_slot = lambda slot: sessions
     cus.tmux_send_keys = lambda pane, *sent, tmux_socket=None: keys.append((pane, *sent, tmux_socket)) or True
     cus.tmux_send_text = lambda pane, message, tmux_socket=None: texts.append((pane, message, tmux_socket)) or True
+    cus.time.sleep = lambda _s: None  # don't burn the escape-settle waits
     try:
         panes = cus._resume_reactive_slot_sessions("slot-2", _config())
         assert panes == ["%1", "%1"], "same pane id on distinct tmux servers is two sessions"
+        # One Escape per send-keys, not `Escape Escape` in a single call: that
+        # writes \x1b\x1b in one burst, which the TUI parses as ONE meta-escape
+        # keypress (see tests/test_escape_prefix_settle.py).
         assert keys == [
-            ("%1", "Escape", "Escape", "/tmp/tmux-a"),
-            ("%1", "Escape", "Escape", "/tmp/tmux-b"),
+            ("%1", "Escape", "/tmp/tmux-a"),
+            ("%1", "Escape", "/tmp/tmux-a"),
+            ("%1", "Escape", "/tmp/tmux-b"),
+            ("%1", "Escape", "/tmp/tmux-b"),
         ]
         assert [socket for _, _, socket in texts] == ["/tmp/tmux-a", "/tmp/tmux-b"]
         assert all("Continue from exactly where" in msg for _, msg, _ in texts)
@@ -392,6 +399,7 @@ def test_reactive_resume_targets_each_pane_once():
         cus.live_sessions_on_slot = original_live
         cus.tmux_send_keys = original_keys
         cus.tmux_send_text = original_text
+        cus.time.sleep = original_sleep
 
 
 def test_fast_cadence_tracks_occupancy_in_per_session():
