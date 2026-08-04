@@ -12249,7 +12249,7 @@ def determine_tier(active_acct: dict, config: dict) -> int:
 
     Tier 1: gentle — wait for Stop, defer if cache warm.
     Tier 2: send pause-message asking session to wrap up.
-    Tier 3: force interrupt (double-Escape), log shell state.
+    Tier 3: force interrupt (Escape), log shell state.
 
     Two inputs are considered (max wins): the ladder step
     (next_swap_at_pct, which represents how many times we've already
@@ -13948,11 +13948,14 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
 
 
 def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
-    """Dismiss Claude's quota modal on one pane (double-Escape) and submit a
+    """Dismiss Claude's quota modal on one pane (Escape prefix) and submit a
     context-preserving continuation. Best-effort; returns True on a sent
     continuation. Shared by the reactive resume path and the escalation fallback."""
-    if not tmux_send_keys(pane, "Escape", "Escape", tmux_socket=tmux_socket):
-        click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
+    if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
+        # An Escape may already have landed (the prefix aborts on the first
+        # failed send), so don't claim the pane is untouched — only that we are
+        # not submitting a continuation into a pane we can't drive.
+        click.echo(f"    reactive resume: pane {pane} Escape prefix undelivered; no continuation submitted")
         return False
     if tmux_send_text(pane, message, tmux_socket=tmux_socket):
         socket_note = f" via {tmux_socket}" if tmux_socket else ""
@@ -13967,7 +13970,7 @@ def _resume_reactive_slot_sessions(slot_name: str, config: dict, state: dict | N
 
     Rewriting a live lane's credentials is necessary but not sufficient: a
     StopFailure leaves Claude Code parked at its session-limit modal. Target only
-    the pane(s) actually backed by `slot_name`, send the established double-Escape
+    the pane(s) actually backed by `slot_name`, send the established Escape
     safety prefix, then submit a context-preserving continuation. Best-effort and
     config-gated; a swap remains successful even when tmux is unavailable.
 
@@ -18513,6 +18516,68 @@ def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> boo
         return False
 
 
+# An ESC byte is ambiguous until the next byte arrives: a keypress parser reads
+# ESC followed by another byte, within its escape-code timeout, as Alt+<byte>.
+# Claude Code's Ink TUI inherits node readline's 500ms `escapeCodeTimeout`, so
+# ANYTHING we send within 500ms of an Escape is absorbed into the escape
+# sequence instead of landing in the input box.
+ESCAPE_CODE_TIMEOUT_SECONDS = 0.5
+# Derived, not hand-tuned: the wait is only correct if it clears the timeout, so
+# tie it structurally rather than leaving two numbers free to drift apart.
+ESCAPE_SETTLE_SECONDS = ESCAPE_CODE_TIMEOUT_SECONDS + 0.25
+
+
+def tmux_escape_prefix(pane: str, count: int = 1, tmux_socket: str | None = None) -> bool:
+    """Send the Escape safety prefix (GH #24), then settle before the payload.
+
+    **ONE Escape — never two.** GH #24 asked for "Escape × 2 to cover nested UI
+    state", but two *delivered* Escapes are destructive in Claude Code 2.1.221.
+    Captured from a real TUI pane on 2026-08-04:
+
+      - Input box non-empty: Esc #1 arms "Esc again to clear" (draft intact);
+        Esc #2 CLEARS the draft — destroying exactly what `draft_handling:
+        "submit"` exists to preserve (GH #11).
+      - Input box empty: Esc #2 opens the **Rewind** overlay ("Nothing to rewind
+        to yet · Esc to cancel"). In a session with history that overlay lists
+        checkpoints, so the blind Enter on the /exit path could restore an
+        earlier conversation/code state.
+
+    Both happen with the old single `send-keys Escape Escape` too — the TUI's
+    parser reads that burst as the double-esc gesture (node readline's parser
+    does not; it yields one meta-escape, which is why the keypress-logger
+    measurements below don't show it). One Escape dismisses a modal/picker,
+    preserves a draft, and opens nothing.
+
+    The settle wait is the other half, measured with a node-readline keypress
+    logger: an ESC byte is ambiguous until the next arrives, so anything sent
+    within ESCAPE_CODE_TIMEOUT_SECONDS of it is eaten as Alt+<byte>:
+
+      - Escape + `-l "The quota-limited…"` with no gap arrived as meta-t +
+        "he quota-limited…" — the 2026-08-04 report of the reactive resume
+        message losing its first character.
+      - Escape + Enter arrived as meta+return, i.e. no submit — which is how
+        `/exit` ends up appended to a leftover draft and sent as a chat message
+        (the 2026-05-20 GH #11 symptom).
+
+    `count` stays a parameter for callers that genuinely need to unwind nested
+    UI, but raising it re-enables the two hazards above — don't, without
+    re-checking against a live pane.
+
+    Returns True when every Escape was delivered; False on the first send
+    failure (callers treat that as "leave the pane alone").
+    """
+    if count < 1:
+        # True here would tell the caller "a prefix landed, your blind Enter is
+        # safe" while nothing was sent — disarming the guard silently. A count
+        # below 1 is caller error, so say so rather than degrade quietly.
+        raise ValueError(f"tmux_escape_prefix needs at least one Escape, got count={count}")
+    for _ in range(count):
+        if not tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket):
+            return False
+        time.sleep(ESCAPE_SETTLE_SECONDS)
+    return True
+
+
 def tmux_capture_pane(pane: str, tmux_socket: str | None = None, lines: int = 30) -> str | None:
     """Best-effort capture of a tmux pane's visible tail (last `lines` lines).
 
@@ -19473,7 +19538,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     return out
 
 
-def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str | None = None) -> None:
+def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str | None = None) -> bool:
     """Cleanly /exit claude in a tmux pane, handling input-box-has-focus cases.
 
     The 2026-05-19 incident showed that a bare `/exit` typed via tmux send-keys
@@ -19502,7 +19567,8 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
         --resume.
 
       "clear" (LEGACY) — wipes any user draft before /exit:
-        1. Escape, Escape (dismiss modal/overlay, defocus input).
+        1. Escape (dismiss modal/overlay, defocus input) — ONE, see
+           tmux_escape_prefix.
         2. C-u (best-effort readline clear; harmless if empty).
         3. BSpace x 400 (brute-force backspace flurry for multi-line drafts).
         4. `/exit` + Enter.
@@ -19512,34 +19578,61 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     Best-effort either way: if claude is genuinely wedged, escape sequences
     may do nothing, and `wait_for_shell` will eventually time out + skip
     relaunch.
+
+    Returns True when the sequence was issued, False when it was skipped: no
+    usable pane, or the safety prefix could not be delivered (in which case
+    sending Enter blind is the very hazard the prefix exists to prevent).
     """
     if not tmux_is_available() or not pane or pane == "no-tmux":
-        return
+        return False
 
-    # CRITICAL safety prefix (GH #24, 2026-05-25): send Escape × 2 FIRST
-    # in BOTH modes. User report: "apparently it sends the answers to
-    # claude's questions too" — if claude is in an interactive prompt
-    # state (permission dialog, choice picker, autocomplete dropdown,
-    # slash-command picker), our blind Enter would have ANSWERED the
-    # prompt. Escape dismisses any modal/picker/prompt without
-    # submitting anything. Two Escapes to cover nested UI state
-    # (autocomplete inside a prompt, etc.).
-    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
-    time.sleep(0.15)
-    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
-    time.sleep(0.15)
+    # CRITICAL safety prefix (GH #24, 2026-05-25): Escape FIRST in BOTH modes.
+    # User report: "apparently it sends the answers to claude's questions too" —
+    # if claude is in an interactive prompt state (permission dialog, choice
+    # picker, autocomplete dropdown, slash-command picker), our blind Enter
+    # would have ANSWERED the prompt. Escape dismisses any modal/picker/prompt
+    # without submitting anything.
+    #
+    # ONE Escape, not the two GH #24 asked for: a second delivered Escape either
+    # clears the user's draft (killing what "submit" mode preserves) or opens the
+    # Rewind overlay, whose entries the Enter below could then select. See
+    # tmux_escape_prefix. It also settles afterwards — the old 0.15s gaps left
+    # the C-u / Enter below inside the parser's escape-code window, where they
+    # arrived as meta+C-u / meta+return: an unsubmitted draft that `/exit` then
+    # appended to (the 2026-05-20 symptom described above).
+    if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
+        # Undelivered, we cannot know that no interactive prompt has focus —
+        # which makes everything below unsafe in BOTH modes: "submit"'s blind
+        # Enter would ANSWER that prompt, and "clear"'s C-u/BSpace flurry does
+        # nothing to a modal before the typed `/exit`, whose trailing Enter
+        # answers it just the same. That is the GH #24 hazard, so bail: the
+        # caller skips this pane's shell-wait and its relaunch.
+        click.echo(f"    pane {pane}: Escape prefix undelivered — not sending /exit (blind Enter unsafe)")
+        return False
 
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
+        #
+        # Clearing now rests ENTIRELY on the C-u + BSpace flurry below. Before
+        # the one-Escape change, the prefix's `Escape Escape` burst also fired
+        # the TUI's own double-esc "clear the input box" gesture, which wiped a
+        # draft of any length; that gesture is unavailable to us now because on
+        # an EMPTY box the same keystrokes open the Rewind overlay instead, and
+        # the `/exit` below would then be typed into it (see
+        # tmux_escape_prefix). Consequence: a draft longer than 400 characters
+        # can leave residue that `/exit` appends to. "clear" is opt-in legacy
+        # and off by default, so this is documented rather than papered over
+        # with a second Escape — raising the flurry is the safe lever if it
+        # ever bites.
         tmux_send_keys(pane, "C-u", tmux_socket=tmux_socket)
         time.sleep(0.15)
         tmux_send_keys(pane, *(["BSpace"] * 400), tmux_socket=tmux_socket)
         time.sleep(0.3)
         tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
-        return
+        return True
 
     # Default: "submit" — preserve draft by sending it as a message first.
-    # Now SAFE because Escape × 2 above dismissed any interactive prompt;
+    # Now SAFE because the Escape above dismissed any interactive prompt;
     # the Enter below only sees the main chat input. If the input is empty,
     # Enter is a no-op in claude's TUI. If non-empty, the draft is sent
     # as a normal user turn (safely persisted in JSONL, visible on --resume).
@@ -19548,6 +19641,7 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     # Type /exit into the (now-empty) input box. tmux_send_text appends
     # Enter automatically.
     tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
+    return True
 
 
 def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25,
@@ -19678,7 +19772,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
       5. Per-tier prep (per pane):
          - Tier 1: if idle, no-op (already at turn boundary); else wait_for_stop.
          - Tier 2: inject pause-message, wait for resulting Stop.
-         - Tier 3: double-Escape to interrupt running tool, log shell context.
+         - Tier 3: Escape to interrupt running tool, log shell context.
       6. /exit each pane's claude.
       7. Poll each pane until its current command is back to shell (replaces
          the prior hard-coded sleep(2) which raced).
@@ -19874,23 +19968,25 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     # rather than just proceeding anyway. The pause_message
                     # apparently didn't land (session stuck in tool call);
                     # force interrupt is the right next step.
-                    click.echo(f"      pause_message timed out; escalating to tier 3 (force double-Escape)")
-                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                    time.sleep(0.3)
-                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                    time.sleep(0.5)
+                    click.echo(f"      pause_message timed out; escalating to tier 3 (force interrupt)")
+                    if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
+                        click.echo(f"      pane {s.pane}: Escape undelivered — interrupt unconfirmed (proceeding)")
         elif tier == 3:
             if is_idle:
                 # Idle — no running tool to interrupt; skip Escape.
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping force-interrupt (no running tool)")
             else:
-                click.echo(f"    pane {s.pane}: mid-turn — force interrupt (double Escape)")
-                # Single Escape may not interrupt — Claude's TUI sometimes
-                # needs two to dismiss running tool calls.
-                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                time.sleep(0.3)
-                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                time.sleep(0.5)
+                click.echo(f"    pane {s.pane}: mid-turn — force interrupt (Escape)")
+                # A single Escape. The pair this used to send never arrived as
+                # two Escape keypresses — the 0.3s gap kept both bytes inside
+                # the parser's escape-code window, so the TUI read them as its
+                # double-esc GESTURE, which clears the input box or opens the
+                # Rewind overlay rather than interrupting twice. Neither form
+                # is safe here; see tmux_escape_prefix.
+                # Interrupt stays best-effort here (the swap proceeds either
+                # way, as below) — but say so when it didn't land.
+                if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
+                    click.echo(f"      pane {s.pane}: Escape undelivered — interrupt unconfirmed (proceeding)")
                 shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                 if shell_note:
                     append_inbox(
@@ -19904,7 +20000,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             else:
                 # Escalation ladder (GH #19, 2026-05-25 user directive):
                 # tier 1 timeout → escalate to tier 2 (send pause_message)
-                # tier 2 timeout → escalate to tier 3 (force double-Escape)
+                # tier 2 timeout → escalate to tier 3 (force interrupt)
                 # tier 3 timeout → skip pane (proceed with others)
                 #
                 # The 2026-05-24 incident: tier 1 wait_for_stop timed out
@@ -19927,12 +20023,10 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     pause_timeout = hot.get("pause_response_timeout_seconds", 120)
                     ok2 = wait_for_stop(s.session_id, pause_timeout)
                     if not ok2:
-                        # Escalate to tier 3: double-Escape force interrupt.
-                        click.echo(f"      tier 2 timed out; escalating to tier 3 (force double-Escape)")
-                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                        time.sleep(0.3)
-                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
-                        time.sleep(0.5)
+                        # Escalate to tier 3: Escape force interrupt.
+                        click.echo(f"      tier 2 timed out; escalating to tier 3 (force interrupt)")
+                        if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
+                            click.echo(f"      pane {s.pane}: Escape undelivered — interrupt unconfirmed (proceeding)")
                         shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                         if shell_note:
                             append_inbox(
@@ -19962,7 +20056,24 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             click.echo(f"    pane {s.pane}: no longer running claude — skipping /exit (GH #37; would type into shell)")
             continue
         click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
-        tmux_exit_claude(s.pane, draft_handling=draft_handling, tmux_socket=s.tmux_socket)
+        if not tmux_exit_claude(s.pane, draft_handling=draft_handling, tmux_socket=s.tmux_socket):
+            # /exit never went out (undeliverable Escape prefix), so claude is
+            # still running: waiting for a shell prompt below would burn the
+            # full shell_return_timeout_seconds and then blame the pane for not
+            # returning. Flag and skip that wait — relaunch is skipped either
+            # way, so same outcome, 10s sooner. Flagged on the session itself
+            # rather than by id() — mirroring how `_stuck_skip` below is read,
+            # though note nothing in cus.py ever SETS that one (GH #19's skip is
+            # currently dead code); this flag is the only live writer.
+            s._exit_unsent = True
+            # And don't let it vanish into the log: this pane keeps running on
+            # the capped account, which an operator needs to know about.
+            click.echo(f"    WARN: pane {s.pane} stays on {current} (no /exit sent, no relaunch)")
+            append_inbox(
+                "deviation",
+                f"Pane {s.pane} left on {current} (no /exit sent)",
+                f"The hot-swap could not drive pane {s.pane} safely (see the daemon log for which step failed), so `/exit` was never typed and the pane was NOT relaunched on `{decision.target}`. That session keeps running on `{current}` and will keep drawing from its budget.\n\n**Walk-back**: `/exit` the pane by hand and start a fresh session on `{decision.target}`, or re-run the swap once the pane is reachable.",
+            )
 
     # Poll each pane until shell prompt is back. Replaces the original
     # sleep(2) which raced — claude wasn't always done exiting when the
@@ -19971,8 +20082,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     shell_timeout = hot.get("shell_return_timeout_seconds", 10)
     panes_ready: list[LiveSession] = []
     for s in swappable:
-        if getattr(s, "_stuck_skip", False):
-            # Already skipped /exit; don't wait for shell either.
+        if getattr(s, "_stuck_skip", False) or getattr(s, "_exit_unsent", False):
+            # /exit was skipped or never delivered; don't wait for a shell that
+            # was never asked for either.
             continue
         if wait_for_shell(s.pane, timeout_seconds=shell_timeout, tmux_socket=s.tmux_socket):
             panes_ready.append(s)
@@ -21634,7 +21746,7 @@ def check_orchestrate_cmd(target: str | None) -> None:
     elif inferred_tier == 2:
         click.echo("    Tier 2: inject pause_message via tmux send-keys, then wait_for_stop")
     elif inferred_tier == 3:
-        click.echo("    Tier 3: double-Escape to interrupt running tool, log shells to inbox.md")
+        click.echo("    Tier 3: Escape to interrupt running tool, log shells to inbox.md")
 
     if not hot.get("enabled", False):
         click.echo()
