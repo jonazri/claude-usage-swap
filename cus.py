@@ -18522,7 +18522,9 @@ def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> boo
 # ANYTHING we send within 500ms of an Escape is absorbed into the escape
 # sequence instead of landing in the input box.
 ESCAPE_CODE_TIMEOUT_SECONDS = 0.5
-ESCAPE_SETTLE_SECONDS = 0.75  # the timeout plus margin
+# Derived, not hand-tuned: the wait is only correct if it clears the timeout, so
+# tie it structurally rather than leaving two numbers free to drift apart.
+ESCAPE_SETTLE_SECONDS = ESCAPE_CODE_TIMEOUT_SECONDS + 0.25
 
 
 def tmux_escape_prefix(pane: str, count: int = 2, tmux_socket: str | None = None) -> bool:
@@ -20003,6 +20005,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     # destroys drafts). Configurable via hot_swap.draft_handling (GH #11).
     # Per GH #19: skip panes that timed out during the Stop-wait above.
     draft_handling = hot.get("draft_handling", "submit")
+    exit_unsent_ids: set[int] = set()  # panes whose /exit never reached the pty
     for s in swappable:
         if getattr(s, "_stuck_skip", False):
             click.echo(f"    pane {s.pane}: skipping /exit (Stop-wait timed out — leaving on old account)")
@@ -20015,7 +20018,13 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             click.echo(f"    pane {s.pane}: no longer running claude — skipping /exit (GH #37; would type into shell)")
             continue
         click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
-        tmux_exit_claude(s.pane, draft_handling=draft_handling, tmux_socket=s.tmux_socket)
+        if not tmux_exit_claude(s.pane, draft_handling=draft_handling, tmux_socket=s.tmux_socket):
+            # /exit never went out (undeliverable Escape prefix), so claude is
+            # still running: waiting for a shell prompt below would burn the
+            # full shell_return_timeout_seconds and then blame the pane for not
+            # returning. Record it and skip that wait; relaunch is skipped
+            # either way, which is the same outcome, just 10s sooner.
+            exit_unsent_ids.add(id(s))
 
     # Poll each pane until shell prompt is back. Replaces the original
     # sleep(2) which raced — claude wasn't always done exiting when the
@@ -20024,8 +20033,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     shell_timeout = hot.get("shell_return_timeout_seconds", 10)
     panes_ready: list[LiveSession] = []
     for s in swappable:
-        if getattr(s, "_stuck_skip", False):
-            # Already skipped /exit; don't wait for shell either.
+        if getattr(s, "_stuck_skip", False) or id(s) in exit_unsent_ids:
+            # /exit was skipped or never delivered; don't wait for a shell that
+            # was never asked for either.
             continue
         if wait_for_shell(s.pane, timeout_seconds=shell_timeout, tmux_socket=s.tmux_socket):
             panes_ready.append(s)
