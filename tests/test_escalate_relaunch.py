@@ -26,9 +26,19 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cus  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleeps(monkeypatch):
+    """Nothing in this file measures wall time, but the resume path now waits
+    out the parser's escape-code timeout inside tmux_escape_prefix (0.75s per
+    Escape) — real sleeps here would just slow the suite."""
+    monkeypatch.setattr(cus.time, "sleep", lambda *_a: None)
 
 
 # --------------------------------------------------------------------------

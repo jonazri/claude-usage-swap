@@ -13952,7 +13952,10 @@ def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
     context-preserving continuation. Best-effort; returns True on a sent
     continuation. Shared by the reactive resume path and the escalation fallback."""
     if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
-        click.echo(f"    reactive resume: pane {pane} double-Escape failed; leaving context intact")
+        # An Escape may already have landed (the prefix aborts on the first
+        # failed send), so don't claim the pane is untouched — only that we are
+        # not submitting a continuation into a pane we can't drive.
+        click.echo(f"    reactive resume: pane {pane} Escape prefix undelivered; no continuation submitted")
         return False
     if tmux_send_text(pane, message, tmux_socket=tmux_socket):
         socket_note = f" via {tmux_socket}" if tmux_socket else ""
@@ -19513,7 +19516,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     return out
 
 
-def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str | None = None) -> None:
+def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str | None = None) -> bool:
     """Cleanly /exit claude in a tmux pane, handling input-box-has-focus cases.
 
     The 2026-05-19 incident showed that a bare `/exit` typed via tmux send-keys
@@ -19552,9 +19555,13 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     Best-effort either way: if claude is genuinely wedged, escape sequences
     may do nothing, and `wait_for_shell` will eventually time out + skip
     relaunch.
+
+    Returns True when the /exit sequence was sent, False when it was skipped:
+    no usable pane, or the safety prefix could not be delivered (in which case
+    sending Enter blind is the very hazard the prefix exists to prevent).
     """
     if not tmux_is_available() or not pane or pane == "no-tmux":
-        return
+        return False
 
     # CRITICAL safety prefix (GH #24, 2026-05-25): send Escape × 2 FIRST
     # in BOTH modes. User report: "apparently it sends the answers to
@@ -19568,7 +19575,13 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     # C-u / Enter below inside the parser's escape-code window, where they
     # arrived as meta+C-u / meta+return — an unsubmitted draft that `/exit`
     # then appended to (the 2026-05-20 symptom described above).
-    tmux_escape_prefix(pane, tmux_socket=tmux_socket)
+    if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
+        # The prefix is the entire reason the Enter below is safe: undelivered,
+        # we cannot know an interactive prompt isn't focused, and a blind Enter
+        # would answer it — the exact GH #24 hazard. Bail instead;
+        # `wait_for_shell` then times out and the caller skips the relaunch.
+        click.echo(f"    pane {pane}: Escape prefix undelivered — not sending /exit (blind Enter unsafe)")
+        return False
 
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
@@ -19577,7 +19590,7 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
         tmux_send_keys(pane, *(["BSpace"] * 400), tmux_socket=tmux_socket)
         time.sleep(0.3)
         tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
-        return
+        return True
 
     # Default: "submit" — preserve draft by sending it as a message first.
     # Now SAFE because Escape × 2 above dismissed any interactive prompt;
@@ -19589,6 +19602,7 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     # Type /exit into the (now-empty) input box. tmux_send_text appends
     # Enter automatically.
     tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
+    return True
 
 
 def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25,
@@ -19916,7 +19930,8 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     # apparently didn't land (session stuck in tool call);
                     # force interrupt is the right next step.
                     click.echo(f"      pause_message timed out; escalating to tier 3 (force double-Escape)")
-                    tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket)
+                    if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
+                        click.echo(f"      pane {s.pane}: Escape undelivered — interrupt unconfirmed (proceeding)")
         elif tier == 3:
             if is_idle:
                 # Idle — no running tool to interrupt; skip Escape.
@@ -19927,7 +19942,10 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 # needs two to dismiss running tool calls. The old 0.3s gap was
                 # inside the parser's escape-code window, so the pair arrived as
                 # ONE meta-escape: this never actually sent two Escapes.
-                tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket)
+                # Interrupt stays best-effort here (the swap proceeds either
+                # way, as below) — but say so when it didn't land.
+                if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
+                    click.echo(f"      pane {s.pane}: Escape undelivered — interrupt unconfirmed (proceeding)")
                 shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                 if shell_note:
                     append_inbox(
@@ -19966,7 +19984,8 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     if not ok2:
                         # Escalate to tier 3: double-Escape force interrupt.
                         click.echo(f"      tier 2 timed out; escalating to tier 3 (force double-Escape)")
-                        tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket)
+                        if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
+                            click.echo(f"      pane {s.pane}: Escape undelivered — interrupt unconfirmed (proceeding)")
                         shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                         if shell_note:
                             append_inbox(

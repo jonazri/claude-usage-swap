@@ -149,7 +149,7 @@ def test_resume_pane_aborts_without_sending_when_escape_fails(monkeypatch):
 
 def test_exit_claude_waits_out_escape_timeout_before_submit_enter(monkeypatch):
     events = _recorder(monkeypatch)
-    cus.tmux_exit_claude("%1")
+    assert cus.tmux_exit_claude("%1") is True
     gap = _gap_after_last_escape(events)
     assert gap > cus.ESCAPE_CODE_TIMEOUT_SECONDS, (
         f"only {gap}s between the Escape prefix and the draft-submit Enter — it "
@@ -159,9 +159,19 @@ def test_exit_claude_waits_out_escape_timeout_before_submit_enter(monkeypatch):
     assert ("text", "/exit") in after
 
 
+def test_exit_claude_aborts_when_the_prefix_is_undelivered(monkeypatch):
+    """The prefix is what makes the blind Enter safe (GH #24): if it never
+    landed, sending Enter could answer an interactive prompt instead."""
+    events = _recorder(monkeypatch)
+    monkeypatch.setattr(cus, "tmux_send_keys",
+                        lambda pane, *keys, tmux_socket=None: events.append(("keys", keys)) or False)
+    assert cus.tmux_exit_claude("%1") is False
+    assert _sends(events) == [("keys", ("Escape",))], f"nothing may follow a failed prefix: {events}"
+
+
 def test_exit_claude_clear_variant_waits_before_ctrl_u(monkeypatch):
     events = _recorder(monkeypatch)
-    cus.tmux_exit_claude("%1", draft_handling="clear")
+    assert cus.tmux_exit_claude("%1", draft_handling="clear") is True
     gap = _gap_after_last_escape(events)
     assert gap > cus.ESCAPE_CODE_TIMEOUT_SECONDS, (
         f"only {gap}s before C-u — it parses as meta+C-u: {events}")
