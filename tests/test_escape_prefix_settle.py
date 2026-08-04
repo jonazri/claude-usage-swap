@@ -128,6 +128,20 @@ def test_escape_prefix_settles_after_every_escape_when_count_raised(monkeypatch)
     ]
 
 
+def test_escape_prefix_rejects_a_countless_prefix(monkeypatch):
+    """count<1 sends nothing, so returning True would tell the caller its blind
+    Enter is safe when no prefix landed. Caller error — raise, don't degrade."""
+    events = _recorder(monkeypatch)
+    for bad in (0, -1):
+        try:
+            cus.tmux_escape_prefix("%1", count=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"count={bad} must raise, not report success")
+    assert events == [], f"nothing may be sent for count<1: {events}"
+
+
 def test_escape_prefix_reports_send_failure(monkeypatch):
     events = _recorder(monkeypatch)
     monkeypatch.setattr(cus, "tmux_send_keys",

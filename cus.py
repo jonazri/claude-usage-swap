@@ -18566,6 +18566,11 @@ def tmux_escape_prefix(pane: str, count: int = 1, tmux_socket: str | None = None
     Returns True when every Escape was delivered; False on the first send
     failure (callers treat that as "leave the pane alone").
     """
+    if count < 1:
+        # True here would tell the caller "a prefix landed, your blind Enter is
+        # safe" while nothing was sent — disarming the guard silently. A count
+        # below 1 is caller error, so say so rather than degrade quietly.
+        raise ValueError(f"tmux_escape_prefix needs at least one Escape, got count={count}")
     for _ in range(count):
         if not tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket):
             return False
@@ -19957,7 +19962,6 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping force-interrupt (no running tool)")
             else:
                 click.echo(f"    pane {s.pane}: mid-turn — force interrupt (Escape)")
-                # Single Escape may not interrupt — Claude's TUI sometimes
                 # A single Escape: the second one this used to send never
                 # arrived as an Escape (the 0.3s gap kept the pair inside the
                 # parser's escape-code window, so the TUI saw the double-esc
@@ -20050,7 +20054,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             append_inbox(
                 "deviation",
                 f"Pane {s.pane} left on {current} (no /exit sent)",
-                f"The hot-swap could not deliver the Escape safety prefix to pane {s.pane}, so `/exit` was never typed and the pane was NOT relaunched on `{decision.target}`. That session keeps running on `{current}` and will keep drawing from its budget.\n\n**Walk-back**: `/exit` the pane by hand and start a fresh session on `{decision.target}`, or re-run the swap once the pane is reachable.",
+                f"The hot-swap could not drive pane {s.pane} safely (see the daemon log for which step failed), so `/exit` was never typed and the pane was NOT relaunched on `{decision.target}`. That session keeps running on `{current}` and will keep drawing from its budget.\n\n**Walk-back**: `/exit` the pane by hand and start a fresh session on `{decision.target}`, or re-run the swap once the pane is reachable.",
             )
 
     # Poll each pane until shell prompt is back. Replaces the original
