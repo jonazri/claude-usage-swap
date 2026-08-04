@@ -19567,7 +19567,8 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
         --resume.
 
       "clear" (LEGACY) — wipes any user draft before /exit:
-        1. Escape, Escape (dismiss modal/overlay, defocus input).
+        1. Escape (dismiss modal/overlay, defocus input) — ONE, see
+           tmux_escape_prefix.
         2. C-u (best-effort readline clear; harmless if empty).
         3. BSpace x 400 (brute-force backspace flurry for multi-line drafts).
         4. `/exit` + Enter.
@@ -19578,8 +19579,8 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     may do nothing, and `wait_for_shell` will eventually time out + skip
     relaunch.
 
-    Returns True when the /exit sequence was sent, False when it was skipped:
-    no usable pane, or the safety prefix could not be delivered (in which case
+    Returns True when the sequence was issued, False when it was skipped: no
+    usable pane, or the safety prefix could not be delivered (in which case
     sending Enter blind is the very hazard the prefix exists to prevent).
     """
     if not tmux_is_available() or not pane or pane == "no-tmux":
@@ -19611,6 +19612,18 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
 
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
+        #
+        # Clearing now rests ENTIRELY on the C-u + BSpace flurry below. Before
+        # the one-Escape change, the prefix's `Escape Escape` burst also fired
+        # the TUI's own double-esc "clear the input box" gesture, which wiped a
+        # draft of any length; that gesture is unavailable to us now because on
+        # an EMPTY box the same keystrokes open the Rewind overlay instead, and
+        # the `/exit` below would then be typed into it (see
+        # tmux_escape_prefix). Consequence: a draft longer than 400 characters
+        # can leave residue that `/exit` appends to. "clear" is opt-in legacy
+        # and off by default, so this is documented rather than papered over
+        # with a second Escape — raising the flurry is the safe lever if it
+        # ever bites.
         tmux_send_keys(pane, "C-u", tmux_socket=tmux_socket)
         time.sleep(0.15)
         tmux_send_keys(pane, *(["BSpace"] * 400), tmux_socket=tmux_socket)
@@ -19964,11 +19977,12 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping force-interrupt (no running tool)")
             else:
                 click.echo(f"    pane {s.pane}: mid-turn — force interrupt (Escape)")
-                # A single Escape: the second one this used to send never
-                # arrived as an Escape (the 0.3s gap kept the pair inside the
-                # parser's escape-code window, so the TUI saw the double-esc
-                # gesture), and delivering it for real would clear the user's
-                # draft or open the Rewind overlay. See tmux_escape_prefix.
+                # A single Escape. The pair this used to send never arrived as
+                # two Escape keypresses — the 0.3s gap kept both bytes inside
+                # the parser's escape-code window, so the TUI read them as its
+                # double-esc GESTURE, which clears the input box or opens the
+                # Rewind overlay rather than interrupting twice. Neither form
+                # is safe here; see tmux_escape_prefix.
                 # Interrupt stays best-effort here (the swap proceeds either
                 # way, as below) — but say so when it didn't land.
                 if not tmux_escape_prefix(s.pane, tmux_socket=s.tmux_socket):
@@ -20048,7 +20062,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             # full shell_return_timeout_seconds and then blame the pane for not
             # returning. Flag and skip that wait — relaunch is skipped either
             # way, so same outcome, 10s sooner. Flagged on the session itself
-            # (the `_stuck_skip` convention), not by id().
+            # rather than by id() — mirroring how `_stuck_skip` below is read,
+            # though note nothing in cus.py ever SETS that one (GH #19's skip is
+            # currently dead code); this flag is the only live writer.
             s._exit_unsent = True
             # And don't let it vanish into the log: this pane keeps running on
             # the capped account, which an operator needs to know about.
