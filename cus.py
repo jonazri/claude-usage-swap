@@ -19600,10 +19600,12 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str
     # arrived as meta+C-u / meta+return: an unsubmitted draft that `/exit` then
     # appended to (the 2026-05-20 symptom described above).
     if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
-        # The prefix is the entire reason the Enter below is safe: undelivered,
-        # we cannot know an interactive prompt isn't focused, and a blind Enter
-        # would answer it — the exact GH #24 hazard. Bail instead;
-        # `wait_for_shell` then times out and the caller skips the relaunch.
+        # Undelivered, we cannot know that no interactive prompt has focus —
+        # which makes everything below unsafe in BOTH modes: "submit"'s blind
+        # Enter would ANSWER that prompt, and "clear"'s C-u/BSpace flurry does
+        # nothing to a modal before the typed `/exit`, whose trailing Enter
+        # answers it just the same. That is the GH #24 hazard, so bail: the
+        # caller skips this pane's shell-wait and its relaunch.
         click.echo(f"    pane {pane}: Escape prefix undelivered — not sending /exit (blind Enter unsafe)")
         return False
 
