@@ -21,10 +21,13 @@ symptom that function's docstring blames on C-u/multi-line semantics: with the
 submit Enter swallowed, `/exit` is appended to the leftover draft and submitted
 as a chat message.
 
-That same measurement also shows `Escape Escape` in ONE send-keys call arrives
-as a SINGLE meta-escape keypress, so GH #24's "two Escapes to cover nested UI
-state" was only ever delivering one. Escapes must therefore be sent as separate
-keys, each followed by the settle wait.
+Capturing a live Claude Code 2.1.221 pane then showed why the prefix must send
+only ONE Escape, contrary to GH #24's "Escape × 2": with a draft in the input box
+the second Escape CLEARS it (destroying what `draft_handling: "submit"`
+preserves), and with an empty box it opens the Rewind overlay, whose checkpoint
+entries a following blind Enter could select. The old single
+`send-keys Escape Escape` hit this too — the TUI reads that burst as the
+double-esc gesture even though node's readline parser yields one meta-escape.
 
 These tests pin the invariant at the send layer: between the last Escape of a
 safety prefix and whatever is sent next, the code waits longer than the parser's
@@ -91,12 +94,34 @@ def test_escape_settle_exceeds_parser_escape_timeout():
     assert cus.ESCAPE_CODE_TIMEOUT_SECONDS >= 0.5  # node readline default
 
 
-def test_escape_prefix_sends_separate_escapes_each_settled(monkeypatch):
-    """Two Escapes must be two keypresses, each followed by the settle wait —
-    `send-keys Escape Escape` would arrive as a single meta-escape."""
+def test_escape_prefix_sends_exactly_one_escape_then_settles(monkeypatch):
+    """ONE Escape by default, then the settle wait.
+
+    A second DELIVERED Escape is destructive on Claude Code 2.1.221 (captured
+    from a live pane): with a draft in the box it clears the draft, and with an
+    empty box it opens the Rewind overlay, whose entries a following Enter could
+    select. See tmux_escape_prefix.
+    """
     events = _recorder(monkeypatch)
     assert cus.tmux_escape_prefix("%1") is True
-    assert _sends(events) == [("keys", ("Escape",)), ("keys", ("Escape",))]
+    assert events == [("keys", ("Escape",)), ("sleep", cus.ESCAPE_SETTLE_SECONDS)]
+
+
+def test_escape_prefix_never_sends_two_escapes_by_default(monkeypatch):
+    """Pinned separately from the ordering test: the count is the safety property."""
+    events = _recorder(monkeypatch)
+    cus.tmux_escape_prefix("%1")
+    escapes = [e for e in events if e[0] == "keys" and "Escape" in e[1]]
+    assert len(escapes) == 1, f"a second Escape clears drafts / opens Rewind: {events}"
+    assert escapes[0] == ("keys", ("Escape",)), "one Escape per send-keys, never a pair in one call"
+
+
+def test_escape_prefix_settles_after_every_escape_when_count_raised(monkeypatch):
+    """`count` still works for a caller that opts in — each Escape is its own
+    send-keys (a pair in one call is read as the double-esc gesture) and each is
+    followed by the settle wait."""
+    events = _recorder(monkeypatch)
+    assert cus.tmux_escape_prefix("%1", count=2) is True
     assert events == [
         ("keys", ("Escape",)), ("sleep", cus.ESCAPE_SETTLE_SECONDS),
         ("keys", ("Escape",)), ("sleep", cus.ESCAPE_SETTLE_SECONDS),
@@ -130,9 +155,7 @@ def test_resume_pane_sends_the_message_after_the_escapes(monkeypatch):
     """Ordering is still prefix-then-payload (the GH #24 safety property)."""
     events = _recorder(monkeypatch)
     assert cus._resume_pane("%1", "/tmp/tmux-a", "continue please") is True
-    assert _sends(events) == [
-        ("keys", ("Escape",)), ("keys", ("Escape",)), ("text", "continue please"),
-    ]
+    assert _sends(events) == [("keys", ("Escape",)), ("text", "continue please")]
 
 
 def test_resume_pane_aborts_without_sending_when_escape_fails(monkeypatch):
@@ -154,7 +177,7 @@ def test_exit_claude_waits_out_escape_timeout_before_submit_enter(monkeypatch):
     assert gap > cus.ESCAPE_CODE_TIMEOUT_SECONDS, (
         f"only {gap}s between the Escape prefix and the draft-submit Enter — it "
         f"parses as meta+return, so /exit appends to the draft: {events}")
-    after = _sends(events)[2:]
+    after = _sends(events)[1:]
     assert after[0] == ("keys", ("Enter",)), f"expected the submit Enter next: {after}"
     assert ("text", "/exit") in after
 
@@ -175,7 +198,7 @@ def test_exit_claude_clear_variant_waits_before_ctrl_u(monkeypatch):
     gap = _gap_after_last_escape(events)
     assert gap > cus.ESCAPE_CODE_TIMEOUT_SECONDS, (
         f"only {gap}s before C-u — it parses as meta+C-u: {events}")
-    after = _sends(events)[2:]
+    after = _sends(events)[1:]
     assert after[0] == ("keys", ("C-u",)), f"expected C-u next: {after}"
     assert ("text", "/exit") in after
 

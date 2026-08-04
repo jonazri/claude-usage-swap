@@ -384,13 +384,11 @@ def test_reactive_resume_targets_each_pane_once():
     try:
         panes = cus._resume_reactive_slot_sessions("slot-2", _config())
         assert panes == ["%1", "%1"], "same pane id on distinct tmux servers is two sessions"
-        # One Escape per send-keys, not `Escape Escape` in a single call: that
-        # writes \x1b\x1b in one burst, which the TUI parses as ONE meta-escape
-        # keypress (see tests/test_escape_prefix_settle.py).
+        # Exactly one Escape per pane, not the old `Escape Escape` in a single
+        # call: a second delivered Escape clears the user's draft or opens the
+        # Rewind overlay (see tests/test_escape_prefix_settle.py).
         assert keys == [
             ("%1", "Escape", "/tmp/tmux-a"),
-            ("%1", "Escape", "/tmp/tmux-a"),
-            ("%1", "Escape", "/tmp/tmux-b"),
             ("%1", "Escape", "/tmp/tmux-b"),
         ]
         assert [socket for _, _, socket in texts] == ["/tmp/tmux-a", "/tmp/tmux-b"]
