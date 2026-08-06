@@ -1639,7 +1639,15 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     `execute_swap` will actually install here, and a predicate that measured
     against a source the reinstall would never use could only produce false
     positives. It can therefore under-detect (a shadow fresher than the snapshot
-    goes unnoticed), which is the safe direction.
+    goes unnoticed), which is the safe direction. One narrow path does install
+    something else: `_execute_swap_locked` claims a pooled family when
+    `_account_held_by_other_live_mount` holds (reachable here only via `--force`
+    onto a live account, and only when a liveness-verified free family exists).
+    That divergence is benign — the predicate asks "should this lane be
+    reinstalled?", not "from which lawful source?", and a lane holding a spent
+    shared-snapshot generation getting an INDEPENDENT family is the #104-safe
+    outcome, not a worse one. The lease it consumes is the designed cost of
+    double-booking.
     The bar they do share:
       * STRICTLY fresher — equal expiry is the same generation, and a lane copy
         that is itself the FRESHER one (it refreshed in place and the save-back
@@ -1696,6 +1704,16 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     mount_exp = _creds_expires_at(mount_creds)
     if snap_exp is None or mount_exp is None:
         return False
+    # A bool `expiresAt` on the MOUNT side reads as epoch-ms 1 — `True` is an
+    # `int` subclass, the trap `_expiry_unjudgeable` exists to name — so almost
+    # any snapshot would compare as strictly fresher and fire a reinstall. That
+    # outcome is right (a mount carrying `expiresAt: true` is unjudgeable, and
+    # repairing it from a healthy snapshot is the safe direction), but it should
+    # be intentional rather than a side effect of bool's int-ness. The snapshot
+    # side needs no equivalent: `_live_mount_creds_invalid` above already rejects
+    # the shape there.
+    if isinstance(mount_exp, bool):
+        return True
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     return snap_exp > mount_exp and snap_exp > now_ms
@@ -29321,6 +29339,15 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # now-accountless lane is free for the allocator to hand to someone
             # else. Put the record back and re-raise: the launch still fails, but
             # it fails without stranding the lane.
+            #
+            # SCOPE of that guarantee, so nobody over-trusts it: this is clean
+            # only for a refusal raised BEFORE any mount write. If execute_swap
+            # fails after writing the mount's credentials but before persisting
+            # state, the reloaded entry still reads None, so the record is put
+            # back to the OLD account while the mount now carries the NEW one.
+            # Reconciling that interruption class is the swap journal's job
+            # (`_recover_pending_swap`), not this undo's — it neither can nor
+            # tries to.
             if reinstall_undo is not None:
                 try:
                     with _swap_lock():
