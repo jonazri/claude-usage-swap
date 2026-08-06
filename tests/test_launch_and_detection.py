@@ -292,6 +292,87 @@ def test_launch_leaves_a_leased_lane_alone_even_when_the_snapshot_is_fresher():
         env.restore()
 
 
+def test_launch_leaves_a_legacy_independent_login_lane_alone():
+    # The OTHER independent-login lineage, and the one state cannot show you: a
+    # LEGACY per-(slot, account) login leaves no `login_family` entry, so
+    # `slot_leased_family` returns None for it. It is still not comparable
+    # against the shared snapshot — `swap_install_source` installs it from its
+    # own store — so the superseded check must skip it exactly as it skips a
+    # pooled lease, or the reinstall re-families the mount (#104).
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        config["independent_logins"] = {"use_independent_logins": True}
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        # Legacy store for THIS (account, slot) — note: no login_family in state.
+        # The store deliberately holds an OLDER in-lineage generation than the
+        # mount (the lane refreshed in place; the save-back hasn't run), so a
+        # wrongful reinstall is VISIBLE: whichever source it picks — the legacy
+        # store or, if the lease verdict isn't "ok", the shared snapshot — the
+        # mount's own newer token is destroyed either way.
+        store = cus.login_store_creds_path("alpha", slot_name)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(_creds("rt-alpha-legacy-v1", expires_at=1_200_000_000_000)))
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-legacy-v2", expires_at=1_500_000_000_000)))
+        assert cus.slot_leased_family(cus.load_state(), slot_name) is None, \
+            "precondition: a legacy login is invisible to slot_leased_family"
+        assert cus.has_independent_login("alpha", slot_name)
+        assert cus._mount_creds_superseded(slot_dir, "alpha"), \
+            "precondition: the shared snapshot IS a different, strictly fresher generation"
+
+        _, got_dir, _ = cus._launch_prepare("alpha", cus.load_state(), config)
+        creds = json.loads((got_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha-legacy-v2", \
+            "legacy lineage survives — never re-familied from the shared snapshot"
+    finally:
+        env.restore()
+
+
+def test_launch_restores_the_lane_when_the_reinstall_is_refused():
+    # The unfit path blanks the lane's account BEFORE execute_swap runs, so a
+    # refusal (dead snapshot, pool exhausted, #15 shared-family fail-closed)
+    # must not leave state saying the lane holds nothing while its mount still
+    # carries the old credentials — an accountless lane is free for the
+    # allocator to hand to someone else. The launch still fails; it just fails
+    # without stranding the lane. (This is the force-launch behavior change:
+    # a superseded lane now reaches execute_swap, which can legitimately refuse,
+    # where before it silently reused the dead grant.)
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-spent", expires_at=1_000_000_000_000)))
+
+        import click
+        saved = cus.execute_swap
+        cus.execute_swap = lambda *a, **k: (_ for _ in ()).throw(
+            click.ClickException("pool exhausted for 'alpha'"))
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), config)
+            raise AssertionError("expected the refusal to propagate")
+        except click.ClickException as exc:
+            assert "pool exhausted" in str(exc)
+        finally:
+            cus.execute_swap = saved
+
+        assert cus.load_state()["slots"][slot_name]["account"] == "alpha", \
+            "lane's recorded account restored after the refused reinstall"
+    finally:
+        env.restore()
+
+
 def test_mount_creds_superseded_is_conservative():
     # The predicate's three refusals, which keep it from ever making things
     # worse. Mirrors _repair_stale_lane_mount's bar exactly.
@@ -308,6 +389,17 @@ def test_mount_creds_superseded_is_conservative():
 
         # Equal expiry is the SAME generation — copying it changes nothing.
         mount.write_text(json.dumps(_creds("rt-same", expires_at=2_000_000_000_000)))
+        assert not cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms)
+
+        # SAME refresh token, older access-token expiry: a pure access-token
+        # re-mint, not a rotation (_refresh_account_token keeps the incumbent
+        # when the endpoint returns no new one), so the lane's grant is intact
+        # and there is nothing to supersede. Expiry ordering alone would fire
+        # here and churn a blank + execute_swap on every idle lane after every
+        # daemon refresh.
+        mount.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-older", "refreshToken": "rt-alpha",
+                               "expiresAt": 1_000_000_000_000}}))
         assert not cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms)
 
         # A snapshot that is itself already expired cannot log anyone back in;

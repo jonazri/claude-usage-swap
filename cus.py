@@ -1633,10 +1633,14 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
         keep falling through to the SOS.
       * Refresh-capable — a shorter runway WITH a working refresh beats a longer
         runway with none (the #13 round-3 capability rule).
-    Caller-side, this is applied only to a PLAIN lane: a lane holding a leased
-    login family (`slot_leased_family`) is not comparable against the shared
-    snapshot, and installing it would cross-family the mount and clobber every
-    other holder of that snapshot on the next refresh (#104)."""
+      * A DIFFERENT generation — identical refresh tokens are the same grant
+        however the expiries compare, so nothing is superseded (below).
+    Caller-side, this is applied only to a PLAIN lane. Neither independent-login
+    lineage is comparable against the shared snapshot — a pooled lease
+    (`slot_leased_family`) nor a legacy per-(slot, account) login
+    (`has_independent_login`, which leaves NO `login_family` in state) — and
+    installing the snapshot over either would cross-family the mount and clobber
+    every other holder of that snapshot on the next refresh (#104)."""
     snap = account_creds_path(account)
     if not snap.exists():
         return False
@@ -1647,7 +1651,20 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
         return False
     # Same shape bar every other install point applies, plus the capability
     # gate: a blank-shaped or refresh-token-less snapshot is not an upgrade.
-    if _live_mount_creds_invalid(snap_creds) or _credential_refresh_token(snap_creds) is None:
+    snap_rt = _credential_refresh_token(snap_creds)
+    if _live_mount_creds_invalid(snap_creds) or snap_rt is None:
+        return False
+    # SAME refresh token = the same grant, however the access-token expiries
+    # compare — so the lane's copy is not spent and there is nothing to
+    # supersede. This is a real case, not a theoretical one: a refresh keeps the
+    # incumbent token whenever the endpoint returns no new one
+    # (`_refresh_account_token`: `data.get("refresh_token") or refresh_token`),
+    # so a snapshot that merely re-minted its ACCESS token is not a rotation.
+    # Checking generation identity before expiry ordering is what makes this
+    # predicate mean what its name says; on expiry alone it would fire on every
+    # idle lane after every daemon refresh and churn a full blank +
+    # `execute_swap` for a grant that was never at risk.
+    if snap_rt == _credential_refresh_token(mount_creds):
         return False
     snap_exp = _creds_expires_at(snap_creds)
     mount_exp = _creds_expires_at(mount_creds)
@@ -29184,27 +29201,66 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     def _mount_unfit_to_reuse(st: dict) -> str | None:
         if not mount_has_usable_credentials(slot_dir):
             return "credentials are unusable"
+        # PLAIN lane only. BOTH independent-login lineages must be excluded, and
+        # only one of them is visible in state: a pooled lease is recorded on
+        # `state.slots[slot].login_family`, but a LEGACY per-(slot, account)
+        # login leaves nothing there at all, so `slot_leased_family` cannot see
+        # it. This mirrors `swap_install_source`'s own gate — the code that would
+        # actually choose the install source — so the two cannot disagree about
+        # which lineage a lane belongs to. Comparing a legacy lane against the
+        # shared snapshot and reinstalling would either re-family the mount
+        # (#104) or copy an OLDER legacy generation over a newer one (GH #77
+        # inverted): the exact logout this whole check exists to prevent.
         if (slot_leased_family(st, slot_name) is None
+                and not (independent_logins_enabled(config)
+                         and has_independent_login(account, slot_name))
                 and _mount_creds_superseded(slot_dir, account)):
             return "credentials are a superseded token generation"
         return None
 
     slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
-    unfit = (slot_account == account and not mount_in_use(slot_dir)
-             and _mount_unfit_to_reuse(state))
-    if unfit:
-        click.echo(f"launch: {slot_name} held '{account}' but {unfit}; reinstalling")
+    # What the unfit path blanked, so a refused reinstall can put it back.
+    reinstall_undo: dict[str, Any] | None = None
+    if (slot_account == account and not mount_in_use(slot_dir)
+            and _mount_unfit_to_reuse(state)):
         with _swap_lock():
             fresh = load_state()
             entry = fresh.setdefault("slots", {}).setdefault(slot_name, {"account": None, "created_ts": now_iso()})
-            if entry.get("account") == account and _mount_unfit_to_reuse(fresh):
+            # Re-check under the lock and announce only if THIS check agrees: the
+            # outer test ran on a pre-lock snapshot, and when the reload disagrees
+            # (the daemon moved the lane meanwhile) nothing is blanked, so saying
+            # "reinstalling" would describe work that never happened.
+            unfit = _mount_unfit_to_reuse(fresh) if entry.get("account") == account else None
+            if unfit:
+                click.echo(f"launch: {slot_name} held '{account}' but {unfit}; reinstalling")
+                reinstall_undo = {"account": entry.get("account"),
+                                  "login_family": entry.get("login_family")}
                 entry["account"] = None
                 entry.pop("login_family", None)
                 save_state(fresh)
         state = load_state()
         slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
     if slot_account != account:
-        execute_swap(account, trigger="launch", slot=slot_name)
+        try:
+            execute_swap(account, trigger="launch", slot=slot_name)
+        except Exception:
+            # The unfit path blanks the lane's account BEFORE the reinstall, so a
+            # refusal here (dead snapshot, pool exhausted, the #15 shared-family
+            # fail-closed guard) would otherwise leave state saying the lane holds
+            # NOTHING while its mount still carries the old credentials — and the
+            # now-accountless lane is free for the allocator to hand to someone
+            # else. Put the record back and re-raise: the launch still fails, but
+            # it fails without stranding the lane.
+            if reinstall_undo is not None:
+                with _swap_lock():
+                    undo = load_state()
+                    e = undo.setdefault("slots", {}).setdefault(slot_name, {"created_ts": now_iso()})
+                    if e.get("account") is None:
+                        e["account"] = reinstall_undo["account"]
+                        if reinstall_undo["login_family"] is not None:
+                            e["login_family"] = reinstall_undo["login_family"]
+                        save_state(undo)
+            raise
 
     state = load_state()
     entry = state.setdefault("slots", {}).setdefault(slot_name, {"account": account, "created_ts": now_iso()})
