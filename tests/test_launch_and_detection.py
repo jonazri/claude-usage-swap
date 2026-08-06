@@ -497,6 +497,33 @@ def test_launch_reserves_the_lane_across_the_blank_to_swap_window():
         env.restore()
 
 
+def test_launch_treats_an_unparseable_login_family_as_leased():
+    # slot_leased_family returns None for any login_family without a "/" (a bare
+    # "family-1" from hand-edited or legacy-shaped state). Reading that as "no
+    # lease" would classify a leased lane as PLAIN and let the shared snapshot
+    # cross-family its mount. Unknown lineage must not be reinstalled.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha", "login_family": "family-1"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-family-1", expires_at=1_000_000_000_000)))
+        assert cus.slot_leased_family(cus.load_state(), slot_name) is None, \
+            "precondition: the malformed value does not parse into a lease"
+
+        _, got_dir, _ = cus._launch_prepare("alpha", cus.load_state(), config)
+        creds = json.loads((got_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha-family-1", \
+            "unparseable lease is treated as leased, not plain — mount untouched"
+    finally:
+        env.restore()
+
+
 def test_mount_creds_superseded_is_conservative():
     # The predicate's three refusals, which keep it from ever making things
     # worse. Mirrors _repair_stale_lane_mount's bar exactly.

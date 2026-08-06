@@ -1647,7 +1647,16 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
         the GH #77 failure, inverted.
       * Not itself already expired — installing a second dead generation cannot
         log the session back in; that lane is a genuine relogin case and must
-        keep falling through to the SOS.
+        keep falling through to the SOS. KNOWN RESIDUAL, accepted: this also
+        declines a snapshot whose ACCESS token has lapsed while its refresh
+        token is still live, which would in fact be an upgrade (Claude Code
+        refreshes on startup and comes up logged in). Taking it would mean
+        installing a grant whose liveness cannot be established locally — the
+        only probe, `_account_snapshot_dead`, SPENDS the single-use token — so
+        the under-detection is kept on purpose. Measured 2026-08-06 across this
+        pool: no lane sat in that shape, because the daemon keeps every ENABLED
+        account's snapshot access token fresh; the single lapsed snapshot
+        belonged to the one DISABLED account, which no lane holds.
       * Refresh-capable — a shorter runway WITH a working refresh beats a longer
         runway with none (the #13 round-3 capability rule).
       * A DIFFERENT generation — identical refresh tokens are the same grant
@@ -29217,6 +29226,15 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     #     shared snapshot, and installing it would cross-family the mount (#104).
     def _mount_unfit_to_reuse(st: dict) -> str | None:
         if not mount_has_usable_credentials(slot_dir):
+            # NOTE, pre-existing and deliberately unchanged here: this branch
+            # does NOT apply the lineage exclusion below. A leased or legacy
+            # lane whose mount is logout-shaped is still blanked, has its lease
+            # popped, and takes the shared snapshot — the very cross-family
+            # install the superseded branch is careful to avoid. The two unfit
+            # reasons are asymmetric on #104 for that reason. Closing it means
+            # changing which source `execute_swap` picks for a logout-shaped
+            # LEASED mount (its family store, not the snapshot), which is a
+            # different change from this one and wants its own tests.
             return "credentials are unusable"
         # PLAIN lane only. BOTH independent-login lineages must be excluded, and
         # only one of them is visible in state: a pooled lease is recorded on
@@ -29234,7 +29252,13 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # shared snapshot and reinstalling would either re-family the mount
         # (#104) or copy an OLDER legacy generation over a newer one (GH #77
         # inverted): the exact logout this whole check exists to prevent.
-        if (slot_leased_family(st, slot_name) is None
+        # Truthiness of the RAW `login_family`, not `slot_leased_family`'s parsed
+        # tuple: that helper returns None for any value without a "/" (a bare
+        # "family-1" from hand-edited or legacy-shaped state), and reading that
+        # as "no lease" would classify a leased lane as PLAIN and let the shared
+        # snapshot cross-family its mount. Unparseable means unknown lineage, and
+        # unknown lineage is exactly what must not be reinstalled from a snapshot.
+        if (not ((st.get("slots", {}) or {}).get(slot_name, {}) or {}).get("login_family")
                 and not (independent_logins_enabled(config)
                          and has_independent_login(account, slot_name))
                 and _mount_creds_superseded(slot_dir, account)):
