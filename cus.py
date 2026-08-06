@@ -1664,7 +1664,18 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
         the under-detection is kept on purpose. Measured 2026-08-06 across this
         pool: no lane sat in that shape, because the daemon keeps every ENABLED
         account's snapshot access token fresh; the single lapsed snapshot
-        belonged to the one DISABLED account, which no lane holds.
+        belonged to the one DISABLED account, which no lane holds. A SECOND
+        reason not to relax it, found in review: `execute_swap` can reach
+        `_account_snapshot_dead`, whose probe SPENDS the snapshot's single-use
+        refresh token. That is unreachable from here today precisely BECAUSE of
+        this bar — the probe's cheap branch returns early on a still-valid
+        access token — so accepting a lapsed snapshot would start burning the
+        account's refresh grant on every superseded-lane launch.
+      * A mount with NO judgeable expiry at all (`expiresAt` absent, so
+        `_creds_expires_at` yields None) is likewise reused as-is, even against
+        a strictly newer live snapshot. Same safe direction, listed here so it
+        is an accepted residual rather than an oversight lumped in with the
+        snapshot-side None check.
       * Refresh-capable — a shorter runway WITH a working refresh beats a longer
         runway with none (the #13 round-3 capability rule).
       * A DIFFERENT generation — identical refresh tokens are the same grant
@@ -29249,10 +29260,14 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         if not mount_has_usable_credentials(slot_dir):
             # NOTE, pre-existing and deliberately unchanged here: this branch
             # does NOT apply the lineage exclusion below. A leased or legacy
-            # lane whose mount is logout-shaped is still blanked, has its lease
-            # popped, and takes the shared snapshot — the very cross-family
-            # install the superseded branch is careful to avoid. The two unfit
-            # reasons are asymmetric on #104 for that reason. Closing it means
+            # lane whose mount is logout-shaped is still blanked and has its
+            # lease popped. What lands then depends on lineage: a LEASED lane
+            # takes the shared snapshot — the very cross-family install the
+            # superseded branch is careful to avoid — while a LEGACY one takes
+            # the shared snapshot only if `_legacy_login_lease_verdict` is not
+            # "ok"; when it is, `swap_install_source` still installs the
+            # per-slot store. So the two unfit reasons are asymmetric on #104,
+            # but only the leased case is unconditionally so. Closing it means
             # changing which source `execute_swap` picks for a logout-shaped
             # LEASED mount (its family store, not the snapshot), which is a
             # different change from this one and wants its own tests.
@@ -29350,7 +29365,13 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # back to the OLD account while the mount now carries the NEW one.
             # Reconciling that interruption class is the swap journal's job
             # (`_recover_pending_swap`), not this undo's — it neither can nor
-            # tries to.
+            # tries to. Nor does it cover a SIGKILL between the blank and
+            # `execute_swap`: no journal exists yet at that point, so once the
+            # reservation lapses the lane reads accountless while its mount
+            # still carries the old credentials. The reservation bounds that to
+            # SLOT_RESERVATION_SECONDS, and in the superseded case the stranded
+            # generation is spent anyway, so the practical loss is small — but
+            # it is a real transient, not something this handler prevents.
             if reinstall_undo is not None:
                 try:
                     with _swap_lock():
