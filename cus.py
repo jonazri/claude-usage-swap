@@ -1704,18 +1704,21 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     mount_exp = _creds_expires_at(mount_creds)
     if snap_exp is None or mount_exp is None:
         return False
-    # A bool `expiresAt` on the MOUNT side reads as epoch-ms 1 — `True` is an
-    # `int` subclass, the trap `_expiry_unjudgeable` exists to name — so almost
-    # any snapshot would compare as strictly fresher and fire a reinstall. That
-    # outcome is right (a mount carrying `expiresAt: true` is unjudgeable, and
-    # repairing it from a healthy snapshot is the safe direction), but it should
-    # be intentional rather than a side effect of bool's int-ness. The snapshot
-    # side needs no equivalent: `_live_mount_creds_invalid` above already rejects
-    # the shape there.
-    if isinstance(mount_exp, bool):
-        return True
     if now_ms is None:
         now_ms = int(time.time() * 1000)
+    # A bool `expiresAt` on the MOUNT side reads as epoch-ms 1 — `True` is an
+    # `int` subclass, the trap `_expiry_unjudgeable` exists to name — so ordering
+    # anything against it is meaningless. Treat the mount's expiry as UNJUDGEABLE
+    # and drop only THAT half of the test: the snapshot must still clear the "not
+    # itself already expired" bar below. Returning True outright here would skip
+    # that bar and let a stale snapshot — a DISABLED account's, say, which the
+    # daemon no longer refreshes — be installed dead over the lane, so the
+    # session comes up logged out with no relogin prompt. That is exactly the
+    # case this predicate promises to leave for the SOS. The snapshot side needs
+    # no bool guard of its own: `_live_mount_creds_invalid` above rejects the
+    # shape there.
+    if isinstance(mount_exp, bool):
+        return snap_exp > now_ms
     return snap_exp > mount_exp and snap_exp > now_ms
 
 

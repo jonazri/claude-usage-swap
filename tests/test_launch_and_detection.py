@@ -524,6 +524,38 @@ def test_launch_treats_an_unparseable_login_family_as_leased():
         env.restore()
 
 
+def test_unjudgeable_mount_expiry_still_requires_a_live_snapshot():
+    # A bool `expiresAt` on the mount makes the ORDERING comparison meaningless
+    # (True is an int subclass, so it reads as epoch-ms 1) — but it must not
+    # excuse the snapshot from the "not itself already expired" bar. Short-
+    # circuiting to True here would install a dead generation over the lane and
+    # the session would come up logged out with no relogin prompt, which is the
+    # case that has to keep reaching the SOS. Reachable in practice: a DISABLED
+    # account's snapshot goes stale because the daemon stops refreshing it.
+    env = _Env()
+    try:
+        _, slot_dir = cus.create_slot(cus.load_state())
+        mount = slot_dir / ".credentials.json"
+        snap = env.accounts_dir / "account-alpha" / ".credentials.json"
+        now_ms = 1_500_000_000_000
+        mount.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-x", "refreshToken": "rt-bool",
+                               "expiresAt": True}}))
+
+        # Snapshot already expired → NOT an upgrade, however unjudgeable the
+        # mount is. Installing it cannot log the session back in.
+        snap.write_text(json.dumps(_creds("rt-alpha", expires_at=1_400_000_000_000)))
+        assert not cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms), \
+            "dead snapshot is never an upgrade, even over an unjudgeable mount"
+
+        # Snapshot still live → the unjudgeable mount is repaired from it.
+        snap.write_text(json.dumps(_creds("rt-alpha", expires_at=2_000_000_000_000)))
+        assert cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms), \
+            "live snapshot does supersede an unjudgeable mount"
+    finally:
+        env.restore()
+
+
 def test_mount_creds_superseded_is_conservative():
     # The predicate's three refusals, which keep it from ever making things
     # worse. Mirrors _repair_stale_lane_mount's bar exactly.
