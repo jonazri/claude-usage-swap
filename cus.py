@@ -1622,8 +1622,17 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     the only code that ever touches one again. So the check belongs at the
     moment of use.
 
-    Deliberately conservative, mirroring `_repair_stale_lane_mount` verbatim so
-    the two halves cannot disagree:
+    Deliberately conservative, taking `_repair_stale_lane_mount`'s bar as its
+    base — but NOT a verbatim mirror of it, in two directions. This predicate
+    ADDS the refresh-token identity short-circuit below, which that function has
+    no equivalent of (so the live-lane repair will still rewrite a mount holding
+    the source's own token — harmless there, because it only runs on an
+    already-expired mount, where a fresher access token of the same family is
+    exactly what is wanted). And it does NOT require the mount's own access token
+    to have already expired, only that the snapshot is a newer generation: a
+    launch is the moment a whole session's runway is decided, so a spent grant
+    matters here even while the current access token still has minutes on it.
+    The bar they do share:
       * STRICTLY fresher — equal expiry is the same generation, and a lane copy
         that is itself the FRESHER one (it refreshed in place and the save-back
         hasn't run yet) must never be clobbered by an older snapshot: that is
@@ -29205,9 +29214,15 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # only one of them is visible in state: a pooled lease is recorded on
         # `state.slots[slot].login_family`, but a LEGACY per-(slot, account)
         # login leaves nothing there at all, so `slot_leased_family` cannot see
-        # it. This mirrors `swap_install_source`'s own gate — the code that would
-        # actually choose the install source — so the two cannot disagree about
-        # which lineage a lane belongs to. Comparing a legacy lane against the
+        # it. The legacy test is the same one `swap_install_source` uses to
+        # recognise the lineage, but deliberately stops short of that gate's
+        # further `_legacy_login_lease_verdict(...) == "ok"` clause: this
+        # exclusion is therefore strictly BROADER, skipping even a legacy lane
+        # whose store is rotten or colliding — one that `execute_swap` would in
+        # fact install the snapshot for. That skew is the safe direction (we
+        # decline to reinstall rather than risk re-familying), and a rotten
+        # legacy store is a relogin case for the SOS to raise, not something to
+        # paper over at launch. Comparing a legacy lane against the
         # shared snapshot and reinstalling would either re-family the mount
         # (#104) or copy an OLDER legacy generation over a newer one (GH #77
         # inverted): the exact logout this whole check exists to prevent.
@@ -29237,6 +29252,18 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                                   "login_family": entry.get("login_family")}
                 entry["account"] = None
                 entry.pop("login_family", None)
+                # RESERVE across the blank→swap window. Until `execute_swap`
+                # lands, this lane is recorded as holding nothing — and
+                # `_slot_busy` is `mount_in_use(...) or _slot_reserved(...)`, so
+                # with no live pids and no reservation an accountless lane is
+                # ALLOCATABLE: a concurrent launch could be handed the lane while
+                # its mount still carries the old account's credentials. An
+                # explicit `--lane` launch never passes through `acquire_slot`,
+                # so it has no reservation of its own to lean on. The exception
+                # restore below cannot cover a SIGKILL in this window; the
+                # reservation can, and it lapses by itself after
+                # SLOT_RESERVATION_SECONDS rather than needing cleanup.
+                _reserve(entry)
                 save_state(fresh)
         state = load_state()
         slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
@@ -29252,14 +29279,22 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # else. Put the record back and re-raise: the launch still fails, but
             # it fails without stranding the lane.
             if reinstall_undo is not None:
-                with _swap_lock():
-                    undo = load_state()
-                    e = undo.setdefault("slots", {}).setdefault(slot_name, {"created_ts": now_iso()})
-                    if e.get("account") is None:
-                        e["account"] = reinstall_undo["account"]
-                        if reinstall_undo["login_family"] is not None:
-                            e["login_family"] = reinstall_undo["login_family"]
-                        save_state(undo)
+                try:
+                    with _swap_lock():
+                        undo = load_state()
+                        e = undo.setdefault("slots", {}).setdefault(slot_name, {"created_ts": now_iso()})
+                        if e.get("account") is None:
+                            e["account"] = reinstall_undo["account"]
+                            if reinstall_undo["login_family"] is not None:
+                                e["login_family"] = reinstall_undo["login_family"]
+                            save_state(undo)
+                except Exception:
+                    # Best-effort, and deliberately swallowing: a lock timeout or
+                    # write error while putting the record back must not replace
+                    # the refusal the operator actually needs to read. The lane
+                    # stays reserved either way, so it is still out of the
+                    # allocator's reach until the reservation lapses.
+                    pass
             raise
 
     state = load_state()

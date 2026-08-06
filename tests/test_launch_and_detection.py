@@ -373,6 +373,50 @@ def test_launch_restores_the_lane_when_the_reinstall_is_refused():
         env.restore()
 
 
+def test_launch_reserves_the_lane_across_the_blank_to_swap_window():
+    # Between blanking `entry["account"]` and execute_swap landing, the lane is
+    # recorded as holding nothing. `_slot_busy` is `mount_in_use or
+    # _slot_reserved`, so with no live pids and no reservation that lane is
+    # ALLOCATABLE and a concurrent launch could be handed it while its mount
+    # still carries the old account's credentials. An explicit --lane launch
+    # never goes through acquire_slot, so it has no reservation of its own.
+    # Reserving as we blank closes the window, and unlike the exception restore
+    # it also survives a SIGKILL (it just lapses).
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-spent", expires_at=1_000_000_000_000)))
+
+        # Observe the state as it stands at the instant execute_swap is called —
+        # i.e. mid-window, after the blank.
+        seen = {}
+        saved = cus.execute_swap
+
+        def _spy(*a, **k):
+            st = cus.load_state()
+            seen["entry"] = dict(st["slots"][slot_name])
+            return saved(*a, **k)
+
+        cus.execute_swap = _spy
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), config)
+        finally:
+            cus.execute_swap = saved
+
+        assert seen["entry"]["account"] is None, "precondition: mid-window, lane is blanked"
+        assert cus._slot_busy(slot_name, seen["entry"]), \
+            "blanked lane is reserved, so the allocator cannot hand it to another launch"
+    finally:
+        env.restore()
+
+
 def test_mount_creds_superseded_is_conservative():
     # The predicate's three refusals, which keep it from ever making things
     # worse. Mirrors _repair_stale_lane_mount's bar exactly.
