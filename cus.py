@@ -1599,6 +1599,113 @@ def mount_has_usable_credentials(mount: Path) -> bool:
         return False
 
 
+def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = None) -> bool:
+    """True iff `account`'s snapshot holds a STRICTLY FRESHER, still-valid,
+    refresh-CAPABLE credential generation than the one sitting on `mount`.
+
+    The companion to `mount_has_usable_credentials` above, which answers only
+    "is a refresh token PRESENT" — and presence is not currency. Refresh tokens
+    are single-use: the moment the account snapshot rotates, every lane copy of
+    the previous generation is SPENT. Reusing the spent copy at launch makes
+    Claude Code refresh on startup, take invalid_grant, and blank the mount, so
+    the session comes up "not logged in" (2026-08-06 slot-4: lane held
+    717ea2c5e6 expired 11:49, snapshot had rotated to 2caf3991735c; blanked at
+    the launch second, repaired 66s later by the reactive lane heal).
+
+    Why it lives on the launch path: every proactive credential repair here —
+    `_preempt_live_lane_blanks`, `_repair_stale_lane_mount`,
+    `_auto_heal_live_lanes` — iterates `occupied_slot_accounts`, i.e. LIVE lanes
+    only, on the reasonable rule that you don't rewrite a mount nobody is
+    reading. So an idle lane's credentials rot untouched and `cus launch` is the
+    only code that ever sees one again. This is the idle-lane half of
+    `_repair_stale_lane_mount`'s job, sharing its conservatism:
+
+      * A DIFFERENT generation — identical refresh tokens are the same grant
+        however the expiries compare, so nothing is superseded.
+      * STRICTLY fresher — equal expiry is the same generation, and a lane copy
+        that is itself fresher (refreshed in place, save-back not yet run) must
+        never be clobbered by an older snapshot: GH #77 inverted.
+      * Refresh-capable — a shorter runway WITH a working refresh beats a longer
+        one with none (#13 round-3).
+      * The snapshot not itself expired — a second dead generation cannot log
+        the session back in; that lane is a relogin case for the SOS.
+
+    Two accepted residuals, both under-detecting (the safe direction). A
+    snapshot whose ACCESS token has lapsed while its refresh token is still live
+    would be a genuine upgrade, and is declined anyway: its liveness cannot be
+    established locally, and the one probe that could — `_account_snapshot_dead`
+    — SPENDS the single-use token. That bar is also what keeps this path from
+    reaching that probe at all, so relaxing it would burn the account's refresh
+    grant on every superseded-lane launch. Measured 2026-08-06: no lane sat in
+    that shape, the daemon keeping every ENABLED account's snapshot fresh and
+    the one lapsed snapshot belonging to the disabled account no lane holds.
+    Second, a mount whose `expiresAt` is ABSENT is reused as-is. Note this is
+    narrower than `_expiry_unjudgeable`, which also counts bool and `<= 0`: a
+    mount at `expiresAt: 0` (blank-shaped, but still carrying a refresh token,
+    so it clears `mount_has_usable_credentials`) IS treated as superseded and
+    repaired, and a bool one is handled at the branch below. Repairing those two
+    is the wanted outcome; only an absent expiry declines.
+
+    Compares against the account snapshot alone, not `_lane_heal_source`'s
+    fresher-of-shadow-or-snapshot pick, because the snapshot is what
+    `execute_swap` installs here — measuring against a source the reinstall
+    would never use could only produce false positives. (One narrow exception:
+    `_execute_swap_locked` claims a pooled family when
+    `_account_held_by_other_live_mount` holds, reachable only via `--force` onto
+    a live account. Benign — an independent family is the #104-safe outcome.)
+
+    Caller-side this applies to a PLAIN lane only: neither independent-login
+    lineage is comparable against the shared snapshot — a pooled lease
+    (`slot_leased_family`) nor a legacy per-(slot, account) login
+    (`has_independent_login`, which leaves NO `login_family` in state) — and
+    installing the snapshot over either cross-families the mount (#104)."""
+    snap = account_creds_path(account)
+    if not snap.exists():
+        return False
+    try:
+        snap_creds = read_json(snap)
+        mount_creds = read_json(mount_creds_path(mount))
+    except (json.JSONDecodeError, OSError):
+        return False
+    # Same shape bar every other install point applies, plus the capability
+    # gate: a blank-shaped or refresh-token-less snapshot is not an upgrade.
+    snap_rt = _credential_refresh_token(snap_creds)
+    if _live_mount_creds_invalid(snap_creds) or snap_rt is None:
+        return False
+    # SAME refresh token = the same grant, however the access-token expiries
+    # compare — so the lane's copy is not spent and there is nothing to
+    # supersede. This is a real case, not a theoretical one: a refresh keeps the
+    # incumbent token whenever the endpoint returns no new one
+    # (`_refresh_account_token`: `data.get("refresh_token") or refresh_token`),
+    # so a snapshot that merely re-minted its ACCESS token is not a rotation.
+    # Checking generation identity before expiry ordering is what makes this
+    # predicate mean what its name says; on expiry alone it would fire on every
+    # idle lane after every daemon refresh and churn a full blank +
+    # `execute_swap` for a grant that was never at risk.
+    if snap_rt == _credential_refresh_token(mount_creds):
+        return False
+    snap_exp = _creds_expires_at(snap_creds)
+    mount_exp = _creds_expires_at(mount_creds)
+    if snap_exp is None or mount_exp is None:
+        return False
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    # A bool `expiresAt` on the MOUNT side reads as epoch-ms 1 — `True` is an
+    # `int` subclass, the trap `_expiry_unjudgeable` exists to name — so ordering
+    # anything against it is meaningless. Treat the mount's expiry as UNJUDGEABLE
+    # and drop only THAT half of the test: the snapshot must still clear the "not
+    # itself already expired" bar below. Returning True outright here would skip
+    # that bar and let a stale snapshot — a DISABLED account's, say, which the
+    # daemon no longer refreshes — be installed dead over the lane, so the
+    # session comes up logged out with no relogin prompt. That is exactly the
+    # case this predicate promises to leave for the SOS. The snapshot side needs
+    # no bool guard of its own: `_live_mount_creds_invalid` above rejects the
+    # shape there.
+    if isinstance(mount_exp, bool):
+        return snap_exp > now_ms
+    return snap_exp > mount_exp and snap_exp > now_ms
+
+
 def _refresh_fingerprint(refresh_token: Any) -> str | None:
     """Short, non-reversible fingerprint of a refresh token for provenance.
 
@@ -29109,23 +29216,168 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     # Install the account into the slot — the same in-place swap primitive the
     # daemon uses (no-op when the slot already holds it). Reloads and persists
     # state itself, under the swap lock. If an idle slot claims the right
-    # account but carries logout-shaped creds, blank its account first so the
-    # swap below actually REINSTALLS from the good snapshot instead of reusing
-    # a dead mount (execute_swap is a no-op when the slot already holds it).
+    # account but its mount cannot seed a working session, blank its account
+    # first so the swap below actually REINSTALLS from the good snapshot
+    # instead of reusing a dead mount (execute_swap is a no-op when the slot
+    # already holds it). Two distinct ways a mount fails that bar:
+    #   * logout-shaped — no refresh token at all;
+    #   * SUPERSEDED — a refresh token that is PRESENT but spent, because the
+    #     snapshot rotated after this lane's last swap. Nothing else repairs an
+    #     idle lane: every proactive credential path here is live-only (see
+    #     `_mount_creds_superseded`), so without this check the session starts
+    #     on a dead grant, Claude Code blanks the mount on its first refresh,
+    #     and the pane comes up "not logged in" (2026-08-06 slot-4). Restricted
+    #     to a PLAIN lane — a leased login family is not comparable against the
+    #     shared snapshot, and installing it would cross-family the mount (#104).
+    def _mount_unfit_to_reuse(st: dict) -> str | None:
+        if not mount_has_usable_credentials(slot_dir):
+            # NOTE, pre-existing and deliberately unchanged here: this branch
+            # does NOT apply the lineage exclusion below. A leased or legacy
+            # lane whose mount is logout-shaped is still blanked and has its
+            # lease popped. What lands then depends on lineage: a LEASED lane
+            # takes the shared snapshot — the very cross-family install the
+            # superseded branch is careful to avoid — while a LEGACY one takes
+            # the shared snapshot only if `_legacy_login_lease_verdict` is not
+            # "ok"; when it is, `swap_install_source` still installs the
+            # per-slot store. So the two unfit reasons are asymmetric on #104,
+            # but only the leased case is unconditionally so. Closing it means
+            # changing which source `execute_swap` picks for a logout-shaped
+            # LEASED mount (its family store, not the snapshot), which is a
+            # different change from this one and wants its own tests.
+            return "credentials are unusable"
+        # PLAIN lane only. BOTH independent-login lineages must be excluded, and
+        # only one of them is visible in state: a pooled lease is recorded on
+        # `state.slots[slot].login_family`, but a LEGACY per-(slot, account)
+        # login leaves nothing there at all, so `slot_leased_family` cannot see
+        # it. The legacy test is the same one `swap_install_source` uses to
+        # recognise the lineage, but deliberately stops short of that gate's
+        # further `_legacy_login_lease_verdict(...) == "ok"` clause: this
+        # exclusion is therefore strictly BROADER, skipping even a legacy lane
+        # whose store is rotten or colliding — one that `execute_swap` would in
+        # fact install the snapshot for. That skew is the safe direction (we
+        # decline to reinstall rather than risk re-familying), and a rotten
+        # legacy store is a relogin case for the SOS to raise, not something to
+        # paper over at launch. Comparing a legacy lane against the
+        # shared snapshot and reinstalling would either re-family the mount
+        # (#104) or copy an OLDER legacy generation over a newer one (GH #77
+        # inverted): the exact logout this whole check exists to prevent.
+        # Truthiness of the RAW `login_family`, not `slot_leased_family`'s parsed
+        # tuple: that helper returns None for any value without a "/" (a bare
+        # "family-1" from hand-edited or legacy-shaped state), and reading that
+        # as "no lease" would classify a leased lane as PLAIN and let the shared
+        # snapshot cross-family its mount. Unparseable means unknown lineage, and
+        # unknown lineage is exactly what must not be reinstalled from a snapshot.
+        if (not ((st.get("slots", {}) or {}).get(slot_name, {}) or {}).get("login_family")
+                and not (independent_logins_enabled(config)
+                         and has_independent_login(account, slot_name))
+                and _mount_creds_superseded(slot_dir, account)):
+            return "credentials are a superseded token generation"
+        return None
+
     slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
-    if slot_account == account and not mount_in_use(slot_dir) and not mount_has_usable_credentials(slot_dir):
-        click.echo(f"launch: {slot_name} held '{account}' but credentials are unusable; reinstalling")
+    # What the unfit path blanked, so a refused reinstall can put it back.
+    reinstall_undo: dict[str, Any] | None = None
+    if (slot_account == account and not mount_in_use(slot_dir)
+            and _mount_unfit_to_reuse(state)):
         with _swap_lock():
             fresh = load_state()
             entry = fresh.setdefault("slots", {}).setdefault(slot_name, {"account": None, "created_ts": now_iso()})
-            if entry.get("account") == account and not mount_has_usable_credentials(slot_dir):
+            # Re-check under the lock and announce only if THIS check agrees: the
+            # outer test ran on a pre-lock snapshot, and when the reload disagrees
+            # (the daemon moved the lane meanwhile) nothing is blanked, so saying
+            # "reinstalling" would describe work that never happened.
+            unfit = _mount_unfit_to_reuse(fresh) if entry.get("account") == account else None
+            if unfit:
+                click.echo(f"launch: {slot_name} held '{account}' but {unfit}; reinstalling")
+                reinstall_undo = {"account": entry.get("account"),
+                                  "login_family": entry.get("login_family"),
+                                  "reserved_until": entry.get("reserved_until")}
+                # Blanking is not bookkeeping — it is what makes the reinstall
+                # happen, and it is load-bearing TWICE over. `_execute_swap_locked`
+                # reads the outgoing account from `state.slots[slot].account`:
+                # leave it as `account` and (1) `target_name == current` returns
+                # early, so nothing is installed at all, and (2) before that it
+                # would save the lane's SPENT credentials back over the account
+                # snapshot, destroying the very generation we are trying to
+                # install. `None` outgoing means "no save-back, no ladder bump"
+                # (see that function's own note). Any future refactor that
+                # reinstalls without blanking first reintroduces both.
                 entry["account"] = None
                 entry.pop("login_family", None)
+                # RESERVE across the blank→swap window. Until `execute_swap`
+                # lands, this lane is recorded as holding nothing — and
+                # `_slot_busy` is `mount_in_use(...) or _slot_reserved(...)`, so
+                # with no live pids and no reservation an accountless lane is
+                # ALLOCATABLE: a concurrent launch could be handed the lane while
+                # its mount still carries the old account's credentials. An
+                # explicit `--lane` launch never passes through `acquire_slot`,
+                # so it has no reservation of its own to lean on. The exception
+                # restore below cannot cover a SIGKILL in this window; the
+                # reservation can, and it lapses by itself after
+                # SLOT_RESERVATION_SECONDS rather than needing cleanup.
+                _reserve(entry)
                 save_state(fresh)
         state = load_state()
         slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
     if slot_account != account:
-        execute_swap(account, trigger="launch", slot=slot_name)
+        try:
+            execute_swap(account, trigger="launch", slot=slot_name)
+        except Exception:
+            # The unfit path blanks the lane's account BEFORE the reinstall, so a
+            # refusal here (dead snapshot, pool exhausted, the #15 shared-family
+            # fail-closed guard) would otherwise leave state saying the lane holds
+            # NOTHING while its mount still carries the old credentials — and the
+            # now-accountless lane is free for the allocator to hand to someone
+            # else. Put the record back and re-raise: the launch still fails, but
+            # it fails without stranding the lane.
+            #
+            # SCOPE of that guarantee, so nobody over-trusts it: this is clean
+            # only for a refusal raised BEFORE any mount write. If execute_swap
+            # fails after writing the mount's credentials but before persisting
+            # state, the reloaded entry still reads None, so the record is put
+            # back to the OLD account while the mount now carries the NEW one.
+            # Reconciling that interruption class is the swap journal's job
+            # (`_recover_pending_swap`), not this undo's — it neither can nor
+            # tries to. Nor does it cover an interruption between the blank and
+            # `execute_swap` — a SIGKILL, or a KeyboardInterrupt/SystemExit,
+            # which are BaseExceptions and so bypass this `except Exception` by
+            # design (a Ctrl-C should not be swallowed into a state rewrite):
+            # no journal exists yet at that point, so once the
+            # reservation lapses the lane reads accountless while its mount
+            # still carries the old credentials. The reservation bounds that to
+            # SLOT_RESERVATION_SECONDS, and in the superseded case the stranded
+            # generation is spent anyway, so the practical loss is small — but
+            # it is a real transient, not something this handler prevents.
+            if reinstall_undo is not None:
+                try:
+                    with _swap_lock():
+                        undo = load_state()
+                        e = undo.setdefault("slots", {}).setdefault(slot_name, {"created_ts": now_iso()})
+                        if e.get("account") is None:
+                            e["account"] = reinstall_undo["account"]
+                            if reinstall_undo["login_family"] is not None:
+                                e["login_family"] = reinstall_undo["login_family"]
+                            # Undo the reservation too, so this is a true undo.
+                            # It earned its keep during the window, but with no
+                            # launch in flight any more, leaving it set holds the
+                            # lane non-allocatable AND non-reapable for up to
+                            # SLOT_RESERVATION_SECONDS and makes the daemon's gc
+                            # report `refused_reserved` for it meanwhile — and a
+                            # repeatedly-failing `cus launch --lane X` would keep
+                            # re-extending that for a lane nobody is launching on.
+                            if reinstall_undo["reserved_until"] is None:
+                                e.pop("reserved_until", None)
+                            else:
+                                e["reserved_until"] = reinstall_undo["reserved_until"]
+                            save_state(undo)
+                except Exception:
+                    # Best-effort, and deliberately swallowing: a lock timeout or
+                    # write error while putting the record back must not replace
+                    # the refusal the operator actually needs to read. The lane
+                    # stays reserved either way, so it is still out of the
+                    # allocator's reach until the reservation lapses.
+                    pass
+            raise
 
     state = load_state()
     entry = state.setdefault("slots", {}).setdefault(slot_name, {"account": account, "created_ts": now_iso()})
