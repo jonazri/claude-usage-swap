@@ -1632,6 +1632,14 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     to have already expired, only that the snapshot is a newer generation: a
     launch is the moment a whole session's runway is decided, so a spent grant
     matters here even while the current access token still has minutes on it.
+    They also differ in SOURCE: that function resolves through
+    `_lane_heal_source`, which for a plain lane takes the fresher of the lane's
+    last-valid shadow and the account snapshot, whereas this compares against the
+    account snapshot alone. That is deliberate — the snapshot is what
+    `execute_swap` will actually install here, and a predicate that measured
+    against a source the reinstall would never use could only produce false
+    positives. It can therefore under-detect (a shadow fresher than the snapshot
+    goes unnoticed), which is the safe direction.
     The bar they do share:
       * STRICTLY fresher — equal expiry is the same generation, and a lane copy
         that is itself the FRESHER one (it refreshed in place and the save-back
@@ -29249,7 +29257,18 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             if unfit:
                 click.echo(f"launch: {slot_name} held '{account}' but {unfit}; reinstalling")
                 reinstall_undo = {"account": entry.get("account"),
-                                  "login_family": entry.get("login_family")}
+                                  "login_family": entry.get("login_family"),
+                                  "reserved_until": entry.get("reserved_until")}
+                # Blanking is not bookkeeping — it is what makes the reinstall
+                # happen, and it is load-bearing TWICE over. `_execute_swap_locked`
+                # reads the outgoing account from `state.slots[slot].account`:
+                # leave it as `account` and (1) `target_name == current` returns
+                # early, so nothing is installed at all, and (2) before that it
+                # would save the lane's SPENT credentials back over the account
+                # snapshot, destroying the very generation we are trying to
+                # install. `None` outgoing means "no save-back, no ladder bump"
+                # (see that function's own note). Any future refactor that
+                # reinstalls without blanking first reintroduces both.
                 entry["account"] = None
                 entry.pop("login_family", None)
                 # RESERVE across the blank→swap window. Until `execute_swap`
@@ -29287,6 +29306,18 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                             e["account"] = reinstall_undo["account"]
                             if reinstall_undo["login_family"] is not None:
                                 e["login_family"] = reinstall_undo["login_family"]
+                            # Undo the reservation too, so this is a true undo.
+                            # It earned its keep during the window, but with no
+                            # launch in flight any more, leaving it set holds the
+                            # lane non-allocatable AND non-reapable for up to
+                            # SLOT_RESERVATION_SECONDS and makes the daemon's gc
+                            # report `refused_reserved` for it meanwhile — and a
+                            # repeatedly-failing `cus launch --lane X` would keep
+                            # re-extending that for a lane nobody is launching on.
+                            if reinstall_undo["reserved_until"] is None:
+                                e.pop("reserved_until", None)
+                            else:
+                                e["reserved_until"] = reinstall_undo["reserved_until"]
                             save_state(undo)
                 except Exception:
                     # Best-effort, and deliberately swallowing: a lock timeout or

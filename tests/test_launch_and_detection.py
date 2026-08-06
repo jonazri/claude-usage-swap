@@ -373,6 +373,86 @@ def test_launch_restores_the_lane_when_the_reinstall_is_refused():
         env.restore()
 
 
+def test_launch_reinstall_does_not_save_the_spent_creds_back_over_the_snapshot():
+    # The blank before execute_swap is load-bearing twice, and this pins both.
+    # _execute_swap_locked reads the outgoing account from
+    # state.slots[slot].account: were the lane still recorded as holding
+    # 'alpha', (1) target_name == current would return early and install
+    # NOTHING, and (2) it would first save the lane's SPENT credentials back
+    # over the account snapshot — destroying the fresher generation the whole
+    # reinstall exists to install. A future refactor that reinstalls without
+    # blanking first reintroduces both, silently.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-spent", expires_at=1_000_000_000_000)))
+        snap = env.accounts_dir / "account-alpha" / ".credentials.json"
+
+        cus._launch_prepare("alpha", cus.load_state(), config)
+
+        assert json.loads(snap.read_text())["claudeAiOauth"]["refreshToken"] == "rt-alpha", \
+            "snapshot intact — the lane's spent generation was NOT saved back over it"
+        assert json.loads((slot_dir / ".credentials.json").read_text()
+                          )["claudeAiOauth"]["refreshToken"] == "rt-alpha", \
+            "and the lane actually received the snapshot (the swap did not no-op)"
+    finally:
+        env.restore()
+
+
+def test_launch_clears_the_reservation_it_set_when_the_reinstall_is_refused():
+    # The reservation earns its keep during the blank→swap window, but once the
+    # reinstall has refused there is no launch in flight: leaving it set holds
+    # the lane non-allocatable AND non-reapable for SLOT_RESERVATION_SECONDS and
+    # makes the daemon gc report `refused_reserved` meanwhile.
+    #
+    # Exercised through --lane, which is the case that matters: an explicit-lane
+    # launch never passes through acquire_slot, so it carries no reservation of
+    # its own and the only one present is the one the blank added. (On the
+    # auto-pick path acquire_slot has already reserved the lane for this launch,
+    # and the undo correctly restores THAT — a failed launch leaving its own
+    # acquire-time reservation behind is pre-existing behavior, unchanged here.
+    # What must not happen either way is this code re-extending a reservation on
+    # a lane nobody is launching on, which is what a repeatedly-failing
+    # `cus launch --lane X` would otherwise do.)
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-spent", expires_at=1_000_000_000_000)))
+        assert "reserved_until" not in cus.load_state()["slots"][slot_name]
+
+        import click
+        saved = cus.execute_swap
+        cus.execute_swap = lambda *a, **k: (_ for _ in ()).throw(
+            click.ClickException("pool exhausted for 'alpha'"))
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), config, lane=slot_name)
+        except click.ClickException:
+            pass
+        finally:
+            cus.execute_swap = saved
+
+        entry = cus.load_state()["slots"][slot_name]
+        assert entry["account"] == "alpha", "account restored"
+        assert "reserved_until" not in entry, \
+            "reservation restored to its prior (absent) state — no lingering gc noise"
+    finally:
+        env.restore()
+
+
 def test_launch_reserves_the_lane_across_the_blank_to_swap_window():
     # Between blanking `entry["account"]` and execute_swap landing, the lane is
     # recorded as holding nothing. `_slot_busy` is `mount_in_use or
