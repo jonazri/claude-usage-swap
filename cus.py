@@ -1639,7 +1639,12 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     grant on every superseded-lane launch. Measured 2026-08-06: no lane sat in
     that shape, the daemon keeping every ENABLED account's snapshot fresh and
     the one lapsed snapshot belonging to the disabled account no lane holds.
-    Second, a mount with no judgeable `expiresAt` at all is reused as-is.
+    Second, a mount whose `expiresAt` is ABSENT is reused as-is. Note this is
+    narrower than `_expiry_unjudgeable`, which also counts bool and `<= 0`: a
+    mount at `expiresAt: 0` (blank-shaped, but still carrying a refresh token,
+    so it clears `mount_has_usable_credentials`) IS treated as superseded and
+    repaired, and a bool one is handled at the branch below. Repairing those two
+    is the wanted outcome; only an absent expiry declines.
 
     Compares against the account snapshot alone, not `_lane_heal_source`'s
     fresher-of-shadow-or-snapshot pick, because the snapshot is what
@@ -29333,8 +29338,11 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # back to the OLD account while the mount now carries the NEW one.
             # Reconciling that interruption class is the swap journal's job
             # (`_recover_pending_swap`), not this undo's — it neither can nor
-            # tries to. Nor does it cover a SIGKILL between the blank and
-            # `execute_swap`: no journal exists yet at that point, so once the
+            # tries to. Nor does it cover an interruption between the blank and
+            # `execute_swap` — a SIGKILL, or a KeyboardInterrupt/SystemExit,
+            # which are BaseExceptions and so bypass this `except Exception` by
+            # design (a Ctrl-C should not be swallowed into a state rewrite):
+            # no journal exists yet at that point, so once the
             # reservation lapses the lane reads accountless while its mount
             # still carries the old credentials. The reservation bounds that to
             # SLOT_RESERVATION_SECONDS, and in the superseded case the stranded
