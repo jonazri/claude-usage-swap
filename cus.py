@@ -1606,86 +1606,54 @@ def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = N
     The companion to `mount_has_usable_credentials` above, which answers only
     "is a refresh token PRESENT" — and presence is not currency. Refresh tokens
     are single-use: the moment the account snapshot rotates, every lane copy of
-    the previous generation is SPENT. A launch that reuses the spent copy makes
+    the previous generation is SPENT. Reusing the spent copy at launch makes
     Claude Code refresh on startup, take invalid_grant, and blank the mount, so
-    the session comes up "not logged in" (2026-08-06 slot-4: the lane held
-    717ea2c5e6 expired 11:49 while the snapshot had rotated to 2caf3991735c;
-    the mount was blanked at the launch second and only repaired 66s later by
-    the daemon's reactive lane heal).
+    the session comes up "not logged in" (2026-08-06 slot-4: lane held
+    717ea2c5e6 expired 11:49, snapshot had rotated to 2caf3991735c; blanked at
+    the launch second, repaired 66s later by the reactive lane heal).
 
-    This is the IDLE-lane half of `_repair_stale_lane_mount`'s job. Every
-    proactive credential repair in this file — `_preempt_live_lane_blanks`,
-    `_repair_stale_lane_mount`, `_auto_heal_live_lanes` — iterates
-    `occupied_slot_accounts`, i.e. LIVE lanes only, on the reasonable rule that
-    you don't rewrite a mount nobody is reading. The consequence is that an idle
-    lane's credentials rot in place with nothing watching, and `cus launch` is
-    the only code that ever touches one again. So the check belongs at the
-    moment of use.
+    Why it lives on the launch path: every proactive credential repair here —
+    `_preempt_live_lane_blanks`, `_repair_stale_lane_mount`,
+    `_auto_heal_live_lanes` — iterates `occupied_slot_accounts`, i.e. LIVE lanes
+    only, on the reasonable rule that you don't rewrite a mount nobody is
+    reading. So an idle lane's credentials rot untouched and `cus launch` is the
+    only code that ever sees one again. This is the idle-lane half of
+    `_repair_stale_lane_mount`'s job, sharing its conservatism:
 
-    Deliberately conservative, taking `_repair_stale_lane_mount`'s bar as its
-    base — but NOT a verbatim mirror of it, in two directions. This predicate
-    ADDS the refresh-token identity short-circuit below, which that function has
-    no equivalent of (so the live-lane repair will still rewrite a mount holding
-    the source's own token — harmless there, because it only runs on an
-    already-expired mount, where a fresher access token of the same family is
-    exactly what is wanted). And it does NOT require the mount's own access token
-    to have already expired, only that the snapshot is a newer generation: a
-    launch is the moment a whole session's runway is decided, so a spent grant
-    matters here even while the current access token still has minutes on it.
-    They also differ in SOURCE: that function resolves through
-    `_lane_heal_source`, which for a plain lane takes the fresher of the lane's
-    last-valid shadow and the account snapshot, whereas this compares against the
-    account snapshot alone. That is deliberate — the snapshot is what
-    `execute_swap` will actually install here, and a predicate that measured
-    against a source the reinstall would never use could only produce false
-    positives. It can therefore under-detect (a shadow fresher than the snapshot
-    goes unnoticed), which is the safe direction. One narrow path does install
-    something else: `_execute_swap_locked` claims a pooled family when
-    `_account_held_by_other_live_mount` holds (reachable here only via `--force`
-    onto a live account, and only when a liveness-verified free family exists).
-    That divergence is benign — the predicate asks "should this lane be
-    reinstalled?", not "from which lawful source?", and a lane holding a spent
-    shared-snapshot generation getting an INDEPENDENT family is the #104-safe
-    outcome, not a worse one. The lease it consumes is the designed cost of
-    double-booking.
-    The bar they do share:
-      * STRICTLY fresher — equal expiry is the same generation, and a lane copy
-        that is itself the FRESHER one (it refreshed in place and the save-back
-        hasn't run yet) must never be clobbered by an older snapshot: that is
-        the GH #77 failure, inverted.
-      * Not itself already expired — installing a second dead generation cannot
-        log the session back in; that lane is a genuine relogin case and must
-        keep falling through to the SOS. KNOWN RESIDUAL, accepted: this also
-        declines a snapshot whose ACCESS token has lapsed while its refresh
-        token is still live, which would in fact be an upgrade (Claude Code
-        refreshes on startup and comes up logged in). Taking it would mean
-        installing a grant whose liveness cannot be established locally — the
-        only probe, `_account_snapshot_dead`, SPENDS the single-use token — so
-        the under-detection is kept on purpose. Measured 2026-08-06 across this
-        pool: no lane sat in that shape, because the daemon keeps every ENABLED
-        account's snapshot access token fresh; the single lapsed snapshot
-        belonged to the one DISABLED account, which no lane holds. A SECOND
-        reason not to relax it, found in review: `execute_swap` can reach
-        `_account_snapshot_dead`, whose probe SPENDS the snapshot's single-use
-        refresh token. That is unreachable from here today precisely BECAUSE of
-        this bar — the probe's cheap branch returns early on a still-valid
-        access token — so accepting a lapsed snapshot would start burning the
-        account's refresh grant on every superseded-lane launch.
-      * A mount with NO judgeable expiry at all (`expiresAt` absent, so
-        `_creds_expires_at` yields None) is likewise reused as-is, even against
-        a strictly newer live snapshot. Same safe direction, listed here so it
-        is an accepted residual rather than an oversight lumped in with the
-        snapshot-side None check.
-      * Refresh-capable — a shorter runway WITH a working refresh beats a longer
-        runway with none (the #13 round-3 capability rule).
       * A DIFFERENT generation — identical refresh tokens are the same grant
-        however the expiries compare, so nothing is superseded (below).
-    Caller-side, this is applied only to a PLAIN lane. Neither independent-login
+        however the expiries compare, so nothing is superseded.
+      * STRICTLY fresher — equal expiry is the same generation, and a lane copy
+        that is itself fresher (refreshed in place, save-back not yet run) must
+        never be clobbered by an older snapshot: GH #77 inverted.
+      * Refresh-capable — a shorter runway WITH a working refresh beats a longer
+        one with none (#13 round-3).
+      * The snapshot not itself expired — a second dead generation cannot log
+        the session back in; that lane is a relogin case for the SOS.
+
+    Two accepted residuals, both under-detecting (the safe direction). A
+    snapshot whose ACCESS token has lapsed while its refresh token is still live
+    would be a genuine upgrade, and is declined anyway: its liveness cannot be
+    established locally, and the one probe that could — `_account_snapshot_dead`
+    — SPENDS the single-use token. That bar is also what keeps this path from
+    reaching that probe at all, so relaxing it would burn the account's refresh
+    grant on every superseded-lane launch. Measured 2026-08-06: no lane sat in
+    that shape, the daemon keeping every ENABLED account's snapshot fresh and
+    the one lapsed snapshot belonging to the disabled account no lane holds.
+    Second, a mount with no judgeable `expiresAt` at all is reused as-is.
+
+    Compares against the account snapshot alone, not `_lane_heal_source`'s
+    fresher-of-shadow-or-snapshot pick, because the snapshot is what
+    `execute_swap` installs here — measuring against a source the reinstall
+    would never use could only produce false positives. (One narrow exception:
+    `_execute_swap_locked` claims a pooled family when
+    `_account_held_by_other_live_mount` holds, reachable only via `--force` onto
+    a live account. Benign — an independent family is the #104-safe outcome.)
+
+    Caller-side this applies to a PLAIN lane only: neither independent-login
     lineage is comparable against the shared snapshot — a pooled lease
     (`slot_leased_family`) nor a legacy per-(slot, account) login
     (`has_independent_login`, which leaves NO `login_family` in state) — and
-    installing the snapshot over either would cross-family the mount and clobber
-    every other holder of that snapshot on the next refresh (#104)."""
+    installing the snapshot over either cross-families the mount (#104)."""
     snap = account_creds_path(account)
     if not snap.exists():
         return False
