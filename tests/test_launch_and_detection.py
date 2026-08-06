@@ -201,6 +201,130 @@ def test_launch_reinstalls_when_slot_holds_account_with_unusable_creds():
         env.restore()
 
 
+def test_launch_reinstalls_when_slot_holds_a_superseded_token_generation():
+    # An idle slot already holding the requested account, whose creds are
+    # PRESENT and well-formed but carry a SUPERSEDED refresh generation (the
+    # snapshot has since rotated), must be reinstalled from the snapshot.
+    # Refresh tokens are single-use: reusing the lane's spent copy makes Claude
+    # Code refresh, get invalid_grant, and blank the mount — the session comes
+    # up "not logged in" (incident 2026-08-06, slot-4: lane held 717ea2c5e6 /
+    # expired 11:49, snapshot held 2caf3991735c; the mount was blanked at the
+    # launch second and the daemon's reactive lane heal only repaired it 66s
+    # later). mount_has_usable_credentials only proves a refresh token is
+    # PRESENT, so the existing unusable-creds guard cannot catch this.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        # Spent generation: parses, HAS a refresh token, but the snapshot's is
+        # newer — and its access token has already expired.
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-spent", expires_at=1_000_000_000_000)))
+        assert cus.mount_has_usable_credentials(slot_dir), \
+            "precondition: the stale copy looks 'usable' — presence, not generation"
+
+        got_slot, got_dir, account = cus._launch_prepare("alpha", cus.load_state(), config)
+        assert account == "alpha"
+        assert got_slot == slot_name, "reused the same slot (matching account)"
+        creds = json.loads((got_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha", \
+            "reinstalled the snapshot's current generation, not the lane's spent one"
+    finally:
+        env.restore()
+
+
+def test_launch_keeps_a_lane_token_the_snapshot_has_not_superseded():
+    # Mirror guard: when the lane's own copy is the FRESHER one (it refreshed
+    # in place and the save-back hasn't run yet), the launch must leave it
+    # alone. Clobbering it with an older snapshot would destroy the live
+    # generation — the GH #77 failure this must not reintroduce.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-newer", expires_at=2_100_000_000_000)))
+
+        _, got_dir, _ = cus._launch_prepare("alpha", cus.load_state(), config)
+        creds = json.loads((got_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha-newer", \
+            "lane's fresher generation survives the launch"
+    finally:
+        env.restore()
+
+
+def test_launch_leaves_a_leased_lane_alone_even_when_the_snapshot_is_fresher():
+    # #104 discipline: a lane holding a LEASED login family runs a different
+    # refresh-token family from the shared snapshot by design, so the snapshot
+    # being "fresher" says nothing about it. Reinstalling would cross-family the
+    # mount and clobber every other holder of that snapshot on the next refresh.
+    # The superseded check must therefore never fire on a leased lane.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update(
+            {"account": "alpha", "login_family": "alpha/family-1"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps(_creds("rt-alpha-family-1", expires_at=1_000_000_000_000)))
+        assert cus._mount_creds_superseded(slot_dir, "alpha"), \
+            "precondition: the shared snapshot IS strictly fresher"
+
+        _, got_dir, _ = cus._launch_prepare("alpha", cus.load_state(), config)
+        creds = json.loads((got_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha-family-1", \
+            "leased family survives — never cross-familied from the shared snapshot"
+    finally:
+        env.restore()
+
+
+def test_mount_creds_superseded_is_conservative():
+    # The predicate's three refusals, which keep it from ever making things
+    # worse. Mirrors _repair_stale_lane_mount's bar exactly.
+    env = _Env()
+    try:
+        _, slot_dir = cus.create_slot(cus.load_state())
+        mount = slot_dir / ".credentials.json"
+        snap = env.accounts_dir / "account-alpha" / ".credentials.json"
+        now_ms = 1_500_000_000_000
+
+        mount.write_text(json.dumps(_creds("rt-old", expires_at=1_000_000_000_000)))
+        assert cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms), \
+            "strictly fresher + still valid + refresh-capable → supersede"
+
+        # Equal expiry is the SAME generation — copying it changes nothing.
+        mount.write_text(json.dumps(_creds("rt-same", expires_at=2_000_000_000_000)))
+        assert not cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms)
+
+        # A snapshot that is itself already expired cannot log anyone back in;
+        # that lane is a genuine relogin case (must reach the SOS, not a copy).
+        snap.write_text(json.dumps(_creds("rt-alpha", expires_at=1_400_000_000_000)))
+        mount.write_text(json.dumps(_creds("rt-old", expires_at=1_000_000_000_000)))
+        assert not cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms)
+
+        # Refresh-token-LESS snapshot: a longer runway with no refresh is not
+        # an upgrade over a shorter one that can actually rotate (#13 round-3).
+        snap.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-x", "expiresAt": 2_000_000_000_000}}))
+        assert not cus._mount_creds_superseded(slot_dir, "alpha", now_ms=now_ms)
+    finally:
+        env.restore()
+
+
 def test_launch_prepare_rejects_unknown_account():
     env = _Env()
     try:

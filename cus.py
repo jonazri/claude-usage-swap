@@ -1599,6 +1599,65 @@ def mount_has_usable_credentials(mount: Path) -> bool:
         return False
 
 
+def _mount_creds_superseded(mount: Path, account: str, *, now_ms: int | None = None) -> bool:
+    """True iff `account`'s snapshot holds a STRICTLY FRESHER, still-valid,
+    refresh-CAPABLE credential generation than the one sitting on `mount`.
+
+    The companion to `mount_has_usable_credentials` above, which answers only
+    "is a refresh token PRESENT" — and presence is not currency. Refresh tokens
+    are single-use: the moment the account snapshot rotates, every lane copy of
+    the previous generation is SPENT. A launch that reuses the spent copy makes
+    Claude Code refresh on startup, take invalid_grant, and blank the mount, so
+    the session comes up "not logged in" (2026-08-06 slot-4: the lane held
+    717ea2c5e6 expired 11:49 while the snapshot had rotated to 2caf3991735c;
+    the mount was blanked at the launch second and only repaired 66s later by
+    the daemon's reactive lane heal).
+
+    This is the IDLE-lane half of `_repair_stale_lane_mount`'s job. Every
+    proactive credential repair in this file — `_preempt_live_lane_blanks`,
+    `_repair_stale_lane_mount`, `_auto_heal_live_lanes` — iterates
+    `occupied_slot_accounts`, i.e. LIVE lanes only, on the reasonable rule that
+    you don't rewrite a mount nobody is reading. The consequence is that an idle
+    lane's credentials rot in place with nothing watching, and `cus launch` is
+    the only code that ever touches one again. So the check belongs at the
+    moment of use.
+
+    Deliberately conservative, mirroring `_repair_stale_lane_mount` verbatim so
+    the two halves cannot disagree:
+      * STRICTLY fresher — equal expiry is the same generation, and a lane copy
+        that is itself the FRESHER one (it refreshed in place and the save-back
+        hasn't run yet) must never be clobbered by an older snapshot: that is
+        the GH #77 failure, inverted.
+      * Not itself already expired — installing a second dead generation cannot
+        log the session back in; that lane is a genuine relogin case and must
+        keep falling through to the SOS.
+      * Refresh-capable — a shorter runway WITH a working refresh beats a longer
+        runway with none (the #13 round-3 capability rule).
+    Caller-side, this is applied only to a PLAIN lane: a lane holding a leased
+    login family (`slot_leased_family`) is not comparable against the shared
+    snapshot, and installing it would cross-family the mount and clobber every
+    other holder of that snapshot on the next refresh (#104)."""
+    snap = account_creds_path(account)
+    if not snap.exists():
+        return False
+    try:
+        snap_creds = read_json(snap)
+        mount_creds = read_json(mount_creds_path(mount))
+    except (json.JSONDecodeError, OSError):
+        return False
+    # Same shape bar every other install point applies, plus the capability
+    # gate: a blank-shaped or refresh-token-less snapshot is not an upgrade.
+    if _live_mount_creds_invalid(snap_creds) or _credential_refresh_token(snap_creds) is None:
+        return False
+    snap_exp = _creds_expires_at(snap_creds)
+    mount_exp = _creds_expires_at(mount_creds)
+    if snap_exp is None or mount_exp is None:
+        return False
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    return snap_exp > mount_exp and snap_exp > now_ms
+
+
 def _refresh_fingerprint(refresh_token: Any) -> str | None:
     """Short, non-reversible fingerprint of a refresh token for provenance.
 
@@ -29109,16 +29168,36 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     # Install the account into the slot — the same in-place swap primitive the
     # daemon uses (no-op when the slot already holds it). Reloads and persists
     # state itself, under the swap lock. If an idle slot claims the right
-    # account but carries logout-shaped creds, blank its account first so the
-    # swap below actually REINSTALLS from the good snapshot instead of reusing
-    # a dead mount (execute_swap is a no-op when the slot already holds it).
+    # account but its mount cannot seed a working session, blank its account
+    # first so the swap below actually REINSTALLS from the good snapshot
+    # instead of reusing a dead mount (execute_swap is a no-op when the slot
+    # already holds it). Two distinct ways a mount fails that bar:
+    #   * logout-shaped — no refresh token at all;
+    #   * SUPERSEDED — a refresh token that is PRESENT but spent, because the
+    #     snapshot rotated after this lane's last swap. Nothing else repairs an
+    #     idle lane: every proactive credential path here is live-only (see
+    #     `_mount_creds_superseded`), so without this check the session starts
+    #     on a dead grant, Claude Code blanks the mount on its first refresh,
+    #     and the pane comes up "not logged in" (2026-08-06 slot-4). Restricted
+    #     to a PLAIN lane — a leased login family is not comparable against the
+    #     shared snapshot, and installing it would cross-family the mount (#104).
+    def _mount_unfit_to_reuse(st: dict) -> str | None:
+        if not mount_has_usable_credentials(slot_dir):
+            return "credentials are unusable"
+        if (slot_leased_family(st, slot_name) is None
+                and _mount_creds_superseded(slot_dir, account)):
+            return "credentials are a superseded token generation"
+        return None
+
     slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
-    if slot_account == account and not mount_in_use(slot_dir) and not mount_has_usable_credentials(slot_dir):
-        click.echo(f"launch: {slot_name} held '{account}' but credentials are unusable; reinstalling")
+    unfit = (slot_account == account and not mount_in_use(slot_dir)
+             and _mount_unfit_to_reuse(state))
+    if unfit:
+        click.echo(f"launch: {slot_name} held '{account}' but {unfit}; reinstalling")
         with _swap_lock():
             fresh = load_state()
             entry = fresh.setdefault("slots", {}).setdefault(slot_name, {"account": None, "created_ts": now_iso()})
-            if entry.get("account") == account and not mount_has_usable_credentials(slot_dir):
+            if entry.get("account") == account and _mount_unfit_to_reuse(fresh):
                 entry["account"] = None
                 entry.pop("login_family", None)
                 save_state(fresh)
