@@ -219,6 +219,16 @@ def test_max_model_weekly_from_acct_treats_stale_as_unknown():
         assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0, flag
 
 
+def test_max_model_weekly_honors_cached_100_before_the_window_resets():
+    # Usage is monotonic within a window, so before seven_day_resets_at a cached
+    # 100% is still >= 100% and must exclude the account.
+    cfg = _gate_config()
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "seven_day_resets_at": _iso(datetime.now(timezone.utc) + timedelta(days=2)),
+            "per_model_weekly_pct": {"Fable": 100.0}}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 100.0
+
+
 def test_swap_away_force_reads_fresh_usage_not_cached_dict():
     """Evidence that the swap-AWAY force was already safe: a token_stale
     account's fresh AccountUsage this cycle is empty, so the swap-away signal
@@ -264,6 +274,64 @@ def test_pick_swap_target_not_refused_on_stale_per_model():
                    "per_model_weekly_pct": {"Fable": 100.0}}
     tgt2 = cus.pick_swap_target(_state_with_spare(fresh_spare), cfg)
     assert tgt2 is None, f"expected HOLD (fresh over-cap sole target), got {tgt2}"
+
+
+def test_max_model_weekly_ignores_cached_100_after_the_window_resets():
+    # The 2026-07-05 incident shape: post-rollover the cached 100% may really be
+    # ~0, so it must not exclude anything.
+    cfg = _gate_config()
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "seven_day_resets_at": _iso(datetime.now(timezone.utc) - timedelta(minutes=1)),
+            "per_model_weekly_pct": {"Fable": 100.0}}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_a_cached_reading_below_100():
+    # Only the ceiling is unambiguous; a cached 94 might have headroom left.
+    cfg = _gate_config()
+    acct = {"token_stale": True, "current_7d_pct": 94.0,
+            "seven_day_resets_at": _iso(datetime.now(timezone.utc) + timedelta(days=2)),
+            "per_model_weekly_pct": {"Fable": 94.0}}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_cached_100_without_a_reset_timestamp():
+    # No reset timestamp = no way to know whether the window rolled.
+    cfg = _gate_config()
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0}}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_pick_swap_target_holds_on_cached_exhaustion_before_reset():
+    """The user-facing requirement: an account known to be 7d-exhausted stays out
+    of rotation while rate-limited/stale, instead of being swapped onto."""
+    cfg = _gate_config()
+
+    def _state_with_spare(spare_acct: dict) -> dict:
+        return {
+            "active": "cur",
+            "accounts": {
+                "cur": {"current_5h_pct": 95.0, "current_7d_pct": 40.0, "next_swap_at_pct": 50},
+                "spare": spare_acct,
+            },
+            "swap_history": [],
+        }
+
+    # Aggregate 7d stays LOW so the never_swap_to_pct filter can't be the reason
+    # for a HOLD, and token_stale (not rate_limited) so the rate-limited filter
+    # can't be either. The only disqualifier available is the cached per-model %.
+    base = {"current_5h_pct": 5.0, "current_7d_pct": 5.0, "next_swap_at_pct": 90,
+            "token_stale": True, "per_model_weekly_pct": {"Fable": 100.0}}
+
+    pre_reset = dict(base, seven_day_resets_at=_iso(datetime.now(timezone.utc) + timedelta(days=2)))
+    assert cus.pick_swap_target(_state_with_spare(pre_reset), cfg) is None, \
+        "cached-exhausted spare must not be a target before its window resets"
+
+    post_reset = dict(base, seven_day_resets_at=_iso(datetime.now(timezone.utc) - timedelta(minutes=1)))
+    tgt = cus.pick_swap_target(_state_with_spare(post_reset), cfg)
+    assert tgt is not None and tgt.name == "spare", \
+        f"post-rollover the reading is unknown, not disqualifying, got {tgt}"
 
 
 # ==========================================================================

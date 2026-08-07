@@ -5270,9 +5270,15 @@ def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
         return 0.0
     # Per-model shares the 7d window's staleness: if we can't trust current_7d
     # for this account, we can't trust its per-model weekly numbers either.
-    if _pct_is_unknown(acct, "current_7d_pct"):
-        return 0.0
     vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    if _pct_is_unknown(acct, "current_7d_pct"):
+        # Unobservable, but usage is monotonic within a window: before the reset
+        # a cached reading is still a valid lower bound, so a cached 100% is
+        # still exhausted. Below 100 stays unknown.
+        if _cached_7d_floor(acct) is None:
+            return 0.0
+        capped = [p for p in vals if isinstance(p, (int, float)) and p >= 100]
+        return max(capped) if capped else 0.0
     return max(vals) if vals else 0.0
 
 
@@ -23318,6 +23324,25 @@ def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool
         padded = f"{raw:>{width}}"
         return click.style(padded, dim=True) if color_on else padded
     return f"{val:>{width}.{prec}f}"
+
+
+def _cached_7d_floor(acct: dict, now=None) -> float | None:
+    """Cached 7d % that is still a valid lower bound, or None once unusable.
+
+    Usage only climbs within a window, so a cached reading cannot have fallen
+    until `seven_day_resets_at` passes. After that it may be anything.
+    """
+    resets_at = acct.get("seven_day_resets_at")
+    pct = acct.get("current_7d_pct")
+    if not resets_at or not isinstance(pct, (int, float)):
+        return None
+    try:
+        reset_dt = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return float(pct) if now < reset_dt else None
 
 
 def _model_pct_is_stale(acct: dict) -> bool:
