@@ -9611,10 +9611,11 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # candidates, the HOLD never fires, and a standard lane may still land on a
     # Fable-capped account by design.
     #
-    # Stale-guard preserved (2026-07-05, GH #161): a token_stale / unobservable
-    # account reads per-model 0.0 via _max_model_weekly_from_acct → stays
-    # ELIGIBLE here. Only a FRESH at/over-cap reading excludes a candidate, so we
-    # never refuse a target on a number we couldn't reconfirm.
+    # Stale-guard (2026-07-05, GH #161): a token_stale / unobservable account
+    # reads per-model 0.0 via _max_model_weekly_from_acct → stays ELIGIBLE here,
+    # so we never refuse a target on a number we couldn't reconfirm. Exception:
+    # a cached >=100 taken since the last observed refresh is still a valid lower
+    # bound and DOES exclude — see _max_model_weekly_from_acct.
     #
     # Cap used is the TARGET-side one (target_cap_pct, falling back to cap_pct,
     # falling back to hard_7d) — identical to the pre-split primary filter:
@@ -12862,7 +12863,9 @@ def decide_swap(
         # let SOS surface the all-capped condition (holding on the current capped
         # account is strictly no worse than a churning lateral move). Backward-
         # compatible: `_max_model_weekly_from_acct` is 0.0 with the per-model gate
-        # off, so that branch is inert on unmodified installs.
+        # off, so that branch is inert on unmodified installs. With the gate on it
+        # also reports a cached >=100 that no refresh has invalidated yet, so an
+        # unobservable target can register as capped here.
         target_acct = state["accounts"].get(target.name, {})
         capped_dims: list[str] = []
         if agg_tripped and target_acct.get("current_7d_pct", 0.0) >= _forcing_agg_cap:
@@ -23342,6 +23345,13 @@ def _cached_7d_usage_valid(acct: dict, config: dict, now=None) -> bool:
     on its fixed cadence — the real ~72h refresh, which precedes the API's
     ~7-day boundary. That API boundary is only consulted as an extra
     invalidator, never to date the cadence.
+
+    Self-expiring: the anchor and the observation are written from the same
+    `u.polled_at` on the success branch, so anchor <= observation always and the
+    k=0 boundary can never invalidate a reading on its own. The first boundary
+    after the observation — at most one period later — flips this False, so an
+    account that can never be polled again stops being excluded after ~72h
+    rather than forever.
     """
     # last_poll_ts is a poll ATTEMPT stamp, restamped by the error branches, so
     # only last_observed_ts dates the reading. No anchor means the 72h cadence is

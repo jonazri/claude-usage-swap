@@ -129,6 +129,19 @@ flow.
 
 None added. `per_model_weekly.gate_enabled` is the existing kill switch.
 
+## Known assumption: per-model shares the aggregate cadence
+
+`_parse_per_model_weekly` reads a per-entry `resets_at` for each model-scoped
+weekly limit, but only the utilization is persisted into `per_model_weekly_pct`.
+The predicate therefore dates a per-model reading by the AGGREGATE 72h anchor. If
+a model-scoped window ever rolls on a different schedule, a cached per-model 100
+could be honored past its own reset.
+
+Bounded by the self-expiry property above: the exclusion lapses at most one period
+after the reading regardless, so the worst case is a bounded over-exclusion rather
+than an indefinite one. Making it model-accurate means persisting the per-model
+`resets_at`, which wants confirmation of real API behavior first — deferred.
+
 ## Incidental change
 
 Guarding `per_model_weekly_pct` against malformed shapes also affects the FRESH

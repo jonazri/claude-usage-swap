@@ -323,6 +323,24 @@ def test_max_model_weekly_ignores_a_reading_with_no_observation_timestamp():
     assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
 
 
+def test_cached_exclusion_self_expires_for_a_permanently_unpollable_account():
+    """Safety bound: the anchor and the observation are written from the same
+    polled_at, so the k=0 boundary never invalidates a reading on its own and the
+    exclusion lapses at the FIRST boundary after it. An account that can never be
+    polled again is sidelined for at most one period, not forever."""
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+
+    def _acct(age_hours: float) -> dict:
+        stamp = _iso(now - timedelta(hours=age_hours))
+        return {"token_stale": True, "current_7d_pct": 100.0,
+                "per_model_weekly_pct": {"Fable": 100.0},
+                "seven_day_last_reset_ts": stamp, "last_observed_ts": stamp}
+
+    assert cus._max_model_weekly_from_acct(_acct(10), cfg) == 100.0, "within the period → still excluded"
+    assert cus._max_model_weekly_from_acct(_acct(80), cfg) == 0.0, "past the first boundary → lapsed"
+
+
 def test_max_model_weekly_requires_an_observed_reset_anchor():
     # Without seven_day_last_reset_ts the 72h cadence is unknown, and the API
     # boundary cannot bound it. Decline rather than guess.
