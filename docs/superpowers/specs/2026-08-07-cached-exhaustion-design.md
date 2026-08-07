@@ -23,9 +23,22 @@ Usage is monotonically non-decreasing within a window — already encoded in
 `_compute_burn_rate` ("a drop means the window reset between polls"). Accounts
 store `seven_day_resets_at`.
 
-So while `now < seven_day_resets_at`, a cached reading is a valid **lower bound**:
-a cached 100% is still ≥100%. Once that timestamp passes it is genuinely unknown.
-The 2026-07-05 incident is exactly the post-rollover case.
+So a cached reading is a valid **lower bound** until a refresh lands: a cached 100%
+is still ≥100%. Once one lands it is genuinely unknown. The 2026-07-05 incident is
+exactly the post-refresh case.
+
+The refresh moment is **not** the raw `seven_day_resets_at`. `projected_seven_day_reset`
+documents that the real ~72h refresh precedes the API's ~7-day boundary; on the live
+fleet 6 of 7 accounts had a projected reset earlier than the API value, by up to 4
+days. Anchoring on the API boundary would keep accounts excluded long after their
+budget returned.
+
+Nor can the projection be used directly as the cutoff: it rolls forward
+(`while nxt <= now`), so it is always in the future and a `now < projected` test
+never expires. The invariant is instead:
+
+> the cached reading is valid iff no refresh boundary falls between when it was
+> observed (`last_observed_ts`) and now.
 
 This yields the needed asymmetry: a cached reading is safe for **excluding** an
 account and unsafe for **admitting** one.
@@ -43,10 +56,16 @@ Already correct, no change:
   read `current_7d_pct` directly without consulting `_pct_is_unknown`, so a cached
   100.0 already fails the `never_swap_to_pct` hard filter.
 
+Also in scope, unavoidably:
+
+- Swap-away when no fresh poll landed. `decide_swap` reads this same function for
+  the active account and force-swaps the lane off on `>= model_cap`. Trigger 1's
+  fresh-usage path is untouched, but the persisted path is reached. Correct under
+  the lower bound — pre-refresh the account really is exhausted — and covered by
+  a test on both sides of the refresh.
+
 Out of scope:
 
-- Swap-away. Already fresh-readings-only; a stale value must not force a live lane
-  off an account.
 - The aggregate path's mirror bug: post-rollover it keeps excluding on a cached 100
   that may really be ~0. Returning `0.0` there is not the fix — a possibly-full
   account would look empty and *attract* swaps (the stale-low trap that the
@@ -65,17 +84,18 @@ call". Sub-100 cached readings remain too uncertain to strand an account on.
 New predicate beside `_pct_is_unknown`:
 
 ```
-_cached_7d_floor(acct, now=None) -> float | None
-    None   if seven_day_resets_at is missing or unparseable
-    None   if now >= seven_day_resets_at        (window rolled; unknown)
-    else   acct["current_7d_pct"]               (valid lower bound)
+_cached_7d_usage_valid(acct, config, now=None) -> bool
+    False  if last_observed_ts or the resolved reset moment is missing/unparseable
+    False  if that reset moment has already passed
+    else   (next_reset - reset_period) <= last_observed_ts
+           i.e. no refresh landed after the reading was taken
 ```
 
 `_max_model_weekly_from_acct`, in the branch that currently returns `0.0`:
 
 ```
-if _cached_7d_floor(acct) is not None:
-    cached_max = max of acct["per_model_weekly_pct"].values()
+if _cached_7d_usage_valid(acct, config):
+    cached_max = max of the numeric per-model values
     if cached_max >= 100:
         return cached_max
 return 0.0

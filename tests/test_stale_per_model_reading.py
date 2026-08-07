@@ -223,9 +223,12 @@ def test_max_model_weekly_honors_cached_100_before_the_window_resets():
     # Usage is monotonic within a window, so before seven_day_resets_at a cached
     # 100% is still >= 100% and must exclude the account.
     cfg = _gate_config()
+    now = datetime.now(timezone.utc)
     acct = {"token_stale": True, "current_7d_pct": 100.0,
-            "seven_day_resets_at": _iso(datetime.now(timezone.utc) + timedelta(days=2)),
-            "per_model_weekly_pct": {"Fable": 100.0}}
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
     assert cus._max_model_weekly_from_acct(acct, cfg) == 100.0
 
 
@@ -276,6 +279,39 @@ def test_pick_swap_target_not_refused_on_stale_per_model():
     assert tgt2 is None, f"expected HOLD (fresh over-cap sole target), got {tgt2}"
 
 
+def test_max_model_weekly_ignores_cached_100_once_a_refresh_landed_since_the_reading():
+    # The real ~72h refresh precedes the API's ~7d boundary
+    # (projected_seven_day_reset). A reading taken BEFORE that refresh says
+    # nothing about the new window, even though the API boundary is still future.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            # refresh cadence anchored 8 days back → a boundary landed 2 days ago
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=192)),
+            "last_observed_ts": _iso(now - timedelta(days=3)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_survives_a_naive_reset_timestamp():
+    # A stored timestamp without an offset must degrade to "unknown", not raise
+    # out of pick_swap_target/decide_swap.
+    cfg = _gate_config()
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "last_observed_ts": "2026-08-07T00:00:00",
+            "seven_day_resets_at": "2026-08-09T00:00:00"}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_survives_a_malformed_per_model_dict():
+    cfg = _gate_config()
+    for pm in ([("Fable", 100.0)], {"Fable": "lots"}, {5: 100.0}, "Fable=100"):
+        acct = {"token_stale": True, "current_7d_pct": 100.0, "per_model_weekly_pct": pm}
+        assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0, pm
+
+
 def test_max_model_weekly_ignores_cached_100_after_the_window_resets():
     # The 2026-07-05 incident shape: post-rollover the cached 100% may really be
     # ~0, so it must not exclude anything.
@@ -303,6 +339,42 @@ def test_max_model_weekly_ignores_cached_100_without_a_reset_timestamp():
     assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
 
 
+def test_decide_swap_force_away_on_cached_exhaustion_respects_the_refresh():
+    """decide_swap reads the PERSISTED per-model dict for the active account when
+    there is no fresh poll (cus.py:12662) and force-swaps the live lane off it.
+    That path is therefore in scope for this change: pre-refresh it must fire (the
+    account really is exhausted), post-refresh it must not (2026-07-05 shape)."""
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+
+    def _state(active_extra: dict) -> dict:
+        return {
+            "active": "cur",
+            "accounts": {
+                "cur": dict({"current_5h_pct": 10.0, "current_7d_pct": 10.0,
+                             "next_swap_at_pct": 90, "token_stale": True,
+                             "per_model_weekly_pct": {"Fable": 100.0},
+                             "seven_day_resets_at": _iso(now + timedelta(days=2))},
+                            **active_extra),
+                "spare": {"current_5h_pct": 1.0, "current_7d_pct": 1.0,
+                          "next_swap_at_pct": 90, "per_model_weekly_pct": {"Fable": 1.0}},
+            },
+            "swap_history": [],
+        }
+
+    # No fresh poll for the active account; reading still valid → force away.
+    valid = _state({"seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+                    "last_observed_ts": _iso(now - timedelta(minutes=30))})
+    d = cus.decide_swap(valid, cfg, {})
+    assert d is not None and d.target == "spare", f"expected force-away, got {d}"
+
+    # A refresh landed after the reading → must NOT move a live lane on it.
+    refreshed = _state({"seven_day_last_reset_ts": _iso(now - timedelta(hours=192)),
+                        "last_observed_ts": _iso(now - timedelta(days=3))})
+    assert cus.decide_swap(refreshed, cfg, {}) is None, \
+        "a reading predating the refresh must not force a live lane off"
+
+
 def test_pick_swap_target_holds_on_cached_exhaustion_before_reset():
     """The user-facing requirement: an account known to be 7d-exhausted stays out
     of rotation while rate-limited/stale, instead of being swapped onto."""
@@ -321,17 +393,25 @@ def test_pick_swap_target_holds_on_cached_exhaustion_before_reset():
     # Aggregate 7d stays LOW so the never_swap_to_pct filter can't be the reason
     # for a HOLD, and token_stale (not rate_limited) so the rate-limited filter
     # can't be either. The only disqualifier available is the cached per-model %.
+    now = datetime.now(timezone.utc)
     base = {"current_5h_pct": 5.0, "current_7d_pct": 5.0, "next_swap_at_pct": 90,
-            "token_stale": True, "per_model_weekly_pct": {"Fable": 100.0}}
+            "token_stale": True, "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
 
-    pre_reset = dict(base, seven_day_resets_at=_iso(datetime.now(timezone.utc) + timedelta(days=2)))
+    # Reading taken AFTER the most recent refresh → still a valid lower bound.
+    pre_reset = dict(base,
+                     seven_day_last_reset_ts=_iso(now - timedelta(hours=1)),
+                     last_observed_ts=_iso(now - timedelta(minutes=30)))
     assert cus.pick_swap_target(_state_with_spare(pre_reset), cfg) is None, \
-        "cached-exhausted spare must not be a target before its window resets"
+        "cached-exhausted spare must not be a target while the reading still holds"
 
-    post_reset = dict(base, seven_day_resets_at=_iso(datetime.now(timezone.utc) - timedelta(minutes=1)))
+    # A refresh landed after the reading → says nothing about the new window.
+    post_reset = dict(base,
+                      seven_day_last_reset_ts=_iso(now - timedelta(hours=192)),
+                      last_observed_ts=_iso(now - timedelta(days=3)))
     tgt = cus.pick_swap_target(_state_with_spare(post_reset), cfg)
     assert tgt is not None and tgt.name == "spare", \
-        f"post-rollover the reading is unknown, not disqualifying, got {tgt}"
+        f"post-refresh the reading is unknown, not disqualifying, got {tgt}"
 
 
 # ==========================================================================

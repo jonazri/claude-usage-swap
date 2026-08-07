@@ -5249,6 +5249,12 @@ def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     0.0), never as a hard cap. Per-model weekly is a 7-day-window concept, so it
     shares current_7d_pct's staleness fate (`_pct_is_unknown`).
 
+    Lower-bound exception: usage only climbs within a window, so a cached
+    reading taken since the last refresh (`_cached_7d_usage_valid`) is still a
+    valid lower bound. A cached >=100 is therefore returned as a hard cap; every
+    other stale case still returns 0.0. Exclusion only — the bound never feeds
+    scoring, so a cached LOW reading still cannot make an account attractive.
+
     Why this direction is the safe one: returning 0.0 for a stale account means
     a STALE per-model % neither (a) EXCLUDES the account from swap-target
     selection via pick_swap_target's `_max_model_weekly_from_acct(a) < model_cap`
@@ -5258,26 +5264,28 @@ def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     token_stale account's cached `Fable=100%` as authoritative and moved a live
     Fable session off it — but the account actually had Fable headroom.
 
-    The swap-AWAY force (decide_swap Trigger 1) is already safe WITHOUT this
-    guard: it reads FRESH usage via `_max_model_weekly_from_usage`, which is 0.0
-    for a token_stale account (its AccountUsage this cycle is empty), so a stale
-    per-model can never force a live lane OFF an account. This guard only closes
-    the CACHED-dict path used by target selection / the pingpong guard.
+    The swap-AWAY force (decide_swap Trigger 1) reads FRESH usage via
+    `_max_model_weekly_from_usage`, which is 0.0 for a token_stale account. But
+    decide_swap ALSO reads this function for the active account when no fresh
+    poll landed this cycle, and force-swaps the lane off on `>= model_cap` — so
+    the lower-bound exception above reaches that path too, by design.
     """
     enabled, allow = _per_model_weekly_gate(config)
-    pm = acct.get("per_model_weekly_pct") or {}
-    if not enabled or not pm:
+    pm = acct.get("per_model_weekly_pct")
+    if not enabled or not isinstance(pm, dict) or not pm:
         return 0.0
     # Per-model shares the 7d window's staleness: if we can't trust current_7d
     # for this account, we can't trust its per-model weekly numbers either.
-    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    vals = [p for m, p in pm.items()
+            if isinstance(p, (int, float))
+            and (not allow or (isinstance(m, str) and m.lower() in allow))]
     if _pct_is_unknown(acct, "current_7d_pct"):
-        # Unobservable, but usage is monotonic within a window: before the reset
-        # a cached reading is still a valid lower bound, so a cached 100% is
-        # still exhausted. Below 100 stays unknown.
-        if _cached_7d_floor(acct) is None:
+        # Unobservable, but usage is monotonic within a window: until a refresh
+        # lands the cached reading is still a valid lower bound, so a cached
+        # 100% is still exhausted. Below 100 stays unknown.
+        if not _cached_7d_usage_valid(acct, config):
             return 0.0
-        capped = [p for p in vals if isinstance(p, (int, float)) and p >= 100]
+        capped = [p for p in vals if p >= 100]
         return max(capped) if capped else 0.0
     return max(vals) if vals else 0.0
 
@@ -23326,23 +23334,28 @@ def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool
     return f"{val:>{width}.{prec}f}"
 
 
-def _cached_7d_floor(acct: dict, now=None) -> float | None:
-    """Cached 7d % that is still a valid lower bound, or None once unusable.
+def _cached_7d_usage_valid(acct: dict, config: dict, now=None) -> bool:
+    """True while no 7d refresh has landed since the cached reading was taken.
 
-    Usage only climbs within a window, so a cached reading cannot have fallen
-    until `seven_day_resets_at` passes. After that it may be anything.
+    Usage only climbs within a window, so until a refresh the cached value stays
+    a valid lower bound. Anchored on `projected_seven_day_reset`, whose real
+    ~72h refresh precedes the API boundary.
     """
-    resets_at = acct.get("seven_day_resets_at")
-    pct = acct.get("current_7d_pct")
-    if not resets_at or not isinstance(pct, (int, float)):
-        return None
-    try:
-        reset_dt = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
+    observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    nxt = projected_seven_day_reset(acct, config, now)
+    if not observed or not nxt:
+        return False
     if now is None:
         now = datetime.now(timezone.utc)
-    return float(pct) if now < reset_dt else None
+    try:
+        observed_dt = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+        next_dt = datetime.fromisoformat(str(nxt).replace("Z", "+00:00"))
+        if next_dt <= now:
+            return False
+        period = timedelta(hours=float(config.get("seven_day_reset_hours", 72)))
+        return next_dt - period <= observed_dt
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 def _model_pct_is_stale(acct: dict) -> bool:
@@ -23362,7 +23375,9 @@ def _model_pct_is_stale(acct: dict) -> bool:
     Bug 1 (this helper) is the DISPLAY half of the fix — mark such numbers stale
     everywhere they're shown so they can never look current. The DECISION half
     lives in `_max_model_weekly_from_acct`, which returns 0.0 under the same
-    condition so a stale reading never forces or refuses a swap.
+    condition — except for a cached >=100 taken since the last refresh, which
+    stays a valid lower bound and does refuse a target (and force a live lane
+    off). See that function's lower-bound exception.
     """
     return _pct_is_unknown(acct, "current_7d_pct")
 
