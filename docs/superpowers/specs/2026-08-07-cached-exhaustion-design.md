@@ -85,11 +85,26 @@ New predicate beside `_pct_is_unknown`:
 
 ```
 _cached_7d_usage_valid(acct, config, now=None) -> bool
-    False  if last_observed_ts or the resolved reset moment is missing/unparseable
-    False  if that reset moment has already passed
-    else   (next_reset - reset_period) <= last_observed_ts
-           i.e. no refresh landed after the reading was taken
+    False  if last_observed_ts or seven_day_last_reset_ts is missing/unparseable
+    False  if a cadence boundary (anchor + k*period) landed after the reading
+    False  if seven_day_resets_at landed after the reading and before now
+    else   True
 ```
+
+The boundary is computed from the OBSERVED anchor on its fixed cadence, not from
+`projected_seven_day_reset`. That helper returns `min(projection, api)`, and the
+API value is a ~7-day oldest-tokens boundary unrelated to the 72h cadence — so
+`resolved - period` is only the previous refresh when the projection won. When the
+API value is nearer, that subtraction yields a bogus moment arbitrarily far in the
+past and readings predating a real refresh get accepted. The API boundary is
+therefore consulted only as an extra invalidator.
+
+`last_poll_ts` is deliberately not a fallback for `last_observed_ts`: the error
+branches restamp it every cycle, so an arbitrarily old reading would look current
+forever.
+
+Requiring the anchor narrows the feature to accounts where a reset drop has been
+observed. That is the conservative direction, and all 7 live accounts carry it.
 
 `_max_model_weekly_from_acct`, in the branch that currently returns `0.0`:
 
@@ -113,6 +128,14 @@ flow.
 ## Configuration
 
 None added. `per_model_weekly.gate_enabled` is the existing kill switch.
+
+## Incidental change
+
+Guarding `per_model_weekly_pct` against malformed shapes also affects the FRESH
+path: a non-numeric entry is now dropped rather than raising out of `max()`. This
+can lower a fresh account's computed cap instead of failing loudly. Chosen
+deliberately — a schema tweak should not take polling down — and consistent with
+the surrounding degrade-to-safe style.
 
 ## Failure modes
 

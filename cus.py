@@ -23338,22 +23338,34 @@ def _cached_7d_usage_valid(acct: dict, config: dict, now=None) -> bool:
     """True while no 7d refresh has landed since the cached reading was taken.
 
     Usage only climbs within a window, so until a refresh the cached value stays
-    a valid lower bound. Anchored on `projected_seven_day_reset`, whose real
-    ~72h refresh precedes the API boundary.
+    a valid lower bound. The boundary is derived from the OBSERVED reset anchor
+    on its fixed cadence — the real ~72h refresh, which precedes the API's
+    ~7-day boundary. That API boundary is only consulted as an extra
+    invalidator, never to date the cadence.
     """
-    observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
-    nxt = projected_seven_day_reset(acct, config, now)
-    if not observed or not nxt:
+    # last_poll_ts is a poll ATTEMPT stamp, restamped by the error branches, so
+    # only last_observed_ts dates the reading. No anchor means the 72h cadence is
+    # unknown and the API boundary cannot bound it — decline rather than guess.
+    observed = acct.get("last_observed_ts")
+    anchor = acct.get("seven_day_last_reset_ts")
+    if not observed or not anchor:
         return False
     if now is None:
         now = datetime.now(timezone.utc)
     try:
         observed_dt = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
-        next_dt = datetime.fromisoformat(str(nxt).replace("Z", "+00:00"))
-        if next_dt <= now:
-            return False
+        t0 = datetime.fromisoformat(str(anchor).replace("Z", "+00:00"))
         period = timedelta(hours=float(config.get("seven_day_reset_hours", 72)))
-        return next_dt - period <= observed_dt
+        if period <= timedelta(0) or now < t0:
+            return False
+        if t0 + period * ((now - t0) // period) > observed_dt:
+            return False
+        api = acct.get("seven_day_resets_at")
+        if api:
+            api_dt = datetime.fromisoformat(str(api).replace("Z", "+00:00"))
+            if observed_dt < api_dt <= now:
+                return False
+        return True
     except (ValueError, AttributeError, TypeError):
         return False
 

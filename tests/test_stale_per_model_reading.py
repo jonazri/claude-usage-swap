@@ -232,7 +232,10 @@ def test_max_model_weekly_honors_cached_100_before_the_window_resets():
     assert cus._max_model_weekly_from_acct(acct, cfg) == 100.0
 
 
-def test_swap_away_force_reads_fresh_usage_not_cached_dict():
+def test_swap_away_trigger1_reads_fresh_usage_not_cached_dict():
+    # Covers Trigger 1 only. decide_swap ALSO force-swaps off the PERSISTED dict
+    # when no fresh poll landed — see
+    # test_decide_swap_force_away_on_cached_exhaustion_respects_the_refresh.
     """Evidence that the swap-AWAY force was already safe: a token_stale
     account's fresh AccountUsage this cycle is empty, so the swap-away signal
     (_max_model_weekly_from_usage) is 0.0 and can never force a lane off it."""
@@ -290,6 +293,44 @@ def test_max_model_weekly_ignores_cached_100_once_a_refresh_landed_since_the_rea
             # refresh cadence anchored 8 days back → a boundary landed 2 days ago
             "seven_day_last_reset_ts": _iso(now - timedelta(hours=192)),
             "last_observed_ts": _iso(now - timedelta(days=3)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_a_reading_predating_the_refresh_when_api_is_nearer():
+    # projected_seven_day_reset returns min(anchor projection, raw API boundary).
+    # The API value is a ~7d oldest-tokens boundary unrelated to the 72h cadence,
+    # so "next - 72h" is only the previous refresh for the anchor branch.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=2)),   # refresh 2h ago
+            "last_observed_ts": _iso(now - timedelta(hours=50)),         # reading predates it
+            "seven_day_resets_at": _iso(now + timedelta(hours=10))}      # API nearer than projection
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_a_reading_with_no_observation_timestamp():
+    # last_poll_ts is a poll ATTEMPT stamp, restamped every cycle by the error
+    # branches, so it cannot stand in for when usage was last actually seen.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=200)),
+            "last_poll_ts": _iso(now - timedelta(seconds=30))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_requires_an_observed_reset_anchor():
+    # Without seven_day_last_reset_ts the 72h cadence is unknown, and the API
+    # boundary cannot bound it. Decline rather than guess.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "last_observed_ts": _iso(now - timedelta(minutes=5)),
             "seven_day_resets_at": _iso(now + timedelta(days=2))}
     assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
 
