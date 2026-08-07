@@ -152,8 +152,18 @@ the surrounding degrade-to-safe style.
 
 ## Failure modes
 
-All degrade to current behavior (no exclusion): `seven_day_resets_at` missing or
-unparseable, `per_model_weekly_pct` missing or malformed, cached max below 100.
+All degrade to current behavior (no exclusion): `seven_day_last_reset_ts` or
+`last_observed_ts` missing or unparseable, `per_model_weekly_pct` missing or
+malformed, cached max below 100. `seven_day_resets_at` is optional — it is only an
+extra invalidator, so an account with an anchor but no API boundary is still
+eligible for exclusion.
+
+## Operator view
+
+`_session_binding` skipped the per-model gate on any stale reading. It now honors
+the same lower bound the decision layer uses, so a lane the daemon is evacuating
+no longer reports "ok, headroom" in `cus sessions`. A stale reading without a
+valid bound still reports the unconfirmed number, unchanged.
 
 ## Display
 

@@ -21459,7 +21459,11 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # that moved a live Fable session off an account which actually had Fable
     # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
     # surface the number marked '~' in the headroom line below instead.
-    model_stale = _model_pct_is_stale(acct)
+    # Exception: a cached >=100 that no refresh has invalidated is a valid lower
+    # bound the decision layer acts on, so report it as blocking rather than
+    # showing headroom while the daemon evacuates the lane.
+    model_stale = _model_pct_is_stale(acct) and not (
+        top_pct is not None and top_pct >= 100 and _cached_7d_usage_valid(acct, config))
     if gate_enabled and not model_stale and top_model is not None and top_pct >= model_cap:
         if pool == "standard":
             # Surface the number but make clear it does NOT bind this lane.

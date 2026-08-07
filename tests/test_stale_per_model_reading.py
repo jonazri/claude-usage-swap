@@ -161,12 +161,27 @@ def test_session_binding_does_not_hard_block_on_stale_per_model():
     must NOT read as a hard 'premium gate' block — the value is unconfirmed."""
     # 5h/7d have headroom (so no ladder/hard-wall trip preempts the gate) — the
     # ONLY thing that would block is the stale Fable=100%, which must not.
+    # No reset anchor, so the cached reading is genuinely unknown rather than a
+    # valid lower bound (see the sibling test for that case).
     acct = {"current_5h_pct": 10.0, "current_7d_pct": 5.0,
             "token_stale": True, "per_model_weekly_pct": {"Fable": 100.0}}
     sev, txt = cus._session_binding(acct, "premium", _gate_config())
     assert sev != "blocked", (sev, txt)
     assert "premium gate" not in txt, txt
     assert "~" in txt or "stale" in txt, txt
+
+
+def test_session_binding_blocks_when_the_cached_100_is_still_a_valid_bound():
+    """The operator view must not report headroom on the same reading the daemon
+    is evacuating the lane on."""
+    now = datetime.now(timezone.utc)
+    acct = {"current_5h_pct": 10.0, "current_7d_pct": 5.0, "token_stale": True,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30))}
+    sev, txt = cus._session_binding(acct, "premium", _gate_config())
+    assert sev == "blocked", (sev, txt)
+    assert "premium gate" in txt, txt
 
 
 # ==========================================================================
@@ -357,8 +372,11 @@ def test_max_model_weekly_survives_a_naive_reset_timestamp():
     # A stored timestamp without an offset must degrade to "unknown", not raise
     # out of pick_swap_target/decide_swap.
     cfg = _gate_config()
+    # Anchor present so the guard is actually entered and the naive/aware
+    # comparison inside it is what degrades.
     acct = {"token_stale": True, "current_7d_pct": 100.0,
             "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": "2026-08-07T00:00:00",
             "last_observed_ts": "2026-08-07T00:00:00",
             "seven_day_resets_at": "2026-08-09T00:00:00"}
     assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
@@ -371,22 +389,30 @@ def test_max_model_weekly_survives_a_malformed_per_model_dict():
         assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0, pm
 
 
-def test_max_model_weekly_ignores_cached_100_after_the_window_resets():
-    # The 2026-07-05 incident shape: post-rollover the cached 100% may really be
-    # ~0, so it must not exclude anything.
+def test_max_model_weekly_ignores_cached_100_when_the_api_boundary_passed():
+    # The API boundary is the extra invalidator: no cadence boundary has landed
+    # since the reading, but seven_day_resets_at fell between it and now.
     cfg = _gate_config()
+    now = datetime.now(timezone.utc)
     acct = {"token_stale": True, "current_7d_pct": 100.0,
-            "seven_day_resets_at": _iso(datetime.now(timezone.utc) - timedelta(minutes=1)),
-            "per_model_weekly_pct": {"Fable": 100.0}}
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30)),
+            "seven_day_resets_at": _iso(now - timedelta(minutes=15))}
     assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
 
 
 def test_max_model_weekly_ignores_a_cached_reading_below_100():
     # Only the ceiling is unambiguous; a cached 94 might have headroom left.
     cfg = _gate_config()
+    now = datetime.now(timezone.utc)
     acct = {"token_stale": True, "current_7d_pct": 94.0,
-            "seven_day_resets_at": _iso(datetime.now(timezone.utc) + timedelta(days=2)),
-            "per_model_weekly_pct": {"Fable": 94.0}}
+            "per_model_weekly_pct": {"Fable": 94.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._cached_7d_usage_valid(acct, cfg), \
+        "precondition: the reading IS valid, so only the threshold can reject it"
     assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
 
 
