@@ -5229,11 +5229,13 @@ def _tracked_model_weekly_from_acct(acct: dict, config: dict) -> float | None:
     per-model gate (it never zeroes on a disabled gate): the standard-pool
     reserve (reserve_safe_for_premium) needs to tell a genuinely Fable-fresh
     account apart from one with no reading even when the gate is off."""
-    pm = acct.get("per_model_weekly_pct") or {}
-    if not pm:
+    pm = acct.get("per_model_weekly_pct")
+    if not isinstance(pm, dict) or not pm:
         return None
     allow = {str(m).lower() for m in (config.get("per_model_weekly", {}).get("models") or [])}
-    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    vals = [p for m, p in pm.items()
+            if isinstance(p, (int, float))
+            and (not allow or (isinstance(m, str) and m.lower() in allow))]
     return max(vals) if vals else None
 
 
@@ -21459,16 +21461,18 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # that moved a live Fable session off an account which actually had Fable
     # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
     # surface the number marked '~' in the headroom line below instead.
-    # Exception: a cached >=100 that no refresh has invalidated is a valid lower
-    # bound the decision layer acts on, so report it as blocking rather than
-    # showing headroom while the daemon evacuates the lane.
-    model_stale = _model_pct_is_stale(acct) and not (
-        top_pct is not None and top_pct >= 100 and _cached_7d_usage_valid(acct, config))
-    if gate_enabled and not model_stale and top_model is not None and top_pct >= model_cap:
+    # Exception: a cached >=100 the decision layer still honors must bind here
+    # too, or the operator reads headroom on a lane the daemon is evacuating.
+    # Read through _max_model_weekly_from_acct so this agrees with the daemon on
+    # allowlist filtering as well as on the bound. `model_stale` keeps its
+    # display meaning ("unconfirmed") and is used for the suffix below.
+    model_stale = _model_pct_is_stale(acct)
+    gate_pct = _max_model_weekly_from_acct(acct, config) if model_stale else top_pct
+    if gate_enabled and top_model is not None and gate_pct >= model_cap:
         if pool == "standard":
             # Surface the number but make clear it does NOT bind this lane.
-            return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
-        return ("blocked", f"weekly-{top_model} {top_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
+            return ("ok", f"ok; weekly-{top_model} {gate_pct:.0f}% ignored (standard pool)")
+        return ("blocked", f"weekly-{top_model} {gate_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
 
     # Graduated ladder pressure (swap-away, not a hard block). The highest
     # tripped step is what the daemon reacts to.

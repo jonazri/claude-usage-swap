@@ -171,6 +171,21 @@ def test_session_binding_does_not_hard_block_on_stale_per_model():
     assert "~" in txt or "stale" in txt, txt
 
 
+def test_session_binding_keeps_the_stale_marker_when_the_gate_is_off():
+    """`model_stale` must keep its DISPLAY meaning. Folding the bound into it
+    would drop the '[stale — repoll to confirm]' hint whenever gate_enabled is
+    False, since the gate block that consumes the bound never runs."""
+    now = datetime.now(timezone.utc)
+    acct = {"current_5h_pct": 10.0, "current_7d_pct": 5.0, "token_stale": True,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30))}
+    sev, txt = cus._session_binding(
+        acct, "premium", _gate_config(per_model_weekly={"gate_enabled": False}))
+    assert sev == "ok", (sev, txt)
+    assert "stale" in txt, txt
+
+
 def test_session_binding_blocks_when_the_cached_100_is_still_a_valid_bound():
     """The operator view must not report headroom on the same reading the daemon
     is evacuating the lane on."""
