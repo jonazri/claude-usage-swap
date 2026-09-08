@@ -5574,9 +5574,12 @@ def _swap_journal_path() -> Path:
     """Path of the write-ahead swap-intent journal (GH #76).
 
     Present on disk = a swap is in flight (or crashed mid-flight). Written
-    before the first mutating step of execute_swap, removed after state.json
-    is persisted. Call-time derivation for the same test-sandboxing reason
-    as _swap_lock_path.
+    before the first LIVE-MOUNT mutation of execute_swap (annotation
+    2026-09-08: previously "before the first mutating step", i.e. ahead of the
+    storage-side save-back AND ahead of the refusal guards — which let a
+    refused swap leave a journal behind for crash recovery to mis-complete),
+    removed after state.json is persisted. Call-time derivation for the same
+    test-sandboxing reason as _swap_lock_path.
     """
     return ACCOUNTS_DIR / "swap.journal"
 
@@ -6184,15 +6187,33 @@ def _recover_pending_swap() -> None:
             live_creds = None
         state = load_state()
         installed_note = ""
+        pending_note: str | None = None
         if live_creds is not None and target_creds.exists():
             verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
             if verdict == "foreign":
-                backup_credentials_file(live_creds_path)   # GH #79 choke point
-                atomic_copy(target_creds, live_creds_path, mode=0o600)
-                installed_note = " (live creds still held the outgoing account's tokens; completed the install)"
+                pending_note = " (live creds still held the outgoing account's tokens; completed the install)"
         elif live_creds is None and slot and target_creds.exists():
+            pending_note = " (slot had no creds yet; completed the install)"
+        if pending_note is not None:
+            # ---- 2026-09-08 hardening (login-family pool-collapse incident) ----
+            # This "complete the install" copy used to be a RAW atomic_copy of
+            # `to`'s snapshot that bypassed every guard execute_swap enforces
+            # (#141 blank shape, the dead-snapshot probe, the #104 family
+            # collision). Combined with the old journal-before-guards ordering
+            # it turned a REFUSED swap into a completed clobber: the swap had
+            # refused precisely because the snapshot was dead / colliding, and
+            # recovery then installed it anyway, logging a live session out and
+            # double-booking the account. Run the same guard stack here and
+            # REFUSE (leave the mount on `from`, roll its identity back, keep the
+            # evidence, surface loudly) whenever the snapshot is not a safe
+            # install source. Refusing never logs anyone out; installing does.
+            refusal = _crash_recovery_install_refusal(to, slot, state)
+            if refusal is not None:
+                _refuse_crash_recovery_install(journal, frm, to, slot, live_cj_path, state, refusal)
+                return
+            backup_credentials_file(live_creds_path)   # GH #79 choke point
             atomic_copy(target_creds, live_creds_path, mode=0o600)
-            installed_note = " (slot had no creds yet; completed the install)"
+            installed_note = pending_note
         if slot:
             entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
             if entry.get("account") != to:
@@ -6242,6 +6263,132 @@ def _recover_pending_swap() -> None:
     _clear_swap_journal()
 
 
+def _crash_recovery_install_refusal(to: str, slot: str | None, state: dict) -> str | None:
+    """Guard stack for crash recovery's "complete the install" copy (2026-09-08).
+
+    Returns a human-readable refusal reason when installing `to`'s CANONICAL
+    snapshot into the mount named by `slot` (None = the shared ~/.claude pair)
+    would violate a guard `_execute_swap_locked` enforces — or None when the
+    copy is safe. Mirrors the swap's ladder, cheapest first:
+
+      1. snapshot unreadable / blank-shaped (GH #141) — writing it blanks the
+         mount and logs every session on it out.
+      2. SLOT swap while `to` is already live on ANOTHER mount (GH #104) — the
+         interrupted swap would have CLAIMED a distinct pooled family for this
+         lane (or refused as pool-exhausted); recovery cannot reproduce that
+         claim, and a raw snapshot copy puts one refresh-token family on two
+         live mounts (the next rotation logs one out).
+      3. the snapshot's token FAMILY is byte-identical to one already live on
+         another mount (`_live_family_would_collide`) — the same #104 clobber
+         measured on actual token bytes; also covers the shared mount, which
+         the swap itself never claims a family for.
+      4. the snapshot's refresh grant is DEAD (`_account_snapshot_dead` —
+         invalid_grant, the 2026-07-07 merkos shape) — a well-shaped-but-dead
+         snapshot blanks the mount on Claude Code's first refresh. The probe is
+         cooldown-cached and fails OPEN on a transient, exactly as at the swap.
+
+    Recovery is rare (a crash or a refused swap), so the one network probe in
+    rung 4 is an acceptable cost for never installing a dead token."""
+    config = load_config()
+    target_creds = account_creds_path(to)
+    try:
+        snap = read_json(target_creds)
+    except (json.JSONDecodeError, OSError) as e:
+        return (f"'{to}' snapshot {target_creds} is unreadable ({e}) — installing it would blank "
+                f"the mount (GH #141)")
+    if _live_mount_creds_invalid(snap):
+        return (f"'{to}' snapshot credentials are blank/expired-shaped — installing them would "
+                f"blank the mount and lock its session(s) out (GH #141)")
+    if slot is not None and _account_held_by_other_live_mount(state, to, slot, config):
+        return (f"'{to}' is already live on another mount — the interrupted swap would have "
+                f"claimed a DISTINCT login family for {slot}; a raw snapshot copy would put one "
+                f"refresh-token family on two live mounts (GH #104 divergence logout)")
+    if _live_family_would_collide(to, target_creds, slot, state, config):
+        return (f"'{to}' snapshot carries the SAME refresh-token family already live on another "
+                f"mount — installing it would double-book that family (GH #104)")
+    if _account_snapshot_dead(to, config):
+        return (f"'{to}' snapshot's OAuth refresh grant returns invalid_grant (DEAD) — installing "
+                f"it would blank the mount on the first refresh (2026-07-07 merkos dead-snapshot "
+                f"shape); re-login first: `cus relogin {to}`")
+    return None
+
+
+def _refuse_crash_recovery_install(journal: Path, frm: str | None, to: str, slot: str | None,
+                                   live_cj_path: Path, state: dict, reason: str) -> None:
+    """Back out of a crash-recovery install that `_crash_recovery_install_refusal`
+    rejected (2026-09-08). The mount's CREDENTIALS still hold `from`'s tokens
+    (that is why an install was pending), so the consistent, session-preserving
+    state is "still on `from`":
+
+      * roll the mount's live .claude.json identity back to `from`'s canonical
+        identity (the interrupted swap had already stamped `to`'s) so identity
+        and tokens agree again — otherwise the next swap's wrong-account guard
+        would refuse the save-back for a mount that is in fact fine;
+      * make sure state.json still names `from` for this mount (it does unless
+        something else moved it — record reality if not);
+      * preserve the journal as `swap.journal.refused.<ts>` (annotate, never
+        delete) so the evidence survives, and clear the live journal so the
+        next cycle does not re-run this same refusal forever;
+      * surface it: stderr, a CRED-AUDIT line, and an inbox entry.
+
+    `frm` may be None (an empty-slot install crashed): there is no identity to
+    roll back to; the slot simply stays unassigned until the next launch
+    installs it through the full guard stack."""
+    rolled_back = False
+    if frm is not None:
+        from_cj_path = ACCOUNTS_DIR / f"account-{frm}" / ".claude.json"
+        try:
+            from_cj = read_json(from_cj_path) if from_cj_path.exists() else None
+            live_cj = read_json(live_cj_path) if live_cj_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            from_cj, live_cj = None, None
+        if isinstance(from_cj, dict) and isinstance(live_cj, dict):
+            for k in ACCOUNT_BOUND_KEYS:
+                if k in from_cj:
+                    live_cj[k] = from_cj[k]
+                else:
+                    live_cj.pop(k, None)
+            try:
+                write_json(live_cj_path, live_cj)
+                rolled_back = True
+            except OSError:
+                rolled_back = False
+    # state.json never moved for this mount (save_state is the swap's LAST
+    # step), but record reality if it somehow did.
+    if slot:
+        entry = state.setdefault("slots", {}).get(slot)
+        if entry is not None and entry.get("account") != frm:
+            entry["account"] = frm
+            save_state(state)
+        where = f"slots.{slot}.account"
+    else:
+        if frm is not None and state.get("active") != frm:
+            state["active"] = frm
+            save_state(state)
+        where = "state.json active"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    refused_path = journal.with_name(f"{journal.name}.refused.{ts}")
+    try:
+        os.replace(journal, refused_path)
+    except OSError:
+        _clear_swap_journal()
+    identity_note = (f"rolled back to {frm!r}" if rolled_back
+                     else "NOT rolled back (no canonical identity to restore)")
+    retry_cmd = f"cus slot move {slot} {to}" if slot else f"cus switch {to}"
+    msg = (f"REFUSED to complete crashed/interrupted swap {frm!r} -> {to!r} on "
+           f"{slot or 'the shared mount'}: {reason}. The mount keeps {frm!r}'s tokens "
+           f"({where} stays {frm!r}); live identity {identity_note}. Evidence preserved at "
+           f"{refused_path.name}. Retry once the target is healthy: `{retry_cmd}`.")
+    click.echo(f"swap-journal: {msg}", err=True)
+    _cred_audit("crash-recovery", "refused-install", reason,
+                slot=slot, mount=(slot or "shared-mount"), account=to,
+                extra=f"from={frm} evidence={refused_path.name}")
+    try:
+        append_inbox("crash-recovery", "crashed swap NOT completed — target failed the install guards", msg)
+    except OSError:
+        pass
+
+
 def _creds_expires_at(creds: Any) -> int | float | None:
     """Extract claudeAiOauth.expiresAt (Unix ms) from a credentials payload,
     tolerating any malformed shape. Used as the FRESHNESS discriminator for
@@ -6269,6 +6416,20 @@ def _live_mount_creds_invalid(creds: Any) -> bool:
     valid. `bool` is excluded from the numeric expiresAt check because it is an
     `int` subclass — a stray `expiresAt: true` must not read as a positive
     epoch.
+
+    Annotation 2026-09-08 (login-family pool-collapse incident): a payload whose
+    access token is already EXPIRED (expiresAt in the past) AND which carries NO
+    refresh token is now also "invalid". Such a file can neither authenticate
+    now nor mint a new token, so a session reading it is logged out and a heal /
+    swap installing it would only re-blank the mount — yet it passed the old
+    shape test (non-empty token, positive expiresAt) and was re-installed by the
+    auto-heal loop. This predicate stays DISK-ONLY on purpose: the
+    expired-access-with-DEAD-refresh case (a refresh token that is present but
+    rotated away) can only be told apart by a refresh-grant probe, and probing
+    here would rotate LIVE sessions' single-use tokens (GH #104) because this
+    predicate runs against every live mount every cycle. That case is handled
+    where a probe IS safe — the lane-heal source pick (`_lane_heal_source`)
+    verifies a blanked lane's family/shadow store before reinstalling it.
     """
     if not isinstance(creds, dict):
         return True  # missing / corrupt / non-dict → unusable
@@ -6279,7 +6440,14 @@ def _live_mount_creds_invalid(creds: Any) -> bool:
     exp = oauth.get("expiresAt")
     token_ok = isinstance(token, str) and token.strip() != ""
     exp_ok = isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0
-    return not (token_ok and exp_ok)
+    if not (token_ok and exp_ok):
+        return True
+    # Expired access token with nothing to refresh from (2026-09-08): unusable.
+    refresh = oauth.get("refreshToken")
+    refresh_ok = isinstance(refresh, str) and refresh.strip() != ""
+    if not refresh_ok and exp <= int(time.time() * 1000):
+        return True
+    return False
 
 
 def _snapshot_fresher_than_live(account_name: str) -> bool:
@@ -6587,10 +6755,26 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"{live_cj_path} missing — cannot save the outgoing account's identity back to "
             f"storage (occupied slot with no live .claude.json; run `cus doctor --fix-dirs`)")
 
-    # GH #76: write the intent journal BEFORE the first mutating step. From
-    # here to the post-save_state clear, a crash leaves the journal on disk
-    # and _recover_pending_swap reconciles on the next swap / daemon start.
-    _write_swap_journal(current, target_name, trigger, slot=slot)
+    # ---- 2026-09-08 ordering fix (login-family pool-collapse incident) ----
+    # The GH #76 intent journal USED to be written right here — before the
+    # save-back, before the live identity write, and crucially BEFORE the
+    # install-source refusal guards further down (pool-exhausted, dead legacy
+    # store, dead snapshot, shared-mount dead snapshot, #104 family collision).
+    # No refusal path cleared it. Worse, the live .claude.json identity was
+    # ALSO written before those guards. So a REFUSED swap left the mount with
+    # target's identity + current's tokens + a live journal, and the next
+    # daemon cycle's `_recover_pending_swap` read that as "crashed after the
+    # live mutation" (identity says target, creds are 'foreign') and
+    # COMPLETED the install with a raw snapshot copy that bypasses every guard
+    # — overwriting a live valid token with the very dead/colliding one the
+    # swap had just refused (2026-09-07/08: clobbered a product session and
+    # manufactured double-books). The journal write and BOTH live-mount writes
+    # now live together just before the creds install, after every guard, so
+    # a refusal is a true no-op for the mount and leaves no journal behind.
+    # The storage-side save-back below is NOT a live-mount mutation (it writes
+    # the OUTGOING account's snapshot/family store) and is guarded on its own,
+    # so it may still run ahead of the journal: a crash inside it leaves
+    # live == from == state, which needs no reconciliation.
 
     # Save current identity + creds back to current's storage — skipped
     # entirely for a swap into an EMPTY slot (current is None: nothing to
@@ -6876,18 +7060,11 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 pass
     # ---- end GH #3 drift detection ----
 
-    # Merge target's account-bound keys into the mount's live .claude.json
+    # Read the target's canonical identity now (read-only). The MERGE into the
+    # mount's live .claude.json is deferred to the install point below — see the
+    # 2026-09-08 ordering note above: writing the live identity before the
+    # refusal guards is what let crash recovery "complete" a refused swap.
     target_account_cj = read_json(target_cj)
-    target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
-    for k, v in target_identity.items():
-        live_cj[k] = v
-    write_json(live_cj_path, live_cj)
-    # GH #79: the live file's content was (normally) just saved back into the
-    # outgoing snapshot — but the clobber bug class exists precisely because
-    # the save-back sometimes goes to the wrong place or is skipped. A rotated
-    # backup of the live file itself makes the install step independently
-    # recoverable.
-    backup_credentials_file(live_creds_path)
     # Install source. Pool model (2026-07-03): if the gate is on and the target
     # is ALREADY live on another mount, a plain snapshot copy would clobber its
     # shared token family (#104) — so CLAIM a free pooled family (a distinct
@@ -7125,6 +7302,31 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
             f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
             f"backup (`cus restore-creds {target_name}`).")
+    # ================================================================
+    # EVERY refusal path is above this line. Nothing below may raise a
+    # refusal: from the journal write on, the swap is COMMITTED and any
+    # exception is a genuine crash for `_recover_pending_swap` to reconcile.
+    # (2026-09-08 ordering fix — see the note at the top of the save-back.)
+    # ================================================================
+    # GH #76: write the intent journal immediately BEFORE the first live-mount
+    # mutation. From here to the post-save_state clear, a crash leaves the
+    # journal on disk and _recover_pending_swap reconciles on the next swap /
+    # daemon start. Written AFTER the guards (2026-09-08) so a refused swap
+    # never leaves a journal that recovery could act on.
+    _write_swap_journal(current, target_name, trigger, slot=slot)
+    # Merge target's account-bound keys into the mount's live .claude.json —
+    # the FIRST live-mount write. Recovery's "creds lagged identity" case
+    # covers a crash between this write and the atomic_copy below.
+    target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
+    for k, v in target_identity.items():
+        live_cj[k] = v
+    write_json(live_cj_path, live_cj)
+    # GH #79: the live file's content was (normally) just saved back into the
+    # outgoing snapshot — but the clobber bug class exists precisely because
+    # the save-back sometimes goes to the wrong place or is skipped. A rotated
+    # backup of the live file itself makes the install step independently
+    # recoverable.
+    backup_credentials_file(live_creds_path)
     atomic_copy(install_src, live_creds_path, mode=0o600)
     # THE install-point: the target account's creds are now live on this mount.
     # source = which store we copied from (claimed pool family / legacy / snapshot);
@@ -9663,6 +9865,14 @@ _STORE_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
 #   housekeeping.sweep_interval_hours so an enabled sweep still runs at most
 #   once per interval per daemon process. Reset below (test hook).
 _HOUSEKEEPING_LAST_RUN: float | None = None
+# _LANE_TRANSFER_ATTEMPT: (slot, account) -> wall-clock seconds of the last
+#   generation-transfer heal ATTEMPT (`_lane_generation_transfer_heal`,
+#   2026-09-08). The transfer fires refresh grants (a probe of the canonical +
+#   the reseed rotation) and the lane heal runs EVERY daemon cycle for a
+#   blanked lane, so a canonical that keeps failing to transfer (network,
+#   "unknown" grant) must not be hammered each cycle — the 2026-06-19 burnout
+#   lesson. Bounded by independent_logins.heal_from_canonical_cooldown_minutes.
+_LANE_TRANSFER_ATTEMPT: dict[tuple[str, str], float] = {}
 
 
 def _reset_blank_tracking() -> None:
@@ -9675,6 +9885,7 @@ def _reset_blank_tracking() -> None:
     _UNSTALE_ATTEMPT_MS.clear()
     _SNAPSHOT_DEAD_PROBE.clear()
     _STORE_DEAD_PROBE.clear()
+    _LANE_TRANSFER_ATTEMPT.clear()
     _HOUSEKEEPING_LAST_RUN = None
 
 
