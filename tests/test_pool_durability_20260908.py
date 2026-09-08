@@ -286,7 +286,7 @@ def test_1b_recovery_refuses_install_when_target_live_on_another_mount():
         assert not env.journal_path().exists()
         refused = list(env.accounts_dir.glob("swap.journal.refused.*"))
         assert len(refused) == 1 and json.loads(refused[0].read_text())["to"] == "a"
-        assert any("decision=refused-install" in l for l in env.audit_lines("crash-recovery")), env.echoes
+        assert any("decision=refused-install" in line for line in env.audit_lines("crash-recovery")), env.echoes
         assert "REFUSED" in env.inbox_md.read_text()
     finally:
         env.restore()
@@ -590,6 +590,149 @@ def test_3d_status_shows_per_family_age_and_wall():
         assert "family-1" in out and "PAST WALL" in out, out
         assert "family-2" in out and "wall in 2" in out, out
         assert "age 31." in out and "age 3." in out, out
+    finally:
+        env.restore()
+
+
+# ===========================================================================
+# Dual-review fixes (PR #201): F-F-1 (no_execute), F-F-2 (lock/lost-update),
+# F-F-3 (crash-after-claimed-copy lease restore), F-F-6 (heal-candidate #104)
+# ===========================================================================
+
+def test_ff1_no_execute_transfer_is_zero_writes():
+    """F-F-1: `cus daemon --once --no-execute` must fire ZERO grants/writes. A
+    pooled lane leasing a BLANK family (so the transfer path is reached without a
+    probe) with an alive canonical: the dry-run logs a WOULD line and touches
+    NOTHING — no new family, no grant (the grant map raises on ANY probe), lease +
+    canonical + state.json all byte-identical."""
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        # BLANK family store → `_heal_candidate_usable` returns False WITHOUT a
+        # probe, so `_lane_heal_source` reaches the generation transfer.
+        env.plant_family("acct", "family-1", _blank(), minted_days_ago=31)
+        lane = env.make_slot("acct", live=True, mount_creds=_blank(), family_id="family-1")
+        # Any grant at all is a failure under --no-execute (the map raises).
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({}))
+        state_before = env.state_json.read_text()
+        healed = cus._auto_heal_live_lanes(cus.load_state(), cus.load_config(), no_execute=True)
+        assert healed == [], env.echoes
+        # ZERO writes: no family-2 minted, lease unchanged, canonical untouched,
+        # state.json byte-identical, mount still blank.
+        assert not cus.login_family_dir("acct", "family-2").exists()
+        assert env.state()["slots"][lane]["login_family"] == "acct/family-1"
+        assert cus._credential_refresh_token(env.snap_creds("acct")) == "rt-canon"
+        assert env.state_json.read_text() == state_before
+        assert cus._live_mount_creds_invalid(env.slot_creds(lane))
+        # A WOULD line was logged; no transfer DECISION (refuse/reseed) was written.
+        assert any("--no-execute" in e and "WOULD" in e and "transfer" in e for e in env.echoes), env.echoes
+        assert not env.audit_lines("lane-generation-transfer")
+        # The account is NOT flagged snapshot_refresh_dead in a dry run.
+        assert not env.state()["accounts"]["acct"].get("snapshot_refresh_dead")
+    finally:
+        env.restore()
+
+
+def test_ff2_transfer_uses_fresh_state_no_lost_update():
+    """F-F-2: the transfer runs UNDER the swap lock on a FRESHLY loaded state and
+    saves THAT — so a concurrent state change (a `cus slot move`/`switch` that
+    committed during the SOS pass) is preserved, not clobbered by a save of the
+    pass-start copy. Proven by mutating state.json after the caller's load and
+    asserting BOTH the concurrent change AND the new lease survive."""
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        lane = _pooled_dead_lane(env)  # expired family-1 (dead grant) → transfer fires
+        env.patch(cus, "_oauth_refresh_grant",
+                  _grant_map({"rt-f1-dead": ("dead", None), "rt-canon": _alive("at-new", "rt-new")}))
+        stale = cus.load_state()  # the pass-start copy (current_5h_pct == 0.0)
+        # A concurrent writer commits an UNRELATED change AFTER the stale load.
+        concurrent = cus.load_state()
+        concurrent["accounts"]["acct"]["current_5h_pct"] = 42.0
+        cus.save_state(concurrent)
+        # Heal with the STALE copy: the transfer must reload fresh state internally.
+        healed = cus._auto_heal_live_lanes(stale, cus.load_config())
+        assert healed == [lane], env.echoes
+        final = env.state()
+        # The concurrent change survived (transfer saved FRESH state, not the stale
+        # copy which still read 0.0) AND the new lease was applied.
+        assert final["accounts"]["acct"]["current_5h_pct"] == 42.0, final["accounts"]["acct"]
+        assert final["slots"][lane]["login_family"] == "acct/family-2", final["slots"][lane]
+        # F-F-5: the transfer flags the (now dead-branched) canonical.
+        assert final["accounts"]["acct"].get("snapshot_refresh_dead") is True
+    finally:
+        env.restore()
+
+
+def test_ff3_recovery_restores_claimed_family_lease_1g():
+    """F-F-3 (test 1g): a crash AFTER the claimed-family creds copy but BEFORE
+    save_state left the live lane running family-2 while state showed it FREE — the
+    next probe would rotate its token (#104). Recovery now reads the journal's
+    `family` and, when the live creds match that family, restores the lease."""
+    env = _Env({"a": _valid("at-a", "rt-a"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        env.plant_family("a", "family-2", _valid("at-f2", "rt-f2"))
+        # Live lane: mount already holds family-2's generation (copy done), identity
+        # already stamped "a" (identity write done), but state.account still "other"
+        # and NO login_family (save_state never ran) — the crash-after-copy window.
+        lane = env.make_slot("other", live=True, mount_creds=_valid("at-f2", "rt-f2"), identity_of="a")
+        cus.write_json(env.journal_path(),
+                       {"from": "other", "to": "a", "slot": lane, "family": "family-2", "ts": cus.now_iso()})
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({}))  # classify + fp match probe nothing
+        with cus._swap_lock():
+            cus._recover_pending_swap()
+        st = env.state()
+        assert st["slots"][lane]["account"] == "a", st["slots"][lane]
+        assert st["slots"][lane]["login_family"] == "a/family-2", st["slots"][lane]
+        assert cus._credential_refresh_token(env.slot_creds(lane)) == "rt-f2", "mount tokens untouched"
+        assert not env.journal_path().exists()
+    finally:
+        env.restore()
+
+
+def test_ff3b_recovery_does_not_restore_lease_when_bytes_dont_match():
+    """F-F-3 guard: never restore a lease the actual token bytes don't back. If the
+    live mount holds a DIFFERENT generation than the journal's family, the lease is
+    left unset (the crash landed before the family copy)."""
+    env = _Env({"a": _valid("at-a", "rt-a"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        env.plant_family("a", "family-2", _valid("at-f2", "rt-f2"))
+        # Mount holds "a"'s SNAPSHOT generation (rt-a), not family-2's — a crash
+        # before the family copy. Identity stamped "a".
+        lane = env.make_slot("other", live=True, mount_creds=_valid("at-a", "rt-a"), identity_of="a")
+        cus.write_json(env.journal_path(),
+                       {"from": "other", "to": "a", "slot": lane, "family": "family-2", "ts": cus.now_iso()})
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({}))
+        with cus._swap_lock():
+            cus._recover_pending_swap()
+        st = env.state()
+        assert st["slots"][lane]["account"] == "a"
+        assert "login_family" not in st["slots"][lane], st["slots"][lane]
+    finally:
+        env.restore()
+
+
+def test_ff6_heal_candidate_refuses_family_live_on_another_mount():
+    """F-F-6: a heal candidate whose refresh family is LIVE on another mount is the
+    #104 double-book — reinstalling it would copy a running session's single-use
+    token onto a 2nd live mount. `_heal_candidate_usable` returns False (was: True)
+    and logs the refusal; no probe fires (the grant map would raise)."""
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        env.plant_family("acct", "family-1", _valid("at-x", "rt-x"))
+        # slot-1 is LIVE on acct running rt-x (family-1's generation).
+        env.make_slot("acct", live=True, mount_creds=_valid("at-x", "rt-x"), family_id="family-1")
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({}))  # any probe is a failure
+        state, config = cus.load_state(), cus.load_config()
+        usable = cus._heal_candidate_usable(
+            cus.login_family_creds_path("acct", "family-1"), "heal-fam:acct/family-1",
+            "acct", state, config)
+        assert usable is False, env.echoes
+        lines = env.audit_lines("heal-candidate")
+        assert lines and "decision=refused-live-elsewhere" in lines[-1], env.echoes
     finally:
         env.restore()
 
