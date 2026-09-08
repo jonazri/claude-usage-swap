@@ -130,7 +130,12 @@ def test_c_refresh_near_ttl_warns_with_date():
     cond = cus._diagnose_mount_creds_health(
         "slot-6", "rayi2", creds, NOW_MS, _cfg(), refresh_age_days=27.0)
     assert cond is not None
-    assert cond.severity == "warning"
+    # Annotation 2026-09-08 (login-family pool-collapse incident): was
+    # "warning". A LIVE mount within independent_logins.urgent_wall_within_days
+    # (default 5) of the absolute refresh-token wall is now URGENT — the
+    # warning fired for weeks at low severity and was ignored while every
+    # family aged into the wall together.
+    assert cond.severity == "urgent"
     assert "refresh token" in cond.summary
     assert "cus relogin rayi2" in cond.action
     # Relogin-by date = now + 3 days, derived from NOW_MS deterministically.
@@ -143,7 +148,9 @@ def test_c_refresh_past_ttl_warns():
     creds = _valid(expires_at=NOW_MS + 6 * 3600 * 1000)
     cond = cus._diagnose_mount_creds_health(
         "shared", "rayi", creds, NOW_MS, _cfg(), refresh_age_days=33.0)  # past 30d
-    assert cond is not None and cond.severity == "warning"
+    # Annotation 2026-09-08: was "warning" — past the wall on a live mount is
+    # an outage in waiting, so it is URGENT now (see test_c_refresh_near_ttl).
+    assert cond is not None and cond.severity == "urgent"
     assert "past its assumed" in cond.summary
 
 

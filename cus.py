@@ -359,6 +359,41 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # network/endpoint trouble FAILS OPEN to today's install-as-is.
         # False ⇒ bit-for-bit pre-#127 claim behavior.
         "verify_family_on_claim": True,
+        # ---- 2026-09-08 generation-transfer lane heal (pool-collapse incident) ----
+        # When a LIVE pooled lane's mount blanks and its leased family store
+        # is dead (refresh grant invalid_grant / blank / missing) but the
+        # account CANONICAL is alive, mint the lane a FRESH family from the
+        # canonical (`_reseed_family_from_canonical`: copy + grant + persist, a
+        # documented generation TRANSFER that dead-branches the canonical) and
+        # re-lease it — instead of re-installing the dead family and looping
+        # heal→blank→heal until a browser relogin. Guarded: the canonical's
+        # token family must not be live on ANY other mount (#104) and must
+        # probe alive. This is the automated form of the manual reseed that
+        # would have revived every dead lane in the 2026-09-07/08 collapse. It
+        # does not extend the ~30-day refresh-token wall — it only removes the
+        # lockout while the canonical still has life. False ⇒ pre-2026-09-08
+        # heal (family store or nothing).
+        "heal_from_canonical": True,
+        # Poll-burnout backoff: at most one transfer ATTEMPT per lane per this
+        # many minutes (the heal runs every cycle for a blanked lane; each
+        # attempt can fire refresh grants).
+        "heal_from_canonical_cooldown_minutes": 10,
+        # ---- 2026-09-08 wall visibility (pool-collapse incident) ----
+        # A pooled family within this many days of the assumed refresh-token
+        # wall (refresh_token_ttl_days) on an account that backs a LIVE lane
+        # raises an URGENT SOS — the 25-day mark at the 30-day default. The
+        # prior WARNING fired hundreds of times a day for weeks at low
+        # severity and was ignored while every family aged into the wall
+        # together. The wall is ABSOLUTE (rotation does not extend it) and a
+        # new family needs a browser /login, so the lead time is the point.
+        "urgent_wall_within_days": 5,
+        # Count a pooled family as FREE only if a claim could still succeed:
+        # not blank / expired-without-refresh on disk, not probe-proven dead
+        # in this process, and (with this flag) not past the assumed wall by
+        # provenance age. Pre-fix "N families, 0 free" could mean "all dead,
+        # none busy" and hid the cliff; `cus status` now shows each family's
+        # age. False ⇒ age is ignored (disk-shape + probe-cache still apply).
+        "free_count_excludes_past_wall": True,
     },
     # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
     # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
@@ -1699,18 +1734,75 @@ def leased_families(account: str, state: dict) -> set[str]:
     return out
 
 
-def free_login_family(account: str, state: dict) -> str | None:
+def _family_past_wall(account: str, family_id: str, config: dict | None = None) -> bool:
+    """True iff the family's provenance mint age is at or past the assumed
+    refresh-token lifetime (independent_logins.refresh_token_ttl_days).
+
+    2026-09-08: the lifetime is ABSOLUTE — the 2026-09-07/08 collapse showed
+    that rotation does not extend it and every family minted in one batch dies
+    in one batch. A family with no provenance (unknown age) is NOT past the
+    wall by this test — the disk-shape and probe checks still apply to it.
+
+    F-O-3 tradeoff (2026-09-08, deliberate): this drops a family from the
+    free/claimable count purely by ASSUMED age, even when its refresh token is in
+    fact still alive (the TTL is unconfirmed — #109 Phase 0). That is the
+    over-conservative / false-NEGATIVE direction (withhold a rescue move onto an
+    account whose past-wall family would actually still claim), which is the safe
+    side given the incident (never plan onto a pool that read healthy while it was
+    dead). Gated by `free_count_excludes_past_wall` (default ON) so it is fully
+    revertible. TODO if it ever bites: fall through to a probe when age is the ONLY
+    disqualifier, rather than counting it out blind."""
+    age = _family_age_days(account, family_id)
+    if age is None:
+        return False
+    cfg = config if config is not None else load_config()
+    ttl = cfg.get("independent_logins", {}).get("refresh_token_ttl_days", 30)
+    return age >= float(ttl)
+
+
+def _family_claimable(account: str, family_id: str, config: dict | None = None) -> bool:
+    """DISK-ONLY "could a claim of this family still succeed?" (2026-09-08).
+
+    The free-family counters used to count every usable-shaped, unleased
+    family as free — including stores whose token was provably gone: blank /
+    expired-without-refresh on disk, probe-proven dead earlier in this process
+    (`_STORE_DEAD_PROBE`, keyed the way `_prune_free_families` and the lane
+    heal key their probes), or minted longer ago than the refresh-token wall.
+    "0 free" therefore meant "0 unleased", not "0 usable", and the pool read
+    as merely busy while it was in fact dead. Never probes (this feeds the
+    per-cycle decision layer); the claim path's grant stays the definitive
+    check and still retires dead stores it meets."""
+    if _creds_shape_expiry_dead(login_family_creds_path(account, family_id)):
+        return False
+    for key in (f"fam:{account}/{family_id}", f"heal-fam:{account}/{family_id}"):
+        cached = _STORE_DEAD_PROBE.get(key)
+        if cached is not None and cached[1]:
+            return False
+    cfg = config if config is not None else load_config()
+    if (cfg.get("independent_logins", {}).get("free_count_excludes_past_wall", True)
+            and _family_past_wall(account, family_id, cfg)):
+        return False
+    return True
+
+
+def free_login_family(account: str, state: dict, config: dict | None = None) -> str | None:
     """Lowest-index usable family of `account` not leased to a live slot, or None
     if the pool is empty or fully leased (exhausted). This is the family a rescue
-    swap claims."""
+    swap claims.
+
+    2026-09-08: also skips families a claim could not succeed on
+    (`_family_claimable` — disk-dead, probe-proven dead, past the wall), so the
+    decision layer holds a move instead of planning onto a dead pool. `config`
+    is optional for back-compat (loaded when None)."""
     leased = leased_families(account, state)
+    cfg = config if config is not None else load_config()
     for fam in list_login_families(account):  # already sorted lowest-first
-        if fam not in leased:
+        if fam not in leased and _family_claimable(account, fam, cfg):
             return fam
     return None
 
 
-def has_free_login_family(account: str, state: dict) -> bool:
+def has_free_login_family(account: str, state: dict, config: dict | None = None) -> bool:
     """True iff a rescue swap onto `account` could claim a distinct login family
     (so double-booking it would not clobber). The pool-model replacement for the
     per-slot has_independent_login predicate.
@@ -1719,17 +1811,22 @@ def has_free_login_family(account: str, state: dict) -> bool:
     layer predicate, called many times per cycle. The claim itself
     (claim_verified_login_family, execution layer) does the definitive
     refresh-grant probe and skips dead stores; an optimistic True here at
-    worst becomes a failed move logged by _execute_slot_moves."""
-    return free_login_family(account, state) is not None
+    worst becomes a failed move logged by _execute_slot_moves. (Since
+    2026-09-08 the disk-only `_family_claimable` filter trims the optimism:
+    a family that is blank, probe-proven dead, or past the wall is not free.)"""
+    return free_login_family(account, state, config) is not None
 
 
-def _free_family_count(account: str, state: dict) -> int:
+def _free_family_count(account: str, state: dict, config: dict | None = None) -> int:
     """How many usable pooled families of `account` are NOT leased to a live slot
     — i.e. how many ADDITIONAL live mounts the pool can back without a clobber,
     beyond the ones already covered. The counting twin of free_login_family
-    (which returns just the lowest free one)."""
+    (which returns just the lowest free one). Since 2026-09-08 this is the
+    ALIVE-free count (`_family_claimable`), so "0 free" means "0 usable"."""
     leased = leased_families(account, state)
-    return sum(1 for fam in list_login_families(account) if fam not in leased)
+    cfg = config if config is not None else load_config()
+    return sum(1 for fam in list_login_families(account)
+               if fam not in leased and _family_claimable(account, fam, cfg))
 
 
 def _distinct_family_capacity(account: str, state: dict, config: dict | None, slot: str | None) -> int:
@@ -1754,7 +1851,7 @@ def _distinct_family_capacity(account: str, state: dict, config: dict | None, sl
     bit unchanged."""
     cap = 0 if _account_held_by_other_live_mount(state, account, slot, config) else 1
     if independent_logins_enabled(config):
-        cap += _free_family_count(account, state)
+        cap += _free_family_count(account, state, config)
         if slot is not None and has_independent_login(account, slot):
             cap += 1
     return cap
@@ -1821,7 +1918,7 @@ def claim_verified_login_family(account: str, state: dict, config: dict | None =
     False short-circuits to plain free_login_family."""
     cfg = config if config is not None else load_config()
     if not cfg.get("independent_logins", {}).get("verify_family_on_claim", True):
-        return free_login_family(account, state)
+        return free_login_family(account, state, cfg)  # F-O-2/F-F-12: thread config
     leased = leased_families(account, state)
     for fam in list_login_families(account):  # lowest-first
         if fam in leased:
@@ -3978,7 +4075,9 @@ def _keepalive_token_for(account: str, acct: dict, state: dict,
         via `_refresh_account_token` (a direct refresh grant that writes back to
         the SNAPSHOT only — never a live lane's .credentials.json) and re-read."""
     if acct.get("snapshot_refresh_dead"):
-        if not has_free_login_family(account, state):
+        # F-O-2/F-F-12 (2026-09-08): thread the in-scope config so the free-family
+        # predicate doesn't re-parse config.yaml from disk on every keepalive call.
+        if not has_free_login_family(account, state, config):
             return None, "snapshot refresh-dead and no free login family — leave for relogin"
         fam = claim_verified_login_family(account, state, config)
         if not fam:
@@ -5225,7 +5324,7 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # authoritative, the same split as has_free_login_family / claim_verified_login_family.
     # If this empties the pool the picker returns None and the dead-snapshot SOS fires.
     candidates = [(name, acct) for name, acct in candidates
-                  if not (acct.get("snapshot_refresh_dead") and not has_free_login_family(name, state))]
+                  if not (acct.get("snapshot_refresh_dead") and not has_free_login_family(name, state, config))]  # F-O-2/F-F-12: thread config (no per-call config.yaml parse)
     if not candidates:
         return None
 
@@ -5574,9 +5673,12 @@ def _swap_journal_path() -> Path:
     """Path of the write-ahead swap-intent journal (GH #76).
 
     Present on disk = a swap is in flight (or crashed mid-flight). Written
-    before the first mutating step of execute_swap, removed after state.json
-    is persisted. Call-time derivation for the same test-sandboxing reason
-    as _swap_lock_path.
+    before the first LIVE-MOUNT mutation of execute_swap (annotation
+    2026-09-08: previously "before the first mutating step", i.e. ahead of the
+    storage-side save-back AND ahead of the refusal guards — which let a
+    refused swap leave a journal behind for crash recovery to mis-complete),
+    removed after state.json is persisted. Call-time derivation for the same
+    test-sandboxing reason as _swap_lock_path.
     """
     return ACCOUNTS_DIR / "swap.journal"
 
@@ -5650,7 +5752,8 @@ def _swap_lock(timeout_seconds: float | None = None):
             pass
 
 
-def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot: str | None = None) -> None:
+def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot: str | None = None,
+                        family: str | None = None) -> None:
     """Persist swap intent BEFORE the first mutating step (GH #76).
 
     If the process dies anywhere inside the swap sequence, this file is what
@@ -5661,6 +5764,13 @@ def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot:
     per_session: `slot` names the mount the swap targets (None = the global
     ~/.claude/ pair). `from_name` may be None for a swap-into-empty-slot
     (a `cus launch` install — there is no outgoing account).
+
+    F-F-3 (2026-09-08): `family` records the pooled family this swap CLAIMED (the
+    `to/family-N` lease it is about to write into state.slots[slot].login_family).
+    A crash after the creds copy but before save_state would otherwise leave the
+    live lane running that family while state shows it FREE — the next claim/prune
+    probe then rotates the lane's token and logs it out (#104). Recovery restores
+    the lease from this field when the live creds match the family (test 1g).
     """
     payload = {
         "from": from_name, "to": to_name, "trigger": trigger, "ts": now_iso(),
@@ -5669,6 +5779,8 @@ def _write_swap_journal(from_name: str | None, to_name: str, trigger: str, slot:
     }
     if slot is not None:
         payload["slot"] = slot
+    if family is not None:
+        payload["family"] = family
     write_json(_swap_journal_path(), payload)
 
 
@@ -6057,6 +6169,26 @@ def _cred_audit(op: str, decision: str, reason: str = "", *,
         pass
 
 
+def _live_creds_are_family(live_creds_path: Path, account: str, family_id: str) -> bool:
+    """True iff the live mount's creds carry the SAME refresh-token generation as
+    `account`'s pooled `family_id` store (F-F-3, 2026-09-08).
+
+    Crash recovery uses this to confirm a live lane really is running the family
+    the crashed swap had claimed before it restores that lease — never restore a
+    lease the actual token bytes don't back (a crash BEFORE the creds copy left
+    the mount on `from`'s tokens, which the recovery guard stack completes from
+    the snapshot, not the family). Best-effort: unreadable/absent either side or a
+    missing refresh token ⇒ False (no lease restored)."""
+    try:
+        live_rt = _credential_refresh_token(read_json(live_creds_path)) if live_creds_path.exists() else None
+        fam_rt = _credential_refresh_token(read_json(login_family_creds_path(account, family_id)))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not live_rt or not fam_rt:
+        return False
+    return _refresh_fingerprint(live_rt) == _refresh_fingerprint(fam_rt)
+
+
 def _recover_pending_swap() -> None:
     """Detect and reconcile a swap that crashed mid-flight (GH #76).
 
@@ -6094,6 +6226,7 @@ def _recover_pending_swap() -> None:
     frm = j.get("from") if isinstance(j, dict) else None
     to = j.get("to") if isinstance(j, dict) else None
     slot = j.get("slot") if isinstance(j, dict) else None
+    fam = j.get("family") if isinstance(j, dict) else None  # F-F-3: claimed pooled family lease
     if stale_reason is None and not to:
         stale_reason = "journal has no 'to' account"
 
@@ -6184,22 +6317,54 @@ def _recover_pending_swap() -> None:
             live_creds = None
         state = load_state()
         installed_note = ""
+        pending_note: str | None = None
         if live_creds is not None and target_creds.exists():
             verdict, _owner, _ = classify_live_creds_owner(live_creds, to, state)
             if verdict == "foreign":
-                backup_credentials_file(live_creds_path)   # GH #79 choke point
-                atomic_copy(target_creds, live_creds_path, mode=0o600)
-                installed_note = " (live creds still held the outgoing account's tokens; completed the install)"
+                pending_note = " (live creds still held the outgoing account's tokens; completed the install)"
         elif live_creds is None and slot and target_creds.exists():
+            pending_note = " (slot had no creds yet; completed the install)"
+        if pending_note is not None:
+            # ---- 2026-09-08 hardening (login-family pool-collapse incident) ----
+            # This "complete the install" copy used to be a RAW atomic_copy of
+            # `to`'s snapshot that bypassed every guard execute_swap enforces
+            # (#141 blank shape, the dead-snapshot probe, the #104 family
+            # collision). Combined with the old journal-before-guards ordering
+            # it turned a REFUSED swap into a completed clobber: the swap had
+            # refused precisely because the snapshot was dead / colliding, and
+            # recovery then installed it anyway, logging a live session out and
+            # double-booking the account. Run the same guard stack here and
+            # REFUSE (leave the mount on `from`, roll its identity back, keep the
+            # evidence, surface loudly) whenever the snapshot is not a safe
+            # install source. Refusing never logs anyone out; installing does.
+            refusal = _crash_recovery_install_refusal(to, slot, state)
+            if refusal is not None:
+                _refuse_crash_recovery_install(journal, frm, to, slot, live_cj_path, state, refusal)
+                return
+            backup_credentials_file(live_creds_path)   # GH #79 choke point
             atomic_copy(target_creds, live_creds_path, mode=0o600)
-            installed_note = " (slot had no creds yet; completed the install)"
+            installed_note = pending_note
         if slot:
             entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
+            _rec_changed = False
             if entry.get("account") != to:
                 entry["account"] = to
                 state.setdefault("swap_history", []).append({
                     "ts": now_iso(), "from": frm, "to": to, "trigger": "crash-recovery", "slot": slot,
                 })
+                _rec_changed = True
+            # F-F-3 (2026-09-08): restore the pooled-family lease the crashed swap
+            # had CLAIMED (journal `family`) but not yet persisted — but ONLY when
+            # the live creds actually carry that family's generation (the crash
+            # landed AFTER the atomic_copy). Without this the lane runs family-N
+            # while state reads it FREE, and the next claim/prune probe rotates its
+            # single-use token and logs the live session out (#104) — the incident's
+            # failure class via the crash door.
+            if (fam and entry.get("login_family") != f"{to}/{fam}"
+                    and _live_creds_are_family(live_creds_path, to, fam)):
+                entry["login_family"] = f"{to}/{fam}"
+                _rec_changed = True
+            if _rec_changed:
                 save_state(state)
             where = f"slots.{slot}.account"
         else:
@@ -6242,6 +6407,158 @@ def _recover_pending_swap() -> None:
     _clear_swap_journal()
 
 
+def _crash_recovery_install_refusal(to: str, slot: str | None, state: dict) -> str | None:
+    """Guard stack for crash recovery's "complete the install" copy (2026-09-08).
+
+    Returns a human-readable refusal reason when installing `to`'s CANONICAL
+    snapshot into the mount named by `slot` (None = the shared ~/.claude pair)
+    would violate a guard `_execute_swap_locked` enforces — or None when the
+    copy is safe. Mirrors the swap's ladder, cheapest first:
+
+      1. snapshot unreadable / blank-shaped (GH #141) — writing it blanks the
+         mount and logs every session on it out.
+      2. SLOT swap while `to` is already live on ANOTHER mount (GH #104) — the
+         interrupted swap would have CLAIMED a distinct pooled family for this
+         lane (or refused as pool-exhausted); recovery cannot reproduce that
+         claim, and a raw snapshot copy puts one refresh-token family on two
+         live mounts (the next rotation logs one out).
+      3. the snapshot's token FAMILY is byte-identical to one already live on
+         another mount (`_live_family_would_collide`) — the same #104 clobber
+         measured on actual token bytes; also covers the shared mount, which
+         the swap itself never claims a family for.
+      4. the snapshot's refresh grant is DEAD (`_account_snapshot_dead` —
+         invalid_grant, the 2026-07-07 merkos shape) — a well-shaped-but-dead
+         snapshot blanks the mount on Claude Code's first refresh. The probe is
+         cooldown-cached and fails OPEN on a transient, exactly as at the swap.
+
+    Recovery is rare (a crash or a refused swap), so the one network probe in
+    rung 4 is an acceptable cost for never installing a dead token."""
+    config = load_config()
+    target_creds = account_creds_path(to)
+    try:
+        snap = read_json(target_creds)
+    except (json.JSONDecodeError, OSError) as e:
+        return (f"'{to}' snapshot {target_creds} is unreadable ({e}) — installing it would blank "
+                f"the mount (GH #141)")
+    if _live_mount_creds_invalid(snap):
+        return (f"'{to}' snapshot credentials are blank/expired-shaped — installing them would "
+                f"blank the mount and lock its session(s) out (GH #141)")
+    # F-F-9 (2026-09-08): DELIBERATELY not gated on independent_logins_enabled (the
+    # swap's own claim block IS, at cus.py ~7167). Rationale: with the pool gate
+    # OFF the interrupted swap would have installed a plain snapshot COPY onto a
+    # double-booked mount — which IS the #104 setup. Recovery refusing it is
+    # STRICTER than the swap, in the safe direction (a refusal never logs anyone
+    # out; completing the copy would). So the asymmetry is intentional, not a bug.
+    if slot is not None and _account_held_by_other_live_mount(state, to, slot, config):
+        return (f"'{to}' is already live on another mount — the interrupted swap would have "
+                f"claimed a DISTINCT login family for {slot}; a raw snapshot copy would put one "
+                f"refresh-token family on two live mounts (GH #104 divergence logout)")
+    if _live_family_would_collide(to, target_creds, slot, state, config):
+        return (f"'{to}' snapshot carries the SAME refresh-token family already live on another "
+                f"mount — installing it would double-book that family (GH #104)")
+    if _account_snapshot_dead(to, config):
+        return (f"'{to}' snapshot's OAuth refresh grant returns invalid_grant (DEAD) — installing "
+                f"it would blank the mount on the first refresh (2026-07-07 merkos dead-snapshot "
+                f"shape); re-login first: `cus relogin {to}`")
+    return None
+
+
+def _refuse_crash_recovery_install(journal: Path, frm: str | None, to: str, slot: str | None,
+                                   live_cj_path: Path, state: dict, reason: str) -> None:
+    """Back out of a crash-recovery install that `_crash_recovery_install_refusal`
+    rejected (2026-09-08). The mount's CREDENTIALS still hold `from`'s tokens
+    (that is why an install was pending), so the consistent, session-preserving
+    state is "still on `from`":
+
+      * roll the mount's live .claude.json identity back to `from`'s canonical
+        identity (the interrupted swap had already stamped `to`'s) so identity
+        and tokens agree again — otherwise the next swap's wrong-account guard
+        would refuse the save-back for a mount that is in fact fine;
+      * make sure state.json still names `from` for this mount (it does unless
+        something else moved it — record reality if not);
+      * preserve the journal as `swap.journal.refused.<ts>` (annotate, never
+        delete) so the evidence survives, and clear the live journal so the
+        next cycle does not re-run this same refusal forever;
+      * surface it: stderr, a CRED-AUDIT line, and an inbox entry.
+
+    `frm` may be None (an empty-slot install crashed): there is no identity to
+    roll back to; the slot simply stays unassigned until the next launch
+    installs it through the full guard stack."""
+    rolled_back = False
+    if frm is not None:
+        from_cj_path = ACCOUNTS_DIR / f"account-{frm}" / ".claude.json"
+        try:
+            from_cj = read_json(from_cj_path) if from_cj_path.exists() else None
+            live_cj = read_json(live_cj_path) if live_cj_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            from_cj, live_cj = None, None
+        if isinstance(from_cj, dict) and isinstance(live_cj, dict):
+            for k in ACCOUNT_BOUND_KEYS:
+                if k in from_cj:
+                    live_cj[k] = from_cj[k]
+                else:
+                    live_cj.pop(k, None)
+            try:
+                write_json(live_cj_path, live_cj)
+                rolled_back = True
+            except OSError:
+                rolled_back = False
+        elif isinstance(live_cj, dict):
+            # F-O-4 (2026-09-08): `from`'s canonical .claude.json is missing/
+            # unreadable, so there is no identity to roll back TO — but leaving the
+            # interrupted swap's `to` identity stamped on a mount that holds `from`'s
+            # tokens is live drift that would trip the NEXT swap's wrong-account
+            # save-back guard for a mount that is actually fine. Neutralize it by
+            # STRIPPING the account-bound identity keys (the mount carries no
+            # identity rather than the wrong one); the next launch re-stamps through
+            # the full guard stack. Best-effort — a failed write leaves today's drift.
+            for k in ACCOUNT_BOUND_KEYS:
+                live_cj.pop(k, None)
+            try:
+                write_json(live_cj_path, live_cj)
+                rolled_back = None  # tri-state: identity neutralized, not restored
+            except OSError:
+                rolled_back = False
+    # state.json never moved for this mount (save_state is the swap's LAST
+    # step), but record reality if it somehow did.
+    if slot:
+        entry = state.setdefault("slots", {}).get(slot)
+        if entry is not None and entry.get("account") != frm:
+            entry["account"] = frm
+            save_state(state)
+        where = f"slots.{slot}.account"
+    else:
+        if frm is not None and state.get("active") != frm:
+            state["active"] = frm
+            save_state(state)
+        where = "state.json active"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    refused_path = journal.with_name(f"{journal.name}.refused.{ts}")
+    try:
+        os.replace(journal, refused_path)
+    except OSError:
+        _clear_swap_journal()
+    if rolled_back is True:
+        identity_note = f"rolled back to {frm!r}"
+    elif rolled_back is None:  # F-O-4: stripped stale target identity (no canonical to restore)
+        identity_note = "stale target identity stripped (no canonical to restore — mount left identity-less)"
+    else:
+        identity_note = "NOT rolled back (identity write failed / nothing to restore)"
+    retry_cmd = f"cus slot move {slot} {to}" if slot else f"cus switch {to}"
+    msg = (f"REFUSED to complete crashed/interrupted swap {frm!r} -> {to!r} on "
+           f"{slot or 'the shared mount'}: {reason}. The mount keeps {frm!r}'s tokens "
+           f"({where} stays {frm!r}); live identity {identity_note}. Evidence preserved at "
+           f"{refused_path.name}. Retry once the target is healthy: `{retry_cmd}`.")
+    click.echo(f"swap-journal: {msg}", err=True)
+    _cred_audit("crash-recovery", "refused-install", reason,
+                slot=slot, mount=(slot or "shared-mount"), account=to,
+                extra=f"from={frm} evidence={refused_path.name}")
+    try:
+        append_inbox("crash-recovery", "crashed swap NOT completed — target failed the install guards", msg)
+    except OSError:
+        pass
+
+
 def _creds_expires_at(creds: Any) -> int | float | None:
     """Extract claudeAiOauth.expiresAt (Unix ms) from a credentials payload,
     tolerating any malformed shape. Used as the FRESHNESS discriminator for
@@ -6269,6 +6586,20 @@ def _live_mount_creds_invalid(creds: Any) -> bool:
     valid. `bool` is excluded from the numeric expiresAt check because it is an
     `int` subclass — a stray `expiresAt: true` must not read as a positive
     epoch.
+
+    Annotation 2026-09-08 (login-family pool-collapse incident): a payload whose
+    access token is already EXPIRED (expiresAt in the past) AND which carries NO
+    refresh token is now also "invalid". Such a file can neither authenticate
+    now nor mint a new token, so a session reading it is logged out and a heal /
+    swap installing it would only re-blank the mount — yet it passed the old
+    shape test (non-empty token, positive expiresAt) and was re-installed by the
+    auto-heal loop. This predicate stays DISK-ONLY on purpose: the
+    expired-access-with-DEAD-refresh case (a refresh token that is present but
+    rotated away) can only be told apart by a refresh-grant probe, and probing
+    here would rotate LIVE sessions' single-use tokens (GH #104) because this
+    predicate runs against every live mount every cycle. That case is handled
+    where a probe IS safe — the lane-heal source pick (`_lane_heal_source`)
+    verifies a blanked lane's family/shadow store before reinstalling it.
     """
     if not isinstance(creds, dict):
         return True  # missing / corrupt / non-dict → unusable
@@ -6279,7 +6610,14 @@ def _live_mount_creds_invalid(creds: Any) -> bool:
     exp = oauth.get("expiresAt")
     token_ok = isinstance(token, str) and token.strip() != ""
     exp_ok = isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0
-    return not (token_ok and exp_ok)
+    if not (token_ok and exp_ok):
+        return True
+    # Expired access token with nothing to refresh from (2026-09-08): unusable.
+    refresh = oauth.get("refreshToken")
+    refresh_ok = isinstance(refresh, str) and refresh.strip() != ""
+    if not refresh_ok and exp <= int(time.time() * 1000):
+        return True
+    return False
 
 
 def _snapshot_fresher_than_live(account_name: str) -> bool:
@@ -6587,10 +6925,26 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"{live_cj_path} missing — cannot save the outgoing account's identity back to "
             f"storage (occupied slot with no live .claude.json; run `cus doctor --fix-dirs`)")
 
-    # GH #76: write the intent journal BEFORE the first mutating step. From
-    # here to the post-save_state clear, a crash leaves the journal on disk
-    # and _recover_pending_swap reconciles on the next swap / daemon start.
-    _write_swap_journal(current, target_name, trigger, slot=slot)
+    # ---- 2026-09-08 ordering fix (login-family pool-collapse incident) ----
+    # The GH #76 intent journal USED to be written right here — before the
+    # save-back, before the live identity write, and crucially BEFORE the
+    # install-source refusal guards further down (pool-exhausted, dead legacy
+    # store, dead snapshot, shared-mount dead snapshot, #104 family collision).
+    # No refusal path cleared it. Worse, the live .claude.json identity was
+    # ALSO written before those guards. So a REFUSED swap left the mount with
+    # target's identity + current's tokens + a live journal, and the next
+    # daemon cycle's `_recover_pending_swap` read that as "crashed after the
+    # live mutation" (identity says target, creds are 'foreign') and
+    # COMPLETED the install with a raw snapshot copy that bypasses every guard
+    # — overwriting a live valid token with the very dead/colliding one the
+    # swap had just refused (2026-09-07/08: clobbered a product session and
+    # manufactured double-books). The journal write and BOTH live-mount writes
+    # now live together just before the creds install, after every guard, so
+    # a refusal is a true no-op for the mount and leaves no journal behind.
+    # The storage-side save-back below is NOT a live-mount mutation (it writes
+    # the OUTGOING account's snapshot/family store) and is guarded on its own,
+    # so it may still run ahead of the journal: a crash inside it leaves
+    # live == from == state, which needs no reconciliation.
 
     # Save current identity + creds back to current's storage — skipped
     # entirely for a swap into an EMPTY slot (current is None: nothing to
@@ -6876,18 +7230,11 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 pass
     # ---- end GH #3 drift detection ----
 
-    # Merge target's account-bound keys into the mount's live .claude.json
+    # Read the target's canonical identity now (read-only). The MERGE into the
+    # mount's live .claude.json is deferred to the install point below — see the
+    # 2026-09-08 ordering note above: writing the live identity before the
+    # refusal guards is what let crash recovery "complete" a refused swap.
     target_account_cj = read_json(target_cj)
-    target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
-    for k, v in target_identity.items():
-        live_cj[k] = v
-    write_json(live_cj_path, live_cj)
-    # GH #79: the live file's content was (normally) just saved back into the
-    # outgoing snapshot — but the clobber bug class exists precisely because
-    # the save-back sometimes goes to the wrong place or is skipped. A rotated
-    # backup of the live file itself makes the install step independently
-    # recoverable.
-    backup_credentials_file(live_creds_path)
     # Install source. Pool model (2026-07-03): if the gate is on and the target
     # is ALREADY live on another mount, a plain snapshot copy would clobber its
     # shared token family (#104) — so CLAIM a free pooled family (a distinct
@@ -7103,6 +7450,32 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"source is a stale snapshot copy). Provision another independent login "
             f"(`cus login-mount {target_name}`) and retry, or move the lane to a different "
             f"account. Lane left on its prior account (no creds written).")
+    # ---- 2026-09-08 F-F-8: shared-mount #104 byte-collision guard ----
+    # The guard just above (slot is not None) refuses installing a source whose
+    # refresh family is already live on another mount. The SHARED mount (slot is
+    # None — `cus switch`) had NO such guard, so a switch could put a live lane's
+    # family onto the bare mount (routine after a #186 heal-back copies a leased
+    # family over the canonical, which F-F-5 makes a normal post-transfer state).
+    # Crash recovery's rung 3 already covers the shared mount; make the switch
+    # itself as strict. `_live_family_would_collide` reads actual token bytes and
+    # handles slot=None (it counts live lanes of `target_name`), so it refuses only
+    # a genuine #104 setup — a normal switch onto an account whose lanes hold
+    # DISTINCT pooled families never collides. Degrade-to-safe: refusing never logs
+    # anyone out; installing the colliding family does.
+    if slot is None and _live_family_would_collide(target_name, install_src, None, state, config):
+        try:
+            _shared_collide_fp = _audit_token_fp(read_json(install_src))
+        except (json.JSONDecodeError, OSError):
+            _shared_collide_fp = "unreadable"
+        _cred_audit("family-collision-refuse", "refused-collision-shared",
+                    "shared-mount switch source shares a live family with a lane (#104)",
+                    mount="shared-mount", account=target_name, shared=True, token_fp=_shared_collide_fp)
+        raise RuntimeError(
+            f"refusing to switch the shared ~/.claude mount onto '{target_name}': the credentials "
+            f"about to be installed carry the SAME OAuth refresh-token family already live on a lane "
+            f"of '{target_name}'. Two live mounts on one token family log one out on the next "
+            f"rotation (GH #104). Move that lane to a distinct pooled family, or switch to a "
+            f"different account. Mount left on its prior account (no creds written). [2026-09-08 F-F-8]")
     # ---- GH #141 root-cause guard (definitive install-point gate) ----
     # This is THE line that writes creds to the live mount; every swap path
     # (snapshot copy, claimed pool family, legacy per-slot login) funnels through
@@ -7125,6 +7498,34 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
             f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
             f"backup (`cus restore-creds {target_name}`).")
+    # ================================================================
+    # EVERY refusal path is above this line. Nothing below may raise a
+    # refusal: from the journal write on, the swap is COMMITTED and any
+    # exception is a genuine crash for `_recover_pending_swap` to reconcile.
+    # (2026-09-08 ordering fix — see the note at the top of the save-back.)
+    # ================================================================
+    # GH #76: write the intent journal immediately BEFORE the first live-mount
+    # mutation. From here to the post-save_state clear, a crash leaves the
+    # journal on disk and _recover_pending_swap reconciles on the next swap /
+    # daemon start. Written AFTER the guards (2026-09-08) so a refused swap
+    # never leaves a journal that recovery could act on.
+    # F-F-3 (2026-09-08): record the claimed pooled family so crash recovery can
+    # restore the lease it would otherwise lose (a live lane on a FREE-reading
+    # family → #104 logout on the next probe).
+    _write_swap_journal(current, target_name, trigger, slot=slot, family=claimed_family)
+    # Merge target's account-bound keys into the mount's live .claude.json —
+    # the FIRST live-mount write. Recovery's "creds lagged identity" case
+    # covers a crash between this write and the atomic_copy below.
+    target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
+    for k, v in target_identity.items():
+        live_cj[k] = v
+    write_json(live_cj_path, live_cj)
+    # GH #79: the live file's content was (normally) just saved back into the
+    # outgoing snapshot — but the clobber bug class exists precisely because
+    # the save-back sometimes goes to the wrong place or is skipped. A rotated
+    # backup of the live file itself makes the install step independently
+    # recoverable.
+    backup_credentials_file(live_creds_path)
     atomic_copy(install_src, live_creds_path, mode=0o600)
     # THE install-point: the target account's creds are now live on this mount.
     # source = which store we copied from (claimed pool family / legacy / snapshot);
@@ -8438,7 +8839,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # REFUSES if the pool turns out exhausted, so this can't cause a clobber.
         # Gated on use_independent_logins — OFF (default) leaves drop unchanged.
         if drop and independent_logins_enabled(config):
-            rescuable = {x for x in drop if has_free_login_family(x, state)}
+            rescuable = {x for x in drop if has_free_login_family(x, state, config)}  # F-O-2/F-F-12: thread config
             drop = drop - rescuable
         if drop:
             shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
@@ -9663,6 +10064,14 @@ _STORE_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
 #   housekeeping.sweep_interval_hours so an enabled sweep still runs at most
 #   once per interval per daemon process. Reset below (test hook).
 _HOUSEKEEPING_LAST_RUN: float | None = None
+# _LANE_TRANSFER_ATTEMPT: (slot, account) -> wall-clock seconds of the last
+#   generation-transfer heal ATTEMPT (`_lane_generation_transfer_heal`,
+#   2026-09-08). The transfer fires refresh grants (a probe of the canonical +
+#   the reseed rotation) and the lane heal runs EVERY daemon cycle for a
+#   blanked lane, so a canonical that keeps failing to transfer (network,
+#   "unknown" grant) must not be hammered each cycle — the 2026-06-19 burnout
+#   lesson. Bounded by independent_logins.heal_from_canonical_cooldown_minutes.
+_LANE_TRANSFER_ATTEMPT: dict[tuple[str, str], float] = {}
 
 
 def _reset_blank_tracking() -> None:
@@ -9675,6 +10084,7 @@ def _reset_blank_tracking() -> None:
     _UNSTALE_ATTEMPT_MS.clear()
     _SNAPSHOT_DEAD_PROBE.clear()
     _STORE_DEAD_PROBE.clear()
+    _LANE_TRANSFER_ATTEMPT.clear()
     _HOUSEKEEPING_LAST_RUN = None
 
 
@@ -9973,7 +10383,7 @@ def _sweep_heal_dead_snapshots(state: dict, config: dict, *, no_execute: bool = 
     for name, acct in list(state.get("accounts", {}).items()):
         if not isinstance(acct, dict) or not acct.get("snapshot_refresh_dead"):
             continue
-        if has_free_login_family(name, state):
+        if has_free_login_family(name, state, config):  # F-O-2/F-F-12: thread config
             continue  # #177 fallback still covers it; no SOS would fire
         try:
             if heal_snapshot_from_live_family(name, state, config, no_execute=no_execute):
@@ -10412,10 +10822,15 @@ def _reseed_family_from_canonical(account: str, state: dict, config: dict) -> st
          (provenance.json records it). We rotate NOW rather than lazily so
          there is never a window where two stores share one live refresh token
          (the #104 shape);
-      4. the canonical snapshot is NOT touched: it will read
-         snapshot_refresh_dead until the operator relogins (this build has no
-         automatic heal-back mechanism — the #186 heal is not present here),
-         which is printed as an explicit consequence, not hidden;
+      4. the canonical snapshot's file is NOT rewritten here, but this function
+         now FLAGS it snapshot_refresh_dead + primes the dead-probe cache
+         (2026-09-08, F-F-5): its refresh token was just CONSUMED by the grant, so
+         it is a dead branch even while its access token stays valid for ≤1h. The
+         #186 heal-back (`heal_snapshot_from_live_family`, which DOES exist and
+         runs every SOS pass — the earlier "no heal-back on this build" note was
+         STALE) re-syncs the canonical from the new live family; until then the
+         flag keeps a `switch`/swap from installing the consumed generation and
+         blanking the mount;
       5. a dead/unverifiable grant on the copy ⇒ the scaffold is removed and
          the operator is told a relogin is required — never leave a half-built
          family that the claim path might trust.
@@ -10436,6 +10851,26 @@ def _reseed_family_from_canonical(account: str, state: dict, config: dict) -> st
         click.echo(f"reseed {account}: canonical snapshot has no refresh token to transfer — "
                    f"relogin required (`cus relogin {account}`).")
         return None
+    # (1b) F-O-1 (2026-09-08): the #104 live-mount guard belongs HERE, inside the
+    # helper, not only in the lane-heal caller. The auto_reseed sweep
+    # (`_sweep_housekeeping`) and `cus prune --reseed` reach this function WITHOUT
+    # the caller-side `_live_surface_fingerprints` check, so guardless they would
+    # rotate a canonical whose token generation is live on a mount — consuming that
+    # running session's single-use token and logging it out (the confirmed
+    # 2026-08-30 live-logout shape). Refuse if the canonical's refresh family is
+    # live on ANY mount (canonicals excluded — an idle snapshot-copy mount must not
+    # self-block). Belt-and-suspenders: the lane-heal caller already refuses first,
+    # so this only bites the guardless callers.
+    _reseed_fp = _refresh_fingerprint(rt)
+    _live = _live_surface_fingerprints(state, include_canonicals=False)
+    if _reseed_fp in _live:
+        _cred_audit("housekeeping", "reseed-refused-canonical-live",
+                    f"canonical token family is live on {_live[_reseed_fp]} — rotating it would "
+                    f"consume that running session's single-use token (#104); refusing to reseed",
+                    account=account, shared=True, token_fp=_reseed_fp)
+        click.echo(f"reseed {account}: canonical token family is live on {_live[_reseed_fp]} — "
+                   f"refusing (rotating it would log that live session out, #104).")
+        return None
     # (2) scaffold + copy (the --from-existing copy path, but into the NEXT
     # index — reseed may coexist with real families, unlike the bootstrap).
     fam = next_family_id(account)
@@ -10452,6 +10887,14 @@ def _reseed_family_from_canonical(account: str, state: dict, config: dict) -> st
         # canonical's (possibly dead) token — either useless or a #104 seed.
         shutil.rmtree(login_family_dir(account, fam), ignore_errors=True)
         if verdict == "dead":
+            # F-F-5 (2026-09-08): the canonical's refresh grant proved DEAD
+            # (invalid_grant) — flag it snapshot_refresh_dead + prime the dead-probe
+            # cache so the swap/switch guards and #186 heal-back see reality instead
+            # of the ≤1h valid-access cheap path. Caller persists state.
+            _acct_dead = state.get("accounts", {}).get(account) if isinstance(state, dict) else None
+            if isinstance(_acct_dead, dict):
+                _acct_dead["snapshot_refresh_dead"] = True
+            _SNAPSHOT_DEAD_PROBE[account] = (time.time(), True)
             click.echo(f"reseed {account}: canonical refresh token is DEAD (invalid_grant) — "
                        f"nothing to transfer; relogin required (`cus relogin {account}`). "
                        f"Removed the half-built {fam} scaffold.")
@@ -10471,27 +10914,60 @@ def _reseed_family_from_canonical(account: str, state: dict, config: dict) -> st
     creds["claudeAiOauth"] = oauth
     atomic_write_bytes(fam_creds, json.dumps(creds, indent=2).encode(), mode=0o600)
     email = account_canonical_identity(account).get("emailAddress")
+    # F-F-4 (2026-09-08): DO NOT stamp minted_ts=now. A transferred family is the
+    # CANONICAL's generation (rotated once) — it hits the ~30-day refresh-token
+    # wall on the canonical's schedule, NOT 30 days from the transfer. Stamping
+    # `now` made every FIX2-minted family read `age 0.0d / wall in 30d`, count
+    # claimable (`_family_claimable`), and be skipped by the day-25 wall SOS —
+    # re-creating the exact invisible cliff FIX3 exists to expose, precisely for
+    # the families FIX2 mints DURING a wall event. So the family INHERITS the
+    # canonical's best-known mint age (`_account_snapshot_age_days` → a synthesized
+    # minted_ts that far in the past) and records the transfer explicitly. When the
+    # canonical's age is unknown, minted_ts is OMITTED (honest `age ?` — not past
+    # the wall by test, still disk-shape + probe gated) rather than faked fresh.
+    # The wall-math (`_family_past_wall`) and free-count (`_family_claimable`) read
+    # minted_ts, so they treat the transferred family honestly with no change.
+    _canon_age = _account_snapshot_age_days(account)
     prov = {
         "account": account,
         "family_id": fam,
-        "minted_ts": now_iso(),
         "source_email": email or "unknown",
         "refresh_fp": _refresh_fingerprint(new_rt),
         "bootstrapped": True,
+        "transferred_ts": now_iso(),
+        "inherits_wall_from": "canonical",
         "note": (f"reseeded-from-canonical {datetime.now(timezone.utc):%Y-%m-%d} — generation "
-                 f"TRANSFER (GH #190); canonical holds a dead branch until relogin/heal"),
+                 f"TRANSFER (GH #190/#201); inherits the canonical's wall age (NOT a fresh "
+                 f"30-day life); canonical holds a dead branch until #186 heal-back / relogin"),
     }
+    if _canon_age is not None:
+        prov["minted_ts"] = (datetime.now(timezone.utc) - timedelta(days=_canon_age)).isoformat()
     write_json(login_family_provenance_path(account, fam), prov)
+    # F-F-5 (2026-09-08): the transfer CONSUMED the canonical's single-use refresh
+    # token (the grant rotated it into the family), so account-<X>/.credentials.json
+    # is now a DEAD branch even though its ACCESS token stays valid for ≤1h. Flag it
+    # dead in state + prime the dead-probe cache so (a) the #186 heal-back
+    # (`heal_snapshot_from_live_family`, which runs every SOS pass) re-syncs the
+    # canonical from the new live family, and (b) once the access token expires a
+    # `switch`/swap sees it dead via the cache instead of installing the consumed
+    # generation and blanking. The caller persists state (the live-heal path
+    # save_states under the swap lock; the sweep/CLI paths save on their own).
+    _acct = state.get("accounts", {}).get(account) if isinstance(state, dict) else None
+    if isinstance(_acct, dict):
+        _acct["snapshot_refresh_dead"] = True
+    _SNAPSHOT_DEAD_PROBE[account] = (time.time(), True)
     _cred_audit("housekeeping", "reseeded-family",
                 "canonical→family generation TRANSFER: new family holds the rotated live "
-                "generation; canonical is knowingly dead-branched until relogin (GH #190)",
+                "generation; canonical is knowingly dead-branched (snapshot_refresh_dead set) "
+                "until the #186 heal-back re-syncs it or the operator relogins (GH #190/#201)",
                 account=account, login_family=f"{account}/{fam}",
                 token_fp=_audit_token_fp(creds))
     click.echo(f"reseed {account}: {fam} now holds the LIVE token generation "
-               f"(refresh grant verified + rotation persisted; provenance recorded).")
+               f"(refresh grant verified + rotation persisted; provenance records the transfer, "
+               f"inheriting the canonical's wall age).")
     click.echo(f"  NOTE: account-{account}/.credentials.json now holds a DEAD branch by design — "
-               f"the canonical will show snapshot_refresh_dead until healed/next relogin "
-               f"(`cus relogin {account}` when convenient; no automatic heal-back on this build).")
+               f"flagged snapshot_refresh_dead; the #186 heal-back re-syncs it from the new live "
+               f"family on the next SOS pass (or `cus relogin {account}` when convenient).")
     return fam
 
 
@@ -10654,7 +11130,7 @@ def _family_age_days(account: str, family_id: str) -> float | None:
     return (datetime.now(timezone.utc) - minted_dt).total_seconds() / 86400.0
 
 
-def _live_surface_fingerprints(state: dict) -> dict[str, str]:
+def _live_surface_fingerprints(state: dict, *, include_canonicals: bool = True) -> dict[str, str]:
     """Refresh-token fingerprint → human label for every surface whose token
     generation a free store must never share (the duplicate-generation check)
     and must certainly never PROBE (a grant rotates the single-use token and
@@ -10672,7 +11148,12 @@ def _live_surface_fingerprints(state: dict) -> dict[str, str]:
     Idle slot mounts are deliberately EXCLUDED: an idle slot sharing its
     (reclaimable) leased family's fingerprint is the normal post-lease state,
     not a duplicate. Best-effort reads throughout — an unreadable surface
-    simply contributes nothing."""
+    simply contributes nothing.
+
+    `include_canonicals=False` (2026-09-08) restricts the map to LIVE mounts
+    (slot mounts in use + the shared mount) — for callers that are about to
+    act on a canonical itself (the generation-transfer heal) and need to know
+    whether a running session, not merely a store file, holds its token."""
     out: dict[str, str] = {}
 
     def _fp_of(path: Path) -> str | None:
@@ -10691,6 +11172,8 @@ def _live_surface_fingerprints(state: dict) -> dict[str, str]:
     fp = _fp_of(CREDS_JSON)
     if fp:
         out.setdefault(fp, "the shared ~/.claude mount")
+    if not include_canonicals:
+        return out
     for acct in sorted(state.get("accounts", {}) or {}):
         fp = _fp_of(account_creds_path(acct))
         if fp:
@@ -11117,9 +11600,15 @@ def _warm_spare_warnings(state: dict, config: dict) -> list[str]:
         if not fams:
             continue  # account not using the pool — nothing to keep warm
         leased = leased_families(acct, state)
+        # F-F-10 (2026-09-08): count warmth via `_family_claimable`, not raw disk
+        # shape. `_creds_shape_expiry_dead` alone counts a probe-proven-dead or
+        # past-the-wall family as a warm spare, so the floor warning stayed silent
+        # on a pool that was entirely past the wall — the FIX3 blind spot re-
+        # appearing in the sweep. `_family_claimable` folds in the probe-cache +
+        # wall age (still zero probes — disk + cache only).
         warm = sum(1 for f in fams
                    if f not in leased
-                   and not _creds_shape_expiry_dead(login_family_creds_path(acct, f)))
+                   and _family_claimable(acct, f, config))
         if warm < need:
             msgs.append(f"{acct}: {warm}/{need} warm spare famil"
                         f"{'y' if need == 1 else 'ies'} — a rescue/evacuation onto this "
@@ -11212,6 +11701,14 @@ def _sweep_housekeeping(state: dict, config: dict, *, no_execute: bool = False) 
     _HOUSEKEEPING_LAST_RUN = now
     execute = not no_execute
     msgs: list[str] = []
+    # TODO (F-F-7, 2026-09-08): run this sweep's `_prune_free_families` under
+    # `with _swap_lock(): state = load_state()` and recompute leased_families /
+    # live_fps from that fresh state, so a lease created by a concurrent process
+    # DURING the sweep is visible and the prune can't probe a family a live lane
+    # just claimed (→ rotate → logout). Deferred: the daemon sweep is DEFAULT-OFF
+    # (housekeeping.daemon_sweep) and the load-bearing credential-safety gate is
+    # `auto_reseed:false` (default) — see the SAFE-IF. The reactive heal path
+    # (default-on) already runs under the lock as of PR #201 (F-F-2).
     for row in _prune_free_families(state, config, execute=execute, probe=True):
         if row["kind"] == "family" and row["dead"]:
             if row["retired"]:
@@ -11348,9 +11845,17 @@ def _blanked_live_lanes(state: dict, config: dict) -> list[tuple[str, str]]:
     return out
 
 
-def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Path | None:
+def _lane_heal_source(slot: str, account: str, state: dict, config: dict,
+                      no_execute: bool = False) -> Path | None:
     """Newest USABLE creds file to reinstall into a blanked live lane mount, or
     None when nothing usable exists (needs a real relogin → escalate to SOS).
+
+    `no_execute` (F-F-1, 2026-09-08) threads the daemon's dry-run flag so this
+    pick fires ZERO refresh grants and does ZERO writes: it suppresses the probe
+    in `_heal_candidate_usable`, skips the plain-lane dead-snapshot probe, and
+    turns the pooled-lane generation transfer into a log-only no-op. Without it,
+    `cus daemon --once --no-execute` — the operator's documented safe diagnostic —
+    would irreversibly transfer a canonical's generation while pretending to.
 
     Honors the GH #104/#109 login-family discipline, which is the ONE thing that
     differs from the shared-mount heal's source pick:
@@ -11371,34 +11876,46 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
     "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
     swap install-point guard and the shared-mount heal apply — so whatever this
     returns is safe to atomic-copy into the mount without re-blanking it.
+
+    Annotation 2026-09-08 (login-family pool-collapse incident): "usable" was
+    SHAPE-only, and that is exactly what looped. A pooled lane healed only from
+    its own family store and a plain lane only from its own `.lastvalid`
+    shadow — both hold the very token whose refresh just failed, so a well-
+    shaped-but-DEAD store passed the bar, got re-installed, Claude Code's next
+    refresh blanked the mount again, and the daemon healed it again
+    (heal→blank→heal) while the account's CANONICAL sat alive and fresh (the
+    `freshness-skip "snapshot fresher than live"` log spam proved cus knew).
+    Now a candidate is PROBE-verified before reinstall — where a probe is safe
+    (`_heal_candidate_usable`) — and a pooled lane whose family is dead falls
+    through to the generation-transfer heal (`_lane_generation_transfer_heal`):
+    a fresh family minted from the alive canonical and re-leased.
     """
     lease = slot_leased_family(state, slot)
     if lease is not None and lease[0] == account and independent_logins_enabled(config):
         fam_path = login_family_creds_path(*lease)
-        if fam_path.exists():
-            try:
-                if not _live_mount_creds_invalid(read_json(fam_path)):
-                    return fam_path
-            except (json.JSONDecodeError, OSError):
-                pass
-        # Leased family store blanked/missing → NO cross-family fallback (#104).
-        # The last-valid shadow is deliberately NOT consulted for a pooled lane:
-        # a stale shadow could predate a re-lease to a different family, and
-        # re-installing it would cross-contaminate; the family store is the only
-        # authoritative source for a pooled lane.
-        return None
+        if _heal_candidate_usable(fam_path, f"heal-fam:{lease[0]}/{lease[1]}", account, state, config,
+                                  allow_probe=not no_execute):
+            return fam_path
+        # Leased family store blanked/missing/DEAD → NO cross-family fallback
+        # to the snapshot or the shadow (#104): a stale shadow could predate a
+        # re-lease to a different family, and the snapshot is a different
+        # generation. Instead (2026-09-08) mint the lane a FRESH family from
+        # the alive canonical and re-lease it — the transfer helper enforces
+        # the collision + liveness guards and returns None when it cannot,
+        # in which case the lane escalates to the relogin SOS as before.
+        return _lane_generation_transfer_heal(slot, account, state, config, no_execute=no_execute)
     # Plain lane. The last-valid shadow is a copy of THIS lane's own mount taken
     # while it was valid — same slot, same refresh-token lineage by construction
     # — so it is the freshest #104-safe heal source and cannot cross-contaminate.
-    # Prefer it; fall through to the snapshot/backup when there's no usable shadow
-    # (e.g. right after a daemon restart, before any valid scan has taken one).
+    # Prefer it (probe-verified since 2026-09-08 — a dead shadow is the same
+    # token that just failed); fall through to the snapshot/backup when there's
+    # no usable shadow (e.g. right after a daemon restart, before any valid
+    # scan has taken one, or when the shadow is an unrotated copy of the
+    # canonical — then the canonical path below is the right prober).
     shadow = _lane_lastvalid_path(mount_creds_path(slot_path(slot)))
-    if shadow.exists():
-        try:
-            if not _live_mount_creds_invalid(read_json(shadow)):
-                return shadow
-        except (json.JSONDecodeError, OSError):
-            pass
+    if _heal_candidate_usable(shadow, f"heal-shadow:{slot}", account, state, config,
+                              allow_probe=not no_execute):
+        return shadow
     # Fall through to the account's newest usable snapshot/backup — UNLESS the
     # snapshot is DEAD (its refresh grant returns invalid_grant). 2026-07-07 merkos
     # incident: `_newest_usable_creds_source` only rejects blank-SHAPED creds
@@ -11410,9 +11927,253 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
     # instead of looping. The pooled-lane branch above already never touches the
     # snapshot (#176), so this closes the one remaining dead-snapshot heal path.
     source = _newest_usable_creds_source(account)
-    if source is not None and source == account_creds_path(account) and _account_snapshot_dead(account, config):
+    # F-F-1 (2026-09-08): the dead-snapshot check fires a refresh-grant probe (and
+    # persists a rotation on success). Skip it under --no-execute so the dry-run is
+    # probe-free; the real run still drops a dead snapshot from the plain-lane heal.
+    if (source is not None and source == account_creds_path(account)
+            and not no_execute and _account_snapshot_dead(account, config)):
         return None
     return source
+
+
+def _heal_candidate_usable(path: Path, cooldown_key: str, account: str, state: dict,
+                           config: dict, *, allow_probe: bool = True) -> bool:
+    """Is `path` (a blanked lane's leased-family store or `.lastvalid` shadow)
+    a source that will actually AUTHENTICATE after reinstall? (2026-09-08)
+
+    Shape first (`_live_mount_creds_invalid` — blank/missing/unreadable ⇒ no),
+    then LIVENESS, because a well-shaped store can hold a dead refresh token
+    (the heal→blank→heal loop). Liveness is decided by `_store_creds_dead`,
+    which is free when the access token is still valid and otherwise fires a
+    cooldown-cached refresh-grant probe that PERSISTS the rotation into `path`
+    (so what gets reinstalled is the fresh pair). The probe rotates a
+    single-use token, so it is only fired when no OTHER holder could be hurt:
+
+      * token family live on another MOUNT (a running session — another lane
+        or the shared mount): REFUSE (F-F-6, 2026-09-08). Reinstalling it would
+        copy that running session's single-use token onto a SECOND live mount —
+        the #104 double-book (already an URGENT SOS). The lane falls through
+        instead: a pooled lane gets a distinct family via the generation transfer,
+        a plain lane escalates to the relogin SOS. (Previously this returned
+        "usable" to avoid stranding a lane, but that knowingly re-created the
+        clobber the next rotation would trigger.)
+      * token family identical to the account CANONICAL's (an unrotated copy):
+        not usable HERE — probing it would dead-branch the canonical, which is
+        exactly the source the fallback paths (`_account_snapshot_dead` for a
+        plain lane, the generation transfer for a pooled lane) probe and
+        persist properly. Let them handle it.
+      * otherwise: the only holder of this token was the lane's own session,
+        whose refresh already failed (that is what blanked the mount) — safe.
+
+    The lane's own blank mount contributes no fingerprint, so it never shields
+    its own candidate."""
+    if not path.exists():
+        return False
+    try:
+        creds = read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return False
+    if _live_mount_creds_invalid(creds):
+        return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # Valid-shaped access token with nothing to refresh from: usable until
+        # it expires (the old verdict); a probe is impossible anyway.
+        return True
+    fp = _refresh_fingerprint(rt)
+    live = _live_surface_fingerprints(state, include_canonicals=False)
+    if fp in live:
+        # F-F-6 (2026-09-08): a candidate whose refresh family is LIVE on another
+        # mount is the #104 double-book itself. Reinstalling it copies a running
+        # session's single-use token onto a 2nd live mount; the next rotation logs
+        # one side out. REFUSE (was: return True) — the lane falls through instead
+        # (pooled → distinct family via the generation transfer; plain → other
+        # source / the URGENT relogin SOS that already names the dup pair).
+        _cred_audit("heal-candidate", "refused-live-elsewhere",
+                    f"candidate heal source's refresh family is live on {live[fp]} — reinstalling "
+                    f"it would double-book a single-use token onto a 2nd live mount (#104)",
+                    account=account, shared=True, token_fp=fp)
+        return False
+    try:
+        canon_rt = _credential_refresh_token(read_json(account_creds_path(account)))
+    except (json.JSONDecodeError, OSError):
+        canon_rt = None
+    if canon_rt and _refresh_fingerprint(canon_rt) == fp:
+        return False  # unrotated copy of the canonical: the canonical path probes it
+    # F-F-1 (2026-09-08): under --no-execute fire ZERO refresh grants. `allow_probe`
+    # threads the daemon's dry-run flag down to `_store_creds_dead`, which fails
+    # OPEN (not dead) when it cannot probe — so a suspect store reads "usable" in
+    # dry-run (the honest "WOULD restore" verdict) while a real run re-probes.
+    return not _store_creds_dead(path, cooldown_key, config, allow_probe=allow_probe)
+
+
+def _lane_generation_transfer_heal(slot: str, account: str, state: dict, config: dict,
+                                   no_execute: bool = False) -> Path | None:
+    """Recover a LIVE pooled lane whose leased family is DEAD by minting it a
+    fresh family from the account's ALIVE canonical (2026-09-08, login-family
+    pool-collapse incident). Returns the new family's creds path (the heal
+    source `_auto_heal_live_lanes` installs) or None when no safe transfer is
+    possible — in which case the caller falls through to the relogin SOS,
+    exactly as before this heal existed.
+
+    THE INCIDENT: every pooled family hit the ~30-day refresh-token wall
+    together. Each affected lane then looped heal→blank→heal on its own dead
+    family store while the account canonical — kept fresh by the un-stale
+    sweep and by swap save-backs — was alive the whole time. The manual fix
+    that revived a lane was `cus prune --reseed <acct>` + re-lease; this is
+    that fix, automated, so a dead lane never needs a browser while the
+    canonical still has life. It does NOT extend the wall (the new family
+    inherits the canonical's mint age); it removes the lockout.
+
+    Guards, in order (every refusal is logged as a CRED-AUDIT line):
+      1. config gate `independent_logins.heal_from_canonical` (default ON) and
+         the pool gate (a plain lane has no lease to re-point);
+      2. per-lane cooldown (`heal_from_canonical_cooldown_minutes`) — the heal
+         runs every cycle and each attempt can fire refresh grants;
+      3. canonical present, well-shaped, with a refresh token;
+      4. #104: the canonical's token family must not be live on ANY other mount
+         (another lane, the shared mount — `_live_surface_fingerprints` with
+         canonicals excluded). Transferring it would consume the token under a
+         running session. This is the guard that makes default-ON acceptable;
+      5. liveness: `_account_snapshot_dead` (free when the access token is
+         valid; cooldown-cached probe otherwise, persisting any rotation into
+         the canonical). A dead canonical ⇒ nothing to transfer ⇒ None.
+
+    Then `_reseed_family_from_canonical` does the transfer (prune this
+    account's dead FREE families, scaffold the next family, copy, grant,
+    persist, provenance), the lane is re-leased to the new family and state is
+    saved IMMEDIATELY, and only THEN is the old dead store retired
+    (`_retire_store_file`, a rename) — that order means a crash between the two
+    steps leaves the old store FREE, where claim-verify's probe retires it,
+    rather than a lane with no lease.
+
+    F-F-2 (2026-09-08): the fingerprint check → reseed/grant → lease save →
+    retire all run UNDER `_swap_lock` on a FRESHLY loaded state. Previously this
+    ran from the SOS pass UNLOCKED and save_state'd a state copy loaded at pass
+    start, so a concurrent `cus slot move`/`switch` (which holds the lock) caused
+    a lost update — either the swap's change or THIS heal's new lease was dropped,
+    and a lost lease makes a live lane's family read FREE, so the next claim/prune
+    probe rotates it and logs the lane out (#104). Holding the lock also makes the
+    #104 fingerprint check ATOMIC w.r.t. a concurrent snapshot install. The caller
+    (`_auto_heal_live_lanes` → `_emit_sos_after`) reloads state after the pass.
+
+    F-F-1 (2026-09-08): `no_execute` (the daemon's --no-execute) makes this a
+    log-only no-op — ZERO writes/probes/grants — returning None. `--no-execute` is
+    the operator's documented safe diagnostic; it must never perform the
+    irreversible generation transfer.
+
+    TODO (deliberately not done here): when the transfer is impossible the
+    dead LEASED store is left in place. Retiring it without a replacement
+    would pop a live lane's lease under it, and the save-back path would
+    recreate the store from whatever the mount holds; leave that to the
+    operator (`cus prune`) or a future explicit release rule."""
+    il = config.get("independent_logins", {}) if isinstance(config, dict) else {}
+    if not il.get("heal_from_canonical", True) or not independent_logins_enabled(config):
+        return None
+    key = (slot, account)
+    now = time.time()
+    cooldown_s = float(il.get("heal_from_canonical_cooldown_minutes", 10)) * 60
+    last = _LANE_TRANSFER_ATTEMPT.get(key)
+    if last is not None and (now - last) < cooldown_s:
+        return None
+    # F-F-1 (2026-09-08): under --no-execute do ZERO writes/probes/grants. The
+    # transfer mints a family, fires a refresh grant that CONSUMES the canonical's
+    # single-use token, rewrites state and retires a store — all irreversible. Return
+    # before the cooldown stamp too: a dry-run one-shot process discards the in-memory
+    # cooldown anyway, and not stamping keeps a later REAL run un-throttled.
+    if no_execute:
+        click.echo(f"  lane-generation-transfer (--no-execute): WOULD mint a fresh family from "
+                   f"'{account}' canonical and re-lease live lane {slot} (its leased family is "
+                   f"dead) — skipped (no writes/probes/grants under --no-execute).")
+        return None
+    _LANE_TRANSFER_ATTEMPT[key] = now
+    # F-F-2 (2026-09-08): run the whole mutating critical section UNDER the swap
+    # lock on a FRESHLY loaded state so a concurrent `cus slot move`/`switch` can't
+    # lose this lease (or have its own change lost) — see the docstring. Holding the
+    # lock also makes the #104 fingerprint check atomic w.r.t. a concurrent snapshot
+    # install. On lock contention skip this cycle (retried next); never crash SOS.
+    old_lease = None
+    new_fam = None
+    retired = None
+    try:
+        with _swap_lock():
+            fresh = load_state()
+            snap = account_creds_path(account)
+            try:
+                canon = read_json(snap) if snap.exists() else None
+            except (json.JSONDecodeError, OSError):
+                canon = None
+            rt = _credential_refresh_token(canon)
+            if canon is None or _live_mount_creds_invalid(canon) or not rt:
+                _cred_audit("lane-generation-transfer", "refused-no-canonical",
+                            "leased family is dead and the account canonical is missing/blank/has no "
+                            "refresh token — nothing to transfer; relogin required",
+                            slot=slot, account=account)
+                return None
+            fp = _refresh_fingerprint(rt)
+            live = _live_surface_fingerprints(fresh, include_canonicals=False)
+            if fp in live:
+                _cred_audit("lane-generation-transfer", "refused-canonical-live-elsewhere",
+                            f"canonical token family is live on {live[fp]} — transferring it would "
+                            f"consume that session's single-use token (#104); not touching it",
+                            slot=slot, account=account, shared=True, token_fp=fp)
+                return None
+            if _account_snapshot_dead(account, config):
+                _cred_audit("lane-generation-transfer", "refused-canonical-dead",
+                            "leased family AND canonical are dead (invalid_grant) — the account has hit "
+                            "the refresh-token wall; browser relogin required (`cus relogin`)",
+                            slot=slot, account=account)
+                return None
+            old_lease = slot_leased_family(fresh, slot)
+            new_fam = _reseed_family_from_canonical(account, fresh, config)
+            if new_fam is None:
+                _cred_audit("lane-generation-transfer", "failed",
+                            "canonical looked alive but the generation transfer did not complete "
+                            "(see the reseed lines above); will retry after the cooldown",
+                            slot=slot, account=account)
+                return None
+            # Re-lease FIRST and persist immediately under the lock — see the
+            # docstring for why this precedes retiring the old store.
+            entry = fresh.setdefault("slots", {}).setdefault(slot, {"account": account, "created_ts": now_iso()})
+            entry["login_family"] = f"{account}/{new_fam}"
+            save_state(fresh)
+            _OCCUPIED_SLOTS_CACHE.clear()
+            if old_lease is not None and old_lease[0] == account and old_lease[1] != new_fam:
+                old_path = login_family_creds_path(*old_lease)
+                if old_path.exists():
+                    try:
+                        retired = _retire_store_file(old_path)
+                    except OSError:
+                        retired = None
+    except RuntimeError as e:
+        # Swap already in flight (lock timeout): skip this cycle, retry next.
+        _cred_audit("lane-generation-transfer", "skipped-lock-contention",
+                    f"could not acquire the swap lock ({e}) — another swap is in flight; "
+                    f"will retry next cycle", slot=slot, account=account)
+        return None
+    new_path = login_family_creds_path(account, new_fam)
+    try:
+        new_fp = _audit_token_fp(read_json(new_path))
+    except (json.JSONDecodeError, OSError):
+        new_fp = "unreadable"
+    _cred_audit("lane-generation-transfer", "reseeded-and-released",
+                "leased family was dead; minted a fresh family from the alive canonical "
+                "(generation transfer, grant verified + persisted) and re-leased the lane to it",
+                slot=slot, account=account, login_family=f"{account}/{new_fam}", token_fp=new_fp,
+                extra=(f"old_family={old_lease[1] if old_lease else 'none'} "
+                       f"retired_to={retired or 'n/a'}"))
+    msg = (f"live lane {slot} ({account}): its leased login family "
+           f"{old_lease[1] if old_lease else '(none)'} was DEAD (refresh grant invalid_grant) "
+           f"while the account canonical was alive — minted {account}/{new_fam} from the "
+           f"canonical (generation transfer) and re-leased the lane to it; the dead store was "
+           f"{'retired to ' + retired if retired else 'already gone'}. The canonical now holds a "
+           f"dead branch by design (it re-heals from the live family via #186 / relogin).")
+    click.echo(f"  lane-generation-transfer: {msg}")
+    try:
+        append_inbox("auto-heal", f"lane {slot} re-seeded from '{account}' canonical (2026-09-08 transfer heal)", msg)
+    except OSError:
+        pass
+    return new_path
 
 
 def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
@@ -11568,7 +12329,9 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
         return []
     healed: list[str] = []
     for slot, account in _blanked_live_lanes(state, config):
-        source = _lane_heal_source(slot, account, state, config)
+        # F-F-1 (2026-09-08): thread no_execute so a dry-run pick fires no probes
+        # and the pooled-lane generation transfer stays a log-only no-op.
+        source = _lane_heal_source(slot, account, state, config, no_execute=no_execute)
         dest = mount_creds_path(slot_path(slot))
         # ── Forensics: characterize the blank BEFORE we heal it (Fix 3). ──────
         # Read the now-blank mount + the last-valid shadow so we can log what the
@@ -11786,9 +12549,17 @@ def _diagnose_mount_creds_health(
         by_dt = datetime.fromtimestamp(now_ms / 1000, timezone.utc) + timedelta(days=max(0.0, days_left or 0.0))
         by_date = by_dt.date().isoformat()
         age_txt = f"~{refresh_age_days:.0f} days old" if refresh_age_days is not None else "of unknown age"
+        # 2026-09-08 (pool-collapse incident): this is a LIVE mount, and the
+        # wall is absolute — within `urgent_wall_within_days` of it (or past
+        # it) the condition is an outage in waiting, not a heads-up. The old
+        # WARNING severity was tuned out after firing for weeks; URGENT gets a
+        # desktop notification (once per condition via the SOS de-dup).
+        urgent_within = float(il.get("urgent_wall_within_days", 5))
+        severity = ("urgent" if days_left is not None and days_left <= urgent_within
+                    else "warning")
         if state == "near":
             return SOSCondition(
-                severity="warning",
+                severity=severity,
                 summary=(f"refresh token on {mount_label} ({account}) nears its assumed "
                          f"{ttl}-day expiry — plan a browser re-login soon"),
                 action=(
@@ -11802,7 +12573,7 @@ def _diagnose_mount_creds_health(
                 affected=account,
             )
         return SOSCondition(
-            severity="warning",
+            severity=severity,
             summary=(f"refresh token on {mount_label} ({account}) is past its assumed "
                      f"{ttl}-day TTL — re-login before it blanks"),
             action=(
@@ -12720,7 +13491,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             # family), so it must NOT count toward starvation — else Condition 2b
             # false-positives on a lane that can actually rescue.
             if drop and independent_logins_enabled(config):
-                drop = drop - {x for x in drop if has_free_login_family(x, state)}
+                drop = drop - {x for x in drop if has_free_login_family(x, state, config)}  # F-O-2/F-F-12: thread config
             shim = dict(state)
             if drop:
                 shim["accounts"] = {n: a for n, a in accounts.items() if n not in drop}
@@ -12766,7 +13537,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # in every no-lane / global-only case.
     if config.get("mode") in ("hybrid", "per_session"):
         occ = occupied_slot_accounts(state)
-        free_fam = ({a for a in occ if has_free_login_family(a, state)}
+        free_fam = ({a for a in occ if has_free_login_family(a, state, config)}  # F-O-2/F-F-12: thread config
                     if independent_logins_enabled(config) else set())
         headroom_cond = _diagnose_premium_headroom(state, config, occ, free_fam)
         if headroom_cond is not None:
@@ -12932,6 +13703,14 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         if _identities_match(login_store_identity(acct, slot), account_canonical_identity(acct)) is False:
             if not account_canonical_store_poisoned(acct)[0]:
                 mismatched.append(f"{slot}->{acct}")
+        if slot.startswith(LOGIN_FAMILY_PREFIX):
+            # 2026-09-08: list_provisioned_logins enumerates EVERY subdir of
+            # logins/<account>/, so pooled `family-N` dirs landed here too and
+            # produced the low-severity "family-N->acct past assumed lifetime"
+            # lines (~275/day for weeks, ignored). Pooled families are judged
+            # by the account-keyed wall condition (10.7) below; only genuine
+            # legacy per-slot stores keep this per-store expiry line.
+            continue
         exp_state, _ = login_expiry_state(acct, slot, config)
         if exp_state == "expired":
             expired.append(f"{slot}->{acct}")
@@ -12994,7 +13773,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     for acct_name, acct in state.get("accounts", {}).items():
         if not isinstance(acct, dict):
             continue
-        if acct.get("snapshot_refresh_dead") and not has_free_login_family(acct_name, state):
+        if acct.get("snapshot_refresh_dead") and not has_free_login_family(acct_name, state, config):  # F-O-2/F-F-12: thread config
             out.append(SOSCondition(
                 severity="urgent",
                 summary=(f"'{acct_name}' snapshot creds are dead and no valid login family remains — "
@@ -13011,6 +13790,65 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         f"      cus login-mount {acct_name}"),
                 affected=acct_name,
             ))
+    # Condition 10.7 (2026-09-08, login-family pool-collapse incident): pooled
+    # login families at or near the refresh-token WALL, keyed by ACCOUNT.
+    # Anthropic refresh-token families have an ABSOLUTE ~28-30 day lifetime
+    # (rotation does not extend it), a new family needs a browser /login, and
+    # every family in the pool was minted in one batch — so the whole pool
+    # hits the wall together and the pool can only shrink until someone logs
+    # in. URGENT when the account backs a LIVE lane (a lane on a walled family
+    # logs out on its next refresh and cannot be re-seeded once the canonical
+    # walls too); a WARNING otherwise. Summaries carry family ids only (stable
+    # across cycles for the SOS de-dup); ages + the exact `cus login-mount`
+    # count go in the action.
+    _il = config.get("independent_logins", {}) or {}
+    _ttl = float(_il.get("refresh_token_ttl_days", 30))
+    _urgent_within = float(_il.get("urgent_wall_within_days", 5))
+    _live_accts = set(occupied_slot_accounts(state))
+    if config.get("mode", "global") in ("global", "hybrid") and state.get("active"):
+        _live_accts.add(state["active"])
+    for acct_name in sorted(state.get("accounts", {})):
+        fams = list_login_families(acct_name)
+        if not fams:
+            continue
+        leased_now = leased_families(acct_name, state)
+        past: list[tuple[str, float]] = []
+        near: list[tuple[str, float]] = []
+        for fam in fams:
+            age = _family_age_days(acct_name, fam)
+            if age is None:
+                continue
+            left = _ttl - age
+            if left <= 0:
+                past.append((fam, age))
+            elif left <= _urgent_within:
+                near.append((fam, age))
+        if not (past or near):
+            continue
+        backs_live = acct_name in _live_accts or bool(leased_now & {f for f, _ in past + near})
+        parts = []
+        if past:
+            parts.append("past the wall: " + ", ".join(f for f, _ in past))
+        if near:
+            parts.append("within " + f"{_urgent_within:.0f}d: " + ", ".join(f for f, _ in near))
+        detail = "; ".join(
+            f"{fam} minted {age:.1f}d ago ({'PAST' if _ttl - age <= 0 else f'{_ttl - age:.1f}d left'}"
+            f"{', LEASED by a live lane' if fam in leased_now else ''})"
+            for fam, age in past + near)
+        out.append(SOSCondition(
+            severity="urgent" if backs_live else "warning",
+            summary=(f"'{acct_name}' login families at the ~{_ttl:.0f}d refresh-token wall "
+                     f"({'; '.join(parts)})"),
+            action=(f"Refresh-token families have an ABSOLUTE ~{_ttl:.0f}-day lifetime — rotation "
+                    f"does NOT extend it, and only a browser /login mints a new one. {detail}. "
+                    f"A lane on a walled family logs out on its next refresh; once the account's "
+                    f"canonical walls too there is nothing left to re-seed from. Mint replacements "
+                    f"NOW, staggered so they do not all wall together again:\n"
+                    f"      cus login-mount {acct_name}   # once per family to replace"
+                    + ("\n    (this account backs a LIVE lane — treat as an outage in waiting)"
+                       if backs_live else "")),
+            affected=acct_name,
+        ))
     if expired:
         out.append(SOSCondition(
             severity="warning",
@@ -15707,10 +16545,80 @@ def status() -> None:
         gate_note = "" if config.get("independent_logins", {}).get("use_independent_logins", False) \
             else click.style("  (gate OFF — swaps still copy; set use_independent_logins: true)", fg="yellow")
         click.echo(f"Login pools (independent backup families):{gate_note}")
+        # 2026-09-08 (pool-collapse incident): the one-line "N family(ies),
+        # M free" hid the cliff — every family had aged into the ~30d
+        # refresh-token wall together, and "0 free" read as "all busy" while
+        # it meant "all dead". Show each family's provenance AGE, days to the
+        # wall, lease state and a disk-only health verdict (no probes: status
+        # must stay side-effect-free), and count only CLAIMABLE families as
+        # free. Retired (.dead-*) stores are counted so a shrinking pool is
+        # visible without listing the dead files.
+        _il = config.get("independent_logins", {}) or {}
+        _ttl = float(_il.get("refresh_token_ttl_days", 30))
+        _urgent_within = float(_il.get("urgent_wall_within_days", 5))
+        _now_ms = int(time.time() * 1000)
         for n, fams in pool_rows:
-            free = [f for f in fams if f not in leased_families(n, state)]
+            leased_now = leased_families(n, state)
+            # fam -> [slots] recorded as leasing it (live or idle; idle leases are
+            # reclaimable, so they are labelled distinctly below).
+            lease_slots: dict[str, list[str]] = {}
+            for _sname, _entry in sorted((state.get("slots") or {}).items()):
+                _ref = (_entry or {}).get("login_family") if isinstance(_entry, dict) else None
+                if isinstance(_ref, str) and _ref.startswith(f"{n}/"):
+                    lease_slots.setdefault(_ref.split("/", 1)[1], []).append(_sname)
+            free_all = [f for f in fams if f not in leased_now]
+            free_ok = [f for f in free_all if _family_claimable(n, f, config)]
+            dead_free = len(free_all) - len(free_ok)
+            try:
+                retired = sum(1 for p in login_pool_dir(n).glob("family-*/.credentials.json.dead-*"))
+            except OSError:
+                retired = 0
             short = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
-            click.echo(f"  {n:<12} {len(fams)} family(ies), {len(free)} free{short}")
+            extra = ""
+            if dead_free:
+                extra += click.style(f", {dead_free} free-but-unusable", fg="red")
+            if retired:
+                extra += f", {retired} retired"
+            # Headline keeps its historical shape ("N family(ies), M free") —
+            # M is now the USABLE-free count; the qualifier only appears when
+            # some unleased family is unusable, so a healthy pool prints as before.
+            click.echo(f"  {n:<12} {len(fams)} family(ies), {len(free_ok)} free{extra}{short}")
+            for f in fams:
+                age = _family_age_days(n, f)
+                if age is None:
+                    age_txt, wall_txt = "age ?", "wall ?"
+                else:
+                    left = _ttl - age
+                    age_txt = f"age {age:.1f}d"
+                    if left <= 0:
+                        wall_txt = click.style(f"PAST WALL by {-left:.1f}d", fg="red", bold=True)
+                    elif left <= _urgent_within:
+                        wall_txt = click.style(f"wall in {left:.1f}d", fg="red")
+                    else:
+                        wall_txt = f"wall in {left:.1f}d"
+                if f in leased_now:
+                    # F-F-14 (2026-09-08): fall back to "leased (?)" when the
+                    # occupied-slot filter yields nothing (the lease was recorded on
+                    # a slot that just went idle mid-call) so we don't print a
+                    # dangling "leased " with no slot names.
+                    _live_lease_slots = [s for s in lease_slots.get(f, []) if s in occupied_slot_accounts(state).get(n, [])]
+                    lease_txt = "leased " + ",".join(_live_lease_slots) if _live_lease_slots else "leased (?)"
+                elif lease_slots.get(f):
+                    lease_txt = "idle-lease " + ",".join(lease_slots[f])
+                else:
+                    lease_txt = "free"
+                try:
+                    _fc = read_json(login_family_creds_path(n, f))
+                    _fexp = _creds_expires_at(_fc)
+                    if _live_mount_creds_invalid(_fc):
+                        health = click.style("blank/unusable", fg="red")
+                    elif _fexp is not None and int(_fexp) <= _now_ms:
+                        health = "access expired (unverified)"
+                    else:
+                        health = click.style("access valid", fg="green")
+                except (json.JSONDecodeError, OSError):
+                    health = click.style("unreadable", fg="red")
+                click.echo(f"      {f:<10} {age_txt:<11} {lease_txt:<24} {health}  {wall_txt}")
         click.echo()
 
     # Locks
@@ -16906,6 +17814,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
         # global mode / when no lane is blanked.
         _auto_heal_live_lanes(state, config, no_execute=no_execute)
+        # F-F-2 (2026-09-08): the pooled-lane generation transfer inside the lane
+        # heal commits a new lease (+ snapshot_refresh_dead) to disk UNDER the swap
+        # lock on a freshly loaded state — NOT this `state` object. Reload so the
+        # #186 dead-snapshot heal-back and diagnose() below (and any save_state they
+        # do) act on the committed state, not the pass-start copy — otherwise a
+        # concurrent swap's change (or the new lease itself) could be clobbered by a
+        # later save of the stale copy. Cheap local read; a no-op when nothing
+        # changed. (preempt + shared-mount heal above only write FILES, never state,
+        # so nothing in-memory is lost by reloading.)
+        state = load_state()
         # #186 (2026-07-14 rayi2 incident): heal a refresh-DEAD canonical snapshot
         # from a verified-valid LIVE login family BEFORE diagnose() — the same
         # heal-then-diagnose funnel discipline as the mount/lane heals above, so a
@@ -19323,7 +20241,7 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     elif not held_elsewhere:
         plan, detail = "snapshot", (
             f"'{target}' is not live on any other mount — a plain snapshot install, no login family needed")
-    elif gate and (has_free_login_family(target, state)
+    elif gate and (has_free_login_family(target, state, config)  # F-O-2/F-F-12: thread config
                    or (has_independent_login(target, slot_name)
                        and not _live_family_would_collide(
                            target, login_store_creds_path(target, slot_name), slot_name, state, config))):
