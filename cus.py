@@ -378,6 +378,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # many minutes (the heal runs every cycle for a blanked lane; each
         # attempt can fire refresh grants).
         "heal_from_canonical_cooldown_minutes": 10,
+        # ---- 2026-09-08 wall visibility (pool-collapse incident) ----
+        # A pooled family within this many days of the assumed refresh-token
+        # wall (refresh_token_ttl_days) on an account that backs a LIVE lane
+        # raises an URGENT SOS — the 25-day mark at the 30-day default. The
+        # prior WARNING fired hundreds of times a day for weeks at low
+        # severity and was ignored while every family aged into the wall
+        # together. The wall is ABSOLUTE (rotation does not extend it) and a
+        # new family needs a browser /login, so the lead time is the point.
+        "urgent_wall_within_days": 5,
+        # Count a pooled family as FREE only if a claim could still succeed:
+        # not blank / expired-without-refresh on disk, not probe-proven dead
+        # in this process, and (with this flag) not past the assumed wall by
+        # provenance age. Pre-fix "N families, 0 free" could mean "all dead,
+        # none busy" and hid the cliff; `cus status` now shows each family's
+        # age. False ⇒ age is ignored (disk-shape + probe-cache still apply).
+        "free_count_excludes_past_wall": True,
     },
     # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
     # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
@@ -1718,18 +1734,65 @@ def leased_families(account: str, state: dict) -> set[str]:
     return out
 
 
-def free_login_family(account: str, state: dict) -> str | None:
+def _family_past_wall(account: str, family_id: str, config: dict | None = None) -> bool:
+    """True iff the family's provenance mint age is at or past the assumed
+    refresh-token lifetime (independent_logins.refresh_token_ttl_days).
+
+    2026-09-08: the lifetime is ABSOLUTE — the 2026-09-07/08 collapse showed
+    that rotation does not extend it and every family minted in one batch dies
+    in one batch. A family with no provenance (unknown age) is NOT past the
+    wall by this test — the disk-shape and probe checks still apply to it."""
+    age = _family_age_days(account, family_id)
+    if age is None:
+        return False
+    cfg = config if config is not None else load_config()
+    ttl = cfg.get("independent_logins", {}).get("refresh_token_ttl_days", 30)
+    return age >= float(ttl)
+
+
+def _family_claimable(account: str, family_id: str, config: dict | None = None) -> bool:
+    """DISK-ONLY "could a claim of this family still succeed?" (2026-09-08).
+
+    The free-family counters used to count every usable-shaped, unleased
+    family as free — including stores whose token was provably gone: blank /
+    expired-without-refresh on disk, probe-proven dead earlier in this process
+    (`_STORE_DEAD_PROBE`, keyed the way `_prune_free_families` and the lane
+    heal key their probes), or minted longer ago than the refresh-token wall.
+    "0 free" therefore meant "0 unleased", not "0 usable", and the pool read
+    as merely busy while it was in fact dead. Never probes (this feeds the
+    per-cycle decision layer); the claim path's grant stays the definitive
+    check and still retires dead stores it meets."""
+    if _creds_shape_expiry_dead(login_family_creds_path(account, family_id)):
+        return False
+    for key in (f"fam:{account}/{family_id}", f"heal-fam:{account}/{family_id}"):
+        cached = _STORE_DEAD_PROBE.get(key)
+        if cached is not None and cached[1]:
+            return False
+    cfg = config if config is not None else load_config()
+    if (cfg.get("independent_logins", {}).get("free_count_excludes_past_wall", True)
+            and _family_past_wall(account, family_id, cfg)):
+        return False
+    return True
+
+
+def free_login_family(account: str, state: dict, config: dict | None = None) -> str | None:
     """Lowest-index usable family of `account` not leased to a live slot, or None
     if the pool is empty or fully leased (exhausted). This is the family a rescue
-    swap claims."""
+    swap claims.
+
+    2026-09-08: also skips families a claim could not succeed on
+    (`_family_claimable` — disk-dead, probe-proven dead, past the wall), so the
+    decision layer holds a move instead of planning onto a dead pool. `config`
+    is optional for back-compat (loaded when None)."""
     leased = leased_families(account, state)
+    cfg = config if config is not None else load_config()
     for fam in list_login_families(account):  # already sorted lowest-first
-        if fam not in leased:
+        if fam not in leased and _family_claimable(account, fam, cfg):
             return fam
     return None
 
 
-def has_free_login_family(account: str, state: dict) -> bool:
+def has_free_login_family(account: str, state: dict, config: dict | None = None) -> bool:
     """True iff a rescue swap onto `account` could claim a distinct login family
     (so double-booking it would not clobber). The pool-model replacement for the
     per-slot has_independent_login predicate.
@@ -1738,17 +1801,22 @@ def has_free_login_family(account: str, state: dict) -> bool:
     layer predicate, called many times per cycle. The claim itself
     (claim_verified_login_family, execution layer) does the definitive
     refresh-grant probe and skips dead stores; an optimistic True here at
-    worst becomes a failed move logged by _execute_slot_moves."""
-    return free_login_family(account, state) is not None
+    worst becomes a failed move logged by _execute_slot_moves. (Since
+    2026-09-08 the disk-only `_family_claimable` filter trims the optimism:
+    a family that is blank, probe-proven dead, or past the wall is not free.)"""
+    return free_login_family(account, state, config) is not None
 
 
-def _free_family_count(account: str, state: dict) -> int:
+def _free_family_count(account: str, state: dict, config: dict | None = None) -> int:
     """How many usable pooled families of `account` are NOT leased to a live slot
     — i.e. how many ADDITIONAL live mounts the pool can back without a clobber,
     beyond the ones already covered. The counting twin of free_login_family
-    (which returns just the lowest free one)."""
+    (which returns just the lowest free one). Since 2026-09-08 this is the
+    ALIVE-free count (`_family_claimable`), so "0 free" means "0 usable"."""
     leased = leased_families(account, state)
-    return sum(1 for fam in list_login_families(account) if fam not in leased)
+    cfg = config if config is not None else load_config()
+    return sum(1 for fam in list_login_families(account)
+               if fam not in leased and _family_claimable(account, fam, cfg))
 
 
 def _distinct_family_capacity(account: str, state: dict, config: dict | None, slot: str | None) -> int:
@@ -1773,7 +1841,7 @@ def _distinct_family_capacity(account: str, state: dict, config: dict | None, sl
     bit unchanged."""
     cap = 0 if _account_held_by_other_live_mount(state, account, slot, config) else 1
     if independent_logins_enabled(config):
-        cap += _free_family_count(account, state)
+        cap += _free_family_count(account, state, config)
         if slot is not None and has_independent_login(account, slot):
             cap += 1
     return cap
@@ -12213,9 +12281,17 @@ def _diagnose_mount_creds_health(
         by_dt = datetime.fromtimestamp(now_ms / 1000, timezone.utc) + timedelta(days=max(0.0, days_left or 0.0))
         by_date = by_dt.date().isoformat()
         age_txt = f"~{refresh_age_days:.0f} days old" if refresh_age_days is not None else "of unknown age"
+        # 2026-09-08 (pool-collapse incident): this is a LIVE mount, and the
+        # wall is absolute — within `urgent_wall_within_days` of it (or past
+        # it) the condition is an outage in waiting, not a heads-up. The old
+        # WARNING severity was tuned out after firing for weeks; URGENT gets a
+        # desktop notification (once per condition via the SOS de-dup).
+        urgent_within = float(il.get("urgent_wall_within_days", 5))
+        severity = ("urgent" if days_left is not None and days_left <= urgent_within
+                    else "warning")
         if state == "near":
             return SOSCondition(
-                severity="warning",
+                severity=severity,
                 summary=(f"refresh token on {mount_label} ({account}) nears its assumed "
                          f"{ttl}-day expiry — plan a browser re-login soon"),
                 action=(
@@ -12229,7 +12305,7 @@ def _diagnose_mount_creds_health(
                 affected=account,
             )
         return SOSCondition(
-            severity="warning",
+            severity=severity,
             summary=(f"refresh token on {mount_label} ({account}) is past its assumed "
                      f"{ttl}-day TTL — re-login before it blanks"),
             action=(
@@ -13359,6 +13435,14 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         if _identities_match(login_store_identity(acct, slot), account_canonical_identity(acct)) is False:
             if not account_canonical_store_poisoned(acct)[0]:
                 mismatched.append(f"{slot}->{acct}")
+        if slot.startswith(LOGIN_FAMILY_PREFIX):
+            # 2026-09-08: list_provisioned_logins enumerates EVERY subdir of
+            # logins/<account>/, so pooled `family-N` dirs landed here too and
+            # produced the low-severity "family-N->acct past assumed lifetime"
+            # lines (~275/day for weeks, ignored). Pooled families are judged
+            # by the account-keyed wall condition (10.7) below; only genuine
+            # legacy per-slot stores keep this per-store expiry line.
+            continue
         exp_state, _ = login_expiry_state(acct, slot, config)
         if exp_state == "expired":
             expired.append(f"{slot}->{acct}")
@@ -13438,6 +13522,65 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         f"      cus login-mount {acct_name}"),
                 affected=acct_name,
             ))
+    # Condition 10.7 (2026-09-08, login-family pool-collapse incident): pooled
+    # login families at or near the refresh-token WALL, keyed by ACCOUNT.
+    # Anthropic refresh-token families have an ABSOLUTE ~28-30 day lifetime
+    # (rotation does not extend it), a new family needs a browser /login, and
+    # every family in the pool was minted in one batch — so the whole pool
+    # hits the wall together and the pool can only shrink until someone logs
+    # in. URGENT when the account backs a LIVE lane (a lane on a walled family
+    # logs out on its next refresh and cannot be re-seeded once the canonical
+    # walls too); a WARNING otherwise. Summaries carry family ids only (stable
+    # across cycles for the SOS de-dup); ages + the exact `cus login-mount`
+    # count go in the action.
+    _il = config.get("independent_logins", {}) or {}
+    _ttl = float(_il.get("refresh_token_ttl_days", 30))
+    _urgent_within = float(_il.get("urgent_wall_within_days", 5))
+    _live_accts = set(occupied_slot_accounts(state))
+    if config.get("mode", "global") in ("global", "hybrid") and state.get("active"):
+        _live_accts.add(state["active"])
+    for acct_name in sorted(state.get("accounts", {})):
+        fams = list_login_families(acct_name)
+        if not fams:
+            continue
+        leased_now = leased_families(acct_name, state)
+        past: list[tuple[str, float]] = []
+        near: list[tuple[str, float]] = []
+        for fam in fams:
+            age = _family_age_days(acct_name, fam)
+            if age is None:
+                continue
+            left = _ttl - age
+            if left <= 0:
+                past.append((fam, age))
+            elif left <= _urgent_within:
+                near.append((fam, age))
+        if not (past or near):
+            continue
+        backs_live = acct_name in _live_accts or bool(leased_now & {f for f, _ in past + near})
+        parts = []
+        if past:
+            parts.append("past the wall: " + ", ".join(f for f, _ in past))
+        if near:
+            parts.append("within " + f"{_urgent_within:.0f}d: " + ", ".join(f for f, _ in near))
+        detail = "; ".join(
+            f"{fam} minted {age:.1f}d ago ({'PAST' if _ttl - age <= 0 else f'{_ttl - age:.1f}d left'}"
+            f"{', LEASED by a live lane' if fam in leased_now else ''})"
+            for fam, age in past + near)
+        out.append(SOSCondition(
+            severity="urgent" if backs_live else "warning",
+            summary=(f"'{acct_name}' login families at the ~{_ttl:.0f}d refresh-token wall "
+                     f"({'; '.join(parts)})"),
+            action=(f"Refresh-token families have an ABSOLUTE ~{_ttl:.0f}-day lifetime — rotation "
+                    f"does NOT extend it, and only a browser /login mints a new one. {detail}. "
+                    f"A lane on a walled family logs out on its next refresh; once the account's "
+                    f"canonical walls too there is nothing left to re-seed from. Mint replacements "
+                    f"NOW, staggered so they do not all wall together again:\n"
+                    f"      cus login-mount {acct_name}   # once per family to replace"
+                    + ("\n    (this account backs a LIVE lane — treat as an outage in waiting)"
+                       if backs_live else "")),
+            affected=acct_name,
+        ))
     if expired:
         out.append(SOSCondition(
             severity="warning",
@@ -16134,10 +16277,75 @@ def status() -> None:
         gate_note = "" if config.get("independent_logins", {}).get("use_independent_logins", False) \
             else click.style("  (gate OFF — swaps still copy; set use_independent_logins: true)", fg="yellow")
         click.echo(f"Login pools (independent backup families):{gate_note}")
+        # 2026-09-08 (pool-collapse incident): the one-line "N family(ies),
+        # M free" hid the cliff — every family had aged into the ~30d
+        # refresh-token wall together, and "0 free" read as "all busy" while
+        # it meant "all dead". Show each family's provenance AGE, days to the
+        # wall, lease state and a disk-only health verdict (no probes: status
+        # must stay side-effect-free), and count only CLAIMABLE families as
+        # free. Retired (.dead-*) stores are counted so a shrinking pool is
+        # visible without listing the dead files.
+        _il = config.get("independent_logins", {}) or {}
+        _ttl = float(_il.get("refresh_token_ttl_days", 30))
+        _urgent_within = float(_il.get("urgent_wall_within_days", 5))
+        _now_ms = int(time.time() * 1000)
         for n, fams in pool_rows:
-            free = [f for f in fams if f not in leased_families(n, state)]
+            leased_now = leased_families(n, state)
+            # fam -> [slots] recorded as leasing it (live or idle; idle leases are
+            # reclaimable, so they are labelled distinctly below).
+            lease_slots: dict[str, list[str]] = {}
+            for _sname, _entry in sorted((state.get("slots") or {}).items()):
+                _ref = (_entry or {}).get("login_family") if isinstance(_entry, dict) else None
+                if isinstance(_ref, str) and _ref.startswith(f"{n}/"):
+                    lease_slots.setdefault(_ref.split("/", 1)[1], []).append(_sname)
+            free_all = [f for f in fams if f not in leased_now]
+            free_ok = [f for f in free_all if _family_claimable(n, f, config)]
+            dead_free = len(free_all) - len(free_ok)
+            try:
+                retired = sum(1 for p in login_pool_dir(n).glob("family-*/.credentials.json.dead-*"))
+            except OSError:
+                retired = 0
             short = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
-            click.echo(f"  {n:<12} {len(fams)} family(ies), {len(free)} free{short}")
+            extra = ""
+            if dead_free:
+                extra += click.style(f", {dead_free} free-but-unusable", fg="red")
+            if retired:
+                extra += f", {retired} retired"
+            # Headline keeps its historical shape ("N family(ies), M free") —
+            # M is now the USABLE-free count; the qualifier only appears when
+            # some unleased family is unusable, so a healthy pool prints as before.
+            click.echo(f"  {n:<12} {len(fams)} family(ies), {len(free_ok)} free{extra}{short}")
+            for f in fams:
+                age = _family_age_days(n, f)
+                if age is None:
+                    age_txt, wall_txt = "age ?", "wall ?"
+                else:
+                    left = _ttl - age
+                    age_txt = f"age {age:.1f}d"
+                    if left <= 0:
+                        wall_txt = click.style(f"PAST WALL by {-left:.1f}d", fg="red", bold=True)
+                    elif left <= _urgent_within:
+                        wall_txt = click.style(f"wall in {left:.1f}d", fg="red")
+                    else:
+                        wall_txt = f"wall in {left:.1f}d"
+                if f in leased_now:
+                    lease_txt = "leased " + ",".join(s for s in lease_slots.get(f, []) if s in occupied_slot_accounts(state).get(n, []))
+                elif lease_slots.get(f):
+                    lease_txt = "idle-lease " + ",".join(lease_slots[f])
+                else:
+                    lease_txt = "free"
+                try:
+                    _fc = read_json(login_family_creds_path(n, f))
+                    _fexp = _creds_expires_at(_fc)
+                    if _live_mount_creds_invalid(_fc):
+                        health = click.style("blank/unusable", fg="red")
+                    elif _fexp is not None and int(_fexp) <= _now_ms:
+                        health = "access expired (unverified)"
+                    else:
+                        health = click.style("access valid", fg="green")
+                except (json.JSONDecodeError, OSError):
+                    health = click.style("unreadable", fg="red")
+                click.echo(f"      {f:<10} {age_txt:<11} {lease_txt:<24} {health}  {wall_txt}")
         click.echo()
 
     # Locks

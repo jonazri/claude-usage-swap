@@ -504,6 +504,96 @@ def test_2f_transfer_attempts_are_cooldown_bounded():
         env.restore()
 
 
+# ===========================================================================
+# FIX 3 — hygiene / visibility
+# ===========================================================================
+
+def test_3a_free_family_count_is_alive_free():
+    env = _Env({"acct": _valid("at-canon", "rt-canon")}, active="acct", config=_ILGATE)
+    try:
+        env.plant_family("acct", "family-1", _valid("at-1", "rt-1"), minted_days_ago=31)   # past wall
+        env.plant_family("acct", "family-2", _valid("at-2", "rt-2"), minted_days_ago=3)    # fresh
+        env.plant_family("acct", "family-3", {"claudeAiOauth": {"accessToken": "at-3", "refreshToken": "rt-3",
+                                                                "expiresAt": _PAST}}, minted_days_ago=3)
+        state, config = cus.load_state(), cus.load_config()
+        # family-3: expired access WITH a refresh token is merely suspect (a claim
+        # probe decides) → still counted; family-1 is past the wall → not free.
+        assert cus._free_family_count("acct", state, config) == 2
+        assert cus.free_login_family("acct", state, config) == "family-2"
+        # A probe-proven-dead verdict (cached the way prune/heal cache it) drops it.
+        cus._STORE_DEAD_PROBE["fam:acct/family-3"] = (time.time(), True)
+        assert cus._free_family_count("acct", state, config) == 1
+        # Flag off: age is ignored again (disk-shape + probe cache still apply).
+        cfg_off = json.loads(json.dumps(config))
+        cfg_off["independent_logins"]["free_count_excludes_past_wall"] = False
+        assert cus._free_family_count("acct", state, cfg_off) == 2
+        assert cus.has_free_login_family("acct", state, config)
+    finally:
+        env.restore()
+
+
+def _wall_conditions(conds):
+    return [c for c in conds if "refresh-token wall" in c.summary]
+
+
+def test_3b_family_wall_sos_is_urgent_for_live_lane_account_and_de_noised():
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "idle": _valid("at-i", "rt-i")},
+               active="acct", config=_ILGATE)
+    try:
+        env.plant_family("acct", "family-1", _valid("at-1", "rt-1"), minted_days_ago=26)   # within 5d
+        env.plant_family("acct", "family-2", _valid("at-2", "rt-2"), minted_days_ago=31)   # past
+        env.plant_family("acct", "family-3", _valid("at-3", "rt-3"), minted_days_ago=2)    # fine
+        env.plant_family("idle", "family-1", _valid("at-i1", "rt-i1"), minted_days_ago=29)
+        env.make_slot("acct", live=True, mount_creds=_valid("at-1", "rt-1"), family_id="family-1")
+        conds = cus.diagnose(cus.load_state(), cus.load_config())
+        walls = {c.affected: c for c in _wall_conditions(conds)}
+        assert walls["acct"].severity == "urgent", walls["acct"]
+        assert "family-1" in walls["acct"].summary and "family-2" in walls["acct"].summary
+        assert "family-3" not in walls["acct"].summary
+        assert "LEASED by a live lane" in walls["acct"].action
+        assert "cus login-mount acct" in walls["acct"].action
+        # 'idle' backs nothing live → a warning, not an alarm.
+        assert walls["idle"].severity == "warning"
+        # De-noised: no legacy per-store "family-N->acct past assumed lifetime" line.
+        assert not any("past assumed refresh-token lifetime" in c.summary for c in conds), \
+            [c.summary for c in conds]
+    finally:
+        env.restore()
+
+
+def test_3c_live_mount_creds_health_goes_urgent_near_the_wall():
+    cfg = {"independent_logins": {"urgent_wall_within_days": 2, "warn_expiry_within_days": 5,
+                                  "refresh_token_ttl_days": 30}}
+    now_ms = int(time.time() * 1000)
+    creds = _valid("at", "rt", expires_at=now_ms + 3_600_000)
+    warn = cus._diagnose_mount_creds_health("slot-1", "acct", creds, now_ms, cfg, refresh_age_days=26.0)
+    assert warn is not None and warn.severity == "warning", warn
+    urgent = cus._diagnose_mount_creds_health("slot-1", "acct", creds, now_ms, cfg, refresh_age_days=28.5)
+    assert urgent is not None and urgent.severity == "urgent", urgent
+    past = cus._diagnose_mount_creds_health("slot-1", "acct", creds, now_ms, cfg, refresh_age_days=31.0)
+    assert past is not None and past.severity == "urgent", past
+    assert cus._diagnose_mount_creds_health("slot-1", "acct", creds, now_ms, cfg, refresh_age_days=10.0) is None
+
+
+def test_3d_status_shows_per_family_age_and_wall():
+    from click.testing import CliRunner
+    env = _Env({"acct": _valid("at-canon", "rt-canon")}, active="acct", config=_ILGATE)
+    try:
+        env.plant_family("acct", "family-1", _valid("at-1", "rt-1"), minted_days_ago=31)
+        env.plant_family("acct", "family-2", _valid("at-2", "rt-2"), minted_days_ago=3)
+        # Restore real echo so CliRunner captures output.
+        cus.click.echo = env._saved_echo
+        res = CliRunner().invoke(cus.cli, ["status"])
+        out = res.output
+        assert res.exit_code == 0, out
+        assert "2 family(ies), 1 free" in out and "1 free-but-unusable" in out, out
+        assert "family-1" in out and "PAST WALL" in out, out
+        assert "family-2" in out and "wall in 2" in out, out
+        assert "age 31." in out and "age 3." in out, out
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
