@@ -359,6 +359,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # network/endpoint trouble FAILS OPEN to today's install-as-is.
         # False ⇒ bit-for-bit pre-#127 claim behavior.
         "verify_family_on_claim": True,
+        # ---- 2026-09-08 generation-transfer lane heal (pool-collapse incident) ----
+        # When a LIVE pooled lane's mount blanks and its leased family store
+        # is dead (refresh grant invalid_grant / blank / missing) but the
+        # account CANONICAL is alive, mint the lane a FRESH family from the
+        # canonical (`_reseed_family_from_canonical`: copy + grant + persist, a
+        # documented generation TRANSFER that dead-branches the canonical) and
+        # re-lease it — instead of re-installing the dead family and looping
+        # heal→blank→heal until a browser relogin. Guarded: the canonical's
+        # token family must not be live on ANY other mount (#104) and must
+        # probe alive. This is the automated form of the manual reseed that
+        # would have revived every dead lane in the 2026-09-07/08 collapse. It
+        # does not extend the ~30-day refresh-token wall — it only removes the
+        # lockout while the canonical still has life. False ⇒ pre-2026-09-08
+        # heal (family store or nothing).
+        "heal_from_canonical": True,
+        # Poll-burnout backoff: at most one transfer ATTEMPT per lane per this
+        # many minutes (the heal runs every cycle for a blanked lane; each
+        # attempt can fire refresh grants).
+        "heal_from_canonical_cooldown_minutes": 10,
     },
     # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
     # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
@@ -10865,7 +10884,7 @@ def _family_age_days(account: str, family_id: str) -> float | None:
     return (datetime.now(timezone.utc) - minted_dt).total_seconds() / 86400.0
 
 
-def _live_surface_fingerprints(state: dict) -> dict[str, str]:
+def _live_surface_fingerprints(state: dict, *, include_canonicals: bool = True) -> dict[str, str]:
     """Refresh-token fingerprint → human label for every surface whose token
     generation a free store must never share (the duplicate-generation check)
     and must certainly never PROBE (a grant rotates the single-use token and
@@ -10883,7 +10902,12 @@ def _live_surface_fingerprints(state: dict) -> dict[str, str]:
     Idle slot mounts are deliberately EXCLUDED: an idle slot sharing its
     (reclaimable) leased family's fingerprint is the normal post-lease state,
     not a duplicate. Best-effort reads throughout — an unreadable surface
-    simply contributes nothing."""
+    simply contributes nothing.
+
+    `include_canonicals=False` (2026-09-08) restricts the map to LIVE mounts
+    (slot mounts in use + the shared mount) — for callers that are about to
+    act on a canonical itself (the generation-transfer heal) and need to know
+    whether a running session, not merely a store file, holds its token."""
     out: dict[str, str] = {}
 
     def _fp_of(path: Path) -> str | None:
@@ -10902,6 +10926,8 @@ def _live_surface_fingerprints(state: dict) -> dict[str, str]:
     fp = _fp_of(CREDS_JSON)
     if fp:
         out.setdefault(fp, "the shared ~/.claude mount")
+    if not include_canonicals:
+        return out
     for acct in sorted(state.get("accounts", {}) or {}):
         fp = _fp_of(account_creds_path(acct))
         if fp:
@@ -11582,34 +11608,44 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
     "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
     swap install-point guard and the shared-mount heal apply — so whatever this
     returns is safe to atomic-copy into the mount without re-blanking it.
+
+    Annotation 2026-09-08 (login-family pool-collapse incident): "usable" was
+    SHAPE-only, and that is exactly what looped. A pooled lane healed only from
+    its own family store and a plain lane only from its own `.lastvalid`
+    shadow — both hold the very token whose refresh just failed, so a well-
+    shaped-but-DEAD store passed the bar, got re-installed, Claude Code's next
+    refresh blanked the mount again, and the daemon healed it again
+    (heal→blank→heal) while the account's CANONICAL sat alive and fresh (the
+    `freshness-skip "snapshot fresher than live"` log spam proved cus knew).
+    Now a candidate is PROBE-verified before reinstall — where a probe is safe
+    (`_heal_candidate_usable`) — and a pooled lane whose family is dead falls
+    through to the generation-transfer heal (`_lane_generation_transfer_heal`):
+    a fresh family minted from the alive canonical and re-leased.
     """
     lease = slot_leased_family(state, slot)
     if lease is not None and lease[0] == account and independent_logins_enabled(config):
         fam_path = login_family_creds_path(*lease)
-        if fam_path.exists():
-            try:
-                if not _live_mount_creds_invalid(read_json(fam_path)):
-                    return fam_path
-            except (json.JSONDecodeError, OSError):
-                pass
-        # Leased family store blanked/missing → NO cross-family fallback (#104).
-        # The last-valid shadow is deliberately NOT consulted for a pooled lane:
-        # a stale shadow could predate a re-lease to a different family, and
-        # re-installing it would cross-contaminate; the family store is the only
-        # authoritative source for a pooled lane.
-        return None
+        if _heal_candidate_usable(fam_path, f"heal-fam:{lease[0]}/{lease[1]}", account, state, config):
+            return fam_path
+        # Leased family store blanked/missing/DEAD → NO cross-family fallback
+        # to the snapshot or the shadow (#104): a stale shadow could predate a
+        # re-lease to a different family, and the snapshot is a different
+        # generation. Instead (2026-09-08) mint the lane a FRESH family from
+        # the alive canonical and re-lease it — the transfer helper enforces
+        # the collision + liveness guards and returns None when it cannot,
+        # in which case the lane escalates to the relogin SOS as before.
+        return _lane_generation_transfer_heal(slot, account, state, config)
     # Plain lane. The last-valid shadow is a copy of THIS lane's own mount taken
     # while it was valid — same slot, same refresh-token lineage by construction
     # — so it is the freshest #104-safe heal source and cannot cross-contaminate.
-    # Prefer it; fall through to the snapshot/backup when there's no usable shadow
-    # (e.g. right after a daemon restart, before any valid scan has taken one).
+    # Prefer it (probe-verified since 2026-09-08 — a dead shadow is the same
+    # token that just failed); fall through to the snapshot/backup when there's
+    # no usable shadow (e.g. right after a daemon restart, before any valid
+    # scan has taken one, or when the shadow is an unrotated copy of the
+    # canonical — then the canonical path below is the right prober).
     shadow = _lane_lastvalid_path(mount_creds_path(slot_path(slot)))
-    if shadow.exists():
-        try:
-            if not _live_mount_creds_invalid(read_json(shadow)):
-                return shadow
-        except (json.JSONDecodeError, OSError):
-            pass
+    if _heal_candidate_usable(shadow, f"heal-shadow:{slot}", account, state, config):
+        return shadow
     # Fall through to the account's newest usable snapshot/backup — UNLESS the
     # snapshot is DEAD (its refresh grant returns invalid_grant). 2026-07-07 merkos
     # incident: `_newest_usable_creds_source` only rejects blank-SHAPED creds
@@ -11624,6 +11660,186 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
     if source is not None and source == account_creds_path(account) and _account_snapshot_dead(account, config):
         return None
     return source
+
+
+def _heal_candidate_usable(path: Path, cooldown_key: str, account: str, state: dict,
+                           config: dict) -> bool:
+    """Is `path` (a blanked lane's leased-family store or `.lastvalid` shadow)
+    a source that will actually AUTHENTICATE after reinstall? (2026-09-08)
+
+    Shape first (`_live_mount_creds_invalid` — blank/missing/unreadable ⇒ no),
+    then LIVENESS, because a well-shaped store can hold a dead refresh token
+    (the heal→blank→heal loop). Liveness is decided by `_store_creds_dead`,
+    which is free when the access token is still valid and otherwise fires a
+    cooldown-cached refresh-grant probe that PERSISTS the rotation into `path`
+    (so what gets reinstalled is the fresh pair). The probe rotates a
+    single-use token, so it is only fired when no OTHER holder could be hurt:
+
+      * token family live on another MOUNT (a running session — another lane
+        or the shared mount): never probe. This is a pre-existing double-book
+        (#104, already an URGENT SOS); keep today's shape-only verdict so the
+        heal does not newly strand a lane that used to be restored.
+      * token family identical to the account CANONICAL's (an unrotated copy):
+        not usable HERE — probing it would dead-branch the canonical, which is
+        exactly the source the fallback paths (`_account_snapshot_dead` for a
+        plain lane, the generation transfer for a pooled lane) probe and
+        persist properly. Let them handle it.
+      * otherwise: the only holder of this token was the lane's own session,
+        whose refresh already failed (that is what blanked the mount) — safe.
+
+    The lane's own blank mount contributes no fingerprint, so it never shields
+    its own candidate."""
+    if not path.exists():
+        return False
+    try:
+        creds = read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return False
+    if _live_mount_creds_invalid(creds):
+        return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # Valid-shaped access token with nothing to refresh from: usable until
+        # it expires (the old verdict); a probe is impossible anyway.
+        return True
+    fp = _refresh_fingerprint(rt)
+    live = _live_surface_fingerprints(state, include_canonicals=False)
+    if fp in live:
+        return True  # pre-existing double-book: today's behavior (SOS flags it)
+    try:
+        canon_rt = _credential_refresh_token(read_json(account_creds_path(account)))
+    except (json.JSONDecodeError, OSError):
+        canon_rt = None
+    if canon_rt and _refresh_fingerprint(canon_rt) == fp:
+        return False  # unrotated copy of the canonical: the canonical path probes it
+    return not _store_creds_dead(path, cooldown_key, config, allow_probe=True)
+
+
+def _lane_generation_transfer_heal(slot: str, account: str, state: dict, config: dict) -> Path | None:
+    """Recover a LIVE pooled lane whose leased family is DEAD by minting it a
+    fresh family from the account's ALIVE canonical (2026-09-08, login-family
+    pool-collapse incident). Returns the new family's creds path (the heal
+    source `_auto_heal_live_lanes` installs) or None when no safe transfer is
+    possible — in which case the caller falls through to the relogin SOS,
+    exactly as before this heal existed.
+
+    THE INCIDENT: every pooled family hit the ~30-day refresh-token wall
+    together. Each affected lane then looped heal→blank→heal on its own dead
+    family store while the account canonical — kept fresh by the un-stale
+    sweep and by swap save-backs — was alive the whole time. The manual fix
+    that revived a lane was `cus prune --reseed <acct>` + re-lease; this is
+    that fix, automated, so a dead lane never needs a browser while the
+    canonical still has life. It does NOT extend the wall (the new family
+    inherits the canonical's mint age); it removes the lockout.
+
+    Guards, in order (every refusal is logged as a CRED-AUDIT line):
+      1. config gate `independent_logins.heal_from_canonical` (default ON) and
+         the pool gate (a plain lane has no lease to re-point);
+      2. per-lane cooldown (`heal_from_canonical_cooldown_minutes`) — the heal
+         runs every cycle and each attempt can fire refresh grants;
+      3. canonical present, well-shaped, with a refresh token;
+      4. #104: the canonical's token family must not be live on ANY other mount
+         (another lane, the shared mount — `_live_surface_fingerprints` with
+         canonicals excluded). Transferring it would consume the token under a
+         running session. This is the guard that makes default-ON acceptable;
+      5. liveness: `_account_snapshot_dead` (free when the access token is
+         valid; cooldown-cached probe otherwise, persisting any rotation into
+         the canonical). A dead canonical ⇒ nothing to transfer ⇒ None.
+
+    Then `_reseed_family_from_canonical` does the transfer (prune this
+    account's dead FREE families, scaffold the next family, copy, grant,
+    persist, provenance), the lane is re-leased to the new family and state is
+    saved IMMEDIATELY (the caller may hold a state copy it never persists), and
+    only THEN is the old dead store retired (`_retire_store_file`, a rename) —
+    that order means a crash between the two steps leaves the old store FREE,
+    where claim-verify's probe retires it, rather than a lane with no lease.
+
+    TODO (deliberately not done here): when the transfer is impossible the
+    dead LEASED store is left in place. Retiring it without a replacement
+    would pop a live lane's lease under it, and the save-back path would
+    recreate the store from whatever the mount holds; leave that to the
+    operator (`cus prune`) or a future explicit release rule."""
+    il = config.get("independent_logins", {}) if isinstance(config, dict) else {}
+    if not il.get("heal_from_canonical", True) or not independent_logins_enabled(config):
+        return None
+    key = (slot, account)
+    now = time.time()
+    cooldown_s = float(il.get("heal_from_canonical_cooldown_minutes", 10)) * 60
+    last = _LANE_TRANSFER_ATTEMPT.get(key)
+    if last is not None and (now - last) < cooldown_s:
+        return None
+    _LANE_TRANSFER_ATTEMPT[key] = now
+    snap = account_creds_path(account)
+    try:
+        canon = read_json(snap) if snap.exists() else None
+    except (json.JSONDecodeError, OSError):
+        canon = None
+    rt = _credential_refresh_token(canon)
+    if canon is None or _live_mount_creds_invalid(canon) or not rt:
+        _cred_audit("lane-generation-transfer", "refused-no-canonical",
+                    "leased family is dead and the account canonical is missing/blank/has no "
+                    "refresh token — nothing to transfer; relogin required",
+                    slot=slot, account=account)
+        return None
+    fp = _refresh_fingerprint(rt)
+    live = _live_surface_fingerprints(state, include_canonicals=False)
+    if fp in live:
+        _cred_audit("lane-generation-transfer", "refused-canonical-live-elsewhere",
+                    f"canonical token family is live on {live[fp]} — transferring it would "
+                    f"consume that session's single-use token (#104); not touching it",
+                    slot=slot, account=account, shared=True, token_fp=fp)
+        return None
+    if _account_snapshot_dead(account, config):
+        _cred_audit("lane-generation-transfer", "refused-canonical-dead",
+                    "leased family AND canonical are dead (invalid_grant) — the account has hit "
+                    "the refresh-token wall; browser relogin required (`cus relogin`)",
+                    slot=slot, account=account)
+        return None
+    old_lease = slot_leased_family(state, slot)
+    new_fam = _reseed_family_from_canonical(account, state, config)
+    if new_fam is None:
+        _cred_audit("lane-generation-transfer", "failed",
+                    "canonical looked alive but the generation transfer did not complete "
+                    "(see the reseed lines above); will retry after the cooldown",
+                    slot=slot, account=account)
+        return None
+    # Re-lease FIRST and persist immediately — see the docstring for why this
+    # precedes retiring the old store.
+    entry = state.setdefault("slots", {}).setdefault(slot, {"account": account, "created_ts": now_iso()})
+    entry["login_family"] = f"{account}/{new_fam}"
+    save_state(state)
+    _OCCUPIED_SLOTS_CACHE.clear()
+    retired = None
+    if old_lease is not None and old_lease[0] == account and old_lease[1] != new_fam:
+        old_path = login_family_creds_path(*old_lease)
+        if old_path.exists():
+            try:
+                retired = _retire_store_file(old_path)
+            except OSError:
+                retired = None
+    new_path = login_family_creds_path(account, new_fam)
+    try:
+        new_fp = _audit_token_fp(read_json(new_path))
+    except (json.JSONDecodeError, OSError):
+        new_fp = "unreadable"
+    _cred_audit("lane-generation-transfer", "reseeded-and-released",
+                "leased family was dead; minted a fresh family from the alive canonical "
+                "(generation transfer, grant verified + persisted) and re-leased the lane to it",
+                slot=slot, account=account, login_family=f"{account}/{new_fam}", token_fp=new_fp,
+                extra=(f"old_family={old_lease[1] if old_lease else 'none'} "
+                       f"retired_to={retired or 'n/a'}"))
+    msg = (f"live lane {slot} ({account}): its leased login family "
+           f"{old_lease[1] if old_lease else '(none)'} was DEAD (refresh grant invalid_grant) "
+           f"while the account canonical was alive — minted {account}/{new_fam} from the "
+           f"canonical (generation transfer) and re-leased the lane to it; the dead store was "
+           f"{'retired to ' + retired if retired else 'already gone'}. The canonical now holds a "
+           f"dead branch by design (it re-heals from the live family via #186 / relogin).")
+    click.echo(f"  lane-generation-transfer: {msg}")
+    try:
+        append_inbox("auto-heal", f"lane {slot} re-seeded from '{account}' canonical (2026-09-08 transfer heal)", msg)
+    except OSError:
+        pass
+    return new_path
 
 
 def _lane_mount_sos(slot: str, account: str) -> SOSCondition:

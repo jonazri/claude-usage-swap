@@ -369,6 +369,141 @@ def test_1f_live_mount_creds_invalid_expired_without_refresh():
     assert not cus._live_mount_creds_invalid(_valid("at", "rt"))
 
 
+# ===========================================================================
+# FIX 2 — generation-transfer heal for a pooled lane with a dead family
+# ===========================================================================
+
+def _pooled_dead_lane(env: _Env, account: str = "acct") -> str:
+    """A LIVE pooled lane on `account` leasing family-1, whose mount is BLANK
+    and whose family store is well-shaped-but-expired with refresh 'rt-f1-dead'.
+    The account canonical is minted by the caller."""
+    env.plant_family(account, "family-1", _expired("rt-f1-dead"), minted_days_ago=31)
+    return env.make_slot(account, live=True, mount_creds=_blank(), family_id="family-1")
+
+
+def test_2a_dead_family_alive_canonical_transfers_and_releases():
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        lane = _pooled_dead_lane(env)
+        # family-1's grant is DEAD; the canonical's is ALIVE and rotates.
+        env.patch(cus, "_oauth_refresh_grant",
+                  _grant_map({"rt-f1-dead": ("dead", None),
+                              "rt-canon": _alive("at-new", "rt-new")}))
+        state = cus.load_state()
+        healed = cus._auto_heal_live_lanes(state, cus.load_config())
+        assert healed == [lane], env.echoes
+        mount = env.slot_creds(lane)
+        assert not cus._live_mount_creds_invalid(mount)
+        assert cus._credential_refresh_token(mount) == "rt-new", mount
+        st = env.state()
+        assert st["slots"][lane]["login_family"] == "acct/family-2", st["slots"][lane]
+        # New family holds the transferred generation + provenance; old one retired.
+        assert cus._credential_refresh_token(
+            json.loads(cus.login_family_creds_path("acct", "family-2").read_text())) == "rt-new"
+        prov = json.loads(cus.login_family_provenance_path("acct", "family-2").read_text())
+        assert "reseeded-from-canonical" in prov["note"]
+        assert not cus.login_family_creds_path("acct", "family-1").exists()
+        assert list(cus.login_family_dir("acct", "family-1").glob(".credentials.json.dead-*"))
+        # The canonical is untouched by the transfer (it now holds a dead branch by
+        # design — the documented reseed contract), never blanked.
+        assert cus._credential_refresh_token(env.snap_creds("acct")) == "rt-canon"
+        lines = env.audit_lines("lane-generation-transfer")
+        assert lines and "decision=reseeded-and-released" in lines[-1], env.echoes
+        assert "rt-new" not in lines[-1] and "rt-canon" not in lines[-1], "raw token leaked"
+        assert "generation transfer" in env.inbox_md.read_text()
+    finally:
+        env.restore()
+
+
+def test_2b_refuses_when_canonical_family_is_live_on_shared_mount():
+    """The #104 guard that makes default-ON safe: the canonical's token is what
+    the shared ~/.claude mount runs on → never consume it. No probe of
+    'rt-canon' may fire (the grant map would raise)."""
+    env = _Env({"acct": _valid("at-canon", "rt-canon")}, active="acct", config=_ILGATE)
+    try:
+        lane = _pooled_dead_lane(env)
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({"rt-f1-dead": ("dead", None)}))
+        state = cus.load_state()
+        assert cus._lane_heal_source(lane, "acct", state, cus.load_config()) is None
+        lines = env.audit_lines("lane-generation-transfer")
+        assert lines and "decision=refused-canonical-live-elsewhere" in lines[-1], env.echoes
+        assert env.state()["slots"][lane]["login_family"] == "acct/family-1"
+        assert cus.login_family_creds_path("acct", "family-1").exists(), "dead lease left in place"
+    finally:
+        env.restore()
+
+
+def test_2c_gate_off_keeps_pre_fix_behavior():
+    cfg = {"independent_logins": {"use_independent_logins": True, "heal_from_canonical": False},
+           "mode": "per_session"}
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "other": _valid("at-o", "rt-o")},
+               active="other", config=cfg)
+    try:
+        lane = _pooled_dead_lane(env)
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({"rt-f1-dead": ("dead", None)}))
+        assert cus._lane_heal_source(lane, "acct", cus.load_state(), cus.load_config()) is None
+        assert not env.audit_lines("lane-generation-transfer")
+        assert not cus.login_family_dir("acct", "family-2").exists()
+    finally:
+        env.restore()
+
+
+def test_2d_alive_but_expired_family_is_refreshed_in_place_no_transfer():
+    """A merely-expired family whose grant is ALIVE is the heal source (rotated
+    tokens persisted into the store first) — no transfer, lease unchanged."""
+    env = _Env({"acct": _valid("at-canon", "rt-canon"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        env.plant_family("acct", "family-1", _expired("rt-f1"))
+        lane = env.make_slot("acct", live=True, mount_creds=_blank(), family_id="family-1")
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({"rt-f1": _alive("at-f1n", "rt-f1n")}))
+        healed = cus._auto_heal_live_lanes(cus.load_state(), cus.load_config())
+        assert healed == [lane], env.echoes
+        assert cus._credential_refresh_token(env.slot_creds(lane)) == "rt-f1n"
+        assert env.state()["slots"][lane]["login_family"] == "acct/family-1"
+        assert not env.audit_lines("lane-generation-transfer")
+    finally:
+        env.restore()
+
+
+def test_2e_dead_canonical_refuses_and_escalates():
+    env = _Env({"acct": _expired("rt-canon-dead"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        lane = _pooled_dead_lane(env)
+        env.patch(cus, "_oauth_refresh_grant",
+                  _grant_map({"rt-f1-dead": ("dead", None), "rt-canon-dead": ("dead", None)}))
+        assert cus._lane_heal_source(lane, "acct", cus.load_state(), cus.load_config()) is None
+        lines = env.audit_lines("lane-generation-transfer")
+        assert lines and "decision=refused-canonical-dead" in lines[-1], env.echoes
+        # The lane is left for the URGENT relogin SOS.
+        conds = cus.diagnose(cus.load_state(), cus.load_config())
+        assert any(c.severity == "urgent" and lane in c.summary for c in conds), [c.summary for c in conds]
+    finally:
+        env.restore()
+
+
+def test_2f_transfer_attempts_are_cooldown_bounded():
+    env = _Env({"acct": _expired("rt-canon-dead"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        lane = _pooled_dead_lane(env)
+        env.patch(cus, "_oauth_refresh_grant",
+                  _grant_map({"rt-f1-dead": ("dead", None), "rt-canon-dead": ("dead", None)}))
+        state, config = cus.load_state(), cus.load_config()
+        assert cus._lane_heal_source(lane, "acct", state, config) is None
+        n = len(env.audit_lines("lane-generation-transfer"))
+        # Second call inside the cooldown: no new attempt (and no new probe).
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({}))
+        cus._STORE_DEAD_PROBE.clear()  # family verdict re-evaluated → dead (cached in map? no: cleared)
+        env.patch(cus, "_store_creds_dead", lambda *a, **k: True)
+        assert cus._lane_heal_source(lane, "acct", state, config) is None
+        assert len(env.audit_lines("lane-generation-transfer")) == n
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
