@@ -180,6 +180,7 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 | `shell-snapshots/` | Shell-env snapshots referenced by session state; same resume argument. |
 | `tasks/`, `todos/` | Task/todo lists keyed by session id; travel with transcripts. |
 | `commands/`, `hooks/`, `plugins/`, `scripts/`, `skills/`, `agents/`, `memory/` | User config, account-independent (already in `SHARED_SYMLINK_SUBDIRS`). |
+| `sessions/` | **Reclassified 2026-09-11 (GH #199)** — Claude Code's *peer registry*: one `<pid>.json` per live session, and the ONLY thing `ListAgents` / `SendMessage` read to discover sibling sessions. Per-mount, a slot-launched session and a bare session are mutually invisible (no error at launch — the peer name simply never resolves). Sharing it restores cross-mount session mail. Migration is liveness-aware, not the generic merge: see below. |
 
 **Per-mount** (each mount its own copy):
 
@@ -187,7 +188,7 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 |---|---|
 | `.credentials.json` | The account credential — the point of the mount. |
 | `.claude.json` | Account-bound keys (`userID`, `oauthAccount`) must differ per mount; the ~37 non-account keys are kept aligned by `cus sync-config`. Lives *inside* non-default config dirs (vs `~/.claude.json` at parent level for the default). |
-| `sessions/` | Pid-keyed, process-scoped JSON (observed: `1687352.json`). |
+| ~~`sessions/`~~ | ~~Pid-keyed, process-scoped JSON (observed: `1687352.json`).~~ **Superseded 2026-09-11 (GH #199)** — moved to the shared table above. The 2026-07-02 reading was right that the *files* are process-scoped and wrong that the *directory* is: it is a registry sessions publish themselves into and read each other out of, so scoping it per mount partitioned the fleet. |
 | `backups/` | Claude Code writes its own `.claude.json.backup.<ts>` here (observed in scratch run) and cus rotates creds backups here; both are mount-scoped by meaning. |
 | `history.jsonl` | Prompt history. Deliberately NOT shared: Claude Code rewrites it, and a tempfile+rename rewrite would silently replace a symlink with a real file and fork the share. Divergent arrow-up history is a trivial cost; a silently-broken share is not. |
 | `cache/`, `stats-cache.json`, `statsig/`, `telemetry/` | Ephemeral / account-scoped caches; refresh from server. |
@@ -195,6 +196,14 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 | `.last-cleanup`, `.last-update-result.json`, `daemon*`, `jobs/` | Process-scoped markers and Claude Code background-jobs state; don't-care. |
 
 **Global-only, never seen via `CLAUDE_CONFIG_DIR`:** `validator.log`, `loops.md`, `loops-events.log`, `reconciliations.json`, `projects-hook-archive` — written by user hooks/scripts with absolute `~/.claude/...` paths; they never resolve through a mount.
+
+**Peer-registry migration (GH #199, 2026-09-11).** A mount that predates the fix owns a real `sessions/` dir holding one file per session that *ever* ran under it (slot-4 held 2,002 on 2026-09-11, nearly all dead pids). `cus doctor --fix-dirs` therefore drains it rather than merging it:
+
+- entries whose pid is **still live** are moved into `~/.claude/sessions/` — those sessions become visible to every other mount's `ListAgents` immediately;
+- everything else — dead pids, unparseable files, stray subdirs, and any live entry whose `<pid>.json` name is already taken in the shared registry (the shared copy is the one Claude Code is maintaining) — is **parked** in `<mount>/sessions.bak-<date>/`. Nothing is deleted;
+- only once the dir is empty is it replaced with the symlink. If any entry could not be moved, the real dir is left in place and the finding reports `healed=False`, so `doctor` exits non-zero instead of claiming success (the GH #192 lesson).
+
+New mounts are born correct: `scaffold_mount_dir` creates `~/.claude/sessions/` when it doesn't exist yet (a slots-only box may never have run a bare session) so the symlink is never skipped as dangling.
 
 **Known sharp edge:** anything that rewrites a shared *file* symlink via tempfile+rename (e.g. `/config` writing `settings.json`) replaces the symlink with a real file and silently forks that mount off the share. `cus doctor --fix-dirs` detects real-file-where-symlink-expected, folds any non-default keys back into the shared file, and re-links.
 

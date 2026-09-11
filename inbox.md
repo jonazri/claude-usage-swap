@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-09-11 — decision — GH #199 peer-registry sharing: migration rides `cus doctor --fix-dirs`, not a separate `--fix-sessions` flag](#2026-09-11-decision-gh-199-peer-registry-sharing-migration-rides-cus-doctor-fix-dirs-not-a-separate-fix-sessions-flag)
 - [2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-125-merge-same-cause-as-123-124-entries)
 - [2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-124-merge-same-cause-as-123-entry)
 - [2026-07-03 — flag — Gym record loop for PR #123 merge blocked: repo not gym-initialized](#2026-07-03-flag-gym-record-loop-for-pr-123-merge-blocked-repo-not-gym-initialized)
@@ -27,6 +28,26 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-09-11 — decision — GH #199 peer-registry sharing: migration rides `cus doctor --fix-dirs`, not a separate `--fix-sessions` flag
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #gh-199 #mounts #peer-registry #doctor #session-mail
+
+**What I decided:** the one-time migration for mounts that already own a private `sessions/` dir runs inside the existing `cus doctor --fix-dirs` heal, rather than behind a new `cus doctor --fix-sessions` flag. `sessions` is now a normal member of `SHARED_SYMLINK_SUBDIRS`, but its real-dir case is special-cased in `doctor_mount` to a liveness-aware drain (`_drain_sessions_dir`) instead of the generic recursive merge used for `projects/`.
+
+**Why:** two reasons. (1) `--fix-dirs` is *the* heal command in this repo — if the sessions drift were behind its own flag, `cus doctor --fix-dirs` would print "all mounts canonical" while the peer registry was still partitioned, which is exactly the misleading-success failure GH #192 was filed about. (2) The generic merge is wrong here and could not simply be reused: a long-lived mount holds one registry file per session that *ever* ran under it (slot-4 held 2,002 on 2026-09-11, nearly all dead pids), and folding those into the shared registry would bury the live peers that `ListAgents` actually reads. The drain adopts live-pid entries into the shared registry and parks everything else in `<mount>/sessions.bak-<date>/` — move, never delete.
+
+**Blast radius if wrong:** the heal only runs when an operator types `--fix-dirs`; the read-only `cus doctor` is unchanged and reports the drift without touching anything. No live mount was modified by this work — verification was done in throwaway temp trees, plus one read-only `cus doctor` dry run against production (21 findings, nothing written).
+
+### Walk-back path
+1. `git revert` the commit on `feature/fix-199-sessions-symlink-20260911` (or close PR #207 unmerged) — that removes `"sessions"` from `SHARED_SYMLINK_SUBDIRS`, the `_drain_sessions_dir` helper, and the doctor special case in one shot.
+2. If the migration had already been run on live mounts, put each mount back the way it was: for each `~/claude-accounts/<mount>/` where `sessions` is now a symlink — `rm ~/claude-accounts/<mount>/sessions` (removes only the link), `mv ~/claude-accounts/<mount>/sessions.bak-<date> ~/claude-accounts/<mount>/sessions`, then move the adopted live-pid files back out of `~/.claude/sessions/` into it. Nothing was deleted, so the park dir plus the adopted filenames are a complete record.
+3. Mounts with no `sessions.bak-<date>/` dir had nothing to migrate; just `rm` the symlink and `mkdir sessions`.
+
+---
+
 
 ## 2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)
 

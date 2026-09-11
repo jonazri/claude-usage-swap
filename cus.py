@@ -138,6 +138,8 @@ HOOK_SETTINGS_KEY = "cus"  # signature key in settings.json so we don't clobber 
 #   - .claude.json         per-account config — minimally has userID + oauthAccount
 #   - meta.yaml            our metadata (priority, locked_sessions, ts)
 #   - projects/ → ~/.claude/projects/  (symlink — shared history)
+#   - sessions/ → ~/.claude/sessions/  (symlink — shared PEER REGISTRY, so
+#                          ListAgents/SendMessage reach across mounts; GH #199)
 #   - plugins/ → ~/.claude/plugins/    (symlink — shared)
 #   - agents/, skills/, commands/, memory/ → likewise symlinked when present
 #
@@ -152,9 +154,21 @@ HOOK_SETTINGS_KEY = "cus"  # signature key in settings.json so we don't clobber 
 # `--resume` + checkpoints work under any mount. Symlinks are only created
 # when the target exists in ~/.claude/ (no dangling links), so installs that
 # lack e.g. todos/ are unaffected.
+#
+# 2026-09-11 (GH #199): added `sessions` — Claude Code's PEER REGISTRY, one
+# `<pid>.json` per live session, is what ListAgents/SendMessage read to
+# discover sibling sessions. It lives under the config dir like everything
+# else here, so a session launched into a slot mount and a bare session were
+# mutually invisible: no error at launch, the peer name simply never resolved
+# (confirmed 2026-09-04 dogfood run, again 2026-09-09 — not a permission-mode
+# effect). Sharing the registry the same way `projects/` is shared restores
+# cross-mount session mail. Unlike the other entries this one needs a
+# liveness-aware migration for mounts that already own a real dir — see
+# _drain_sessions_dir.
 SHARED_SYMLINK_SUBDIRS = [
     "projects", "plugins", "agents", "skills", "commands", "memory", "hooks", "scripts",
     "plans", "file-history", "paste-cache", "session-env", "shell-snapshots", "tasks", "todos",
+    "sessions",
 ]
 
 # Files (not dirs) symlinked from every mount to the canonical ~/.claude/ copy.
@@ -2873,6 +2887,14 @@ def scaffold_mount_dir(mount: Path) -> list[str]:
     (fold-and-relink vs leave) belongs to doctor --fix-dirs.
     """
     actions: list[str] = []
+    # GH #199: the shared peer registry may not exist yet (it only appears once
+    # a session has run bare). Create it BEFORE the link loop, otherwise the
+    # "don't create dangling links" rule skips sessions/ and the fresh mount
+    # grows its own private registry — the exact split this fix removes.
+    shared_sessions = CLAUDE_DIR / SESSIONS_SUBDIR
+    if CLAUDE_DIR.exists() and not shared_sessions.exists():
+        shared_sessions.mkdir(parents=True, exist_ok=True)
+        shared_sessions.chmod(0o700)
     if not mount.exists():
         # exist_ok=True: two racing creators can both reach here for the same
         # index (the create_slot TOCTOU); the loser must not crash on
@@ -3332,6 +3354,127 @@ def _merge_real_dir_into_shared(src: Path, dst: Path) -> tuple[int, int]:
     return merged, collisions
 
 
+# GH #199: the peer registry — `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`, one
+# file per live session, read by ListAgents/SendMessage to discover siblings —
+# is per-config-dir, so slot-mounted sessions and bare sessions never saw each
+# other. Sharing it needs more care than the generic real-dir merge used for
+# `projects/`: a long-lived mount accumulates one file per session that EVER
+# ran under it (slot-4 held 2,002 of them on 2026-09-11, nearly all dead), and
+# folding thousands of dead-pid registrations into the shared registry would
+# bury the handful of live peers every bare session reads.
+SESSIONS_SUBDIR = "sessions"
+
+# Where a mount's pre-migration registry files are parked. Dated so repeat
+# migrations never clobber an earlier park (preserve-the-log: move, never
+# delete — nothing here is ever removed by cus).
+SESSIONS_PARK_PREFIX = "sessions.bak-"
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when `pid` names a live process.
+
+    Module-level rather than inlined so the sessions migration can be tested
+    deterministically (tests monkeypatch this instead of spawning processes).
+    A PermissionError means the pid EXISTS but belongs to another user — still
+    alive, so the registry entry is not ours to park.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OverflowError, ValueError, OSError):
+        return False
+    return True
+
+
+def _session_registry_pid(path: Path) -> int | None:
+    """The pid a peer-registry entry claims: from its `<pid>.json` filename,
+    falling back to the `pid` field inside.
+
+    Filename first because that is what Claude Code keys the registry by, and
+    it still parses when the body is a truncated half-written file — exactly
+    the case where we must NOT guess "dead" and must not crash either.
+    """
+    stem = path.name[:-len(".json")] if path.name.endswith(".json") else path.name
+    if stem.isdigit():
+        return int(stem)
+    try:
+        pid = read_json(path).get("pid")
+    except (json.JSONDecodeError, OSError, AttributeError):
+        return None
+    return pid if isinstance(pid, int) else None
+
+
+def _drain_sessions_dir(src: Path, dst: Path, now: datetime | None = None) -> dict:
+    """Empty a mount's REAL `sessions/` dir so it can become a symlink to the
+    shared registry, without losing anything (move, never delete).
+
+    Entries whose pid is still LIVE are ADOPTED into the shared registry —
+    that is the point of the fix: sessions running right now become visible to
+    every other mount's ListAgents the moment their file lands in the shared
+    dir. Everything else is PARKED in `<mount>/sessions.bak-<date>/`:
+
+      - dead-pid entries      → historical noise; merging them would make the
+                                shared registry unreadable (see slot-4 above)
+      - unnameable entries    → no pid recoverable from name or body
+      - name collisions       → the shared dir already has that `<pid>.json`;
+                                the shared copy is the one Claude Code is
+                                actually maintaining, so the mount's copy is
+                                parked rather than allowed to overwrite it
+      - stray subdirs/links   → not registry files at all; never merged blind
+
+    Returns {"adopted", "parked", "left", "park_dir"}. `left` > 0 means some
+    entry could not be moved (permission/IO); the caller must then leave the
+    real dir in place and report the heal as FAILED rather than relinking over
+    live state.
+    """
+    adopted = parked = left = 0
+    park_dir: Path | None = None
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d")
+
+    def _park(child: Path) -> None:
+        nonlocal parked, left, park_dir
+        if park_dir is None:
+            park_dir = src.parent / f"{SESSIONS_PARK_PREFIX}{stamp}"
+            park_dir.mkdir(parents=True, exist_ok=True)
+        dest = park_dir / child.name
+        # A same-named park from an earlier migration on the same day is kept
+        # too (suffix bump) — this function never destroys a prior record.
+        n = 1
+        while dest.exists() or dest.is_symlink():
+            dest = park_dir / f"{child.name}.{n}"
+            n += 1
+        try:
+            shutil.move(str(child), str(dest))
+            parked += 1
+        except OSError:
+            left += 1
+
+    for child in sorted(src.iterdir()):
+        # is_symlink() checked first: exists() follows links, so a dangling
+        # symlink would otherwise read as "gone" and be skipped silently.
+        if child.is_symlink() or not child.is_file():
+            _park(child)
+            continue
+        pid = _session_registry_pid(child)
+        if pid is None or not _pid_alive(pid):
+            _park(child)
+            continue
+        target = dst / child.name
+        if target.exists() or target.is_symlink():
+            _park(child)
+            continue
+        try:
+            shutil.move(str(child), str(target))
+            adopted += 1
+        except OSError:
+            left += 1
+
+    return {"adopted": adopted, "parked": parked, "left": left, "park_dir": park_dir}
+
+
 def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
     """Check (and with fix=True, heal) one mount dir against the canonical
     layout. Idempotent: a healed mount reports no findings on re-run.
@@ -3342,6 +3485,10 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
 
       - missing symlink            → create (only if target exists in ~/.claude/)
       - symlink to wrong target    → repoint
+      - real `sessions/` dir (the peer registry) → GH #199: adopt entries whose
+        pid is still live into the shared registry, park everything else in
+        `sessions.bak-<date>/`, then relink. Never the generic merge below:
+        a mount holds one file per session that ever ran under it.
       - real DIR where symlink expected → move children into the shared target
         (skip name collisions — uuid-keyed dirs make these rare), then relink.
         If collisions remain, leave the dir and report; merging colliding
@@ -3367,6 +3514,18 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
         findings.append({"entry": entry, "problem": problem, "action": action,
                          "healed": fix if healed is None else healed})
 
+    # GH #199: every other shared subdir is created by Claude Code itself long
+    # before cus runs, but the peer registry only appears once a session has
+    # run BARE — on a box driven entirely through slots there is nothing for
+    # sessions/ to point at, and the loop below would skip it forever. Create
+    # it (0700, matching Claude Code's own mode) under --fix-dirs only, so a
+    # read-only doctor run still changes nothing.
+    if fix:
+        shared_sessions = CLAUDE_DIR / SESSIONS_SUBDIR
+        if not shared_sessions.exists():
+            shared_sessions.mkdir(parents=True, exist_ok=True)
+            shared_sessions.chmod(0o700)
+
     for sub in SHARED_SYMLINK_SUBDIRS:
         link = mount / sub
         target = CLAUDE_DIR / sub
@@ -3379,6 +3538,32 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
                     link.unlink()
                     link.symlink_to(target)
                 note(sub, f"symlink → {old_target}", f"repoint{'ed' if fix else ''} → {target}")
+            continue
+        if link.is_dir() and sub == SESSIONS_SUBDIR:
+            # GH #199: the peer registry gets a liveness-aware DRAIN, never the
+            # generic recursive merge — see _drain_sessions_dir for why folding
+            # a mount's dead registrations into the shared registry is worse
+            # than the bug it would be fixing.
+            problem = "real dir where symlink expected (peer registry not shared — GH #199)"
+            if not fix:
+                note(sub, problem,
+                     "would adopt live session entries into the shared registry, "
+                     f"park the rest in {SESSIONS_PARK_PREFIX}<date>/, and relink")
+                continue
+            drained = _drain_sessions_dir(link, target)
+            if drained["left"] or any(link.iterdir()):
+                note(sub, problem,
+                     f"adopted {drained['adopted']}, parked {drained['parked']}, "
+                     f"{drained['left']} entr(ies) could not be moved — left as real dir, "
+                     "resolve manually", healed=False)
+                continue
+            link.rmdir()
+            link.symlink_to(target)
+            parked_where = (f", parked {drained['parked']} in {drained['park_dir'].name}/"
+                            if drained["park_dir"] else "")
+            note(sub, problem,
+                 f"adopted {drained['adopted']} live session(s) into the shared registry"
+                 f"{parked_where}, relinked")
             continue
         if link.is_dir():
             if fix:
@@ -21260,6 +21445,12 @@ def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | N
     for a second INDEPENDENTLY-swappable lane, enable independent_logins, run
     `cus login-mount <free-slot> <account>`, then `cus launch <account> --lane
     <free-slot>` (GH #109).
+
+    Session mail (ListAgents / SendMessage) reaches a launched session only
+    when its slot's peer registry is SHARED (GH #199). New slots are scaffolded
+    that way; a slot created before 2026-09-11 still owns a private
+    `sessions/` dir and its sessions are invisible to bare peers until you run
+    `cus doctor --fix-dirs` once.
     """
     state = load_state()
     config = load_config()

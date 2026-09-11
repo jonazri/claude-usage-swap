@@ -254,3 +254,40 @@ this skill:
   confirm a pane is DEAD before relaunching (login shell at the bottom, no claude child)
   and to verify a nudge submitted — the sensor tells you *what* stopped and *why*, the
   pane tells you *whether a process is there to nudge*.
+
+---
+
+## Update 2026-09-11 — session mail across mounts is fixed (GH #199)
+
+**What was broken.** Claude Code's peer registry — the thing `ListAgents` lists and
+`SendMessage` addresses — lives at `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`. Every cus
+slot mount owned a *private* real `sessions/` dir, so a session launched with
+`cus launch` and a bare session were mutually invisible: no error at launch, the peer
+name simply never resolved. That is why the build-babysitter had to fall back to a file
+channel (`docs/babysitter/<date>-builder-reports.md`) for builder → babysitter reports,
+and why a watchdog in a slot could see none of the panes it was protecting.
+
+**What changed.** `sessions/` is now symlinked to the shared `~/.claude/sessions/` the
+same way `projects/` always was, in every mount-creation path (`scaffold_mount_dir`,
+the login-store and login-family scaffolds, the account-dir migration). New slots are
+born correct.
+
+**Owner step — run once per machine.** Mounts created before 2026-09-11 still own a
+private registry. Heal them with:
+
+```bash
+cus doctor            # read-only: shows which mounts still have a private sessions/
+cus doctor --fix-dirs # heals them
+```
+
+The migration is liveness-aware and never deletes: entries whose pid is still live are
+moved into the shared registry (those sessions become addressable immediately);
+dead-pid entries, unreadable files, stray subdirs and any name that already exists in
+the shared registry are parked in `<mount>/sessions.bak-<date>/`. A mount is only
+relinked once its dir is empty; if anything could not be moved, the real dir is left
+alone and `doctor` exits non-zero.
+
+**Verifying it worked:** from a bare session run `ListAgents` and confirm a slotted peer
+now appears (and vice versa). A slot whose session started *before* the migration keeps
+writing to whatever path it opened at startup — restart or relaunch that session if it
+still doesn't show.
