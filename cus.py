@@ -1354,6 +1354,13 @@ class AccountUsage:
       - poll_error: some other transport/parse failure.
       - token_expired: 401 response WITH a non-expired stored access token
         — means refresh-token-level failure, needs interactive re-login.
+        [Annotation 2026-09-14, C1/C5 (PR #210): the discriminator is no longer
+        the access token's expiry — it is refresh-token RECOVERABILITY. A 401 is
+        token_expired only when the account holds NO not-known-dead, escalation-
+        covered-or-self-healing refresh token (see
+        `_account_has_recoverable_refresh_token`). A 401 whose account still has a
+        recoverable refresh is the benign token_stale instead — the pre-flight-
+        expiry wording above is one route into token_stale, not the only one.]
       - subscription_disabled (2026-08-07, orthogonal to the above — it rides
         ALONG WITH rate_limited, not instead of it): the 429 was disambiguated
         by the OAuth profile probe as "this org's Claude subscription ENDED"
@@ -4113,14 +4120,31 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
             creds = read_json(path)
             oauth = creds.get("claudeAiOauth", {})
             return oauth.get("accessToken"), oauth.get("expiresAt")
-        except (json.JSONDecodeError, OSError):
+        # C4 (2026-09-14, PR #210 dual review): (ValueError, OSError), not
+        # (json.JSONDecodeError, OSError). Same defect as `_has_rt`: a non-UTF-8
+        # creds file makes `read_json` raise UnicodeDecodeError (a ValueError, not
+        # a JSONDecodeError), which used to escape and abort the poll on EVERY
+        # cycle from this hot path. ValueError covers both, so one bad creds file
+        # is skipped (the whole point of having multiple candidates).
+        except (ValueError, OSError):
             return None, None
 
     def _is_fresh(expires_at) -> bool:
         """Mirror poll_account_usage's staleness test: fresh iff expiresAt is
         not more than 30s in the past. An unknown/unparseable expiresAt counts
         as fresh — we can't prove it stale, and the live HTTP call will still
-        surface a real 401 as token_expired if the token is actually dead."""
+        surface a real 401 as token_expired if the token is actually dead.
+
+        Annotation 2026-09-14 (C5, PR #210): that last clause was the stale
+        assumption the false-alarm fix corrected. Post-PR #210, a real 401 does
+        NOT unconditionally surface as token_expired — it surfaces as token_expired
+        ONLY when the account has no recoverable (not-known-dead, escalation-
+        covered-or-self-healing) refresh token; otherwise the 401 is the benign
+        token_stale (see poll_account_usage's 401 branch and
+        `_account_has_recoverable_refresh_token`). The bypass this comment warns
+        about (unknown expiresAt treated as fresh) is exactly why keying the 401
+        classification off refresh recoverability rather than access-token expiry
+        was necessary."""
         if expires_at is None:
             return True
         try:
@@ -4178,6 +4202,147 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         if first_stale_pair[0] is None:
             first_stale_pair = (token, expires_at)
     return primary_pair if primary_pair[0] is not None else first_stale_pair
+
+
+def _account_has_recoverable_refresh_token(account_name: str) -> bool:
+    """True iff `account_name` still holds a refresh token that is NOT known-dead.
+
+    This is the discriminator poll_account_usage's 401 branch uses to tell a
+    BENIGN, self-healing stale access token (token_stale) apart from a real
+    browser-relogin condition (token_expired).
+
+    Why it exists (2026-09-10 false "TOKEN EXPIRED — re-auth this account" alarm,
+    GH #13 follow-up): the 401 branch used to assume "the pre-flight proved the
+    stored access token fresh, so a 401 must be a refresh-token-level failure —
+    that's token_expired." That assumption is FALSE whenever the pre-flight
+    staleness gate is bypassed. `_read_access_token_with_expiry`'s `_is_fresh`
+    deliberately treats an unknown/unparseable `expiresAt` as "fresh", and
+    poll_account_usage's `int(expiresAt)` parse sits inside a swallowing
+    try/except — so an aged-out access token whose REFRESH token is perfectly
+    valid can slip past the gate, 401 on the live call, and be mislabeled
+    token_expired. That mislabel (a) made the daemon evict slots from the account
+    (token_expired is picker-excluded, token_stale is not) and (b) prompted an
+    UNNECESSARY browser relogin. The tell it was benign: the very next poll
+    returned 429 — the token authenticates fine; a genuinely dead token 401s with
+    invalid_grant, it does not 429.
+
+    READ-ONLY by contract: this NEVER fires an OAuth grant, rotates, or writes a
+    token. OAuth refresh tokens are single-use, so probing liveness *here* would
+    risk logging out a live session (#104). The actual liveness probe and the
+    escalation of a genuinely dead refresh token live in the mature un-stale
+    machinery (`_unstale_account_snapshot` / `_sweep_unstale_idle_accounts` /
+    `cus force-poll`), which a token_stale classification routes the account into:
+    it runs `_oauth_refresh_grant` and, on a DEFINITIVE invalid_grant, sets
+    `snapshot_refresh_dead` (picker-excluded + surfaced in SOS). So routing a
+    refresh-present 401 to token_stale does NOT mask a dead refresh — it defers
+    the death certificate to the grant probe, exactly as GH #13's design intends.
+
+    This function only answers the cheap on-disk question "is self-healing even
+    possible, and not already ruled out?":
+      - False if the account is already flagged `snapshot_refresh_dead` — a prior
+        grant probe returned a definitive invalid_grant, so the refresh token is
+        KNOWN dead and this 401 IS a real relogin condition.
+      - True if a credential store for the account carries a non-empty refresh
+        token AND that store is either escalation-covered or self-healing:
+        the canonical snapshot (the store the un-stale grant probes and can
+        stamp dead), the live shared mount (only when this is the shared-active
+        account — Claude Code refreshes it transparently on first use, the
+        textbook self-heal), or a LIVE backing slot's creds.
+      - False otherwise — no refresh token anywhere, OR the only refresh lives
+        on a store with no escalation path and no self-heal — so a browser
+        relogin is genuinely required.
+
+    Annotation 2026-09-14 (C1, PR #210 dual review): source (3) was tightened
+    from "any backing slot" to "a LIVE backing slot" (see the inline comment at
+    the source-(3) loop). The canonical-scoped escalation cannot probe/kill a
+    slot's refresh, so an IDLE-slot-only refresh (canonical blank) has no
+    death-certificate path; counting it recoverable would permanently mask a dead
+    refresh as token_stale. A live slot self-heals via its own running session, so
+    it stays recoverable. This aligns the helper's "recoverable" scope with what
+    the escalation can actually probe-and-kill (canonical) plus what self-heals
+    without escalation (the live mount / a live slot).
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except Exception:
+        state = {}
+
+    # Known-dead short-circuit: honor a prior definitive invalid_grant verdict so
+    # we don't relabel a real relogin need as benign.
+    acct = (state.get("accounts") or {}).get(account_name)
+    if isinstance(acct, dict) and acct.get("snapshot_refresh_dead"):
+        return False
+
+    def _has_rt(path: Path) -> bool:
+        try:
+            if not path.exists():
+                return False
+            return _credential_refresh_token(read_json(path)) is not None
+        # C4 (2026-09-14, PR #210 dual review): broadened from
+        # (json.JSONDecodeError, OSError) to (ValueError, OSError). `read_json`
+        # opens in text mode with the default UTF-8 codec, so a creds file with
+        # non-UTF-8 bytes raises UnicodeDecodeError — a ValueError that is NOT a
+        # JSONDecodeError and was escaping this helper and ABORTING the whole poll
+        # cycle. ValueError subsumes JSONDecodeError (its own subclass) and
+        # UnicodeDecodeError, so a corrupt creds file is now swallowed as
+        # "no readable refresh token here" rather than crashing the poll.
+        except (ValueError, OSError):
+            return False
+
+    # (1) canonical snapshot — the store the un-stale grant refreshes.
+    if _has_rt(account_creds_path(account_name)):
+        return True
+    # (2) live shared mount, only when this account is the shared-active one.
+    if state.get("active") == account_name and _has_rt(CREDS_JSON):
+        return True
+    # (3) a LIVE slot backing this account — a running lane self-heals its creds.
+    #
+    # C1 (2026-09-14, PR #210 dual review — close the masking gap): tightened from
+    # "ANY backing slot" to "a slot with a session actually running on it
+    # (mount_in_use)". WHY THIS MATTERS FOR THE INVARIANT "nothing genuinely dead
+    # is permanently masked as token_stale":
+    #
+    #   The ONLY escalation that stamps a refresh dead — `_unstale_account_snapshot`
+    #   / the un-stale sweep → `_oauth_refresh_grant` → `snapshot_refresh_dead` — is
+    #   CANONICAL-scoped: it reads only `account_creds_path` (the snapshot), never a
+    #   slot's or the mount's `.credentials.json`. So a refresh reachable ONLY via a
+    #   slot has NO death-certificate path. Left as "any slot" (the pre-C1 code), a
+    #   DEAD refresh sitting on an IDLE slot while the canonical snapshot is
+    #   blank/absent would be labeled token_stale on every poll and NEVER escalate
+    #   to token_expired — a PERMANENT mask, precisely the invariant C1 exists to
+    #   protect.
+    #
+    #   A LIVE slot is the safe exception, and the whole reason source (3) exists:
+    #   the Claude Code process running on it refreshes its own `.credentials.json`
+    #   transparently on the next API call (the textbook self-heal), so a live-slot
+    #   refresh is genuinely recoverable WITHOUT any escalation — and a genuinely
+    #   dead one surfaces LOUDLY as that live session logging out (caught by the
+    #   logout-scan watchdog), never as a silent token_stale that sits forever. An
+    #   IDLE slot has no self-heal and no escalation can probe it, so an
+    #   idle-slot-only refresh must NOT count as recoverable → the 401 then
+    #   classifies token_expired (the safe pre-PR behavior the fix falls back to).
+    #
+    #   We deliberately do NOT probe the slot's refresh here to decide liveness:
+    #   rotating a live lane's single-use refresh token would log it out (#104), and
+    #   this helper is read-only by contract. `mount_in_use` (a /proc scan, the same
+    #   predicate `_read_access_token_with_expiry` uses to rank live-vs-idle slots)
+    #   is the cheap, side-effect-free liveness signal.
+    for slot_name, entry in (state.get("slots") or {}).items():
+        if (entry or {}).get("account") != account_name:
+            continue
+        slot_dir = slot_path(slot_name)
+        try:
+            slot_live = mount_in_use(slot_dir)
+        except Exception:
+            # mount_in_use walks /proc; a probe failure must never crash the poll.
+            # Fail CLOSED (treat as not-live) — the conservative side for the
+            # invariant: an unprovable slot cannot be allowed to mask a dead
+            # refresh as recoverable. A false not-live at worst yields a
+            # token_expired that self-heals on the next token_stale/429 recovery.
+            slot_live = False
+        if slot_live and _has_rt(slot_dir / ".credentials.json"):
+            return True
+    return False
 
 
 def _refresh_account_token(account_name: str, creds_path: Path | None = None) -> bool:
@@ -4322,6 +4487,12 @@ def _unstale_account_snapshot(account: str, state: dict, config: dict | None = N
     # Only the recoverable idle case: stale but NOT hard-expired (a real 401 on a
     # non-expired stored token is token_expired — that needs a browser relogin, not
     # a refresh grant).
+    # Annotation 2026-09-14 (C5, PR #210): "a real 401 on a non-expired stored token
+    # is token_expired" now reads via refresh recoverability, not the access token's
+    # expiry — a 401 is token_expired only when there is no recoverable refresh
+    # token (see poll_account_usage's 401 branch). The gate below is unchanged and
+    # still correct: this un-stale path acts only on accounts already classified
+    # token_stale (and not token_expired), i.e. the recoverable ones.
     if not acct.get("token_stale") or acct.get("token_expired"):
         return False
     # Poll-burnout backoff (per account, success OR fail), bypassed by force.
@@ -4786,9 +4957,12 @@ def poll_account_usage(account_name: str) -> AccountUsage:
       - token_stale: stored access token's expiresAt is in the past. Don't
         even attempt the HTTP call — we know we'd get 401 and the account
         is recoverable (refresh token still valid). NOT an SOS condition.
+        Also set on an actual HTTP 401 when the account still holds a
+        not-known-dead refresh token (see the 401 branch — 2026-09-10).
       - rate_limited: HTTP 429.
-      - token_expired: HTTP 401 despite the stored access token being
-        within its expiresAt window — real auth failure needing re-login.
+      - token_expired: HTTP 401 AND the account has NO usable refresh token
+        (or its refresh token is already known-dead via snapshot_refresh_dead)
+        — the only genuinely-needs-a-browser-relogin condition.
       - poll_error: any other transport/parse failure.
 
     GH #13: previously ANY 401 was treated as token_expired. That produced
@@ -4796,6 +4970,15 @@ def poll_account_usage(account_name: str) -> AccountUsage:
     out (>1 hour since the last swap-to-this-account), because we wrote
     the access token to storage at swap-time but only the LIVE creds file
     gets the periodic refresh.
+
+    2026-09-10 (GH #13 follow-up): the expiresAt pre-flight below can be
+    BYPASSED (unknown/unparseable expiresAt → _is_fresh treats it as fresh;
+    the int() parse is in a swallowing try/except), so a benign stale access
+    token could still reach the HTTP 401 branch and get mislabeled
+    token_expired — the false "TOKEN EXPIRED — re-auth this account" alarm.
+    The 401 branch now keys off refresh-token recoverability
+    (`_account_has_recoverable_refresh_token`), not the access token's expiry,
+    so a refresh-present 401 degrades to the benign token_stale path instead.
 
     2026-07-02 (token_self_refresh): before falling back to token_stale, try
     a self-refresh via _refresh_account_token. On success this re-reads a
@@ -4857,12 +5040,43 @@ def poll_account_usage(account_name: str) -> AccountUsage:
         u = AccountUsage.empty()
         body_preview = e.read()[:200].decode(errors="replace") if e.fp else ""
         if e.code == 401:
-            # We pre-checked expiresAt above and the token was within its
-            # validity window — so a 401 HERE means refresh-token-level
-            # failure (or Anthropic key rotation, or account revoked).
-            # That's the real token_expired condition.
+            # GH #13 follow-up (2026-09-10 false "TOKEN EXPIRED — re-auth this
+            # account" alarm): a 401 does NOT by itself prove a relogin is needed.
+            # The historical assumption here — "the pre-flight above proved the
+            # stored access token fresh, so a 401 must be a refresh-token-level
+            # failure = token_expired" — breaks whenever the pre-flight staleness
+            # gate was BYPASSED: `_read_access_token_with_expiry`'s `_is_fresh`
+            # treats an unknown/unparseable `expiresAt` as "fresh", and the
+            # `int(expiresAt)` parse above is wrapped in a swallowing try/except.
+            # So an aged-out access token whose REFRESH token is still perfectly
+            # valid can reach this branch and 401 — and was then mislabeled
+            # token_expired, which evicted the account's slots (token_expired is
+            # picker-excluded) and prompted an UNNECESSARY browser relogin. The
+            # tell it was benign: the very next poll returned 429, i.e. the token
+            # authenticates; a genuinely dead token 401s with invalid_grant.
+            #
+            # Correct rule (the refresh token, not the access token's expiry, is
+            # the recoverability signal): a 401 whose account still holds a
+            # not-known-dead refresh token is a BENIGN, self-healing token_stale
+            # condition. Routing it to token_stale hands the account to the mature
+            # un-stale machinery (_unstale_account_snapshot /
+            # _sweep_unstale_idle_accounts / `cus force-poll`), which fires the
+            # `_oauth_refresh_grant` liveness probe and ONLY escalates a genuinely
+            # dead refresh (definitive invalid_grant) via `snapshot_refresh_dead`.
+            # Nothing is masked — the death certificate is just deferred to the
+            # grant probe. Only when NO usable refresh token exists (or it is
+            # already known-dead) is a browser relogin truly required: that stays
+            # token_expired, preserving the real detection GH #13 added.
+            if _account_has_recoverable_refresh_token(account_name):
+                u.token_stale = True
+                u.raw = {
+                    "error": "HTTP 401 with a still-valid refresh token — "
+                             f"self-heals on next use, NOT a relogin: {body_preview}",
+                }
+                return u
             u.token_expired = True
-            u.raw = {"error": f"HTTP 401 despite non-expired stored token: {body_preview}"}
+            u.raw = {"error": "HTTP 401 and no usable refresh token "
+                              f"(needs browser relogin): {body_preview}"}
             return u
         elif e.code == 429:
             # Account is currently rate-limited by Anthropic. Flag it; do NOT
@@ -9877,8 +10091,13 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
     Each per-account update follows one of six exclusive branches:
       0. token_stale (stored access token aged out — refresh token still
          valid) — flag and preserve prior percentages, NO SOS escalation
-      1. token_expired (HTTP 401 despite non-expired stored token) — real
+      1. token_expired (HTTP 401 with NO recoverable refresh token) — real
          auth failure, flag and preserve prior percentages
+         [Annotation 2026-09-14, C5 (PR #210): described as "401 despite non-
+         expired stored token" pre-PR; the true condition is a 401 whose account
+         has no not-known-dead, escalation-covered-or-self-healing refresh token
+         (see `_account_has_recoverable_refresh_token`), not the access token's
+         expiry.]
       1.5. subscription_disabled (2026-08-07: 429 disambiguated by the
          profile probe as "org's Claude subscription ENDED") — flag for
          auto-exclusion (see _disabled_accounts), keep rate_limited set
@@ -9915,7 +10134,9 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["last_poll_ts"] = u.polled_at
             continue
 
-        # Branch 1: token expired (401 despite non-expired stored token)
+        # Branch 1: token expired (401 with NO recoverable refresh token — C5,
+        # PR #210: the classifier keys off refresh recoverability, not the access
+        # token's expiry; see poll_account_usage's 401 branch).
         if u.token_expired:
             acct["token_expired"] = True
             acct.pop("token_stale", None)
@@ -17787,8 +18008,15 @@ def poll(account: str | None, no_write: bool) -> None:
         # poll_error), so say so explicitly to preempt the "will it ever swap
         # to it?" worry that GH #68 documents.
         if u.token_stale:
-            minutes = u.raw.get("expired_minutes_ago", "?")
-            click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable and swap-eligible).")
+            # C5 (2026-09-14, PR #210 dual review): guard the "expired Nm ago" text.
+            # The pre-flight-expiry path sets `expired_minutes_ago`; a 401-origin
+            # token_stale (PR #210 branch) does not, so "expired ?m ago" would be
+            # nonsense — say it plainly without the "?m" when N is unknown.
+            minutes = u.raw.get("expired_minutes_ago")
+            staleness = (f"stored access token expired {minutes}m ago"
+                         if minutes is not None
+                         else "stored access token was rejected (HTTP 401)")
+            click.echo(f"  TOKEN_STALE — {staleness} (refresh token still valid; account remains usable and swap-eligible).")
             continue
         if u.token_expired:
             # GH #77 auto-heal hint: for the ACTIVE account, poll reads the
@@ -17882,12 +18110,43 @@ def force_poll(account: str) -> None:
                 sys.exit(4)
             acct = state["accounts"][account]
         if u.token_stale:
-            # Un-stale failed (dead refresh token) OR the re-poll is somehow still
-            # stale — don't loop; record and exit with the recoverable-stale note.
-            minutes = u.raw.get("expired_minutes_ago", "?")
-            click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token "
-                       f"still valid; account remains usable). A direct refresh grant could not revive "
-                       f"it now; if it persists, re-login: cus relogin {account}.")
+            # C3 (2026-09-14, PR #210 dual review): tell "the forced un-stale proved
+            # the refresh DEAD" apart from "still stale for a transient reason". The
+            # `_unstale_account_snapshot` call above runs an OAuth refresh grant; on a
+            # DEFINITIVE invalid_grant it stamps `snapshot_refresh_dead` on the
+            # account (state branch 0 for token_stale never touches that flag, so it
+            # survives the update above). When it is set, the refresh token genuinely
+            # needs a browser relogin — so force-poll must surface the LOUD TOKEN
+            # EXPIRED verdict and exit 2 IN THE SAME RUN, not the benign "refresh
+            # token still valid; account remains usable" note + exit 0 (which would
+            # send the operator away believing the account is fine). Reclassify to
+            # token_expired, persist it (state branch 1) so `cus status` agrees, then
+            # print + exit like the token_expired branch below.
+            if acct.get("snapshot_refresh_dead"):
+                u.token_stale = False
+                u.token_expired = True
+                u.raw = {"error": "HTTP 401; the forced un-stale refresh grant returned "
+                                  "invalid_grant — refresh token is dead, needs browser relogin"}
+                update_state_with_usage(state, {account: u})
+                save_state(state)
+                click.echo(f"  TOKEN EXPIRED — the direct refresh grant returned invalid_grant "
+                           f"(refresh token dead); re-auth this account "
+                           f"(`cus relogin {account}` shows the right command)")
+                sys.exit(2)
+            # Un-stale failed for a NON-dead reason (network/endpoint "unknown"
+            # verdict, or no canonical snapshot to probe) OR the re-poll is somehow
+            # still stale — don't loop; record and exit with the recoverable note.
+            # C5 (2026-09-14): only mention "expired Nm ago" when we actually KNOW N.
+            # The pre-flight-expiry path sets `expired_minutes_ago`, but a 401-origin
+            # token_stale (the PR #210 branch) does not — printing "expired ?m ago"
+            # there is nonsense, so say it plainly without the "?m".
+            minutes = u.raw.get("expired_minutes_ago")
+            staleness = (f"stored access token expired {minutes}m ago"
+                         if minutes is not None
+                         else "stored access token was rejected (HTTP 401)")
+            click.echo(f"  TOKEN_STALE — {staleness} (refresh token still valid; account "
+                       f"remains usable). A direct refresh grant could not revive it now; "
+                       f"if it persists, re-login: cus relogin {account}.")
             update_state_with_usage(state, {account: u})
             save_state(state)
             sys.exit(0)
