@@ -261,7 +261,9 @@ this skill:
 
 **What was broken.** Claude Code's peer registry — the thing `ListAgents` lists and
 `SendMessage` addresses — lives at `<CLAUDE_CONFIG_DIR>/sessions/`. Each live session
-publishes a **pair**: `<pid>.json` (metadata, includes `pid` + `procStart`) and
+publishes a **pair**: `<pid>.json` (metadata, includes `pid`; `procStart` is
+present on some shapes and omitted on others — 4 of 5 live shared-registry
+`.json` files on 2026-09-14 had none) and
 `<pid>.<sha256>.key` (`peerToken` / `pidDomain` / `procStart` — no `pid`). Every cus
 slot mount owned a *private* real `sessions/` dir, so a session launched with
 `cus launch` and a bare session were mutually invisible: no error at launch, the peer
@@ -293,10 +295,13 @@ cus doctor --fix-sessions
 # cus doctor --fix-dirs
 ```
 
-The migration never deletes. Live pairs are **not moved** (conversion deferred). Dead
-pairs and orphan files are parked as units in `<mount>/sessions.bak-<date>/`. A mount
-is only relinked once its dir is empty; if anything could not be moved, the real dir is
-left alone and `doctor` exits non-zero.
+The migration never deletes. Live pairs, and pairs whose liveness cannot be
+confirmed (no readable `procStart`, or `/proc` unreadable), are **not moved**
+(conversion deferred — a false live is a deferral; a false dead parks a running
+session's peerToken). Dead pairs and orphan files are parked as units in
+`<mount>/sessions.bak-<date>/`. A mount is only relinked once its dir is empty;
+if anything could not be moved, the real dir is left alone and `doctor` exits
+non-zero.
 
 **Verifying it worked:** from a bare session run `ListAgents` and confirm a slotted peer
 now appears (and vice versa). A slot whose session was live during a deferred heal still

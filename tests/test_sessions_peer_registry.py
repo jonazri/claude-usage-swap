@@ -7,10 +7,11 @@ session publishes a PAIR: `<pid>.json` (metadata) and `<pid>.<sha256>.key`
 private real `sessions/` dir, a session launched with `cus launch` and a bare
 session were mutually invisible.
 
-Covers (fix pass 1 / dual-review F-B-1..7, F-A-1..3):
+Covers (fix pass 1 / dual-review F-B-1..7, F-A-1..3; fix pass 2 F-B-R1-1/2):
   - scaffold paths create shared sessions/ and symlink it
   - doctor dry run: reports drift, changes nothing
   - live pair → deferred (files untouched, not relinked)
+  - unknown liveness (no procStart + corrupt key) → deferred, nothing moved
   - dead / recycled-pid pairs + orphan files → parked as units, then relink
   - ENOTEMPTY on rmdir → re-scan / defer, no sweep crash
   - wrong-target sessions symlink repointed
@@ -23,6 +24,7 @@ Run under pytest: pytest tests/test_sessions_peer_registry.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -62,9 +64,14 @@ class _Env:
         cus.ACCOUNTS_DIR = self.accounts_dir
         # Liveness is /proc + procStart in production; tests declare it so no
         # real process has to be spawned (and no real pid can be misread).
-        # Signature matches cus._pid_alive(pid, proc_start=None).
+        # Drain calls `_pid_liveness` (live/dead/unknown); `_pid_alive` is the
+        # bool wrapper. Patch both so either call site stays deterministic.
+        self._saved_liveness = cus._pid_liveness
         self._saved_alive = cus._pid_alive
         self.live_pids: set[int] = set()
+        cus._pid_liveness = (
+            lambda pid, proc_start=None: "live" if pid in self.live_pids else "dead"
+        )
         cus._pid_alive = lambda pid, proc_start=None: pid in self.live_pids
 
     @property
@@ -74,6 +81,7 @@ class _Env:
     def restore(self) -> None:
         for k, v in self._saved.items():
             setattr(cus, k, v)
+        cus._pid_liveness = self._saved_liveness
         cus._pid_alive = self._saved_alive
         self._tmp.cleanup()
 
@@ -191,6 +199,9 @@ def test_live_pair_defers_conversion_and_moves_nothing():
         assert (real / "222.json").exists(), "deferral moves nothing, including dead pairs"
         assert not list(env.mount.glob("sessions.bak-*"))
         assert not list(env.shared_sessions.iterdir())
+        drained = cus._drain_sessions_dir(real, env.shared_sessions)
+        assert drained["parked"] == 0  # F-B-R1-2: documented key on the early return
+        assert drained["deferred_pids"] == [111]
     finally:
         env.restore()
 
@@ -353,11 +364,65 @@ def test_doctor_cmd_dry_run_flag_writes_nothing():
         env.restore()
 
 
-def test_pid_alive_rejects_nonpositive_and_requires_proc_start():
-    """F-B-9 / F-B-2: pid<=0 never live; missing procStart never live."""
+def test_pid_alive_rejects_nonpositive_and_fail_open_when_unknown():
+    """F-B-9 / F-B-R1-1: pid<=0 is dead; missing procStart or unreadable /proc is unknown→live."""
     assert cus._pid_alive(0, "1") is False
     assert cus._pid_alive(-1, "1") is False
-    assert cus._pid_alive(1, None) is False
+    assert cus._pid_liveness(0, "1") == "dead"
+    me = os.getpid()
+    assert cus._pid_liveness(me, None) == "unknown"
+    assert cus._pid_alive(me, None) is True
+    with mock.patch.object(cus, "_proc_start_ticks", return_value=None):
+        assert cus._pid_liveness(me, "999") == "unknown"
+        assert cus._pid_alive(me, "999") is True
+    # Mismatched procStart is recycled → confirmed dead (F-B-2 still holds).
+    assert cus._pid_liveness(me, "1") == "dead"
+    assert cus._pid_alive(me, "1") is False
+
+
+def test_live_pid_json_without_procstart_and_corrupt_key_defers():
+    """F-B-R1-1: live pid + .json without procStart + corrupt .key → defer, move nothing.
+
+    This is the live shared-registry shape (4 of 5 entries on 2026-09-14): the
+    `.json` has no `procStart`, so liveness rests on the `.key`. A missing or
+    unparseable key must fail OPEN (defer), not park the running session's
+    peerToken. Uses this process's real pid and the real `_pid_liveness`.
+    """
+    env = _Env()
+    try:
+        # Restore the real liveness probes — the fixture is the fail-open path.
+        cus._pid_liveness = env._saved_liveness
+        cus._pid_alive = env._saved_alive
+        pid = os.getpid()
+        real = env.mount / "sessions"
+        real.mkdir()
+        (real / f"{pid}.json").write_text(json.dumps({
+            "pid": pid,
+            "sessionId": f"sess-{pid}",
+            "cwd": "/home/user/repo",
+            "entrypoint": "cli",
+            "kind": "interactive",
+            # no procStart — the live shared-registry shape
+        }))
+        (real / f"{pid}.deadbeef.key").write_text("not-json{{{")
+
+        findings = cus.doctor_mount(env.mount, fix=True)
+        entry = next(f for f in findings if f["entry"] == "sessions")
+        assert not entry["healed"], entry
+        assert f"deferred (liveness unknown: pids {pid})" in entry["action"], entry["action"]
+        assert (real / f"{pid}.json").exists(), "unknown liveness must not move the pair"
+        assert (real / f"{pid}.deadbeef.key").exists()
+        assert not (env.mount / "sessions").is_symlink()
+        assert not list(env.mount.glob("sessions.bak-*"))
+        assert not list(env.shared_sessions.iterdir())
+
+        # The early-return dict carries the documented parked key (F-B-R1-2).
+        drained = cus._drain_sessions_dir(real, env.shared_sessions)
+        assert drained["parked"] == 0
+        assert drained["unknown_pids"] == [pid]
+        assert drained["deferred_pids"] == []
+    finally:
+        env.restore()
 
 
 def test_registry_pid_from_key_prefix_and_json_fallback():

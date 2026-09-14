@@ -49,6 +49,9 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ### Correction 2026-09-14 (fix pass 1 on PR #211)
 Dual-review (F-B-1/2 + F-A-4) amended the decision without reversing the "sessions stays inside `--fix-dirs`" invariant: `--fix-sessions` was **added as a narrower alias** (sessions-only heal) for the safer owner path, while `--fix-dirs` still heals sessions/ as part of the full layout so it can never claim "all mounts canonical" while the peer registry is partitioned. Live pairs are now **deferred** (not moved into shared). One registry entry = `.json` + `.key`. Count corrected to 1,001 × 2. Walk-back step 1 PR number fixed (#211, was #207).
 
+### Correction 2026-09-14 (fix pass 2 on PR #211)
+F-B-R1-1: unknown liveness (`procStart` missing from `.json` — 4 of 5 live shared-registry entries that day — and `.key` missing/corrupt, or `/proc` unreadable) fails OPEN. The drain treats those pids as live and defers the mount (`deferred (liveness unknown: pids …)`) instead of parking a running session's peerToken. Walk-back is still revert of the PR-branch commit.
+
 ---
 
 

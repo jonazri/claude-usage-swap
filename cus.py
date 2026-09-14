@@ -158,7 +158,9 @@ HOOK_SETTINGS_KEY = "cus"  # signature key in settings.json so we don't clobber 
 #
 # 2026-09-11 (GH #199): added `sessions` — Claude Code's PEER REGISTRY.
 # One live session publishes TWO files under `<CLAUDE_CONFIG_DIR>/sessions/`:
-# `<pid>.json` (session metadata, includes `pid` + `procStart`) and
+# `<pid>.json` (session metadata, includes `pid`; `procStart` is present on
+# some shapes and omitted on others — 4 of 5 live shared-registry `.json`
+# files on 2026-09-14 had no `procStart`) and
 # `<pid>.<sha256>.key` (`peerToken` / `pidDomain` / `procStart` — no `pid`).
 # ListAgents/SendMessage read that pair to discover siblings. It lives under
 # the config dir like everything else here, so a session launched into a slot
@@ -3418,33 +3420,51 @@ def _proc_start_ticks(pid: int) -> str | None:
         return None
 
 
-def _pid_alive(pid: int, proc_start: str | None = None) -> bool:
-    """True when `pid` is a live process AND (when given) matches `procStart`.
+def _pid_liveness(pid: int, proc_start: str | None = None) -> str:
+    """`'live' | 'dead' | 'unknown'` for one registry pid.
 
     Module-level so the sessions migration can be tested deterministically
     (tests monkeypatch this instead of spawning processes). A PermissionError
     on kill means the pid EXISTS but belongs to another user — still a live
-    holder for the kill half of the check. Without a matching `procStart` we
-    refuse to call the pid live: a recycled pid must be parked, not treated as
-    the session that wrote the registry files (F-B-2). `pid <= 0` is never live
-    (F-B-9: `os.kill(0, 0)` / `os.kill(-1, 0)` are the wrong questions).
+    holder for the kill half of the check. `pid <= 0` is never live (F-B-9:
+    `os.kill(0, 0)` / `os.kill(-1, 0)` are the wrong questions).
+
+    A matching `procStart` vs `/proc/<pid>/stat` starttime is the anti-pid-reuse
+    token (F-B-2). When that token is *unavailable* — `proc_start is None`
+    (the live shared-registry `.json` often omits it; a missing/corrupt `.key`
+    then leaves nothing to compare) or `/proc` is unreadable — we return
+    `'unknown'`, not `'dead'`. The drain treats unknown as LIVE and defers
+    the mount (F-B-R1-1): a false live costs a deferral, a false dead parks a
+    running session's peerToken. A *mismatched* `procStart` is still `'dead'`
+    (recycled pid).
     """
     if not isinstance(pid, int) or pid <= 0:
-        return False
+        return "dead"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return "dead"
     except PermissionError:
         pass
     except (OverflowError, ValueError, OSError):
-        return False
+        return "dead"
     if proc_start is None:
-        return False
+        return "unknown"
     actual = _proc_start_ticks(pid)
     if actual is None:
-        return False
-    return str(proc_start) == actual
+        return "unknown"
+    return "live" if str(proc_start) == actual else "dead"
+
+
+def _pid_alive(pid: int, proc_start: str | None = None) -> bool:
+    """True when the pid is live *or* liveness is unknown (F-B-R1-1 fail-open).
+
+    Wrapper over `_pid_liveness`: anything that is not confirmed `'dead'` is
+    treated as live so the drain defers instead of parking. Tests that only
+    need a bool keep patching this; the drain itself calls `_pid_liveness` so
+    the action string can say `liveness unknown` vs `live sessions`.
+    """
+    return _pid_liveness(pid, proc_start) != "dead"
 
 
 def _session_registry_pid(path: Path) -> int | None:
@@ -3492,23 +3512,29 @@ def _drain_sessions_dir(src: Path, dst: Path, now: datetime | None = None) -> di
     pair together.
 
     LIVE pairs are NEVER moved — healing under a running process would yank the
-    peerToken out from under Claude Code. If any live pair is present the whole
-    conversion is DEFERRED: nothing is moved, the real dir stays, and the
-    caller reports `deferred (live sessions: pids …)`.
+    peerToken out from under Claude Code. UNKNOWN liveness (no readable
+    `procStart`, or `/proc` unreadable) is treated the same way (F-B-R1-1):
+    fail open, defer the mount, do not move the pair. If any live *or* unknown
+    pair is present the whole conversion is DEFERRED: nothing is moved, the
+    real dir stays, and the caller reports `deferred (live sessions: pids …)`
+    and/or `deferred (liveness unknown: pids …)`.
 
-    When no live pair remains, every complete dead pair and every orphan file
-    is PARKED in `<mount>/sessions.bak-<date>/` (move, never delete). Dead
-    registrations are never folded into the shared registry — that would bury
-    the live peers ListAgents actually reads. `adopted` counts pairs moved
-    into `dst`; under the defer-if-live policy it stays 0 (live pairs defer,
-    dead pairs park). `dst` is retained for call-site symmetry.
+    When no live/unknown pair remains, every complete dead pair and every
+    orphan file is PARKED in `<mount>/sessions.bak-<date>/` (move, never
+    delete). Dead registrations are never folded into the shared registry —
+    that would bury the live peers ListAgents actually reads. `adopted` counts
+    pairs moved into `dst`; under the defer-if-live policy it stays 0 (live
+    pairs defer, dead pairs park). `dst` is retained for call-site symmetry.
 
     Returns {"adopted", "parked_orphans", "parked_pairs", "parked",
-    "deferred_pids", "left", "park_dir"}. Non-empty `deferred_pids` or
-    `left` > 0 means the caller must leave the real dir in place (healed=False).
+    "deferred_pids", "unknown_pids", "left", "park_dir"}. Non-empty
+    `deferred_pids` / `unknown_pids` or `left` > 0 means the caller must
+    leave the real dir in place (healed=False). The early-return dict always
+    includes `"parked": 0` (F-B-R1-2) so callers can index the documented key.
     """
     adopted = parked_orphans = parked_pairs = left = 0
     deferred_pids: list[int] = []
+    unknown_pids: list[int] = []
     park_dir: Path | None = None
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d")
 
@@ -3544,17 +3570,24 @@ def _drain_sessions_dir(src: Path, dst: Path, now: datetime | None = None) -> di
             continue
         groups.setdefault(pid, []).append(child)
 
-    # Live check first — if ANY pair is live, move nothing (F-B-1 deferral).
+    # Live / unknown check first — if ANY pair is not confirmed dead, move
+    # nothing (F-B-1 deferral; F-B-R1-1 fail-open). Uses `_pid_liveness` so
+    # the action string can distinguish confirmed-live from unknown.
     for pid, files in sorted(groups.items()):
         proc_start = _registry_pair_proc_start(files)
-        if _pid_alive(pid, proc_start):
+        status = _pid_liveness(pid, proc_start)
+        if status == "live":
             deferred_pids.append(pid)
-    if deferred_pids:
+        elif status == "unknown":
+            unknown_pids.append(pid)
+    if deferred_pids or unknown_pids:
         return {
             "adopted": 0,
             "parked_orphans": 0,
             "parked_pairs": 0,
+            "parked": 0,  # F-B-R1-2: documented key, always present
             "deferred_pids": deferred_pids,
+            "unknown_pids": unknown_pids,
             "left": 0,
             "park_dir": None,
         }
@@ -3581,6 +3614,7 @@ def _drain_sessions_dir(src: Path, dst: Path, now: datetime | None = None) -> di
         "parked_pairs": parked_pairs,
         "parked": parked_orphans + parked_pairs,  # legacy sum for callers
         "deferred_pids": [],
+        "unknown_pids": [],
         "left": left,
         "park_dir": park_dir,
     }
@@ -3597,9 +3631,10 @@ def doctor_mount(mount: Path, fix: bool = False, sessions_only: bool = False) ->
       - missing symlink            → create (only if target exists in ~/.claude/)
       - symlink to wrong target    → repoint
       - real `sessions/` dir (the peer registry) → GH #199: if any LIVE
-        `<pid>.json`+`<pid>.*.key` pair is present, DEFER (move nothing, leave
-        the real dir). Otherwise park dead pairs + orphan files in
-        `sessions.bak-<date>/`, then relink. Never the generic merge below.
+        *or liveness-unknown* `<pid>.json`+`<pid>.*.key` pair is present,
+        DEFER (move nothing, leave the real dir). Otherwise park dead pairs
+        + orphan files in `sessions.bak-<date>/`, then relink. Never the
+        generic merge below.
       - real DIR where symlink expected → move children into the shared target
         (skip name collisions — uuid-keyed dirs make these rare), then relink.
         If collisions remain, leave the dir and report; merging colliding
@@ -3630,16 +3665,22 @@ def doctor_mount(mount: Path, fix: bool = False, sessions_only: bool = False) ->
                          "healed": fix if healed is None else healed})
 
     def _sessions_action(drained: dict, *, relinked: bool, leftover: bool = False) -> str:
-        """F-B-6: distinguish adopted pairs / parked orphans / deferred live."""
+        """F-B-6 / F-B-R1-1: distinguish adopted / parked / deferred live / unknown."""
         parts = [f"adopted {drained['adopted']} pairs"]
         if drained.get("parked_pairs"):
             parts.append(f"parked {drained['parked_pairs']} pairs")
         parts.append(f"parked {drained.get('parked_orphans', 0)} orphan files")
         if drained.get("park_dir"):
             parts[-1] += f" in {drained['park_dir'].name}/"
+        live_bits: list[str] = []
         if drained.get("deferred_pids"):
             pids = ", ".join(str(p) for p in drained["deferred_pids"])
-            return f"deferred (live sessions: pids {pids}) — left as real dir"
+            live_bits.append(f"live sessions: pids {pids}")
+        if drained.get("unknown_pids"):
+            pids = ", ".join(str(p) for p in drained["unknown_pids"])
+            live_bits.append(f"liveness unknown: pids {pids}")
+        if live_bits:
+            return f"deferred ({'; '.join(live_bits)}) — left as real dir"
         if drained.get("left"):
             parts.append(f"{drained['left']} entr(ies) could not be moved — left as real dir")
         elif leftover:
@@ -3685,7 +3726,7 @@ def doctor_mount(mount: Path, fix: bool = False, sessions_only: bool = False) ->
                      "live session pair is present")
                 continue
             drained = _drain_sessions_dir(link, target)
-            if drained.get("deferred_pids"):
+            if drained.get("deferred_pids") or drained.get("unknown_pids"):
                 note(sub, problem, _sessions_action(drained, relinked=False), healed=False)
                 continue
             if drained["left"] or any(link.iterdir()):
@@ -3713,7 +3754,10 @@ def doctor_mount(mount: Path, fix: bool = False, sessions_only: bool = False) ->
                     drained["park_dir"] = drained2["park_dir"]
                 drained["deferred_pids"] = list(drained.get("deferred_pids") or []) + list(
                     drained2.get("deferred_pids") or [])
-                if drained.get("deferred_pids") or drained["left"] or any(link.iterdir()):
+                drained["unknown_pids"] = list(drained.get("unknown_pids") or []) + list(
+                    drained2.get("unknown_pids") or [])
+                if (drained.get("deferred_pids") or drained.get("unknown_pids")
+                        or drained["left"] or any(link.iterdir())):
                     note(sub, problem,
                          f"{_sessions_action(drained, relinked=False, leftover=True)} "
                          "(ENOTEMPTY re-scan)", healed=False)

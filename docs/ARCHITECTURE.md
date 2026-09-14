@@ -199,13 +199,15 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 
 **Peer-registry migration (GH #199, 2026-09-11; amended 2026-09-14 fix pass 1).** A mount that predates the fix owns a real `sessions/` dir holding one **pair** per session that *ever* ran under it (slot-4 held **1,001 sessions × (`.json` + `.key`) = 2,002 names** on 2026-09-11, nearly all dead). `cus doctor --fix-sessions` (or `--fix-dirs`, which also covers sessions/ as part of the full layout) therefore drains it rather than merging it:
 
-- if any pair is **still live** (`os.kill(pid, 0)` **and** `procStart` matches `/proc/<pid>/stat` starttime), conversion is **deferred**: the live pair is left in place, nothing is moved, `healed=False`. Do not heal under a running process;
+- if any pair is **still live** (`os.kill(pid, 0)` **and** `procStart` matches `/proc/<pid>/stat` starttime), **or liveness is unknown** (`procStart` unreadable — the live shared-registry `.json` often omits it, so a missing/corrupt `.key` leaves nothing to compare — or `/proc` is unreadable), conversion is **deferred**: the pair is left in place, nothing is moved, `healed=False`. Do not heal under a running process. A false "live" costs a deferral; a false "dead" parks a running session's peerToken (F-B-R1-1);
 - otherwise every complete dead pair and every orphan file is **parked** as a unit in `<mount>/sessions.bak-<date>/`. Nothing is deleted. Dead registrations are never folded into the shared registry;
-- only once the dir is empty is it replaced with the symlink. `rmdir` ENOTEMPTY races re-scan once, then defer that mount — the doctor sweep continues. Action strings distinguish `adopted N pairs` / `parked N orphan files` / `deferred (live sessions: pids …)`. Exit code **1** whenever findings remain (including the read-only dry-run) — by design.
+- only once the dir is empty is it replaced with the symlink. `rmdir` ENOTEMPTY races re-scan once, then defer that mount — the doctor sweep continues. Action strings distinguish `adopted N pairs` / `parked N orphan files` / `deferred (live sessions: pids …)` / `deferred (liveness unknown: pids …)`. Exit code **1** whenever findings remain (including the read-only dry-run) — by design.
 
 New mounts are born correct: every mount-creation path (`scaffold_mount_dir`, login-store / login-family scaffolds, account-dir migration, `cus add`, `init` import) creates `~/.claude/sessions/` when missing so the symlink is never skipped as dangling. Doctor also visits `logins/<acct>/family-N/`.
 
 > Prior text (2026-09-11): claimed "one file per session (slot-4 held 2,002)" and "live pids are moved into the shared registry". Corrected above after dual-review F-B-1/F-B-2: one entry = two files; live pairs are deferred, not moved.
+>
+> Annotation 2026-09-14 (fix pass 2 / F-B-R1-1): unknown liveness fails OPEN (defer), not closed (park). The `.json` does not always carry `procStart` — 4 of 5 live shared-registry entries that day omitted it.
 
 **Known sharp edge:** anything that rewrites a shared *file* symlink via tempfile+rename (e.g. `/config` writing `settings.json`) replaces the symlink with a real file and silently forks that mount off the share. `cus doctor --fix-dirs` detects real-file-where-symlink-expected, folds any non-default keys back into the shared file, and re-links.
 
