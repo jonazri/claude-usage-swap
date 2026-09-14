@@ -263,3 +263,56 @@ this skill:
   confirm a pane is DEAD before relaunching (login shell at the bottom, no claude child)
   and to verify a nudge submitted — the sensor tells you *what* stopped and *why*, the
   pane tells you *whether a process is there to nudge*.
+
+---
+
+## Update 2026-09-11 — session mail across mounts is fixed (GH #199)
+
+**What was broken.** Claude Code's peer registry — the thing `ListAgents` lists and
+`SendMessage` addresses — lives at `<CLAUDE_CONFIG_DIR>/sessions/`. Each live session
+publishes a **pair**: `<pid>.json` (metadata, includes `pid`; `procStart` is
+present on some shapes and omitted on others — 4 of 5 live shared-registry
+`.json` files on 2026-09-14 had none) and
+`<pid>.<sha256>.key` (`peerToken` / `pidDomain` / `procStart` — no `pid`). Every cus
+slot mount owned a *private* real `sessions/` dir, so a session launched with
+`cus launch` and a bare session were mutually invisible: no error at launch, the peer
+name simply never resolved. That is why the build-babysitter had to fall back to a file
+channel (`docs/babysitter/<date>-builder-reports.md`) for builder → babysitter reports,
+and why a watchdog in a slot could see none of the panes it was protecting.
+
+**What changed.** `sessions/` is now symlinked to the shared `~/.claude/sessions/` the
+same way `projects/` always was, in every mount-creation path (`scaffold_mount_dir`,
+the login-store and login-family scaffolds, the account-dir migration, `cus add`,
+`init` import). New slots are born correct. Doctor also visits `logins/<acct>/family-N/`.
+
+**Owner step — run once per machine.** Mounts created before 2026-09-11 still own a
+private registry. Heal them with:
+
+```bash
+# Dry-run first (default read-only). Exit code 1 when findings exist is EXPECTED —
+# it means drift was detected, not that doctor itself failed.
+cus doctor --fix-sessions --dry-run
+
+# Then heal. Prefer no slotted `claude` session running: a live session's
+# json+key pair is left in place and that mount is DEFERRED (healed=False) rather
+# than moving peerToken out from under the process. Re-run after those sessions exit,
+# or accept per-mount deferral and relaunch later.
+cus doctor --fix-sessions
+
+# --fix-dirs also heals sessions/ but its blast radius is the FULL mount layout
+# (settings stubs, other real dirs, etc.), not sessions alone.
+# cus doctor --fix-dirs
+```
+
+The migration never deletes. Live pairs, and pairs whose liveness cannot be
+confirmed (no readable `procStart`, or `/proc` unreadable), are **not moved**
+(conversion deferred — a false live is a deferral; a false dead parks a running
+session's peerToken). Dead pairs and orphan files are parked as units in
+`<mount>/sessions.bak-<date>/`. A mount is only relinked once its dir is empty;
+if anything could not be moved, the real dir is left alone and `doctor` exits
+non-zero.
+
+**Verifying it worked:** from a bare session run `ListAgents` and confirm a slotted peer
+now appears (and vice versa). A slot whose session was live during a deferred heal still
+writes to its private dir until relaunch — restart that session after the mount
+relinks.

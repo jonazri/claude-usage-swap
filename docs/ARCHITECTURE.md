@@ -180,6 +180,7 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 | `shell-snapshots/` | Shell-env snapshots referenced by session state; same resume argument. |
 | `tasks/`, `todos/` | Task/todo lists keyed by session id; travel with transcripts. |
 | `commands/`, `hooks/`, `plugins/`, `scripts/`, `skills/`, `agents/`, `memory/` | User config, account-independent (already in `SHARED_SYMLINK_SUBDIRS`). |
+| `sessions/` | **Reclassified 2026-09-11 (GH #199)** — Claude Code's *peer registry*: one live session publishes **two** files — `<pid>.json` (metadata) **and** `<pid>.<sha256>.key` (`peerToken` / `pidDomain` / `procStart`) — and that pair is the ONLY thing `ListAgents` / `SendMessage` read to discover sibling sessions. Per-mount, a slot-launched session and a bare session are mutually invisible (no error at launch — the peer name simply never resolves). Sharing it restores cross-mount session mail. Migration is liveness-aware, not the generic merge: see below. *(Annotation 2026-09-14 fix pass 1: corrected from "one `<pid>.json` per live session".)* |
 
 **Per-mount** (each mount its own copy):
 
@@ -187,7 +188,7 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 |---|---|
 | `.credentials.json` | The account credential — the point of the mount. |
 | `.claude.json` | Account-bound keys (`userID`, `oauthAccount`) must differ per mount; the ~37 non-account keys are kept aligned by `cus sync-config`. Lives *inside* non-default config dirs (vs `~/.claude.json` at parent level for the default). |
-| `sessions/` | Pid-keyed, process-scoped JSON (observed: `1687352.json`). |
+| ~~`sessions/`~~ | ~~Pid-keyed, process-scoped JSON (observed: `1687352.json`).~~ **Superseded 2026-09-11 (GH #199)** — moved to the shared table above. The 2026-07-02 reading was right that the *files* are process-scoped and wrong that the *directory* is: it is a registry sessions publish themselves into and read each other out of, so scoping it per mount partitioned the fleet. |
 | `backups/` | Claude Code writes its own `.claude.json.backup.<ts>` here (observed in scratch run) and cus rotates creds backups here; both are mount-scoped by meaning. |
 | `history.jsonl` | Prompt history. Deliberately NOT shared: Claude Code rewrites it, and a tempfile+rename rewrite would silently replace a symlink with a real file and fork the share. Divergent arrow-up history is a trivial cost; a silently-broken share is not. |
 | `cache/`, `stats-cache.json`, `statsig/`, `telemetry/` | Ephemeral / account-scoped caches; refresh from server. |
@@ -195,6 +196,18 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 | `.last-cleanup`, `.last-update-result.json`, `daemon*`, `jobs/` | Process-scoped markers and Claude Code background-jobs state; don't-care. |
 
 **Global-only, never seen via `CLAUDE_CONFIG_DIR`:** `validator.log`, `loops.md`, `loops-events.log`, `reconciliations.json`, `projects-hook-archive` — written by user hooks/scripts with absolute `~/.claude/...` paths; they never resolve through a mount.
+
+**Peer-registry migration (GH #199, 2026-09-11; amended 2026-09-14 fix pass 1).** A mount that predates the fix owns a real `sessions/` dir holding one **pair** per session that *ever* ran under it (slot-4 held **1,001 sessions × (`.json` + `.key`) = 2,002 names** on 2026-09-11, nearly all dead). `cus doctor --fix-sessions` (or `--fix-dirs`, which also covers sessions/ as part of the full layout) therefore drains it rather than merging it:
+
+- if any pair is **still live** (`os.kill(pid, 0)` **and** `procStart` matches `/proc/<pid>/stat` starttime), **or liveness is unknown** (`procStart` unreadable — the live shared-registry `.json` often omits it, so a missing/corrupt `.key` leaves nothing to compare — or `/proc` is unreadable), conversion is **deferred**: the pair is left in place, nothing is moved, `healed=False`. Do not heal under a running process. A false "live" costs a deferral; a false "dead" parks a running session's peerToken (F-B-R1-1);
+- otherwise every complete dead pair and every orphan file is **parked** as a unit in `<mount>/sessions.bak-<date>/`. Nothing is deleted. Dead registrations are never folded into the shared registry;
+- only once the dir is empty is it replaced with the symlink. `rmdir` ENOTEMPTY races re-scan once, then defer that mount — the doctor sweep continues. Action strings distinguish `adopted N pairs` / `parked N orphan files` / `deferred (live sessions: pids …)` / `deferred (liveness unknown: pids …)`. Exit code **1** whenever findings remain (including the read-only dry-run) — by design.
+
+New mounts are born correct: every mount-creation path (`scaffold_mount_dir`, login-store / login-family scaffolds, account-dir migration, `cus add`, `init` import) creates `~/.claude/sessions/` when missing so the symlink is never skipped as dangling. Doctor also visits `logins/<acct>/family-N/`.
+
+> Prior text (2026-09-11): claimed "one file per session (slot-4 held 2,002)" and "live pids are moved into the shared registry". Corrected above after dual-review F-B-1/F-B-2: one entry = two files; live pairs are deferred, not moved.
+>
+> Annotation 2026-09-14 (fix pass 2 / F-B-R1-1): unknown liveness fails OPEN (defer), not closed (park). The `.json` does not always carry `procStart` — 4 of 5 live shared-registry entries that day omitted it.
 
 **Known sharp edge:** anything that rewrites a shared *file* symlink via tempfile+rename (e.g. `/config` writing `settings.json`) replaces the symlink with a real file and silently forks that mount off the share. `cus doctor --fix-dirs` detects real-file-where-symlink-expected, folds any non-default keys back into the shared file, and re-links.
 
