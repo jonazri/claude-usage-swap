@@ -180,7 +180,7 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 | `shell-snapshots/` | Shell-env snapshots referenced by session state; same resume argument. |
 | `tasks/`, `todos/` | Task/todo lists keyed by session id; travel with transcripts. |
 | `commands/`, `hooks/`, `plugins/`, `scripts/`, `skills/`, `agents/`, `memory/` | User config, account-independent (already in `SHARED_SYMLINK_SUBDIRS`). |
-| `sessions/` | **Reclassified 2026-09-11 (GH #199)** — Claude Code's *peer registry*: one `<pid>.json` per live session, and the ONLY thing `ListAgents` / `SendMessage` read to discover sibling sessions. Per-mount, a slot-launched session and a bare session are mutually invisible (no error at launch — the peer name simply never resolves). Sharing it restores cross-mount session mail. Migration is liveness-aware, not the generic merge: see below. |
+| `sessions/` | **Reclassified 2026-09-11 (GH #199)** — Claude Code's *peer registry*: one live session publishes **two** files — `<pid>.json` (metadata) **and** `<pid>.<sha256>.key` (`peerToken` / `pidDomain` / `procStart`) — and that pair is the ONLY thing `ListAgents` / `SendMessage` read to discover sibling sessions. Per-mount, a slot-launched session and a bare session are mutually invisible (no error at launch — the peer name simply never resolves). Sharing it restores cross-mount session mail. Migration is liveness-aware, not the generic merge: see below. *(Annotation 2026-09-14 fix pass 1: corrected from "one `<pid>.json` per live session".)* |
 
 **Per-mount** (each mount its own copy):
 
@@ -197,13 +197,15 @@ Method (2026-07-02): full listing of the production `~/.claude/` (35 entries), d
 
 **Global-only, never seen via `CLAUDE_CONFIG_DIR`:** `validator.log`, `loops.md`, `loops-events.log`, `reconciliations.json`, `projects-hook-archive` — written by user hooks/scripts with absolute `~/.claude/...` paths; they never resolve through a mount.
 
-**Peer-registry migration (GH #199, 2026-09-11).** A mount that predates the fix owns a real `sessions/` dir holding one file per session that *ever* ran under it (slot-4 held 2,002 on 2026-09-11, nearly all dead pids). `cus doctor --fix-dirs` therefore drains it rather than merging it:
+**Peer-registry migration (GH #199, 2026-09-11; amended 2026-09-14 fix pass 1).** A mount that predates the fix owns a real `sessions/` dir holding one **pair** per session that *ever* ran under it (slot-4 held **1,001 sessions × (`.json` + `.key`) = 2,002 names** on 2026-09-11, nearly all dead). `cus doctor --fix-sessions` (or `--fix-dirs`, which also covers sessions/ as part of the full layout) therefore drains it rather than merging it:
 
-- entries whose pid is **still live** are moved into `~/.claude/sessions/` — those sessions become visible to every other mount's `ListAgents` immediately;
-- everything else — dead pids, unparseable files, stray subdirs, and any live entry whose `<pid>.json` name is already taken in the shared registry (the shared copy is the one Claude Code is maintaining) — is **parked** in `<mount>/sessions.bak-<date>/`. Nothing is deleted;
-- only once the dir is empty is it replaced with the symlink. If any entry could not be moved, the real dir is left in place and the finding reports `healed=False`, so `doctor` exits non-zero instead of claiming success (the GH #192 lesson).
+- if any pair is **still live** (`os.kill(pid, 0)` **and** `procStart` matches `/proc/<pid>/stat` starttime), conversion is **deferred**: the live pair is left in place, nothing is moved, `healed=False`. Do not heal under a running process;
+- otherwise every complete dead pair and every orphan file is **parked** as a unit in `<mount>/sessions.bak-<date>/`. Nothing is deleted. Dead registrations are never folded into the shared registry;
+- only once the dir is empty is it replaced with the symlink. `rmdir` ENOTEMPTY races re-scan once, then defer that mount — the doctor sweep continues. Action strings distinguish `adopted N pairs` / `parked N orphan files` / `deferred (live sessions: pids …)`. Exit code **1** whenever findings remain (including the read-only dry-run) — by design.
 
-New mounts are born correct: `scaffold_mount_dir` creates `~/.claude/sessions/` when it doesn't exist yet (a slots-only box may never have run a bare session) so the symlink is never skipped as dangling.
+New mounts are born correct: every mount-creation path (`scaffold_mount_dir`, login-store / login-family scaffolds, account-dir migration, `cus add`, `init` import) creates `~/.claude/sessions/` when missing so the symlink is never skipped as dangling. Doctor also visits `logins/<acct>/family-N/`.
+
+> Prior text (2026-09-11): claimed "one file per session (slot-4 held 2,002)" and "live pids are moved into the shared registry". Corrected above after dual-review F-B-1/F-B-2: one entry = two files; live pairs are deferred, not moved.
 
 **Known sharp edge:** anything that rewrites a shared *file* symlink via tempfile+rename (e.g. `/config` writing `settings.json`) replaces the symlink with a real file and silently forks that mount off the share. `cus doctor --fix-dirs` detects real-file-where-symlink-expected, folds any non-default keys back into the shared file, and re-links.
 

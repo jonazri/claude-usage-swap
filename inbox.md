@@ -42,9 +42,12 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 **Blast radius if wrong:** the heal only runs when an operator types `--fix-dirs`; the read-only `cus doctor` is unchanged and reports the drift without touching anything. No live mount was modified by this work — verification was done in throwaway temp trees, plus one read-only `cus doctor` dry run against production (21 findings, nothing written).
 
 ### Walk-back path
-1. `git revert` the commit on `feature/fix-199-sessions-symlink-20260911` (or close PR #207 unmerged) — that removes `"sessions"` from `SHARED_SYMLINK_SUBDIRS`, the `_drain_sessions_dir` helper, and the doctor special case in one shot.
-2. If the migration had already been run on live mounts, put each mount back the way it was: for each `~/claude-accounts/<mount>/` where `sessions` is now a symlink — `rm ~/claude-accounts/<mount>/sessions` (removes only the link), `mv ~/claude-accounts/<mount>/sessions.bak-<date> ~/claude-accounts/<mount>/sessions`, then move the adopted live-pid files back out of `~/.claude/sessions/` into it. Nothing was deleted, so the park dir plus the adopted filenames are a complete record.
+1. `git revert` the commit on `feature/fix-199-sessions-symlink-20260911` (or close PR #211 unmerged) — that removes `"sessions"` from `SHARED_SYMLINK_SUBDIRS`, the `_drain_sessions_dir` helper, and the doctor special case in one shot.
+2. If the migration had already been run on live mounts, put each mount back the way it was: for each `~/claude-accounts/<mount>/` where `sessions` is now a symlink — `rm ~/claude-accounts/<mount>/sessions` (removes only the link), `mv ~/claude-accounts/<mount>/sessions.bak-<date> ~/claude-accounts/<mount>/sessions`, then move any adopted files back out of `~/.claude/sessions/` into it. Nothing was deleted, so the park dir plus adopted filenames are a complete record. (Fix pass 1 no longer adopts live pairs — deferred mounts never moved them.)
 3. Mounts with no `sessions.bak-<date>/` dir had nothing to migrate; just `rm` the symlink and `mkdir sessions`.
+
+### Correction 2026-09-14 (fix pass 1 on PR #211)
+Dual-review (F-B-1/2 + F-A-4) amended the decision without reversing the "sessions stays inside `--fix-dirs`" invariant: `--fix-sessions` was **added as a narrower alias** (sessions-only heal) for the safer owner path, while `--fix-dirs` still heals sessions/ as part of the full layout so it can never claim "all mounts canonical" while the peer registry is partitioned. Live pairs are now **deferred** (not moved into shared). One registry entry = `.json` + `.key`. Count corrected to 1,001 × 2. Walk-back step 1 PR number fixed (#211, was #207).
 
 ---
 
