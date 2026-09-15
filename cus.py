@@ -2665,6 +2665,40 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     # these fallbacks don't filter, so new lanes kept landing on it.
     disabled = _disabled_accounts(config, state)
 
+    # Issue #219: an account is lane-share-JOINABLE only if it has ≥1 NON-LOCKED
+    # live lane a launch could actually join (or is joinable via the shared
+    # ~/.claude mount — see below). A locked slot is reserved to its owner
+    # (`cus lock`), and the JOIN path in _launch_prepare (also #219) now SKIPS
+    # locked lanes — so an account whose ONLY live lane is locked has no lane a
+    # launch could join. Picking such an account in the lane_sharing fallbacks
+    # below would make `cus launch auto` choose an account it then cannot join:
+    # the join finds no eligible lane, falls through, and the #104 duplicate-mount
+    # guard REFUSES the launch. So the two lane_sharing fallbacks gate on
+    # membership in this set instead of raw `n in live_occupied`.
+    #
+    # We DERIVE it from `live_occupied` and subtract only accounts we can PROVE
+    # are locked-only, rather than recomputing from occupied_slot_accounts: that
+    # keeps this set == live_occupied byte-for-byte whenever no slots are locked
+    # (the no-regression property), and stays consistent with `live_occupied`'s
+    # own definition above (which may be stubbed/derived differently than the
+    # raw /proc scan). An account is dropped only when its ENTIRE visible live
+    # lane set is locked; an account with no lanes recorded (e.g. live via the
+    # shared mount) is never dropped — we never drop what we can't prove.
+    lane_share_joinable = set(live_occupied)
+    _locked = _locked_slots(config)
+    if _locked:
+        _occ = occupied_slot_accounts(state)  # account -> [live slot names]
+        # The shared ~/.claude mount is a legal lane-share target (a bare session
+        # JOINS it) and can NOT be locked (locks name slots only), so never drop
+        # the active account while its shared mount is live.
+        _shared_active = state["active"] if (state.get("active") and mount_in_use(CLAUDE_DIR)) else None
+        for _acct in list(lane_share_joinable):
+            if _acct == _shared_active:
+                continue
+            _lanes = _occ.get(_acct)
+            if _lanes and all(s in _locked for s in _lanes):
+                lane_share_joinable.discard(_acct)
+
     # ---- Placement-side per-model (Fable) weekly gate (2026-07-14) ----
     # Incident (the 03/sxe mis-placements, 2026-07-14): new sessions launched
     # while nearly every account sat at Fable 88–100% kept landing on account
@@ -2733,9 +2767,12 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     # refusing — the refusal predates lanes and left `cus launch auto` dead
     # whenever slots saturated the pool, even with a 4%-used account joinable.
     if target is None and config.get("per_session", {}).get("lane_sharing", False):
+        # Issue #219: `lane_share_joinable`, not raw `live_occupied` — an account
+        # whose only live lane is locked has no joinable lane (see the set's
+        # definition above), so choosing it here would refuse the launch downstream.
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
                  if not a.get("token_expired") and not a.get("poll_error")
-                 and n in live_occupied and n not in disabled]
+                 and n in lane_share_joinable and n not in disabled]
         clean = [(n, a) for n, a in cands if n not in fable_capped]
         if clean:
             n, _ = min(clean, key=lambda p: _account_estimated_effective_pct(p[1], config))
@@ -2755,9 +2792,13 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
             if not a.get("token_expired") and not a.get("poll_error")
             and n not in live_occupied and n not in disabled]
         if config.get("per_session", {}).get("lane_sharing", False):
+            # Issue #219: gate on `lane_share_joinable` (locked-only lanes
+            # excluded) rather than raw `live_occupied`, same reasoning as the
+            # lane-share fallback above — never degrade onto an account we cannot
+            # actually join.
             least_bad += [(n, a, True) for n, a in state.get("accounts", {}).items()
                           if not a.get("token_expired") and not a.get("poll_error")
-                          and n in live_occupied and n not in disabled]
+                          and n in lane_share_joinable and n not in disabled]
         if least_bad:
             n, a, _live = min(least_bad, key=lambda p: (
                 _max_model_weekly_from_acct(p[1], config, trust_stale=True),
@@ -21609,7 +21650,22 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     # the #104 guard / independent-login hatch below).
     if lane is None and config.get("per_session", {}).get("lane_sharing", False):
         occ = occupied_slot_accounts(state)  # account -> [live slot names]
-        lanes = sorted(occ.get(account, []),
+        # Issue #219: a LOCKED slot must never be JOINED by an auto lane-share.
+        # `cus lock <slot>` is user intent — "this slot stays put AND stays
+        # mine" — but lane sharing (GH #109) had no notion of the lock: it only
+        # stopped the daemon from MOVING/GC-ing the slot, never reserved it
+        # against co-tenancy, so a new session would silently land as a
+        # co-tenant on a locked lane (the reported incident: a work session
+        # sharing the cus-watchdog's locked slot-2). Excluding locked slots here
+        # closes the same asymmetry the ALLOCATION path already closed on
+        # 2026-07-08 — find_free_slot / _allocate_slot_unlocked skip locked slots
+        # so a fresh pick never lands on one; this makes the JOIN path match.
+        # If the account's ONLY occupied lanes are locked, `lanes` becomes empty
+        # and we correctly fall through to the shared-mount-join check / #104
+        # duplicate-mount guard below (an explicit `--lane <locked-slot>` is
+        # still refused separately by the lock guard on that branch).
+        locked = _locked_slots(config)
+        lanes = sorted((n for n in occ.get(account, []) if n not in locked),
                        key=lambda n: int(n.removeprefix(SLOT_PREFIX)) if n.removeprefix(SLOT_PREFIX).isdigit() else 1 << 30)
         if lanes:
             lane = lanes[0]
