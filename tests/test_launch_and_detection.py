@@ -412,6 +412,271 @@ def test_launch_swap_does_not_arm_ladder_hysteresis():
         env.restore()
 
 
+# ---------------------------------------------------------------------------
+# Issue #219: a `cus lock <slot>` slot must be EXCLUSIVE under lane sharing —
+# never joined as a co-tenant, never picked as an auto lane-share target,
+# never pinned onto by an explicit --lane (without --force). The lock used to
+# only stop the daemon MOVING/GC-ing the slot; it did not reserve it against
+# co-tenancy, so a work session could share the watchdog's locked slot-2.
+# ---------------------------------------------------------------------------
+def _seed_live_lane(name: str, account: str) -> Path:
+    """Scaffold a slot dir as a HEALTHY, joinable lane holding `account`'s creds:
+    projects/ symlinked to the shared tree (so _projects_resolves_to_shared
+    passes) and a valid OAuth payload installed (so the launch-gate shape check
+    accepts the join). Returns the slot dir. State bookkeeping is the caller's."""
+    d = cus.slot_path(name)
+    cus.scaffold_mount_dir(d)  # dir + projects→shared symlink + settings links
+    cus.mount_creds_path(d).write_text(json.dumps(_creds(f"rt-{account}")))
+    return d
+
+
+def test_launch_prepare_join_skips_locked_lane():
+    """Issue #219 (Part 1): an auto lane-share JOIN must skip a LOCKED occupied
+    lane. Given account alpha live on [locked slot-2, unlocked slot-5], the join
+    picks slot-5, never the locked slot-2. And when alpha's ONLY live lane is
+    the locked one, the join selects nothing and falls through to the #104
+    duplicate-mount refusal (no silent co-tenancy onto a locked lane)."""
+    import click
+    env = _Env()
+    try:
+        # alpha occupies a locked lane (slot-2) and an unlocked lane (slot-5).
+        _seed_live_lane("slot-2", "alpha")
+        _seed_live_lane("slot-5", "alpha")
+        state = cus.load_state()
+        state["slots"] = {"slot-2": {"account": "alpha"}, "slot-5": {"account": "alpha"}}
+        cus.save_state(state)
+        live = {str(cus.slot_path("slot-2")), str(cus.slot_path("slot-5"))}
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        config = cus.deep_merge(cus.load_config(), {
+            "per_session": {"lane_sharing": True},
+            "session_locks": {"locked_slots": ["slot-2"]},
+        })
+        slot_name, slot_dir, account = cus._launch_prepare("alpha", cus.load_state(), config)
+        assert slot_name == "slot-5", f"join must pick the unlocked lane, got {slot_name}"
+        assert account == "alpha"
+        assert slot_dir == cus.slot_path("slot-5")
+
+        # Lock BOTH of alpha's lanes → the join has no eligible lane and falls
+        # through to the #104 guard (alpha is live on a mount, not the shared
+        # active, no independent login provisioned) → refusal, not co-tenancy.
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        config2 = cus.deep_merge(cus.load_config(), {
+            "per_session": {"lane_sharing": True},
+            "session_locks": {"locked_slots": ["slot-2", "slot-5"]},
+        })
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), config2)
+            raise AssertionError("expected #104 refusal when alpha's only lanes are locked")
+        except click.ClickException as e:
+            assert "GH #104" in str(e.message), e.message
+    finally:
+        env.restore()
+
+
+def test_pick_launch_account_lane_share_skips_locked_only_account():
+    """Issue #219 (Part 2): pick_launch_account's lane-share fallback must not
+    pick an account whose ONLY live-occupied lane is locked — such an account
+    has no lane a launch could actually join, so choosing it would make
+    `cus launch auto` pick an account it then refuses (#104). It prefers an
+    account with a non-locked lane; when every live lane is locked it yields no
+    lane-share target (None)."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        # Only alpha + beta in play: drop gamma from `accounts` (state["active"]
+        # stays "gamma", but the shared mount is kept NOT live below, so the
+        # shared-active account is never a candidate) — this isolates the
+        # lane-share fallback under test so the earlier picker tiers can't hand
+        # back an idle account.
+        state["accounts"].pop("gamma", None)
+        state["slots"] = {"slot-1": {"account": "alpha"}, "slot-2": {"account": "beta"}}
+        for s in ("slot-1", "slot-2"):
+            cus.slot_path(s).mkdir(parents=True, exist_ok=True)
+        live = {str(cus.slot_path("slot-1")), str(cus.slot_path("slot-2"))}  # shared NOT live
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        # alpha's only lane (slot-1) is locked; beta's lane (slot-2) is not.
+        config = cus.deep_merge(cus.load_config(), {
+            "per_session": {"lane_sharing": True},
+            "session_locks": {"locked_slots": ["slot-1"]},
+        })
+        t = cus.pick_launch_account(state, config)
+        assert t is not None and t.name == "beta", t
+        assert "lane-share fallback" in t.reason
+
+        # Lock BOTH lanes → no joinable account at all → no lane-share target.
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        config = cus.deep_merge(cus.load_config(), {
+            "per_session": {"lane_sharing": True},
+            "session_locks": {"locked_slots": ["slot-1", "slot-2"]},
+        })
+        assert cus.pick_launch_account(state, config) is None, \
+            "every live lane locked ⇒ no lane-share target"
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_explicit_lane_refuses_locked():
+    """Issue #219 (Part 3, pre-existing since 2026-07-08 commit 940cc65): an
+    explicit `--lane <locked-slot>` refuses without --force (mirroring
+    `cus slot move`'s lock guard) and proceeds with --force. This test locks in
+    that behavior alongside the two new #219 fixes."""
+    import click
+    env = _Env()
+    try:
+        state = cus.load_state()
+        name, _d = cus.create_slot(state)  # a free slot to pin onto
+        st = cus.load_state()
+        st["slots"][name].pop("reserved_until", None)  # make it acquirable
+        cus.save_state(st)
+
+        config = cus.deep_merge(cus.load_config(), {
+            "session_locks": {"locked_slots": [name]},
+        })
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), config, lane=name)
+            raise AssertionError("expected ClickException for --lane onto a locked slot")
+        except click.ClickException as e:
+            assert name in str(e.message) and "locked" in str(e.message), e.message
+
+        # --force overrides, exactly like `cus slot move --force`.
+        slot_name, _slot_dir, account = cus._launch_prepare(
+            "alpha", cus.load_state(), config, lane=name, force=True)
+        assert slot_name == name and account == "alpha"
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_force_joins_locked_only_lane():
+    """Issue #219 / PR #220 dual review (C5a — GUARDS C1). `cus launch <acct>
+    --force` with NO --lane, on an account whose only live lane is LOCKED, must
+    JOIN that locked lane (deliberate co-tenancy — same dir, same login family,
+    no second mount), NOT fall through and mint a fresh slot on the same family
+    (the GH #104 double-book). --force here means "co-tenant the locked lane on
+    purpose", mirroring how `--lane <locked> --force` already joins.
+
+    This test is the regression guard for C1: WITHOUT the `locked = set() if
+    force` carve-out, force skips the locked lane, falls through, and (force
+    also bypassing the #104 guard) `acquire_slot` mints a NEW slot on alpha's
+    family — so the `slot_name == "slot-2"` assertion below FAILS. Confirmed by
+    temporarily reverting C1 during development."""
+    env = _Env()
+    try:
+        # alpha is live ONLY on the locked lane slot-2 (its sole occupied lane).
+        _seed_live_lane("slot-2", "alpha")
+        state = cus.load_state()
+        state["slots"] = {"slot-2": {"account": "alpha"}}
+        cus.save_state(state)
+        live = {str(cus.slot_path("slot-2"))}  # shared mount NOT live
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        config = cus.deep_merge(cus.load_config(), {
+            "per_session": {"lane_sharing": True},
+            "session_locks": {"locked_slots": ["slot-2"]},
+        })
+        slot_name, slot_dir, account = cus._launch_prepare(
+            "alpha", cus.load_state(), config, force=True)
+        assert slot_name == "slot-2", \
+            f"--force must JOIN the locked lane, got {slot_name} (a fresh mint = the #104 double-book)"
+        assert account == "alpha"
+        assert slot_dir == cus.slot_path("slot-2")
+    finally:
+        env.restore()
+
+
+def test_pick_launch_account_keeps_shared_active_on_locked_lane():
+    """Issue #219 / PR #220 dual review (C5b — the `_shared_active` carve-out).
+    An account that is the LIVE shared-mount active is joinable via the bare
+    ~/.claude mount (which can NOT be locked), so it must stay lane-share-joinable
+    even when its ONLY slot lane is locked. Every other #219 test keeps CLAUDE_DIR
+    NOT live, so `_shared_active` is always None and this branch never fired.
+
+    Non-vacuity: WITHOUT the `_acct == _shared_active: continue` carve-out, gamma
+    (live on locked slot-3, all-locked) would be dropped from lane_share_joinable
+    and the lane-share fallback would pick alpha (5h 10%) instead of gamma (5%)."""
+    env = _Env()
+    try:
+        state = cus.load_state()  # active == "gamma"
+        # All three accounts live (saturated pool → lane-share fallback fires);
+        # gamma is BOTH the shared-mount active AND live on the locked slot-3.
+        state["slots"] = {
+            "slot-1": {"account": "alpha"},
+            "slot-2": {"account": "beta"},
+            "slot-3": {"account": "gamma"},
+        }
+        for s in ("slot-1", "slot-2", "slot-3"):
+            cus.slot_path(s).mkdir(parents=True, exist_ok=True)
+        live = {str(cus.slot_path(s)) for s in ("slot-1", "slot-2", "slot-3")}
+        live.add(str(cus.CLAUDE_DIR))  # shared mount IS live on gamma
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        config = cus.deep_merge(cus.load_config(), {
+            "per_session": {"lane_sharing": True},
+            "session_locks": {"locked_slots": ["slot-3"]},  # gamma's only slot lane
+        })
+        t = cus.pick_launch_account(state, config)
+        # gamma stays joinable (via the shared mount) and is lowest-usage (5%).
+        assert t is not None and t.name == "gamma", t
+        assert "lane-share fallback" in t.reason
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_auto_joins_nonlocked_lane_end_to_end():
+    """Issue #219 / PR #220 dual review (C5c — end-to-end `auto` pick→join). The
+    two #219 halves (picker-skip in pick_launch_account, join-skip in
+    _launch_prepare) are each tested in isolation; this drives the FULL auto flow
+    through `_launch_prepare("auto", ...)` to assert their composition — pick a
+    lane-share-joinable account, then JOIN its NON-locked lane, skipping a locked
+    lane on the same account."""
+    env = _Env()
+    try:
+        # Saturate the pool so the auto pick reaches the lane-share fallback:
+        # alpha live on [locked slot-2, unlocked slot-5], beta live on slot-1,
+        # gamma dropped + shared mount NOT live (no idle account to spread onto).
+        _seed_live_lane("slot-5", "alpha")  # the healthy lane we expect to JOIN
+        cus.slot_path("slot-2").mkdir(parents=True, exist_ok=True)  # locked, live
+        cus.slot_path("slot-1").mkdir(parents=True, exist_ok=True)  # beta, live
+        state = cus.load_state()
+        state["accounts"].pop("gamma", None)
+        state["slots"] = {
+            "slot-1": {"account": "beta"},
+            "slot-2": {"account": "alpha"},
+            "slot-5": {"account": "alpha"},
+        }
+        cus.save_state(state)
+        live = {str(cus.slot_path(s)) for s in ("slot-1", "slot-2", "slot-5")}  # shared NOT live
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        # Degrade the fresh-reading verify-poll to "no trustworthy reading" so the
+        # auto pick is trusted as-is with no network call (the loop's own
+        # documented safe-degrade path), keeping the test deterministic.
+        _saved_poll = cus._force_poll_launch_candidate
+        cus._force_poll_launch_candidate = lambda *a, **k: False
+        try:
+            config = cus.deep_merge(cus.load_config(), {
+                "per_session": {"lane_sharing": True},
+                "session_locks": {"locked_slots": ["slot-2"]},
+            })
+            slot_name, slot_dir, account = cus._launch_prepare("auto", cus.load_state(), config)
+        finally:
+            cus._force_poll_launch_candidate = _saved_poll
+
+        # alpha (5h 10%) is the lowest-usage joinable account; its join skips the
+        # LOCKED slot-2 and lands on the unlocked slot-5.
+        assert account == "alpha", f"auto should pick lane-share-joinable alpha, got {account}"
+        assert slot_name == "slot-5", f"join must skip locked slot-2 for slot-5, got {slot_name}"
+        assert slot_dir == cus.slot_path("slot-5")
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
