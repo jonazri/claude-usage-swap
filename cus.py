@@ -2641,8 +2641,14 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     if state.get("active"):
         spread_occupied.add(state["active"])
     # Hard floor: accounts on a LIVE mount — never double-book these.
+    # `shared_live`: is the global ~/.claude mount currently held by a live bare
+    # session? Computed ONCE here (C6 fold, PR #220 dual review) and reused for
+    # both the hard floor below and the #219 locked-only carve-out further down —
+    # the predicate is identical and re-scanning /proc twice invited the two
+    # reads drifting mid-call.
+    shared_live = bool(state.get("active") and mount_in_use(CLAUDE_DIR))
     live_occupied = _live_slot_accounts(state)
-    if state.get("active") and mount_in_use(CLAUDE_DIR):
+    if shared_live:
         live_occupied.add(state["active"])
 
     def _try(excluded: set) -> SwapTarget | None:
@@ -2678,8 +2684,8 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     #
     # We DERIVE it from `live_occupied` and subtract only accounts we can PROVE
     # are locked-only, rather than recomputing from occupied_slot_accounts: that
-    # keeps this set == live_occupied byte-for-byte whenever no slots are locked
-    # (the no-regression property), and stays consistent with `live_occupied`'s
+    # keeps this set's membership identical to live_occupied whenever no slots
+    # are locked (the no-regression property), and stays consistent with `live_occupied`'s
     # own definition above (which may be stubbed/derived differently than the
     # raw /proc scan). An account is dropped only when its ENTIRE visible live
     # lane set is locked; an account with no lanes recorded (e.g. live via the
@@ -2690,8 +2696,8 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         _occ = occupied_slot_accounts(state)  # account -> [live slot names]
         # The shared ~/.claude mount is a legal lane-share target (a bare session
         # JOINS it) and can NOT be locked (locks name slots only), so never drop
-        # the active account while its shared mount is live.
-        _shared_active = state["active"] if (state.get("active") and mount_in_use(CLAUDE_DIR)) else None
+        # the active account while its shared mount is live (reuses `shared_live`).
+        _shared_active = state["active"] if shared_live else None
         for _acct in list(lane_share_joinable):
             if _acct == _shared_active:
                 continue
@@ -9340,8 +9346,12 @@ def _locked_slots(config: dict) -> set[str]:
 
     A locked slot's account is never moved by the daemon — ladder, hard-cap,
     and reactive-429 slot moves all skip it, and idle slot-gc won't reap it.
-    The lock is user intent ("this slot stays put no matter what"), so it
-    lives in config.yaml next to the session pins, not in daemon state.
+    Since #219 (PR #220) a lock ALSO makes the slot EXCLUSIVE to its owner
+    under lane sharing: the slot is never auto-joined as a lane-share co-tenant
+    and is never auto-picked/pinned onto (an explicit `--lane <slot> --force`
+    still co-tenants it deliberately). The lock is user intent ("this slot
+    stays put AND stays mine, no matter what"), so it lives in config.yaml next
+    to the session pins, not in daemon state.
     """
     return {str(s) for s in (config.get("session_locks", {}).get("locked_slots") or [])}
 
@@ -19087,12 +19097,16 @@ def _normalize_slot_name(slot_name: str) -> str:
 @cli.command()
 @click.argument("slot_name")
 def lock(slot_name: str) -> None:
-    """Lock a slot (e.g. slot-1) so the daemon never swaps its account.
+    """Lock a slot (e.g. slot-1) so the daemon never swaps its account, and
+    (with lane sharing) so no other session ever joins it.
 
     Ladder, hard-cap, and reactive-429 slot moves all skip a locked slot,
-    and idle slot-gc won't reap it. per_session-mode counterpart of `pin`
-    (which protects a session from hot-swap orchestration): a lock freezes
-    the slot's credential mount itself. Persists in config.yaml under
+    and idle slot-gc won't reap it. Since #219, a lock also makes the slot
+    EXCLUSIVE under lane sharing — never auto-joined as a co-tenant and never
+    auto-picked/pinned onto (`--lane <slot> --force` still co-tenants it on
+    purpose). per_session-mode counterpart of `pin` (which protects a session
+    from hot-swap orchestration): a lock freezes the slot's credential mount
+    itself and reserves the lane. Persists in config.yaml under
     session_locks.locked_slots. Undo with `cus unlock <slot>`.
     """
     if not CONFIG_YAML.exists():
@@ -19111,7 +19125,8 @@ def lock(slot_name: str) -> None:
         return
     locked.append(name)
     write_yaml(CONFIG_YAML, user_cfg)
-    click.echo(f"Locked {name} — the daemon will not swap or gc this slot (unlock with `cus unlock {name}`)")
+    click.echo(f"Locked {name} — the daemon will not swap or gc this slot, and no session will lane-share-join it "
+               f"(unlock with `cus unlock {name}`; `--lane {name} --force` co-tenants it deliberately)")
 
 
 @cli.command()
@@ -21538,11 +21553,38 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         pool_config = _config_for_pool(config, pool)
         target = pick_launch_account(state, pool_config)
         if target is None:
+            # Issue #219 / PR #220 dual review: name the LOCK when it is the
+            # reason. If lane_sharing is on and one or more accounts are live
+            # ONLY on LOCKED slot(s), pick_launch_account correctly refused to
+            # hand them back (their sole lane is reserved to its owner and the
+            # join below would skip it). The generic message points the operator
+            # at the wrong lever — "turn on lane_sharing / add an account" —
+            # during exactly the saturated crunch the lock exists to protect, so
+            # append the real cause and remedy. (The repo's memory notes are full
+            # of misread cus messages; don't add another.)
+            locked_note = ""
+            if pool_config.get("per_session", {}).get("lane_sharing", False):
+                _locked = _locked_slots(pool_config)
+                if _locked:
+                    _occ = occupied_slot_accounts(state)  # account -> [live slot names]
+                    # A shared-mount-active account is joinable via the bare mount
+                    # (which can't be locked), so it is not a locked-only casualty.
+                    _shared_active = state.get("active") if (state.get("active") and mount_in_use(CLAUDE_DIR)) else None
+                    _locked_only = sorted(
+                        a for a, lns in _occ.items()
+                        if a != _shared_active and lns and all(s in _locked for s in lns))
+                    if _locked_only:
+                        locked_note = (
+                            f" NOTE: account(s) {', '.join(_locked_only)} are live ONLY on locked slot(s) "
+                            f"(session_locks.locked_slots) — those lanes are reserved to their owner and are "
+                            f"not auto-joined (GH #219). To use one: `cus unlock <slot>` to release the lock, "
+                            f"or `cus launch <account> --lane <slot> --force` to deliberately co-tenant the "
+                            f"locked lane.")
             raise click.ClickException(
                 "no launchable account: every account is expired, erroring, or on a live mount with "
                 "per_session.lane_sharing off (GH #104 — won't double-book a live account; lane sharing "
                 "makes live accounts joinable). Exit a session, wait for a 5h/weekly reset, fix logins, "
-                "or add an account. See `cus status` / `cus sos`.")
+                "or add an account. See `cus status` / `cus sos`." + locked_note)
 
         # ---- Fresh-reading verify-and-repick (2026-07-07, this fix) ----
         # WHY: pick_launch_account scores accounts off their CACHED state
@@ -21658,15 +21700,29 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # co-tenant on a locked lane (the reported incident: a work session
         # sharing the cus-watchdog's locked slot-2). Excluding locked slots here
         # closes the same asymmetry the ALLOCATION path already closed on
-        # 2026-07-08 — find_free_slot / _allocate_slot_unlocked skip locked slots
+        # 2026-07-08 — acquire_slot / _allocate_slot_unlocked skip locked slots
         # so a fresh pick never lands on one; this makes the JOIN path match.
         # If the account's ONLY occupied lanes are locked, `lanes` becomes empty
         # and we correctly fall through to the shared-mount-join check / #104
         # duplicate-mount guard below (an explicit `--lane <locked-slot>` is
         # still refused separately by the lock guard on that branch).
-        locked = _locked_slots(config)
-        lanes = sorted((n for n in occ.get(account, []) if n not in locked),
-                       key=lambda n: int(n.removeprefix(SLOT_PREFIX)) if n.removeprefix(SLOT_PREFIX).isdigit() else 1 << 30)
+        #
+        # --force carve-out (#219 / PR #220 dual review): `--force` must
+        # override the LOCK on this join path, not fall through past it.
+        # Without this carve-out, `cus launch <acct> --force` (no --lane) on an
+        # account whose ONLY live lane is locked skipped the join → fell through
+        # to the #104 guard → and `--force` then BYPASSES that guard, so
+        # acquire_slot mints a SECOND mount on the account's own login family:
+        # the #104 double-book (the credential-death class this repo fought all
+        # summer). Pre-PR that exact command JOINED the locked lane safely (same
+        # dir, same family, no second mount). Restoring `set()` under --force
+        # keeps that safe co-tenancy AND matches `--lane <locked> --force`, which
+        # already joins the locked lane deliberately. So --force here means
+        # "co-tenant the locked lane on purpose", never "silently double-book".
+        locked = set() if force else _locked_slots(config)
+        lanes = sorted(
+            (n for n in occ.get(account, []) if n not in locked),
+            key=lambda n: int(n.removeprefix(SLOT_PREFIX)) if n.removeprefix(SLOT_PREFIX).isdigit() else 1 << 30)
         if lanes:
             lane = lanes[0]
             lane_dir = slot_path(lane)
@@ -21758,6 +21814,28 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         independent_ok = (lane is not None and independent_logins_enabled(config)
                           and has_independent_login(account, lane))
         if not independent_ok:
+            # Issue #219 / PR #220 dual review: when lane_sharing is ON and the
+            # account's ONLY live lane(s) are LOCKED, the auto-join above skipped
+            # them (a locked slot is reserved to its owner) and we fell through to
+            # this #104 guard. In that case the generic message misdiagnoses the
+            # cause — it tells the operator to "turn on lane_sharing" (already on)
+            # and never names the lock. Emit a lock-specific remedy instead. Only
+            # when `lane is None` (the auto-join path); an explicit --lane onto a
+            # live account is a genuine #104 case (and the explicit-lane lock
+            # guard below handles a locked --lane separately). With --force we
+            # never reach here: C1's carve-out joins the locked lane above.
+            if lane is None and config.get("per_session", {}).get("lane_sharing", False):
+                _locked = _locked_slots(config)
+                _acct_lanes = occupied_slot_accounts(state).get(account) or []
+                if _locked and _acct_lanes and all(s in _locked for s in _acct_lanes):
+                    _lk = sorted(_acct_lanes)
+                    raise click.ClickException(
+                        f"'{account}' is live only on LOCKED slot(s) {', '.join(_lk)} "
+                        f"(session_locks.locked_slots) — lane sharing reserves a locked lane to its owner, "
+                        f"so there is no lane to JOIN and minting a second mount would rotate the login "
+                        f"token and sign one out (GH #104). Options: `cus unlock {_lk[0]}` to release the "
+                        f"lock; `cus launch {account} --lane {_lk[0]} --force` to deliberately co-tenant the "
+                        f"locked lane; or pick another account (`cus launch auto`).")
             raise click.ClickException(
                 f"'{account}' is already running on a live mount. A second session on it would rotate "
                 f"its login token and sign one out (GH #104). Options: pick another account "

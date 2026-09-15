@@ -162,7 +162,7 @@ cus rename <old> <new>        # rename an account (preserves config + history)
 # Locks
 cus pin <pane> <account>      # pin a tmux pane to an account (never swap)
 cus unpin <pane>              # remove pin
-cus lock <slot>               # freeze a SLOT's account (per_session/hybrid): never swapped or gc'd
+cus lock <slot>               # freeze a SLOT's account (per_session/hybrid): never swapped, gc'd, or lane-share-joined
 cus unlock <slot>             # remove a slot lock
 
 # Rotation-set pools (per_session/hybrid)
@@ -231,7 +231,7 @@ Everything above describes `mode: global` (the default): one live mount (`~/.cla
 
 **Slot locks & rotation-set pools (per_session / hybrid):**
 
-- `cus lock <slot>` / `cus unlock <slot>` — freeze a slot so the daemon never swaps its account or gc's it (the slot-level counterpart of `cus pin`, which protects a *session* from hot-swap). Shown as `🔒locked` in `cus status`.
+- `cus lock <slot>` / `cus unlock <slot>` — freeze a slot so the daemon never swaps its account or gc's it, and (with lane sharing) so the slot is **exclusive** to its owner: never auto-joined as a lane-share co-tenant and never auto-picked/pinned onto (`--lane <slot> --force` still co-tenants it deliberately). The slot-level counterpart of `cus pin`, which protects a *session* from hot-swap. Shown as `🔒locked` in `cus status`.
 - `cus pool <slot> [premium|standard]` (and `cus launch --pool <p>`) — put a slot in a rotation set. **premium** (default) honors the per-model weekly cap (`per_model_weekly.cap_pct`, on when `per_model_weekly.gate_enabled: true`): the slot swaps off an account, and won't swap back, once a tracked model's week hits the cap — e.g. leave a Fable-exhausted account at 97% and don't return until its week resets. **standard** ignores the per-model cap (only aggregate 5h/7d + `hard_7d_cap` apply), so a model-exhausted account keeps serving standard-model work instead of stranding its aggregate headroom. Per-model weekly is a *hard cap*, not a gradual ladder — see `docs/STRATEGIES.md` § "Per-model weekly cap".
 
 ### `mode: hybrid` — manage slots AND the shared mount together (2026-07-02)
