@@ -1,16 +1,21 @@
 # RESUME.md — durable fleet-resume runbook (panes · transcripts · sessions)
 
-Born 2026-09-16, the day the machine crashed mid-fleet (6 panes) ahead of a
+Born 2026-09-16, the day the machine crashed mid-fleet (several panes) ahead of a
 resize+reboot. Written from the practices already proven in watch.md (dead-pane
 recovery, nudge discipline) and RUNBOOK.md (hot-swap orchestrator, `cus launch
 -- --resume`). This file is the ONE place to open after any crash, reboot, or
 resize.
 
+> Account names, session ids, tmux pane names, project paths, and machine infra
+> IDs in this doc are **placeholders** (`acct-A`, `<session-id>`, `sess-A`,
+> `~/repos/<project>`, `/mnt/<offload-volume>`). Substitute your own; the live
+> specifics for a given box live in the operator's private notes, not here.
+
 ## The durability model — what survives what
 
 | Thing | Survives claude exit? | Survives reboot? | Where it lives |
 | --- | --- | --- | --- |
-| Transcripts (the session state) | YES | YES | `<config_dir>/projects/<cwd-encoded>/<session-id>.jsonl` — and the projects store is SHARED across ~/.claude and every `/home/rayi/claude-accounts/slot-N` (login-family mounts), so ANY slot/account can resume ANY session. Mirrored to ~/claude-history (git). |
+| Transcripts (the session state) | YES | YES | `<config_dir>/projects/<cwd-encoded>/<session-id>.jsonl` — and the projects store is SHARED across `~/.claude` and every `~/claude-accounts/slot-N` (login-family mounts), so ANY slot/account can resume ANY session. Mirrored to a git history repo. |
 | Pushed git work | YES | YES | origin. The standing "push often" rule is the real safety net. |
 | tmux panes | YES (pane shows bare shell) | NO | tmux server memory. Cheap to recreate — a pane is just cwd + config dir + `claude --resume`. |
 | cus account/lane state | YES | YES | cus state.json + account dirs. `cus doctor` heals. |
@@ -23,8 +28,8 @@ resize.
 2. **Journal every session-local timer** the moment you create it: what fires
    when, and the full recreation prompt (or a pointer to a repo-committed spec
    it can be rebuilt from) — into the session's auto-memory AND the repo's
-   inbox.md. Worked example: zajac's Shabbos-build timer — the prompt says
-   "the spec is docs/plans/2026-09-15-review-pipeline.md", so the timer is
+   inbox.md. Worked example: a project's scheduled-build timer whose journalled
+   prompt says "the spec is `docs/plans/<date>-<slug>.md`", so the timer is
    rebuildable from one line in memory. A timer whose prompt exists only
    in-session is a timer you've already lost.
 3. **Commit ledgers/plans to the repo**, not only scratchpads. Scratchpad =
@@ -34,9 +39,9 @@ resize.
 
 ## Post-crash / post-reboot recovery (in order)
 
-**0. Disk sanity first:** `df -h /` and inode check on the offload volumes
-(sdb = /mnt/volume_nyc1_1783020202575 had ZERO inodes as of 2026-09-16 — reads
-ok, writes fail; use sda = /mnt/volume_nyc1_1777864675482/offload/).
+**0. Disk sanity first:** `df -h /` and an inode check (`df -i`) on any offload
+volumes (one offload volume had ZERO free inodes once — reads ok, writes fail;
+switch to a volume with inodes free).
 
 **1. cus first:** `python3 ~/repos/claude-usage-swap/cus.py doctor` then
 `... status`. Fix mounts/creds before launching anything (a resumed session
@@ -46,12 +51,12 @@ with dead creds just walls immediately).
 account ground truth before acting on any pre-crash plan (a planned switch may
 be moot after the downtime).
 
-> **Annotation 2026-09-16:** the watchdog is now the FRESH session
-> `4af83056-fc16-4937-a0b1-a287ab5fc394` in tmux session `cus-watchdog`, parked
-> **locked on slot-6 / merkos** (Fable-dead, standard pool). The old `cus1a` /
-> `146dc334` on slot-8 is retired (its loop died on the reboot; the pane became
-> an interactive ops chat). When re-homing the watchdog after a crash/reboot, use
-> the **new-pane FRESH-session handoff** now documented in
+> **Annotation 2026-09-16:** after a reboot the watchdog was re-established as a
+> **FRESH session** in tmux session `cus-watchdog`, parked **locked on a
+> Fable-dead, standard-pool account** (the correct Opus park). The prior
+> watchdog pane was retired (its loop died on the reboot; the pane became an
+> interactive ops chat). When re-homing the watchdog after a crash/reboot, use
+> the **new-pane FRESH-session handoff** documented in
 > `skills/watch.md` §"Update 2026-09-16 — Migrating / re-homing the watchdog" —
 > do NOT resume the same session id in a second live pane (transcript-write
 > conflict), and verify the target account has a free independent login family
@@ -59,11 +64,11 @@ be moot after the downtime).
 > GH #190/#104).
 
 **3. Per pane — classify before touching** (watch.md rules, condensed):
-- Pane exists, bottom line is a shell prompt (`❯` under `rayi in …`) → claude
+- Pane exists, bottom line is a shell prompt (`❯` under `<user> in …`) → claude
   is DEAD in a live pane → resume in place.
 - Pane exists, claude running → LIVE. Do NOT kill/relaunch; nudge only if
   stalled ("Keep going with your task autonomously…", signed
-  `[automated — NOT from Rayi]`, Enter as a separate keystroke, then read the
+  `[automated — NOT the operator]`, Enter as a separate keystroke, then read the
   pane to confirm it submitted).
 - Pane gone (post-reboot: all of them) → recreate:
   `tmux new-session -d -s <name> -c <cwd>`.
@@ -89,19 +94,21 @@ This is why rule 2 above exists.
 
 **7. Only then** resume normal watch cadence.
 
-## Crash manifest — 2026-09-16 ~17:28 UTC (worked example, and live for THIS recovery)
+## Crash manifest — 2026-09-16 (worked example / template)
 
-| pane | state at 17:50 | cwd | session id | resume |
+The shape to capture at crash time, one row per pane:
+
+| pane | state at crash | cwd | session id | resume |
 | --- | --- | --- | --- | --- |
-| 2zajac2a 1.1 | claude LIVE (survived) | ~/repos/zajac | 82dd63da-c3de-430f-88d7-eb1bb56a3513 | nothing now; post-reboot: `cus launch <acct> -- --resume 82dd63da-…` from ~/repos/zajac. First duty: recreate the Shabbos-build timer (see zajac memory "CRASH-RESUME BRIEF 2026-09-16"). |
-| cus1a 1.1 | claude DEAD (bash) | ~ (launched from ~/repos/claude-usage-swap) | 146dc334-03d9-4103-9dac-9a2c97a8057c | resume per step 5; it was holding for a 17:50 `cus switch rayi1` — tell it to RE-CHECK ground truth first (rayi2 was 5h≈92%). |
-| yudi1a 1.1 | claude DEAD (bash) | ~ | likely 9f89e99d-66fb-46df-9b53-e6bb613cfad4 (newest -home-rayi, 04:01) — VERIFY by content-match before resuming | step 4 content-match, then step 5. |
+| sess-A | claude LIVE (survived) | ~/repos/<project-A> | `<session-id-A>` | nothing now; post-reboot: `cus launch <acct> -- --resume <session-id-A>` from its cwd. First duty: recreate its scheduled-build timer (see that project's crash-resume memory brief). |
+| cus-watchdog | claude DEAD (bash) | ~ (launched from ~/repos/claude-usage-swap) | `<session-id-B>` | resume per step 5; if it was holding for a pre-crash `cus switch`, tell it to RE-CHECK ground truth first (the target account's headroom may have changed). |
+| sess-C | claude DEAD (bash) | ~ | `<session-id-C>` (VERIFY by content-match before resuming — pick the newest transcript for the cwd, then grep a distinctive phrase) | step 4 content-match, then step 5. |
 
 ## Optional machinery (not built — build if manual recovery gets old)
 
 A 10-minute user-cron that snapshots `tmux list-panes -a` + each pane's claude
 child's CLAUDE_CONFIG_DIR (from /proc/<pid>/environ) + newest transcript id
-into a JSON manifest on sda offload, plus a `resume-fleet` script that replays
-the newest manifest post-reboot (dry-run default). `cus check-orchestrate`
+into a JSON manifest on an offload volume, plus a `resume-fleet` script that
+replays the newest manifest post-reboot (dry-run default). `cus check-orchestrate`
 already computes the live half; the delta is persisting it. If built, home it
 here under scripts/ and document it in this file.
