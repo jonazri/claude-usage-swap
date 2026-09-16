@@ -4,6 +4,8 @@ Stand up a background watchdog that keeps a chosen set of Claude Code sessions a
 
 This was distilled from a real multi-day weekend watch. The design principle throughout: **do the least intervention that works, prefer letting the daemon self-heal, and never take an irreversible action on a session's behalf.**
 
+> **Identifiers below are generic placeholders** (`acct-A`, `sess-A`, `<session-id>`, `<user>`, `~/repos/<project>`) — substitute your own. Placeholder letters are scoped to **each worked example**, not one fleet-wide legend: the same letter in two different dated examples may be two different real accounts.
+
 > **Posture update 2026-07-07 (operator directive — supersedes "prefer letting the daemon self-heal" above for the attended case):** when the watchdog agent is actively present, **the agent's management takes PRECEDENCE over the daemon — act decisively, do NOT ask permission before a safe at-risk swap, and do NOT defer to the daemon to handle it.** When a protected lane is AT-RISK (within ~5% of the 95% step on ANY of 5h/7d/per-model-Fable), **move it preemptively yourself, now**, rather than waiting for the daemon to swap it at the step. The safety rules below still govern *how* you swap (fresh non-`~` reading — force-poll first; dry-run for clobber-safety; in-place so a live session's context is never reset on an unverified/stale number; never touch locked slots; no `--force`; Escape-only in native prompts) — but *whether* to act on a verified at-risk lane is not a question the operator wants asked. The original "least intervention / let the daemon self-heal" principle still applies to the *unattended* case (headless timer with no agent watching) and to genuinely irreversible actions (browser relogins, hand-edits), which still escalate to a human.
 
 > **LOOK before you report (2026-07-07 — learned from a bad call):** never claim a pane's status ("recovered", "working", "healed") from a single grepped line. A positive-signal line (`● Bash(...)`, `◯ general-purpose ...`, `✻ …`) can be **stale scrollback** left over from *before* a swap, a `/clear`, or a logout — the pane may actually be at an empty `❯` prompt, cleared, or logged out. **Before reporting, full-capture the pane and read its ACTUAL current bottom state**: an empty `❯` prompt (optionally with SessionStart reminders) = idle/cleared, NOT working; a live `◯`/`✻` row with a *ticking* timer at the bottom = working; a `Please run /login`/`/rate-limit-options` menu at the bottom = down. After ANY heal/swap+nudge, verify recovery by reading the pane a few seconds later — do not infer it. Incident: reported sess-X "recovered, working (running git)" off a stale `● Bash` line while the pane had actually been `/clear`ed and was empty.
@@ -83,7 +85,7 @@ Most intervals are green. Keep them one line. Detail only appears when something
 > **REPORT FORMAT — every tick emits TWO compact markdown tables, not just the terse line (2026-07-20 — operator directive):** the operator asked that each interval's report show an **accounts table** (fleet headroom + reset ETAs) and an **active-panes table** (protected sessions + the account each rides) at a glance, every tick — not only on an explicit "snapshot". A helper renders both from ground truth so you don't hand-build them:
 > ```bash
 > python3 <cus-repo>/skills/watch_tables.py                         # default active panes
-> python3 <cus-repo>/skills/watch_tables.py sess-F acct-J sess-H   # or name them (session name or %pane id)
+> python3 <cus-repo>/skills/watch_tables.py sess-F sess-G sess-H   # or name them (session name or %pane id)
 > ```
 > It reads `cus sessions --json` (live pane→slot→account, pool, 5h/7d/Fable, drift) + `state.json` (reset timestamps) + `config.yaml` (disabled accounts), and prints:
 > - **Accounts table** — every account sorted cleanest-Fable-first, with 5h / 7d / Fable %, plus THREE reset ETAs: `5h reset`, **`7d reset (72h)`** (the projected real refresh cus rotates on — the one that matters), and `7d reset (API)` (raw `seven_day_resets_at`, ~7d out, misleading — shown only for comparison). Accounts hosting an active pane are **bold** with a `← pane` marker; disabled accounts show `⛔ DISABLED`.
@@ -143,7 +145,7 @@ To dismiss a session's native rate-limit menu after its window has reset, `tmux 
 
 ## Hard rules — do NOT violate
 
-- **Never kill/exit a pane or session** (`/exit`, Ctrl-C, closing it). Pausing and continue-nudges are the only keystrokes you send, only to panes you track.
+- **Never kill/exit a pane or session** (`/exit`, Ctrl-C, closing it). Pausing and continue-nudges are the only keystrokes you send, only to panes you track. (One deliberate exception: retiring the watchdog's OWN prior pane during a migration handoff — step 6 of the "Migrating / re-homing the watchdog" section — and only after its fresh replacement is verified healthy. Never `kill-session` a pane you are protecting.)
 - **Never answer a permission / yes-no / upgrade prompt** on the human's behalf.
 - **Never drive an interactive `/login` / `relogin` browser flow** — you can't; your move is to hand the human the exact command.
 - **Never hand-edit `state.json` / `.credentials.json` / `.claude.json`** — go through `cus` commands. When only a hand-edit will fix it (no-journal drift), escalate.

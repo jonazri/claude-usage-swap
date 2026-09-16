@@ -21,7 +21,7 @@ the OAuth usage endpoint — either of which can change upstream at any time
 - **`cus.py`** — everything: the CLI subcommands, the daemon loop, credential
   I/O, usage polling, and the swap state machine. It's large and single-file by
   design; use `grep`/symbol search to navigate rather than reading top-to-bottom.
-- **`cus.service`** (`systemd --user`) — the background daemon that polls usage
+- **`cus.service`** (`systemd --user`; installed on the host, not committed in-repo) — the background daemon that polls usage
   and moves credentials. **The config file is hot-read; the *code* is not** —
   after editing `cus.py` you must `systemctl --user restart cus.service` for the
   daemon to pick it up. Config changes need no restart.
