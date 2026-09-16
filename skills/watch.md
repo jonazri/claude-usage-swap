@@ -316,3 +316,61 @@ non-zero.
 now appears (and vice versa). A slot whose session was live during a deferred heal still
 writes to its private dir until relaunch — restart that session after the mount
 relinks.
+
+## Update 2026-09-16 — Migrating / re-homing the watchdog (new-pane FRESH-session handoff)
+
+When the watchdog must move to a different account/slot (its host account is
+Fable-clean and you want to preserve that capacity, its account died, or it
+drifted onto a shared slot after a crash-revive) — do **NOT** relaunch it in
+place by resuming the same session id, and do **NOT** open a second pane that
+`--resume`s the SAME session id. Two live processes on one session's `.jsonl`
+transcript both take turns and append → interleaved / undefined writes (and some
+Claude Code builds refuse the second attach outright). Either way the old,
+working watchdog dies (or misbehaves) before the new one is proven healthy —
+no fallback. This is the trap the 2026-09-16 migration hit.
+
+**The safe procedure — a new pane running a FRESH session (the watchdog is
+state-light: its whole contract is THIS file + `MEMORY.md`, so a fresh session
+loses nothing operational):**
+
+1. **Pick + verify the target is actually launchable.** The park should be a
+   **Fable-dead, standard-pool** account (Opus watchdog burns zero Fable, so it
+   wastes nothing there and frees Fable-clean accounts for real Fable lanes —
+   see memory `opus-watchdog-pin-to-fable-dead-account`). Confirm the target has
+   a **free independent login family** and no live mount elsewhere, or the
+   locked-slot launch is refused (GH #190/#104). A *canonical* relogin does NOT
+   provision an independent family — only `cus login-mount <acct>` (interactive
+   browser) does. 2026-09-16 example: `default` was relogged but its family pool
+   was exhausted, so `cus launch default --lane slot-1` was refused; the launch
+   fell back to `merkos` (which had a free family). Pre-provisioned locked
+   standard slots exist for this (slot-1/default, slot-5/rayi1, slot-6/merkos).
+2. **Write a handoff briefing file** (see `~/.claude/cus-watchdog-handoff-<date>.md`
+   for the 2026-09-16 template): who/where it runs, that it's a fresh session
+   REPLACING the prior one (and that the prior pane is now a dead-loop ops chat,
+   not a peer watchdog), the loop contract summary, the external cron net, a
+   current fleet snapshot, the standing red-lines, and its first actions.
+3. **Launch the new pane** in a shell (not a one-shot command that exits — that
+   kills the tmux session): `tmux -L default new-session -d -s cus-watchdog -c
+   <repo>` then send-keys `cus launch <acct> --lane <slot> --force -- --dangerously-skip-permissions`
+   (no `--resume` = fresh session). Name the tmux session `cus-watchdog` to match
+   the heartbeat cron's canonical `TMUX_SESSION`.
+4. **Verify it came up healthy** (statusline shows the right locked slot+account,
+   at a `❯`), then **bootstrap it**: send-keys a prompt pointing it at the handoff
+   file → it reads `watch.md`, runs its first tick, and re-arms. Confirm the
+   heartbeat file (`~/.claude/cus-watchdog.heartbeat`) mtime goes fresh — that
+   proves it ran a real tick, not just booted.
+5. **Re-point the external net** (`~/bin/cus-watchdog-heartbeat.sh`): update `SID`,
+   `TRANSCRIPT` (to the new slot's config dir), `ANCHOR_ACCT`, `WD_SLOT`. Do this
+   BEFORE relying on the net so a failed bounce self-recovers to the RIGHT place.
+   The heartbeat SID gates the whole net — a stale SID means it watches a dead
+   session and never fires for the live one.
+6. **Only now retire the old pane** (`tmux kill-session -t <old>`). Because the
+   new watchdog is a *different* session id, the old pane can linger harmlessly as
+   a fallback until you're satisfied — there is no transcript conflict.
+
+**Net-liveness caveat (2026-09-16):** the heartbeat cron judges liveness by
+`max(heartbeat-file, transcript)` mtime. An *interactive* session (a human/agent
+chatting with the watchdog session) keeps the transcript fresh, so a **dead loop
+can be masked** from the net while the session is being talked to. Mitigation:
+touch the heartbeat file EVERY tick (already in the contract) — it's the only
+signal that reflects loop ticks specifically, not arbitrary session activity.

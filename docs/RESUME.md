@@ -42,9 +42,21 @@ ok, writes fail; use sda = /mnt/volume_nyc1_1777864675482/offload/).
 `... status`. Fix mounts/creds before launching anything (a resumed session
 with dead creds just walls immediately).
 
-**2. Relaunch the watchdog** (cus1a) per skills/watch.md — it should RE-CHECK
+**2. Relaunch the watchdog** per skills/watch.md — it should RE-CHECK
 account ground truth before acting on any pre-crash plan (a planned switch may
 be moot after the downtime).
+
+> **Annotation 2026-09-16:** the watchdog is now the FRESH session
+> `4af83056-fc16-4937-a0b1-a287ab5fc394` in tmux session `cus-watchdog`, parked
+> **locked on slot-6 / merkos** (Fable-dead, standard pool). The old `cus1a` /
+> `146dc334` on slot-8 is retired (its loop died on the reboot; the pane became
+> an interactive ops chat). When re-homing the watchdog after a crash/reboot, use
+> the **new-pane FRESH-session handoff** now documented in
+> `skills/watch.md` §"Update 2026-09-16 — Migrating / re-homing the watchdog" —
+> do NOT resume the same session id in a second live pane (transcript-write
+> conflict), and verify the target account has a free independent login family
+> (`cus login-mount` if not; a canonical relogin alone does NOT provision one —
+> GH #190/#104).
 
 **3. Per pane — classify before touching** (watch.md rules, condensed):
 - Pane exists, bottom line is a shell prompt (`❯` under `rayi in …`) → claude
