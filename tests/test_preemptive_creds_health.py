@@ -130,7 +130,12 @@ def test_c_refresh_near_ttl_warns_with_date():
     cond = cus._diagnose_mount_creds_health(
         "slot-6", "rayi2", creds, NOW_MS, _cfg(), refresh_age_days=27.0)
     assert cond is not None
-    assert cond.severity == "warning"
+    # Annotation 2026-09-08 (login-family pool-collapse incident): was
+    # "warning". A LIVE mount within independent_logins.urgent_wall_within_days
+    # (default 5) of the absolute refresh-token wall is now URGENT — the
+    # warning fired for weeks at low severity and was ignored while every
+    # family aged into the wall together.
+    assert cond.severity == "urgent"
     assert "refresh token" in cond.summary
     assert "cus relogin rayi2" in cond.action
     # Relogin-by date = now + 3 days, derived from NOW_MS deterministically.
@@ -143,7 +148,9 @@ def test_c_refresh_past_ttl_warns():
     creds = _valid(expires_at=NOW_MS + 6 * 3600 * 1000)
     cond = cus._diagnose_mount_creds_health(
         "shared", "rayi", creds, NOW_MS, _cfg(), refresh_age_days=33.0)  # past 30d
-    assert cond is not None and cond.severity == "warning"
+    # Annotation 2026-09-08: was "warning" — past the wall on a live mount is
+    # an outage in waiting, so it is URGENT now (see test_c_refresh_near_ttl).
+    assert cond is not None and cond.severity == "urgent"
     assert "past its assumed" in cond.summary
 
 
@@ -296,15 +303,35 @@ def test_e2e_live_lane_access_near_expiry_warns():
 
 
 def test_e2e_live_lane_refresh_ttl_warns_from_snapshot_age():
+    # c03767b changed the base-snapshot token-age proxy from "meta.yaml refreshed_ts
+    # age" to min(meta.yaml age, canonical creds-FILE mtime age): a browser relogin
+    # or rotation save-back bumps the creds file's mtime but NEVER meta.yaml's
+    # refreshed_ts, so trusting whichever evidence is NEWER (smaller age) is what
+    # kills the 2026-08-10 false "past TTL" alarm. This test asserts BOTH directions
+    # of that corrected min() behavior, so it meaningfully covers the fix rather
+    # than just the old meta-only proxy.
     env = _Env(active="rayi", mode="per_session")
     try:
-        # Base-snapshot age proxy: meta.yaml refreshed_ts 27 days ago → within warn.
-        env.make_account("rayi2", _valid(), refreshed_days_ago=27.0)
         # Access token healthy (far future) so ONLY the refresh-TTL branch can fire.
+        # meta.yaml says 27 days old (inside the warn window) but the canonical creds
+        # file is freshly written (mtime ~ now). Corrected behavior: min() trusts the
+        # fresh file → the token is NOT actually old → NO refresh-TTL warning. This is
+        # exactly the false alarm c03767b eliminated (pre-fix this warned).
+        env.make_account("rayi2", _valid(), refreshed_days_ago=27.0)
         env.make_slot("rayi2", live=True,
                       mount_creds=_valid("at-lane", "rt-lane", _now_plus_min(600)))
-        conds = cus._diagnose_live_mounts_creds_health(cus.load_state(), cus.load_config())
-        warns = [c for c in conds if "refresh token" in c.summary]
+        fresh = cus._diagnose_live_mounts_creds_health(cus.load_state(), cus.load_config())
+        assert [c for c in fresh if "refresh token" in c.summary] == [], (
+            "a fresh canonical creds mtime must win the min() and suppress the TTL warn")
+        # Now backdate the canonical creds file mtime to 27 days as well: meta AND
+        # file BOTH old → min() is ~27d → the refresh-TTL warning fires and names the
+        # browser re-login. (A genuinely old token still warns; only a fresh file
+        # suppresses.)
+        snap = cus.account_creds_path("rayi2")
+        old = time.time() - 27.0 * 86400
+        os.utime(snap, (old, old))
+        warns = [c for c in cus._diagnose_live_mounts_creds_health(
+            cus.load_state(), cus.load_config()) if "refresh token" in c.summary]
         assert len(warns) == 1
         assert "cus relogin rayi2" in warns[0].action
     finally:
@@ -367,6 +394,14 @@ def test_e_dedup_stable_signature_across_two_cycles():
         env.make_account("rayi2", _valid(), refreshed_days_ago=27.0)
         env.make_slot("rayi2", live=True,
                       mount_creds=_valid("at-lane", "rt-lane", _now_plus_min(600)))
+        # Backdate the canonical creds mtime too, so min(meta age, creds-file mtime
+        # age) is GENUINELY old (c03767b): with the default fresh file the min()
+        # would pick the fresh mtime and no aging condition would exist to de-dup.
+        # Both signals old → the refresh-TTL warning fires and must be STABLE across
+        # cycles (so maybe_write_sos's notify hash won't re-fire every poll).
+        snap = cus.account_creds_path("rayi2")
+        old = time.time() - 27.0 * 86400
+        os.utime(snap, (old, old))
         c1 = cus._diagnose_live_mounts_creds_health(cus.load_state(), cus.load_config())
         c2 = cus._diagnose_live_mounts_creds_health(cus.load_state(), cus.load_config())
         assert c1 and c2

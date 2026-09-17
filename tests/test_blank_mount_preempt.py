@@ -741,6 +741,10 @@ def test_e_legacy_independent_login_lane_never_heals_from_snapshot():
             _valid("at-legacy", "rt-own-lineage", expires_at=1_700_000_000_000)))
         env.shadow_path(slot).write_text(json.dumps(
             _valid("at-shadow-own-lineage", "rt-own-lineage", expires_at=1_700_000_000_000)))
+        cus._STORE_DEAD_PROBE.clear()
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: ("alive", {}) if rt == "rt-own-lineage"
+                  else (_ for _ in ()).throw(AssertionError(f"snapshot must not be probed: {rt!r}")))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-shadow-own-lineage"
         # A real in-lineage comparison happened → forensic pick line (round-4),
@@ -833,6 +837,10 @@ def test_e_legacy_tokenless_shadow_loses_to_store():
         store.write_text(json.dumps(
             _valid("at-legacy-capable", "rt-legacy", expires_at=1_700_000_000_000)))
         env.shadow_path(slot).write_text(json.dumps(shadow))
+        cus._STORE_DEAD_PROBE.clear()
+        env.patch(cus, "_oauth_refresh_grant",
+                  lambda rt: ("alive", {}) if rt == "rt-legacy"
+                  else (_ for _ in ()).throw(AssertionError(f"only the legacy store may be probed: {rt!r}")))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
         assert env.slot_creds(slot)["claudeAiOauth"]["accessToken"] == "at-legacy-capable"
     finally:

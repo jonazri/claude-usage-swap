@@ -118,10 +118,12 @@ def test_inactive_due_after_slow_interval():
 
 def test_flat_config_polls_everyone_each_interval():
     # Backward-compat: with no polling.* keys, both roles are due after the
-    # flat interval and not before.
+    # flat interval and not before. Fresh clock: the module-level NOW ages
+    # during a long suite run and would push "b" past the interval.
+    now = datetime.now(timezone.utc)
     st = _state(active="a", accounts={
-        "a": {"last_poll_ts": _iso(NOW - timedelta(seconds=310))},
-        "b": {"last_poll_ts": _iso(NOW - timedelta(seconds=290))},
+        "a": {"last_poll_ts": _iso(now - timedelta(seconds=310))},
+        "b": {"last_poll_ts": _iso(now - timedelta(seconds=290))},
     })
     assert cus._account_poll_due(st, FLAT_CFG, "a")[0]
     assert not cus._account_poll_due(st, FLAT_CFG, "b")[0]

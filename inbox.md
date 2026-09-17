@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-09-11 — decision — GH #199 peer-registry sharing: migration rides `cus doctor --fix-dirs`, not a separate `--fix-sessions` flag](#2026-09-11-decision-gh-199-peer-registry-sharing-migration-rides-cus-doctor-fix-dirs-not-a-separate-fix-sessions-flag)
 - [2026-07-10 — decision — Dead-snapshot heal-from-live-family: reseed a refresh-dead canonical snapshot from a valid pooled family instead of demanding a browser relogin (rayi2 incident)](#2026-07-10-decision-dead-snapshot-heal-from-live-family-reseed-a-refresh-dead-canonical-snapshot-from-a-valid-pooled-family-instead-of-demanding-a-browser-relogin-rayi2-incident)
 - [2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-125-merge-same-cause-as-123-124-entries)
 - [2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-124-merge-same-cause-as-123-entry)
@@ -29,6 +30,28 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 
 <!-- AVC:ENTRIES -->
 
+## 2026-09-11 — decision — GH #199 peer-registry sharing: migration rides `cus doctor --fix-dirs`, not a separate `--fix-sessions` flag
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #gh-199 #mounts #peer-registry #doctor #session-mail
+
+**What I decided:** the one-time migration for mounts that already own a private `sessions/` dir runs inside the existing `cus doctor --fix-dirs` heal, rather than behind a new `cus doctor --fix-sessions` flag. `sessions` is now a normal member of `SHARED_SYMLINK_SUBDIRS`, but its real-dir case is special-cased in `doctor_mount` to a liveness-aware drain (`_drain_sessions_dir`) instead of the generic recursive merge used for `projects/`.
+
+**Why:** two reasons. (1) `--fix-dirs` is *the* heal command in this repo — if the sessions drift were behind its own flag, `cus doctor --fix-dirs` would print "all mounts canonical" while the peer registry was still partitioned, which is exactly the misleading-success failure GH #192 was filed about. (2) The generic merge is wrong here and could not simply be reused: a long-lived mount holds one registry file per session that *ever* ran under it (slot-4 held 2,002 on 2026-09-11, nearly all dead pids), and folding those into the shared registry would bury the live peers that `ListAgents` actually reads. The drain adopts live-pid entries into the shared registry and parks everything else in `<mount>/sessions.bak-<date>/` — move, never delete.
+
+**Blast radius if wrong:** the heal only runs when an operator types `--fix-dirs`; the read-only `cus doctor` is unchanged and reports the drift without touching anything. No live mount was modified by this work — verification was done in throwaway temp trees, plus one read-only `cus doctor` dry run against production (21 findings, nothing written).
+
+### Walk-back path
+1. `git revert` the commit on `feature/fix-199-sessions-symlink-20260911` (or close PR #211 unmerged) — that removes `"sessions"` from `SHARED_SYMLINK_SUBDIRS`, the `_drain_sessions_dir` helper, and the doctor special case in one shot.
+2. If the migration had already been run on live mounts, put each mount back the way it was: for each `~/claude-accounts/<mount>/` where `sessions` is now a symlink — `rm ~/claude-accounts/<mount>/sessions` (removes only the link), `mv ~/claude-accounts/<mount>/sessions.bak-<date> ~/claude-accounts/<mount>/sessions`, then move any adopted files back out of `~/.claude/sessions/` into it. Nothing was deleted, so the park dir plus adopted filenames are a complete record. (Fix pass 1 no longer adopts live pairs — deferred mounts never moved them.)
+3. Mounts with no `sessions.bak-<date>/` dir had nothing to migrate; just `rm` the symlink and `mkdir sessions`.
+
+### Correction 2026-09-14 (fix pass 1 on PR #211)
+Dual-review (F-B-1/2 + F-A-4) amended the decision without reversing the "sessions stays inside `--fix-dirs`" invariant: `--fix-sessions` was **added as a narrower alias** (sessions-only heal) for the safer owner path, while `--fix-dirs` still heals sessions/ as part of the full layout so it can never claim "all mounts canonical" while the peer registry is partitioned. Live pairs are now **deferred** (not moved into shared). One registry entry = `.json` + `.key`. Count corrected to 1,001 × 2. Walk-back step 1 PR number fixed (#211, was #207).
+
+### Correction 2026-09-14 (fix pass 2 on PR #211)
+F-B-R1-1: unknown liveness (`procStart` missing from `.json` — 4 of 5 live shared-registry entries that day — and `.key` missing/corrupt, or `/proc` unreadable) fails OPEN. The drain treats those pids as live and defers the mount (`deferred (liveness unknown: pids …)`) instead of parking a running session's peerToken. Walk-back is still revert of the PR-branch commit.
 ## 2026-07-10 — decision — Dead-snapshot heal-from-live-family: reseed a refresh-dead canonical snapshot from a valid pooled family instead of demanding a browser relogin (rayi2 incident)
 
 - **Status:** open

@@ -178,7 +178,7 @@ cus rename <old> <new>        # rename an account (preserves config + history)
 # Locks
 cus pin <pane> <account>      # pin a tmux pane to an account (never swap)
 cus unpin <pane>              # remove pin
-cus lock <slot>               # freeze a SLOT's account (per_session/hybrid): never swapped or gc'd
+cus lock <slot>               # freeze a SLOT's account (per_session/hybrid): never swapped, gc'd, or lane-share-joined
 cus unlock <slot>             # remove a slot lock
 
 # Rotation-set pools (per_session/hybrid)
@@ -247,7 +247,7 @@ Everything above describes `mode: global` (the default): one live mount (`~/.cla
 
 **Slot locks & rotation-set pools (per_session / hybrid):**
 
-- `cus lock <slot>` / `cus unlock <slot>` — freeze a slot so the daemon never swaps its account or gc's it (the slot-level counterpart of `cus pin`, which protects a *session* from hot-swap). Shown as `🔒locked` in `cus status`.
+- `cus lock <slot>` / `cus unlock <slot>` — freeze a slot so the daemon never swaps its account or gc's it, and (with lane sharing) so the slot is **exclusive** to its owner: never auto-joined as a lane-share co-tenant and never auto-picked/pinned onto (`--lane <slot> --force` still co-tenants it deliberately). The slot-level counterpart of `cus pin`, which protects a *session* from hot-swap. Shown as `🔒locked` in `cus status`.
 - `cus pool <slot> [premium|standard]` (and `cus launch --pool <p>`) — put a slot in a rotation set. **premium** (default) honors the per-model weekly cap (`per_model_weekly.cap_pct`, on when `per_model_weekly.gate_enabled: true`): the slot swaps off an account, and won't swap back, once a tracked model's week hits the cap — e.g. leave a Fable-exhausted account at 97% and don't return until its week resets. **standard** ignores the per-model cap (only aggregate 5h/7d + `hard_7d_cap` apply), so a model-exhausted account keeps serving standard-model work instead of stranding its aggregate headroom. Per-model weekly is a *hard cap*, not a gradual ladder — see `docs/STRATEGIES.md` § "Per-model weekly cap".
 
 ### `mode: hybrid` — manage slots AND the shared mount together (2026-07-02)
@@ -326,9 +326,23 @@ independent_logins:
   use_independent_logins: false  # true = swaps install/save-back the per-(slot,account) independent login when one is provisioned
   refresh_token_ttl_days: 30     # assumed refresh-token lifetime — drives only the sos near-expiry nudge (unconfirmed; see #109 Phase 0)
   warn_expiry_within_days: 5
+  # ---- 2026-09-08 login-family pool-durability (PR #201) ----
+  heal_from_canonical: true              # DEFAULT-ON (new behavior): when a live pooled lane's leased family is DEAD but the account canonical is alive, mint the lane a fresh family from the canonical (a documented generation transfer that dead-branches the canonical) and re-lease it — instead of looping heal→blank→heal. Guarded #104-safe (never touches a canonical whose family is live on another mount) + probe-verified. false = pre-2026-09-08 heal (family store or nothing).
+  heal_from_canonical_cooldown_minutes: 10  # poll-burnout backoff: at most one transfer attempt per lane per this many minutes
+  urgent_wall_within_days: 5             # DEFAULT-ON (new behavior): a pooled family within this many days of the assumed refresh-token wall on an account backing a LIVE lane raises an URGENT sos (was a low-severity warning that fired for weeks and was ignored while the pool aged into the wall together)
+  free_count_excludes_past_wall: true    # DEFAULT-ON (new behavior): count a family FREE only if a claim could still succeed — not blank/expired on disk, not probe-proven dead, and not past the assumed wall by provenance age. false = age-blind counting (disk-shape + probe-cache still apply). `cus status` now prints each family's age + wall distance.
+housekeeping:
+  daemon_sweep: false            # DEFAULT-OFF: the opt-in daemon-side automation of `cus prune`. Inert with the default config (zero probes/writes). SAFE to enable IFF `auto_reseed: false` (default) — see below.
+  sweep_interval_hours: 6        # when the sweep is on, run at most once per this many hours
+  family_probe_cooldown_minutes: 60   # cooldown for the sweep's free-family refresh-grant probe
+  auto_reseed: false             # DEFAULT-OFF (KEEP OFF): auto-run the canonical→family generation transfer on an out-of-band-relogin detection. The transfer deliberately dead-branches the canonical (an operator-approval-class action) — leave it to `cus prune --reseed <acct>`. Enabling daemon_sweep with auto_reseed:true is the one credential-unsafe combination.
+  auto_evacuate: true            # move LIVE lanes off subscription-dead accounts (only fires on a definitively-dead account; churn/cache-warmth preference, NOT the credential-safety gate)
+  warm_spare_families: 1         # warn (warn-only) when an account has fewer than this many claimable free families
 ```
 
-Design + the experiment that established it: `docs/plans/2026-07-02-seamless-swap-independent-logins.md` and issue #109.
+`daemon_sweep` **SAFE-IF**: enabling `daemon_sweep` is credential-safe IFF `auto_reseed: false` (the default). `auto_reseed` is what runs canonical-consuming generation transfers guardless of a manual review; `auto_evacuate` is only a churn/cache-warmth preference, not a safety gate. (The reactive `heal_from_canonical` transfer, default-on, is separately #104-guarded and, since PR #201, runs under the swap lock on freshly-loaded state.)
+
+Design + the experiment that established it: `docs/plans/2026-07-02-seamless-swap-independent-logins.md` and issue #109. Pool-durability incident + fixes: PR #201.
 
 ## Progressive thresholds (the novel bit)
 

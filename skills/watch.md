@@ -4,9 +4,13 @@ Stand up a background watchdog that keeps a chosen set of Claude Code sessions a
 
 This was distilled from a real multi-day weekend watch. The design principle throughout: **do the least intervention that works, prefer letting the daemon self-heal, and never take an irreversible action on a session's behalf.**
 
+> **Identifiers below are generic placeholders** (`acct-A`, `sess-A`, `<session-id>`, `<user>`, `~/repos/<project>`) — substitute your own. Placeholder letters are scoped to **each worked example**, not one fleet-wide legend: the same letter in two different dated examples may be two different real accounts.
+
 > **Posture update 2026-07-07 (operator directive — supersedes "prefer letting the daemon self-heal" above for the attended case):** when the watchdog agent is actively present, **the agent's management takes PRECEDENCE over the daemon — act decisively, do NOT ask permission before a safe at-risk swap, and do NOT defer to the daemon to handle it.** When a protected lane is AT-RISK (within ~5% of the 95% step on ANY of 5h/7d/per-model-Fable), **move it preemptively yourself, now**, rather than waiting for the daemon to swap it at the step. The safety rules below still govern *how* you swap (fresh non-`~` reading — force-poll first; dry-run for clobber-safety; in-place so a live session's context is never reset on an unverified/stale number; never touch locked slots; no `--force`; Escape-only in native prompts) — but *whether* to act on a verified at-risk lane is not a question the operator wants asked. The original "least intervention / let the daemon self-heal" principle still applies to the *unattended* case (headless timer with no agent watching) and to genuinely irreversible actions (browser relogins, hand-edits), which still escalate to a human.
 
-> **LOOK before you report (2026-07-07 — learned from a bad call):** never claim a pane's status ("recovered", "working", "healed") from a single grepped line. A positive-signal line (`● Bash(...)`, `◯ general-purpose ...`, `✻ …`) can be **stale scrollback** left over from *before* a swap, a `/clear`, or a logout — the pane may actually be at an empty `❯` prompt, cleared, or logged out. **Before reporting, full-capture the pane and read its ACTUAL current bottom state**: an empty `❯` prompt (optionally with SessionStart reminders) = idle/cleared, NOT working; a live `◯`/`✻` row with a *ticking* timer at the bottom = working; a `Please run /login`/`/rate-limit-options` menu at the bottom = down. After ANY heal/swap+nudge, verify recovery by reading the pane a few seconds later — do not infer it. Incident: reported tabby-3 "recovered, working (running git)" off a stale `● Bash` line while the pane had actually been `/clear`ed and was empty.
+> **LOOK before you report (2026-07-07 — learned from a bad call):** never claim a pane's status ("recovered", "working", "healed") from a single grepped line. A positive-signal line (`● Bash(...)`, `◯ general-purpose ...`, `✻ …`) can be **stale scrollback** left over from *before* a swap, a `/clear`, or a logout — the pane may actually be at an empty `❯` prompt, cleared, or logged out. **Before reporting, full-capture the pane and read its ACTUAL current bottom state**: an empty `❯` prompt (optionally with SessionStart reminders) = idle/cleared, NOT working; a live `◯`/`✻` row with a *ticking* timer at the bottom = working; a `Please run /login`/`/rate-limit-options` menu at the bottom = down. After ANY heal/swap+nudge, verify recovery by reading the pane a few seconds later — do not infer it. Incident: reported sess-X "recovered, working (running git)" off a stale `● Bash` line while the pane had actually been `/clear`ed and was empty.
+
+> **DEAD ≠ idle, and a FROZEN pane ≠ a live one (2026-07-10 — learned from another bad call):** an agent-count scan (grepping `◯`) cannot tell three different states apart — a **live-idle claude** at an empty `❯`, a **claude that exited to a bare shell**, and a **frozen pane still showing stale content** all read as "0 agents." Two checks close the gap: **(1) Is claude even running under the pane?** A bottom line like `<user> in 🌐 … in ~` `❯` is a **login shell prompt, not claude** — the session is DEAD (exited/crashed/killed), not idle; it needs a **relaunch** (`claude --resume <id>` in the session's cwd + `CLAUDE_CONFIG_DIR`), not a nudge. Confirm with `/proc`: `pid=$(tmux list-panes -t <pane> -F '#{pane_pid}'); pgrep -P $pid` — no `claude`/`node` child = dead shell. A freshly-short `etime` on the pane's `-bash` (e.g. `ps -o etime= -p $pid` → `01:57`) tells you *when* it died. **(2) Has the pane's content actually CHANGED since last cycle?** Identical bottom text across two checks (e.g. the same half-typed `❯ why issues?` for an hour) means the session is idle/dead and you're reading a still frame — do NOT report it as "you're actively driving it" or "working." Diff the capture against last cycle before asserting live interaction. Incident: reported sess-Y "acct-A idle, you're driving it" for ~4 cycles off frozen user-text while its claude had actually gone idle at 21:34 and later exited to a bare shell; only a `/proc` check (bash `etime` 1:57) revealed it was DEAD. To recover a DEAD protected pane: find its session id by content-matching transcripts under `<config_dir>/projects/<cwd-encoded>/*.jsonl` (grep a distinctive phrase), then `tmux send-keys -t <pane> 'cd <cwd> && CLAUDE_CONFIG_DIR=<dir> claude --resume <id>' Enter` and verify the title/prompt came back.
 
 ---
 
@@ -21,7 +25,7 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 
 ## Setup — one-time, before the loop
 
-1. **Pick the panes to protect and their priority.** Track sessions by tmux **pane id** (stable for the pane's life) or by **tmux session name** (survives a relaunch into a new pane). Decide equal-priority vs. lower-priority — the lower-priority one is the first to shed load if the pool is oversubscribed. Example: `%5 (chats1a)` and `%76 (ratiod2a)` equal; `%70 (tabby-5)` lower.
+1. **Pick the panes to protect and their priority.** Track sessions by tmux **pane id** (stable for the pane's life) or by **tmux session name** (survives a relaunch into a new pane). Decide equal-priority vs. lower-priority — the lower-priority one is the first to shed load if the pool is oversubscribed. Example: `%5 (sess-A)` and `%76 (sess-B)` equal; `%70 (sess-Z)` lower.
 2. **Confirm the tools exist:** `command -v cus` and `systemctl --user is-active cus.service`. If `cus` is missing, install per `cus.md`.
 3. **Schedule the recurring check.** Two options:
    - **`/loop 1h <the check prompt>`** — session-local recurring task; simplest, dies when your Claude session exits. Good for a defined watch window.
@@ -31,6 +35,26 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 ---
 
 ## The recurring check — run this each interval
+
+> **TRACK WHAT'S RUNNING — do NOT watch a hardcoded pane list (2026-07-12 — user directive, learned from a bad miss):** the set of live sessions changes constantly; a fixed list (`sess-*`, `work-*`, …) silently drops panes and lets them die uncovered. **Each cycle, DISCOVER every pane that has a live `claude` process** and check all of them — the tracked set is "whatever is running now", recomputed every interval, not a list you carry forward. Enumerate with `cus sessions` (preferred — it already walks live pids) OR directly:
+> ```bash
+> tmux list-panes -a -F '#{session_name}	#{pane_pid}' | while IFS=$'\t' read s pid; do
+>   ch=$(pgrep -P "$pid"); for c in $ch; do grep -qE 'claude|node' /proc/$c/comm 2>/dev/null && { echo "$s"; break; }; done
+> done   # every session with a live claude child = a pane you must check this cycle
+> ```
+> For each discovered pane: resolve its slot/account (`CLAUDE_CONFIG_DIR` in the proc env; **`bare` = on `~/.claude`, outside cus rotation** — flag it, it won't auto-rotate), read that account's 5h/7d/Fable, and scan its bottom state for the block/stall/dead classes. Incident: **sess-D (slot-11) sat maxed-out at the `/rate-limit-options` menu for ~24h** because it wasn't in the watcher's hardcoded set (which only covered slots 1/2/4/8/9) — the daemon had already rotated its account to a fresh one, but the frozen pane never retried and nobody dismissed the stale menu. Discovering all 16 live panes (vs the 6 tracked) surfaced it immediately.
+
+> **PARK-AND-SHUFFLE — when "0 valid swap targets" but a WORKING lane is capped (2026-07-14 — user directive, learned from a bad "nothing I can do"):** a Fable-saturated + login-pool-full fleet can make `cus slot move` refuse everywhere ("no free login family" / "0 valid swap targets"), and it's tempting to declare the capped working lane unmovable and just watch it 429. **Don't.** An **idle** lane sitting on a Fable-clean account (e.g. acct-A Fab29) is *wasted capacity* — it burns nothing, so it does not need the clean account. **Free that clean family by PARKING the idle lane onto a Fable-MAXED account** (`cus slot move <idle-slot> <maxed-acct-with-a-free-family>` — a maxed account is fine for an idle lane, it won't burn its Fable), **then move the WORKING/capped lane into the freed clean family.** Worked 2026-07-14 when slot-2 + slot-13 were both Fable-limited on maxed-acct-C with 0 valid targets: parked idle slot-14 (acct-A→acct-B) and idle slot-5 (acct-D→acct-G), then moved slot-13→acct-A (Fab29) and slot-2→acct-D (Fab89) into the freed families — which also cleared the "0 valid swap targets" SOS. Rules: park only genuinely-IDLE lanes (0 agents, empty `❯`); target a maxed account that has a **free login family** (dry-run to confirm SNAPSHOT/CLAIM, never a pool-exhausted install that blanks the mount — see the acct-A/acct-D blank-hazard); after the shuffle **verify the working lane's creds are valid (not blanked)** and nudge it to retry. Capacity is conserved, just re-allocated from idle → working. If EVERY account is both maxed AND full (no idle lane on any clean account to displace), that's genuine exhaustion — escalate `cus login-mount <clean-acct>` (browser) or ride the weekly reset.
+
+> **A NUDGE ISN'T SENT UNTIL YOU PRESS ENTER — and you MUST verify it submitted (2026-07-14 — user: "your nudge failed because you didn't press enter"):** `tmux send-keys -t <pane> " …message…" Enter` frequently TYPES the message into Claude Code's input box but the trailing `Enter` races the TUI's input debounce and never registers — the text just sits there at `❯ …message…` un-submitted, and the session does nothing. **Send the Enter as a SEPARATE keystroke after a beat, then READ the pane to confirm it fired:** `tmux send-keys -t <pane> " …message…"; sleep 1; tmux send-keys -t <pane> Enter; sleep 3; tmux capture-pane -t <pane> -p | tail -6`. Success = the input box is now empty (`❯ `) AND a `✻ …/◯ …` working row appeared (it re-submitted and is churning). Failure = the message still sits in the `❯` box → press Enter again / re-send. NEVER report a nudge as done off the send-keys return code — that only means keystrokes were delivered to tmux, not that the message was submitted or that the session resumed. (This is the same "verify after, don't infer" rule as swaps — it applies to nudges too.)
+
+> **FIX A LIVE STUCK / LOGGED-OUT / WALLED PANE WITH `cus slot move` + A NUDGE — NEVER `tmux kill-session` (2026-08-07 — user directive: "you're supposed to use cus commands and then nudge the pane. You don't have to kill session"):** when a **LIVE** pane (claude still running under it) shows `Not logged in` / `401` / a Fable wall / blanked mount creds, the fix is two steps and **never a process restart**: **(1) `cus slot move <slot> <clean-Max-acct>`** — self-refuses on clobber; claim-verifies + rotates tokens + installs a fresh #109 login family, rewriting the live mount's creds; a same-account move is a no-op, so move to a *different* clean account. Then **(2) nudge the pane** — `send-keys`, signed `[automated cus watchdog, NOT the operator]`, Enter-verified per the NUDGE rule above. The running claude **re-reads the now-fresh credentials file on its next attempt** and clears the stale `Not logged in`/wall. A cached bad token does **NOT** require restarting the process. **Do NOT `tmux kill-session` + `claude --resume` a LIVE pane** — that tears down the whole tmux window (indistinguishable from a crash to the operator — "maybe that's the secret to crashes"), **interrupts the pane's in-progress work, and a fresh relaunch does not resume where the user was holding, silently destroying their state.** Incident 2026-08-07: I killed + fresh-restarted sess-E to "unstick" a logout; the operator saw it "crash the moment you did whatever you did" and lost held work — the correct move was `cus slot move slot-9 acct-I` + a nudge. **This supersedes any earlier "stuck-cached token → restart the process" guidance for LIVE panes.** The `claude --resume` relaunch (line 11 / DEAD-pane recovery) is ONLY for a genuinely DEAD/GONE pane — claude already exited to a bare shell, or `tmux has-session` is false, so there is nothing to nudge; **confirm the pane is actually gone before recreating it.**
+
+> **AFTER A SWAP, IMMEDIATELY TELL THE PANE'S SESSION YOU SWAPPED IT — or it self-swaps and you fight (2026-07-15 — user directive: "you have to tell the other session that you already swapped, otherwise it starts swapping on its own… and you have to tell it right away"):** every live pane runs its OWN session that manages its OWN account (babysitter / self-heal / its own cus logic). When YOU (the watchdog) move that pane's account from outside via `cus slot move`, the pane's session has no idea — it still thinks it's on the old account and its own management ALSO tries to swap/heal, so the two swap against each other (churn + token-rotation divergence). **So the moment you `cus slot move` a LIVE (non-exited) pane, in the SAME turn, send that pane a notice.** This applies to ANY live-pane swap — a preemptive at-risk move too, not just at a limit menu. Do NOT notify EXITED/parked panes (no session to fight you). Right away, same turn as the move.
+>
+> **BUT — injected messages read as if THE OPERATOR typed them, so SIGN them and VERIFY they make sense (2026-07-16 — user correction: "if you're going to send stupid messages to sessions without checking if they make sense, at least sign off that you're an ai not me"):** `tmux send-keys` puts your text into the pane's input box as a **user turn** — the session interprets it as if the human operator typed it. So (1) **ALWAYS sign the message as automated**, e.g. prefix `[automated cus-watchdog message — NOT the operator]`, so no session mistakes it for the human; (2) **only send content you've VERIFIED is true for THAT session** — the always-safe factual notice is `"[automated cus-watchdog message — NOT the operator] Your account was swapped to <acct> by the watchdog (the old one was near its cap); retry the step if it errored."` Do NOT tell a session to "stop self-swapping / don't run cus slot move" unless you've actually SEEN that session run a swap in its scrollback — an account's 5h climbing can be cached-token drift or daemon re-placement, not the session, so that instruction is often false and confusing; (3) **when unsure, don't inject at all** — a silent cred swap + natural re-auth beats a wrong message. Send text, `sleep 1`, `Enter` as a SEPARATE keystroke, `sleep 3`, then read the pane to confirm it submitted ([[nudge-only-stalled-mid-task]] press-Enter rule).
+
+> **Fable-5 SOFT limit is a distinct failure class the block-scan must catch (2026-07-14):** the hard block you grep for is `/rate-limit-options` / `❯ 1. Stop and wait` / `Upgrade your plan`. But hitting a per-model cap shows a DIFFERENT, softer message — **`You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model`** (and the "thinking" verb `Brewed for …`) — rendered as a `⎿` tool-output block ABOVE the input prompt, so a `tail -5` capture at the idle `❯` MISSES it and the pane reads "clean/idle." Add these strings to the scan AND capture the last ~15-18 lines (not 5) so a `⎿` limit block above the prompt is seen. Also: when diagnosing WHICH account a limited pane is really burning, **trust the pane's own live cus statusline (`🔒slot-N acct*`) over `cus sessions` and over disk `oauthAccount`** — the running process caches its token, so it can be authing to (and capping on) a different account than state/disk claim; only the statusline reflects the live token.
 
 ### 1. Resolve + health (one command does most of it)
 
@@ -49,12 +73,25 @@ cus sos; echo "EXIT:$?"
 **GREEN** iff: every protected pane is live; `cus sos` exit 0 (or the only SOS items are non-protected / benign — see SOS (d)); each protected pane's account is `5h% < ~90` **and** per-model-weekly `< ~95`; Status `ok` or `TOKEN_STALE`; nothing needlessly paused; and no pane needed a nudge. → Emit **one terse heartbeat line** and stop, nothing more:
 
 ```
-14:00 ✓ chats1a rayi2 24% · ratiod2a rayi1 55% · tabby5 rayi4 61%
+14:00 ✓ sess-A acct-D 24% · sess-B acct-C 55% · sess-Z acct-F 61%
 ```
 
 Most intervals are green. Keep them one line. Detail only appears when something happened.
 
 **Exception** (anything else) → follow the playbook below, then write a few plain sentences: what was wrong, what you did, and what — if anything — the human must do (spell out exact commands). Write it so it can be read cold hours later.
+
+> **"snapshot" ALWAYS means a FULL snapshot (2026-07-15 — user directive):** when the operator asks for "a snapshot" (or "snapshot please"), that is NOT the terse heartbeat line — it means the **complete fleet + lane picture**, and it must include **per-account 5h %, 7d %, per-model Fable %, AND reset ETAs for BOTH the 5h window and the 7d window** (the 7d/Fable weekly reset time is explicitly required — the user called this out). Render it as: (1) an SOS one-liner (benign flags noted as such); (2) a fleet table — every account with 5h / 7d / Fable + 5h-reset ETA + 7d-reset ETA (show the 72h-projected 7d reset; mark Fable-clean accounts, i.e. Fable < ~90); (3) a live-lane table — each live premium/work pane → its slot, account, 5h %, Fable %, and whether it's working vs exited/parked (a pane showing `Resume this session with: claude --resume` at the bottom = exited). Compute reset ETAs from `state.json` `five_hour_resets_at` and the 72h-projected `seven_day_resets_at` (see the [[fable5-soft-limit-and-statusline-groundtruth]] caveat: the 72h/7d projection does NOT reliably predict the per-model FABLE reset — only an actual force-poll drop confirms Fable freed, so label the 7d ETA as an estimate). Don't abbreviate a snapshot down to the heartbeat line — the operator asked for the full board on purpose. **`python3 <cus-repo>/skills/watch_tables.py` renders the fleet + panes tables (both 7d-reset columns) for you** — the same helper the per-tick report uses (see the REPORT FORMAT directive above); add the SOS one-liner above it for a full snapshot.
+
+> **REPORT FORMAT — every tick emits TWO compact markdown tables, not just the terse line (2026-07-20 — operator directive):** the operator asked that each interval's report show an **accounts table** (fleet headroom + reset ETAs) and an **active-panes table** (protected sessions + the account each rides) at a glance, every tick — not only on an explicit "snapshot". A helper renders both from ground truth so you don't hand-build them:
+> ```bash
+> python3 <cus-repo>/skills/watch_tables.py                         # default active panes
+> python3 <cus-repo>/skills/watch_tables.py sess-F sess-G sess-H   # or name them (session name or %pane id)
+> ```
+> It reads `cus sessions --json` (live pane→slot→account, pool, 5h/7d/Fable, drift) + `state.json` (reset timestamps) + `config.yaml` (disabled accounts), and prints:
+> - **Accounts table** — every account sorted cleanest-Fable-first, with 5h / 7d / Fable %, plus THREE reset ETAs: `5h reset`, **`7d reset (72h)`** (the projected real refresh cus rotates on — the one that matters), and `7d reset (API)` (raw `seven_day_resets_at`, ~7d out, misleading — shown only for comparison). Accounts hosting an active pane are **bold** with a `← pane` marker; disabled accounts show `⛔ DISABLED`.
+> - **Active-panes table** — each protected pane → id / slot / pool / account / 5h / 7d / Fable + a status word. A pane `cus sessions` can't resolve (orphan slot) is `/proc`-resolved from its claude child's `CLAUDE_CONFIG_DIR` → `state.json` slots map (shown with a `*` on the slot + "proc-resolved").
+> - **Status words** (shared by both tables): `✓ CLEAN` (Fable <10), `✓ headroom`, `⚠ Fable high` (≥90), `⛔ Fable at gate` (≥97, premium daemon swaps here), `⚠ 5h hot` (≥90), `⛔ DISABLED`. A pane row can also read `⛔ GONE (crashed?)` — that's the loud crash alert.
+> This does NOT replace the exception playbook: still judge GREEN-vs-exception and act on at-risk lanes; the tables are the *reporting surface*, the terse `HH:MM ✓` line is now the one-line header ABOVE the tables. On a green tick: header line + both tables. On an exception: header + tables + the plain-sentences write-up of what you did.
 
 ---
 
@@ -108,7 +145,7 @@ To dismiss a session's native rate-limit menu after its window has reset, `tmux 
 
 ## Hard rules — do NOT violate
 
-- **Never kill/exit a pane or session** (`/exit`, Ctrl-C, closing it). Pausing and continue-nudges are the only keystrokes you send, only to panes you track.
+- **Never kill/exit a pane or session** (`/exit`, Ctrl-C, closing it). Pausing and continue-nudges are the only keystrokes you send, only to panes you track. (One deliberate exception: retiring the watchdog's OWN prior pane during a migration handoff — step 6 of the "Migrating / re-homing the watchdog" section — and only after its fresh replacement is verified healthy. Never `kill-session` a pane you are protecting.)
 - **Never answer a permission / yes-no / upgrade prompt** on the human's behalf.
 - **Never drive an interactive `/login` / `relogin` browser flow** — you can't; your move is to hand the human the exact command.
 - **Never hand-edit `state.json` / `.credentials.json` / `.claude.json`** — go through `cus` commands. When only a hand-edit will fix it (no-journal drift), escalate.
@@ -146,7 +183,7 @@ cus restore-creds "$active" --live
 ```
 
 Caveats learned the hard way:
-- **Restore the currently-active account, not the one you assume.** The shared mount may have swapped under you (seen: merkos→03) — `restore-creds --live` refuses any account that isn't `state.json.active`. Read active first.
+- **Restore the currently-active account, not the one you assume.** The shared mount may have swapped under you (seen: acct-A→acct-I) — `restore-creds --live` refuses any account that isn't `state.json.active`. Read active first.
 - **It's best-effort.** If the newest backup's refresh token was already server-rotated, `cus poll` still shows `TOKEN_EXPIRED` after the restore → that account genuinely needs an interactive `cus relogin <acct>` (escalate). Seen on an account whose 0.6h-old backup was already dead.
 - A **daemon-side auto-heal** for this is landing (prevents a swap from blanking the mount *and* auto-restores it each cycle). Once deployed, this manual step is redundant — check whether the daemon already recovered it before intervening.
 
@@ -174,3 +211,168 @@ Moves a live lane onto a target account **in place, session uninterrupted** (cla
 - **72-hour weekly reset:** the `seven_day` cap actually resets ~every 72h (fixed ~04:50–05:00 UTC anchor), *not* every 7 days; `seven_day.resets_at` from the API is misleading. cus now projects the real 72h reset, so "resets in Xh" reflects reality.
 - **Autonomy:** for reversible fixes (restore, retag, slot move, config tweak) just do them and log a walk-back — don't escalate a question that a reversible command resolves.
 - **New reference:** `docs/DIAGNOSTICS.md` now covers mount topology, the two-dimensional (5h vs per-model-weekly) exhaustion model, the premium/standard split, the blank-mount signature, and the stale-poll gotcha.
+
+## Update 2026-09-04 — the build-babysitter layer + transcript ground truth
+
+Two additions from the flagship-site retrospective (2026-09-02 → 04), both additive to
+this skill:
+
+- **`build-babysitter` skill** (`~/repos/vibeCoding/skills/build-babysitter/`, PR #330):
+  the *momentum* companion to this *keep-alive* skill. Where `watch` keeps sessions
+  alive, logged in and under cap, the babysitter holds the owner's chair over ONE build
+  family — next-item nudges instead of bare "keep going", the D-queue defaults with a
+  logged trail, owner-lens QA on a cadence, and the effort scorecard at the end. It
+  **uses** this skill's mechanics (dead-pane relaunch, `cus slot move` + nudge, the
+  sign-and-verify rules) and does not restate them. Load both when a build is running
+  unattended.
+- **Read panes through `skills/pane_state.py`, not by hand.** `python3
+  ~/repos/claude-usage-swap/skills/pane_state.py <tmux session names or pane ids>` prints
+  one JSON line per named pane: `state` ∈ `working` (a live spinner row like
+  `· Zigzagging… (12s · ↓ 1.2k tokens)`, "Waiting for N background agent", a live
+  `◯ agent … 21m 55s` row, `⎿ Running…`) / `idle` / `idle_with_draft` (with
+  `draft_signed` — press Enter ONLY on your own `[automated …` nudge, and only after it
+  has sat `unchanged_for_s` ≥ 30; any other draft is a human mid-sentence) / `approval`
+  (a numbered box — never answer it) / `limit_menu` / `login_menu` / `exited` (banner
+  while a process is still alive — re-read, never relaunch into it) / `no_claude` (TUI on
+  screen, no process — re-read) / `dead` (no process and no TUI — the only relaunch
+  state) / `unknown` (a shell under a live node, a redraw) / `tmux_error`. Menus and
+  boxes are judged only in the active block above the input rule, so answered boxes and
+  dismissed menus higher in scrollback cannot re-trigger. `bg_agents` is the footer's
+  `← N agents` count (`← for agents` = 0), not busy-ness. Name your panes: `--all` lists
+  live processes only, so a dead pane vanishes from it; a name that matches no pane at
+  all prints `not_found` (the pane is gone or renamed — look the session up by uuid
+  before assuming death); a pane with no process is `dead`. A whole-tmux failure prints
+  one `{"error": …}` line and exits 2 — every protected pane is unknown that tick, not
+  dead. Nudge only on `idle` with `unchanged_for_s` ≥ 60; press Enter only on your own
+  `[automated …` draft. Pane text still decides liveness and submission; the transcript
+  sense below decides WHY it stopped.
+  (Since 2026-09-04 that path is a SHIM: the reader's code and tests live in
+  `~/repos/vibeCoding/skills/build-babysitter/pane_state.py`, the build-babysitter skill's
+  directory, so that skill runs without cus; the shim execs the vibeCoding copy — or, if it
+  is not cloned, prints one `{"error": …}` line and exits 3, distinct from the reader's
+  exit 2 for "tmux unusable". Remedy for exit 3: `git -C ~/repos/vibeCoding pull` (or clone
+  rayistern/vibeCoding there), or link the skill at `~/.claude/skills/build-babysitter`, or
+  set `PANE_STATE_PY=<file>`. Rollout order on this box: vibeCoding #334 → #336 → pull →
+  a real row from a live pane → only then cus #200; a watchdog that reads exit 3 every tick
+  is blind, not broken — escalate, do not scrape by hand.)
+- **Session state from transcripts, not panes.** `python3
+  ~/repos/context-dashboard/ingest/session_metrics.py <family-slug> --live` (PR #60)
+  prints each owner-prompted session with a state judged from its transcript's last
+  assistant message — `working` / `parked` / `died_limit` / `died_login` /
+  `died_killed` / `cut_off` — plus idle minutes and last words. This is immune to the two
+  failure modes above (stale scrollback, 2026-07-07; the Fable soft-limit `⎿` block
+  above the prompt that `tail -5` misses, 2026-07-14). Pane capture is still needed to
+  confirm a pane is DEAD before relaunching (login shell at the bottom, no claude child)
+  and to verify a nudge submitted — the sensor tells you *what* stopped and *why*, the
+  pane tells you *whether a process is there to nudge*.
+
+---
+
+## Update 2026-09-11 — session mail across mounts is fixed (GH #199)
+
+**What was broken.** Claude Code's peer registry — the thing `ListAgents` lists and
+`SendMessage` addresses — lives at `<CLAUDE_CONFIG_DIR>/sessions/`. Each live session
+publishes a **pair**: `<pid>.json` (metadata, includes `pid`; `procStart` is
+present on some shapes and omitted on others — 4 of 5 live shared-registry
+`.json` files on 2026-09-14 had none) and
+`<pid>.<sha256>.key` (`peerToken` / `pidDomain` / `procStart` — no `pid`). Every cus
+slot mount owned a *private* real `sessions/` dir, so a session launched with
+`cus launch` and a bare session were mutually invisible: no error at launch, the peer
+name simply never resolved. That is why the build-babysitter had to fall back to a file
+channel (`docs/babysitter/<date>-builder-reports.md`) for builder → babysitter reports,
+and why a watchdog in a slot could see none of the panes it was protecting.
+
+**What changed.** `sessions/` is now symlinked to the shared `~/.claude/sessions/` the
+same way `projects/` always was, in every mount-creation path (`scaffold_mount_dir`,
+the login-store and login-family scaffolds, the account-dir migration, `cus add`,
+`init` import). New slots are born correct. Doctor also visits `logins/<acct>/family-N/`.
+
+**Owner step — run once per machine.** Mounts created before 2026-09-11 still own a
+private registry. Heal them with:
+
+```bash
+# Dry-run first (default read-only). Exit code 1 when findings exist is EXPECTED —
+# it means drift was detected, not that doctor itself failed.
+cus doctor --fix-sessions --dry-run
+
+# Then heal. Prefer no slotted `claude` session running: a live session's
+# json+key pair is left in place and that mount is DEFERRED (healed=False) rather
+# than moving peerToken out from under the process. Re-run after those sessions exit,
+# or accept per-mount deferral and relaunch later.
+cus doctor --fix-sessions
+
+# --fix-dirs also heals sessions/ but its blast radius is the FULL mount layout
+# (settings stubs, other real dirs, etc.), not sessions alone.
+# cus doctor --fix-dirs
+```
+
+The migration never deletes. Live pairs, and pairs whose liveness cannot be
+confirmed (no readable `procStart`, or `/proc` unreadable), are **not moved**
+(conversion deferred — a false live is a deferral; a false dead parks a running
+session's peerToken). Dead pairs and orphan files are parked as units in
+`<mount>/sessions.bak-<date>/`. A mount is only relinked once its dir is empty;
+if anything could not be moved, the real dir is left alone and `doctor` exits
+non-zero.
+
+**Verifying it worked:** from a bare session run `ListAgents` and confirm a slotted peer
+now appears (and vice versa). A slot whose session was live during a deferred heal still
+writes to its private dir until relaunch — restart that session after the mount
+relinks.
+
+## Update 2026-09-16 — Migrating / re-homing the watchdog (new-pane FRESH-session handoff)
+
+When the watchdog must move to a different account/slot (its host account is
+Fable-clean and you want to preserve that capacity, its account died, or it
+drifted onto a shared slot after a crash-revive) — do **NOT** relaunch it in
+place by resuming the same session id, and do **NOT** open a second pane that
+`--resume`s the SAME session id. Two live processes on one session's `.jsonl`
+transcript both take turns and append → interleaved / undefined writes (and some
+Claude Code builds refuse the second attach outright). Either way the old,
+working watchdog dies (or misbehaves) before the new one is proven healthy —
+no fallback. This is the trap the 2026-09-16 migration hit.
+
+**The safe procedure — a new pane running a FRESH session (the watchdog is
+state-light: its whole contract is THIS file + `MEMORY.md`, so a fresh session
+loses nothing operational):**
+
+1. **Pick + verify the target is actually launchable.** The park should be a
+   **Fable-dead, standard-pool** account (Opus watchdog burns zero Fable, so it
+   wastes nothing there and frees Fable-clean accounts for real Fable lanes —
+   see memory `opus-watchdog-pin-to-fable-dead-account`). Confirm the target has
+   a **free independent login family** and no live mount elsewhere, or the
+   locked-slot launch is refused (GH #190/#104). A *canonical* relogin does NOT
+   provision an independent family — only `cus login-mount <acct>` (interactive
+   browser) does. 2026-09-16 example: `acct-B` was relogged but its family pool
+   was exhausted, so `cus launch acct-B --lane slot-1` was refused; the launch
+   fell back to `acct-A` (which had a free family). Pre-provisioned locked
+   standard slots exist for this (slot-1/acct-B, slot-5/acct-C, slot-6/acct-A).
+2. **Write a handoff briefing file** (see `~/.claude/cus-watchdog-handoff-<date>.md`
+   for the 2026-09-16 template): who/where it runs, that it's a fresh session
+   REPLACING the prior one (and that the prior pane is now a dead-loop ops chat,
+   not a peer watchdog), the loop contract summary, the external cron net, a
+   current fleet snapshot, the standing red-lines, and its first actions.
+3. **Launch the new pane** in a shell (not a one-shot command that exits — that
+   kills the tmux session): `tmux -L default new-session -d -s cus-watchdog -c
+   <repo>` then send-keys `cus launch <acct> --lane <slot> --force -- --dangerously-skip-permissions`
+   (no `--resume` = fresh session). Name the tmux session `cus-watchdog` to match
+   the heartbeat cron's canonical `TMUX_SESSION`.
+4. **Verify it came up healthy** (statusline shows the right locked slot+account,
+   at a `❯`), then **bootstrap it**: send-keys a prompt pointing it at the handoff
+   file → it reads `watch.md`, runs its first tick, and re-arms. Confirm the
+   heartbeat file (`~/.claude/cus-watchdog.heartbeat`) mtime goes fresh — that
+   proves it ran a real tick, not just booted.
+5. **Re-point the external net** (`~/bin/cus-watchdog-heartbeat.sh`): update `SID`,
+   `TRANSCRIPT` (to the new slot's config dir), `ANCHOR_ACCT`, `WD_SLOT`. Do this
+   BEFORE relying on the net so a failed bounce self-recovers to the RIGHT place.
+   The heartbeat SID gates the whole net — a stale SID means it watches a dead
+   session and never fires for the live one.
+6. **Only now retire the old pane** (`tmux kill-session -t <old>`). Because the
+   new watchdog is a *different* session id, the old pane can linger harmlessly as
+   a fallback until you're satisfied — there is no transcript conflict.
+
+**Net-liveness caveat (2026-09-16):** the heartbeat cron judges liveness by
+`max(heartbeat-file, transcript)` mtime. An *interactive* session (a human/agent
+chatting with the watchdog session) keeps the transcript fresh, so a **dead loop
+can be masked** from the net while the session is being talked to. Mitigation:
+touch the heartbeat file EVERY tick (already in the contract) — it's the only
+signal that reflects loop ticks specifically, not arbitrary session activity.

@@ -189,12 +189,12 @@ def test_recover_returns_none_when_no_pane_pid(monkeypatch):
     assert cus._recover_pane_relaunch_cmd("%1") == (None, None)
 
 
-def test_pid_alive_reads_proc_root(monkeypatch, tmp_path):
+def test_proc_pid_exists_reads_proc_root(monkeypatch, tmp_path):
     proc = tmp_path / "proc"
     (proc / "777").mkdir(parents=True)
     monkeypatch.setattr(cus, "_PROC_ROOT", proc)
-    assert cus._pid_alive(777) is True
-    assert cus._pid_alive(888) is False
+    assert cus._proc_pid_exists(777) is True
+    assert cus._proc_pid_exists(888) is False
 
 
 def test_wait_for_pid_exit_returns_when_pid_gone(monkeypatch):
@@ -204,14 +204,14 @@ def test_wait_for_pid_exit_returns_when_pid_gone(monkeypatch):
         calls["n"] += 1
         return calls["n"] < 3  # alive twice, then gone
 
-    monkeypatch.setattr(cus, "_pid_alive", fake_alive)
+    monkeypatch.setattr(cus, "_proc_pid_exists", fake_alive)
     monkeypatch.setattr(cus.time, "sleep", lambda *_a: None)
     assert cus._wait_for_pid_exit(999, timeout=10, interval=0.1) is True
     assert calls["n"] == 3
 
 
 def test_wait_for_pid_exit_times_out(monkeypatch):
-    monkeypatch.setattr(cus, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cus, "_proc_pid_exists", lambda pid: True)
     monkeypatch.setattr(cus.time, "sleep", lambda *_a: None)
     assert cus._wait_for_pid_exit(999, timeout=0, interval=0.1) is False
 

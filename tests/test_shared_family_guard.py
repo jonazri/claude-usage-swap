@@ -657,7 +657,7 @@ def test_recovery_roll_forward_collision_refuses_no_copy():
             "a refused completion must not record a family lease either (round 5)"
         assert any("op=family-collision-refuse" in e
                    and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
-        assert any("[URGENT]" in e for e in env.echoes), env.echoes
+        assert any("REFUSED to complete" in e and "ALREADY LIVE" in e for e in env.echoes), env.echoes
     finally:
         env.restore()
 
@@ -710,7 +710,7 @@ def test_recovery_roll_forward_blank_source_skips_copy():
             "a skipped copy must not record the family lease"
         assert any("op=blank-source-refuse" in e
                    and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
-        assert any("SKIPPED" in e and "GH #141" in e for e in env.echoes), env.echoes
+        assert any("REFUSED to complete" in e and "GH #141" in e for e in env.echoes), env.echoes
     finally:
         env.restore()
 
@@ -749,7 +749,7 @@ def test_recovery_roll_forward_vanished_source_leaves_state_untouched():
             "a skipped copy must not record the target account"
         assert "login_family" not in st["slots"][mover], \
             "a skipped copy must not record the family lease"
-        assert any("SKIPPED" in e and "is gone" in e for e in env.echoes), env.echoes
+        assert any("REFUSED to complete" in e and "is gone" in e for e in env.echoes), env.echoes
     finally:
         env.restore()
 
@@ -796,8 +796,8 @@ def test_recovery_roll_forward_blank_source_shared_mount_leaves_active_untouched
             "a slot=None skipped copy must not manufacture slot/lease residue"
         assert any("op=blank-source-refuse" in e and "mount=shared-mount" in e
                    and "refused-recovery-roll-forward" in e for e in env.echoes), env.echoes
-        assert any("SKIPPED" in e and "GH #141" in e for e in env.echoes), env.echoes
-        assert any("state.json active left untouched" in e for e in env.echoes), env.echoes
+        assert any("REFUSED to complete" in e and "GH #141" in e for e in env.echoes), env.echoes
+        assert any("state.json active stays 'alpha'" in e for e in env.echoes), env.echoes
     finally:
         env.restore()
 

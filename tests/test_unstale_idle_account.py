@@ -248,7 +248,14 @@ def test_c_force_poll_unstales_and_repolls():
         env.restore()
 
 
-def test_c_force_poll_dead_token_keeps_stale():
+def test_c_force_poll_dead_token_escalates_to_expired():
+    """Superseded 2026-09-14 (C3, PR #210). Was `test_c_force_poll_dead_token_
+    keeps_stale`, which asserted force-poll KEPT the benign token_stale note and
+    exited 0 when the forced un-stale found the refresh dead. That was the bug C3
+    fixes: a DEFINITIVE invalid_grant (which stamps snapshot_refresh_dead) means a
+    browser relogin is genuinely required, so force-poll must surface the LOUD
+    TOKEN EXPIRED verdict and exit 2 IN THE SAME RUN — not tell the operator the
+    account "remains usable". This test now pins the corrected behavior."""
     from click.testing import CliRunner
 
     env = _Env({"merkos": _snap("at-old", "rt-dead")}, flags={"merkos": {"token_stale": True}})
@@ -265,9 +272,15 @@ def test_c_force_poll_dead_token_keeps_stale():
         env.patch(cus.click, "echo", env._saved_echo)
 
         result = CliRunner().invoke(cus.cli, ["force-poll", "merkos"])
-        assert result.exit_code == 0, result.output
-        assert "TOKEN_STALE" in result.output and "UN-STALED" not in result.output
-        assert cus.load_state()["accounts"]["merkos"]["token_stale"] is True
+        # C3: dead refresh (snapshot_refresh_dead stamped by the grant) → loud
+        # TOKEN EXPIRED + exit 2 in the same run, never the benign stale note.
+        assert result.exit_code == 2, result.output
+        assert "TOKEN EXPIRED" in result.output and "UN-STALED" not in result.output
+        assert "remains usable" not in result.output
+        acct = cus.load_state()["accounts"]["merkos"]
+        assert acct.get("token_expired") is True
+        assert acct.get("token_stale") in (None, False)
+        assert acct.get("snapshot_refresh_dead") is True
     finally:
         env.restore()
 

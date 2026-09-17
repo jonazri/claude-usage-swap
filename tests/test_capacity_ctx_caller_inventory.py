@@ -163,7 +163,8 @@ EXPECTED: dict[Fingerprint, str] = {
     # NOT call sites of pick_swap_target / decide_swap /
     # _target_would_immediately_re_trip / _launch_candidate_saturated, so they
     # never appear in this inventory).
-    ("_candidate_is_valid_premium_target", "pick_swap_target", 1): "ctx",  # L10692 task-5: SOS probe stashes fleet ctx onto its 2-acct shim (G8/formula 2)
+    ("_candidate_is_valid_premium_target", "pick_swap_target", 1): "ctx",
+    ("_pick_shared_mount_migration_target", "pick_swap_target", 1): "carveout",  # shared-mount auto-migrate target pick (upstream #195): percent-path carve-out — the bare mount has no lane-load to normalize  # L10692 task-5: SOS probe stashes fleet ctx onto its 2-acct shim (G8/formula 2)
     ("_hybrid_cycle", "decide_swap", 1): "ctx",  # L9099 task-5: shared-mount decide shim carries stashed ctx
     ("_launch_candidate_saturated", "_target_would_immediately_re_trip", 1): "ctx",  # L2483 task-5: launch-accept wall threads name+ctx (G3/formula 2)
     ("_launch_prepare", "_launch_candidate_saturated", 1): "ctx",  # L18419 task-5: verify-and-repick builds fresh ctx, passes name+ctx
