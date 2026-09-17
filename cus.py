@@ -20252,6 +20252,7 @@ def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: 
     if exec_flag:
         click.echo()
         click.echo(f"(--exec) launching claude under {dst} …")
+        _prefer_as_oom_victim()
         os.execvp("claude", ["claude"])
 
 
@@ -22049,7 +22050,7 @@ def _prefer_as_oom_victim() -> None:
     likely OOM / earlyoom victim than the `systemd --user` manager — call it
     right before any `os.execvpe("claude", ...)`.
 
-    Why (root-confirmed fleet crash 2026-09-17, GH #245): on Ubuntu,
+    Why (root-confirmed fleet crash 2026-09-17, GH #221): on Ubuntu,
     `user@.service` sets `OOMScoreAdjust=100`, inherited by every user unit —
     including the ~11 MB `systemd --user` manager itself. A `claude` launched
     here runs at adj 0, i.e. a LOWER-priority victim than that manager. Under
