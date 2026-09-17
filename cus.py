@@ -20065,6 +20065,7 @@ def add_cmd(name: str, exec_flag: bool) -> None:
         click.echo("Launching claude now...")
         env = os.environ.copy()
         env["CLAUDE_CONFIG_DIR"] = str(dst)
+        _prefer_as_oom_victim()
         os.execvpe("claude", ["claude"], env)
 
 
@@ -20126,6 +20127,7 @@ def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
             env.pop("CLAUDE_CONFIG_DIR", None)
         else:
             env["CLAUDE_CONFIG_DIR"] = str(dst)
+        _prefer_as_oom_victim()
         os.execvpe("claude", ["claude"], env)
 
 
@@ -20250,6 +20252,7 @@ def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: 
     if exec_flag:
         click.echo()
         click.echo(f"(--exec) launching claude under {dst} …")
+        _prefer_as_oom_victim()
         os.execvp("claude", ["claude"])
 
 
@@ -20449,6 +20452,7 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
         click.echo("Launching claude now (log in, then /exit and run --finish)...")
         env = os.environ.copy()
         env["CLAUDE_CONFIG_DIR"] = str(dst)
+        _prefer_as_oom_victim()
         os.execvpe("claude", ["claude"], env)
 
 
@@ -22041,6 +22045,35 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     return slot_name, slot_dir, account
 
 
+def _prefer_as_oom_victim() -> None:
+    """Raise this process's `oom_score_adj` so a launched `claude` tree is a MORE
+    likely OOM / earlyoom victim than the `systemd --user` manager — call it
+    right before any `os.execvpe("claude", ...)`.
+
+    Why (root-confirmed fleet crash 2026-09-17, GH #221): on Ubuntu,
+    `user@.service` sets `OOMScoreAdjust=100`, inherited by every user unit —
+    including the ~11 MB `systemd --user` manager itself. A `claude` launched
+    here runs at adj 0, i.e. a LOWER-priority victim than that manager. Under
+    memory+swap exhaustion `earlyoom` then walks the small systemd procs and
+    SIGTERMs the manager, whose exit tears down every `tmux-spawn-*.scope` and
+    drops the WHOLE fleet at once — instead of reaping the one runaway session.
+    Raising adj (only ever RAISED; unprivileged; inherited across the following
+    exec and by every child) makes a runaway die ALONE. Mirrors the
+    `~/bin/claude-pane-launcher` lever; `cus launch` execs claude directly and
+    previously left it at adj 0.
+
+    Best-effort by design: the value is `CUS_PANE_OOM_SCORE_ADJ` (default 500,
+    matching the pane launcher). A denied/failed write MUST never block a launch,
+    so any OSError degrades to the prior behavior (adj unchanged).
+    """
+    try:
+        adj = os.environ.get("CUS_PANE_OOM_SCORE_ADJ", "500")
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write(adj)
+    except OSError:
+        pass  # /proc unavailable or write denied — leave adj unchanged, still launch
+
+
 @cli.command(name="launch", context_settings={"ignore_unknown_options": True})
 @click.argument("account", required=False)
 @click.option("--pool", type=click.Choice(list(VALID_POOLS)), default=None,
@@ -22094,6 +22127,7 @@ def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | N
         env.pop("CLAUDE_CONFIG_DIR", None)
     # execvpe replaces this process — claude runs as if launched directly
     # from the shell (signals, tty, exit code all pass through untouched).
+    _prefer_as_oom_victim()
     os.execvpe("claude", ["claude", *claude_args], env)
 
 
