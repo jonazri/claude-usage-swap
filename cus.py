@@ -1177,10 +1177,22 @@ def restore_creds_backup(account_name: str, backup: Path, into_live: bool = Fals
     """
     snap = ACCOUNTS_DIR / f"account-{account_name}" / ".credentials.json"
     backup_credentials_file(snap)  # make the restore itself walk-back-able
-    atomic_copy(backup, snap, mode=0o600)
+    atomic_copy(backup, snap, mode=0o600)  # storage→storage: verbatim bytes, deliberately unmerged
     if into_live:
         backup_credentials_file(CREDS_JSON)
-        atomic_copy(backup, CREDS_JSON, mode=0o600)
+        # 2026-09-17 mcpOAuth preservation: the live file being repaired is
+        # usually blanked ONLY in claudeAiOauth (the #141 signature) while its
+        # mcpOAuth still holds live remote-MCP tokens; a verbatim copy of a
+        # backup taken before those servers were authorised would silently
+        # erase them and force re-auth in every session on the mount. Merge
+        # the live file's mcpOAuth into the backup's payload (claudeAiOauth is
+        # exactly the backup's — the helper cannot touch it, and it degrades to
+        # the unchanged backup payload on any failure). Safe because mcpOAuth
+        # is account-agnostic (see _preserve_mcp_oauth).
+        atomic_write_bytes(CREDS_JSON,
+                           json.dumps(_preserve_mcp_oauth(CREDS_JSON, read_json(backup),
+                                                          account=account_name), indent=2).encode(),
+                           mode=0o600)
 
 
 def read_json(path: Path) -> dict:
@@ -1190,6 +1202,151 @@ def read_json(path: Path) -> dict:
 
 def write_json(path: Path, data: Any, mode: int = 0o644) -> None:
     atomic_write_bytes(path, (json.dumps(data, indent=2, sort_keys=True) + "\n").encode(), mode=mode)
+
+
+# --------------------------------------------------------------------------
+# MCP OAuth preservation across credential writes (2026-09-17; supersedes the
+# unmerged PR #185 design).
+#
+# Claude Code stores OAuth tokens for REMOTE MCP servers (atlassian, singlemcp,
+# otter-ai, ...) in the SAME `.credentials.json` as the account login, under a
+# sibling top-level key `mcpOAuth`, keyed "serverName|configHash". Those
+# entries are bound to the MCP server (its URL + a dynamically-registered
+# OAuth client; each entry carries its own clientId/refreshToken) and carry NO
+# Anthropic-account identity — verified 2026-09-17: the same key/values appear
+# byte-identical across every account on this box. They are therefore
+# account-AGNOSTIC and safe to carry across ANY account swap.
+#
+# The failure this prevents: cus has always installed `.credentials.json`
+# WHOLESALE (`atomic_copy(install_src, live_creds_path)` at the swap install
+# point, plus raw-byte save-backs), so the DESTINATION's `mcpOAuth` was
+# replaced by the SOURCE's — usually a registration-only stub, or nothing —
+# on every swap / switch / slot move / launch. A session that had authorised
+# a remote MCP server kept working from its in-memory token while ON DISK the
+# token was gone, and every NEW session on that mount opened to "needs
+# authentication" (MCP re-auth churn on every rotation; first reported
+# 2026-07-10 jira2a/slot-11, root-caused 2026-09-17: `grep -n mcpOAuth cus.py`
+# was empty — MCP auth only ever survived a swap by accident).
+#
+# Fix: MERGE, NEVER CLOBBER — at every existing credential-write site the
+# payload's `mcpOAuth` becomes the union of the destination's and the
+# source's entries (live-wins, a stub never beats a live entry, fresher
+# expiresAt wins between two live entries, never delete). No new writers, no
+# new files, no daemon pass: PR #185's canonical-store + periodic
+# read-modify-write of live mounts was deliberately NOT taken because it
+# rewrote live mounts every poll and raced single-use refresh tokens (#104).
+#
+# `claudeAiOauth` (the account token, with its whole #3/#77/#104/#141 guard
+# stack) is NEVER touched by anything in this block — it is a disjoint key,
+# and every guard runs on the SOURCE before the merge, so the account payload
+# written is exactly the already-validated source's.
+# --------------------------------------------------------------------------
+
+def _mcp_entry_live(entry: Any) -> bool:
+    """A usable mcpOAuth entry: carries an access token or at least a refresh
+    token (expired-but-refreshable is still valuable — Claude Code refreshes
+    it silently on connect). Registration-only stubs (clientId +
+    discoveryState with empty token fields) are what a needs-auth server
+    looks like on disk — those are NOT live and must never overwrite a real
+    token during a merge. (Salvaged verbatim from PR #185.)"""
+    return isinstance(entry, dict) and bool(entry.get("accessToken") or entry.get("refreshToken"))
+
+
+def _mcp_entry_score(entry: Any) -> float:
+    """Freshness ordering between two LIVE entries for the same server key:
+    expiresAt (ms epoch) when present. A live entry without expiresAt (rare:
+    a non-expiring grant) scores 0 so it never beats a dated token — a
+    non-expiring token doesn't rotate, so losing that comparison is harmless,
+    whereas letting it win could pin a long-revoked token forever.
+    (Salvaged verbatim from PR #185.)"""
+    exp = entry.get("expiresAt") if isinstance(entry, dict) else None
+    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+
+
+def _mcp_merge(dst: dict, src: dict) -> int:
+    """Merge src's LIVE mcpOAuth entries into dst (both are mcpOAuth-shaped
+    dicts, mutating dst). Returns how many keys changed. Never deletes a dst
+    entry, never downgrades a fresher live entry, and an identical entry is a
+    no-op — so repeated merges are idempotent and backup-rotation-friendly.
+    (Salvaged verbatim from PR #185.)"""
+    changed = 0
+    for key, entry in (src or {}).items():
+        if not _mcp_entry_live(entry):
+            continue
+        cur = dst.get(key)
+        if cur == entry:
+            continue
+        if _mcp_entry_live(cur) and _mcp_entry_score(cur) >= _mcp_entry_score(entry):
+            continue
+        dst[key] = entry
+        changed += 1
+    return changed
+
+
+def _preserve_mcp_oauth(dest: Path | dict | None, new_creds: dict, *,
+                        slot: str | None = None, account: str | None = None) -> dict:
+    """Return a COPY of new_creds whose mcpOAuth is the union of dest's and new_creds'
+    entries (via _mcp_merge: live-wins, stub-never-beats-live, fresher-expiresAt-wins,
+    never-delete). `dest` is a Path (read here; missing/unreadable/corrupt => nothing to
+    preserve, return new_creds copy unchanged) OR an already-parsed dict (swap path has the
+    outgoing live file in hand). NEVER touches claudeAiOauth. NEVER raises — any failure
+    returns new_creds unchanged. Emits _cred_audit op=mcp-oauth-preserve decision=merged
+    (n>0) / decision=skipped (on failure/none). Does NOT write.
+
+    Why a COPY: callers hold `new_creds` for other purposes (freshness compares,
+    token fingerprints in the audit line) and must keep seeing the unmodified
+    source; the merged mcpOAuth is a fresh dict, so the source's own mcpOAuth
+    object is never mutated either.
+
+    Why the merge is base=source, overlay=destination: the payload being
+    written IS the source (that is what every guard validated), and we only
+    ADD what the destination would otherwise lose. A destination stub for a
+    key the source lacks is not carried (a stub is "needs auth" either way,
+    so dropping it loses nothing); a destination LIVE entry always survives
+    unless the source's is live AND fresher.
+
+    Why never raise: this helper sits between a validated source and the
+    atomic write at every credential install / save-back. A bug here must
+    degrade to exactly today's behaviour (write the source as-is), never to a
+    refused install or — far worse — a blanked mount. `slot`/`account` are
+    audit context only.
+    """
+    try:
+        if not isinstance(new_creds, dict):
+            return new_creds  # not creds-shaped; nothing sensible to merge into
+        out = dict(new_creds)  # shallow copy — claudeAiOauth is shared by reference, never mutated
+        if isinstance(dest, dict):
+            dest_creds: Any = dest
+        elif isinstance(dest, Path) and dest.exists():
+            dest_creds = read_json(dest)  # JSONDecodeError/OSError → caught below → unchanged
+        else:
+            _cred_audit("mcp-oauth-preserve", "skipped", "no destination creds to preserve from",
+                        slot=slot, account=account)
+            return out
+        dest_mcp = dest_creds.get("mcpOAuth") if isinstance(dest_creds, dict) else None
+        if not isinstance(dest_mcp, dict) or not dest_mcp:
+            _cred_audit("mcp-oauth-preserve", "skipped", "destination carries no mcpOAuth entries",
+                        slot=slot, account=account)
+            return out
+        src_mcp = new_creds.get("mcpOAuth")
+        merged = dict(src_mcp) if isinstance(src_mcp, dict) else {}
+        n = _mcp_merge(merged, dest_mcp)
+        if n > 0:
+            out["mcpOAuth"] = merged
+            _cred_audit("mcp-oauth-preserve", "merged",
+                        "carried destination MCP OAuth entries across the credentials write",
+                        slot=slot, account=account, extra=f"mcp_entries_preserved={n}")
+        else:
+            _cred_audit("mcp-oauth-preserve", "skipped", "destination adds no live MCP entry",
+                        slot=slot, account=account)
+        return out
+    except Exception as e:  # noqa: BLE001 — degrade to today's behaviour, never block a write
+        try:
+            _cred_audit("mcp-oauth-preserve", "skipped", f"preserve failed ({type(e).__name__}); wrote source unchanged",
+                        slot=slot, account=account)
+        except Exception:  # noqa: BLE001
+            pass
+        return new_creds
 
 
 def read_yaml(path: Path) -> dict:
@@ -2491,7 +2648,19 @@ def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_byte
         if store_exp is not None and store_exp > live_exp:
             return "skipped-stale"
     backup_credentials_file(store_path)
-    atomic_write_bytes(store_path, live_bytes, mode=0o600)
+    # 2026-09-17 mcpOAuth preservation: write the PARSED live creds with the
+    # store entry's mcpOAuth merged in, instead of `live_bytes` verbatim. A
+    # mount whose mcpOAuth is stub-only (a lane that never authorised a remote
+    # MCP server) must not erase the live MCP token the family store still
+    # holds — that token is account-agnostic and the next install from this
+    # store is what carries it back to a mount. claudeAiOauth is exactly the
+    # live file's (parsed from the same `live_bytes` the freshness guard above
+    # judged; the helper cannot alter it). `live_bytes` stays a parameter so
+    # callers' byte-level handling is unchanged.
+    atomic_write_bytes(store_path,
+                       json.dumps(_preserve_mcp_oauth(store_path, live_creds, slot=slot, account=account),
+                                  indent=2).encode(),
+                       mode=0o600)
     return "saved"
 
 
@@ -3231,7 +3400,14 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
             return {"action": "skipped", "account": expected_account,
                     "detail": "live not fresher than family store (periodic no-op)"}
         backup_credentials_file(fam_path)
-        atomic_write_bytes(fam_path, json.dumps(live_creds, indent=2).encode(), mode=0o600)
+        # 2026-09-17 mcpOAuth preservation: merge the family store's live
+        # remote-MCP tokens into the save-back so a stub-only mount cannot
+        # erase them (see _preserve_mcp_oauth; claudeAiOauth untouched).
+        atomic_write_bytes(fam_path,
+                           json.dumps(_preserve_mcp_oauth(fam_path, live_creds,
+                                                          slot=slot_name, account=expected_account),
+                                      indent=2).encode(),
+                           mode=0o600)
         _cred_audit("saveback", "wrote", "pooled family store (#109)",
                     slot=slot_name, mount=mount.name, account=expected_account,
                     login_family=f"{lease[0]}/{lease[1]}", token_fp=_audit_token_fp(live_creds))
@@ -3291,7 +3467,13 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         if only_if_fresher and not (snap_exp is not None and live_exp is not None and live_exp > snap_exp):
             return {"action": "skipped", "account": save_to, "detail": "live not fresher than snapshot (periodic no-op)"}
     backup_credentials_file(snap)
-    atomic_write_bytes(snap, json.dumps(live_creds, indent=2).encode(), mode=0o600)
+    # 2026-09-17 mcpOAuth preservation: merge the snapshot's live remote-MCP
+    # tokens into the save-back so a stub-only mount cannot erase them (see
+    # _preserve_mcp_oauth; claudeAiOauth is exactly the guarded live payload).
+    atomic_write_bytes(snap,
+                       json.dumps(_preserve_mcp_oauth(snap, live_creds, slot=slot_name, account=save_to),
+                                  indent=2).encode(),
+                       mode=0o600)
     action = "saved_to_owner" if verdict == "foreign" else "saved"
     # Audit the canonical-store write: incoming = the mount's own identity, existing
     # = save_to's trusted anchor. In a clobber these disagree — the whole reason the
@@ -7000,7 +7182,16 @@ def _recover_pending_swap() -> None:
                 _refuse_crash_recovery_install(journal, frm, to, slot, live_cj_path, state, refusal)
                 return
             backup_credentials_file(live_creds_path)   # GH #79 choke point
-            atomic_copy(target_creds, live_creds_path, mode=0o600)
+            # 2026-09-17 mcpOAuth preservation: complete the install as a
+            # merge-then-write, not a wholesale copy, so the mount's live
+            # remote-MCP tokens survive the recovery exactly as they survive a
+            # normal swap (see the install point in _execute_swap_locked).
+            # claudeAiOauth is exactly `to`'s snapshot — the refusal stack
+            # above already validated it; the helper cannot alter it.
+            atomic_write_bytes(live_creds_path,
+                               json.dumps(_preserve_mcp_oauth(live_creds_path, read_json(target_creds),
+                                                              slot=slot, account=to), indent=2).encode(),
+                               mode=0o600)
             installed_note = pending_note
         if slot:
             entry = state.setdefault("slots", {}).setdefault(slot, {"account": None, "created_ts": now_iso()})
@@ -7824,7 +8015,17 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 # if any clobber bug slips past the verdict above, the refresh
                 # token is recoverable via `cus restore-creds`.
                 backup_credentials_file(current_dir / ".credentials.json")
-                atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+                # 2026-09-17 mcpOAuth preservation: write the PARSED live creds
+                # (the same `live_creds_bytes` version the guards judged — the
+                # read-check-write race closure is unchanged) with the
+                # snapshot's live remote-MCP tokens merged in, so a stub-only
+                # mount can't erase them from the snapshot. claudeAiOauth is
+                # byte-for-byte the live file's; only mcpOAuth can grow.
+                atomic_write_bytes(current_dir / ".credentials.json",
+                                   json.dumps(_preserve_mcp_oauth(current_dir / ".credentials.json", live_creds,
+                                                                  slot=slot, account=current),
+                                              indent=2).encode(),
+                                   mode=0o600)
                 # Canonical credentials write accepted — incoming = the live mount's
                 # identity, existing = current's anchor. In the rayi1 clobber these
                 # disagreed while a #77-fresher foreign token slipped through; logging
@@ -7847,8 +8048,14 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             # GH #79: the owner-heal is a same-lineage write, but back up the
             # owner's snapshot anyway — cheap insurance against a wrong verdict.
             backup_credentials_file(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json")
+            # 2026-09-17 mcpOAuth preservation: same merge-then-write as the
+            # `current` save-back above — the owner's snapshot keeps any live
+            # remote-MCP token this drifted mount happens not to carry.
             atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
-                               live_creds_bytes, mode=0o600)
+                               json.dumps(_preserve_mcp_oauth(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
+                                                              live_creds, slot=slot, account=owner),
+                                          indent=2).encode(),
+                               mode=0o600)
             # Same-lineage owner-heal (GH #3): tokens routed to their TRUE owner,
             # not `current`. account=owner records where they actually landed.
             _cred_audit("saveback", "wrote", "GH#3 drift — routed foreign tokens to true owner",
@@ -8142,8 +8349,9 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # (GH #141). The early guard above already covers the default snapshot path
     # with zero partial state; this backstops the pool paths (independent-login
     # families) whose source is resolved only here. `live_creds_path` is still
-    # untouched at this point — the atomic_copy below is its first and only write
-    # — so raising keeps the mount's current, valid creds intact.
+    # untouched at this point — the merge-then-write below (atomic_copy until
+    # 2026-09-17) is its first and only write — so raising keeps the mount's
+    # current, valid creds intact.
     try:
         _install_src_creds = read_json(install_src)
     except (json.JSONDecodeError, OSError) as e:
@@ -8173,7 +8381,7 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     _write_swap_journal(current, target_name, trigger, slot=slot, family=claimed_family)
     # Merge target's account-bound keys into the mount's live .claude.json —
     # the FIRST live-mount write. Recovery's "creds lagged identity" case
-    # covers a crash between this write and the atomic_copy below.
+    # covers a crash between this write and the creds install below.
     target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
     for k, v in target_identity.items():
         live_cj[k] = v
@@ -8184,7 +8392,27 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # backup of the live file itself makes the install step independently
     # recoverable.
     backup_credentials_file(live_creds_path)
-    atomic_copy(install_src, live_creds_path, mode=0o600)
+    # ---- 2026-09-17 mcpOAuth preservation (THE clobber site) ----
+    # Every swap / switch / slot move / launch / force-reinstall funnels through
+    # this write. Until 2026-09-17 it was `atomic_copy(install_src, ...)`: the
+    # mount's `mcpOAuth` (remote-MCP OAuth tokens — atlassian, singlemcp,
+    # otter-ai, ...) was replaced wholesale by the source's, usually a stub, so
+    # every rotation silently de-authorised the mount's MCP servers and the
+    # next session opened to "needs authentication". Merge-then-write instead:
+    #   * `new_creds` = `_install_src_creds`, the EXACT payload the #3/#77/#104/
+    #     #141 guards above validated — its claudeAiOauth is written untouched;
+    #   * `dest` = the outgoing live creds already parsed for the save-back
+    #     (`live_creds`); when that is None (empty-slot install, or an
+    #     unparseable live file) the path is passed and the helper reads it —
+    #     missing/corrupt ⇒ nothing to preserve ⇒ the source is written as-is,
+    #     i.e. identical to the old atomic_copy.
+    # Safe because mcpOAuth is account-agnostic (see _preserve_mcp_oauth) and
+    # the helper never raises. This remains the first and only live-creds write.
+    atomic_write_bytes(live_creds_path,
+                       json.dumps(_preserve_mcp_oauth(live_creds if live_creds is not None else live_creds_path,
+                                                      _install_src_creds, slot=slot, account=target_name),
+                                  indent=2).encode(),
+                       mode=0o600)
     # THE install-point: the target account's creds are now live on this mount.
     # source = which store we copied from (claimed pool family / legacy / snapshot);
     # existing = target's trusted anchor identity; token_fp names the family that is
@@ -10455,7 +10683,8 @@ def finish_active_relogin(account_name: str) -> None:
             f"{snap_creds} does not exist — run the re-login first: "
             f"CLAUDE_CONFIG_DIR={acct_dir}/ claude   (then rerun --finish)")
     try:
-        snap_exp = _creds_expires_at(read_json(snap_creds))
+        snap_creds_payload = read_json(snap_creds)
+        snap_exp = _creds_expires_at(snap_creds_payload)
     except (json.JSONDecodeError, OSError) as e:
         raise RuntimeError(f"{snap_creds} unreadable ({e}) — not installing it live")
     live_exp = None
@@ -10472,7 +10701,16 @@ def finish_active_relogin(account_name: str) -> None:
             f"there; rerun it. If the LIVE tokens are the good ones, there is nothing to finish.")
 
     backup_credentials_file(CREDS_JSON)  # GH #79 choke point
-    atomic_copy(snap_creds, CREDS_JSON, mode=0o600)
+    # 2026-09-17 mcpOAuth preservation: a freshly re-logged-in snapshot carries
+    # NO remote-MCP tokens (a browser login writes only claudeAiOauth), so a
+    # verbatim copy would de-authorise every MCP server on the live mount.
+    # Merge the live file's mcpOAuth into the snapshot payload; claudeAiOauth
+    # is exactly the snapshot's (the freshness guard above judged that same
+    # parsed payload; the helper cannot alter it and never raises).
+    atomic_write_bytes(CREDS_JSON,
+                       json.dumps(_preserve_mcp_oauth(CREDS_JSON, snap_creds_payload, account=account_name),
+                                  indent=2).encode(),
+                       mode=0o600)
 
     # Also carry the account-bound identity keys over, in case the re-login
     # refreshed them (e.g. a changed oauthAccount payload). Best-effort: a
@@ -10666,7 +10904,15 @@ def _auto_heal_live_mount(state: dict, config: dict, no_execute: bool = False) -
     # is a heal SOURCE here, never a write target, so a healthy snapshot is
     # preserved untouched.
     backup_credentials_file(CREDS_JSON)
-    atomic_copy(source, CREDS_JSON, mode=0o600)
+    # 2026-09-17 mcpOAuth preservation: a #141 blank hits claudeAiOauth only —
+    # the blanked live file typically still holds live remote-MCP tokens that
+    # the (older) snapshot/backup source does not. Merge-then-write keeps them;
+    # claudeAiOauth is exactly the validated source's (the helper cannot alter
+    # it, and degrades to the unchanged source payload on any failure).
+    atomic_write_bytes(CREDS_JSON,
+                       json.dumps(_preserve_mcp_oauth(CREDS_JSON, read_json(source), account=active),
+                                  indent=2).encode(),
+                       mode=0o600)
     msg = (f"live shared mount ~/.claude/.credentials.json was blanked/invalid (GH #141) — "
            f"auto-restored '{active}' credentials from {source.name} into the live file; "
            f"bare sessions on the shared mount are usable again without a human.")
@@ -13040,16 +13286,27 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
         # already validated by _lane_heal_source, but re-check at the install point
         # so a source that went bad between pick and copy can't re-blank the mount.
         try:
-            if _live_mount_creds_invalid(read_json(source)):
+            _heal_src_creds = read_json(source)
+            if _live_mount_creds_invalid(_heal_src_creds):
                 continue
         except (json.JSONDecodeError, OSError):
             continue
         # Same discipline as _auto_heal_live_mount / restore_creds_backup: back up
         # the (blank) lane mount first so the heal is itself reversible, then
-        # atomic-copy the validated source over it. Only the lane mount is touched
-        # — the family store / snapshot is a heal SOURCE here, never a write target.
+        # atomically write the validated source over it. Only the lane mount is
+        # touched — the family store / snapshot is a heal SOURCE here, never a
+        # write target.
         backup_credentials_file(dest)
-        atomic_copy(source, dest, mode=0o600)
+        # 2026-09-17 mcpOAuth preservation: the blanked lane mount usually still
+        # carries live remote-MCP tokens in mcpOAuth (a #141 blank hits
+        # claudeAiOauth only); merge them into the source payload instead of
+        # copying the source wholesale. claudeAiOauth is exactly the source's
+        # that the install-point guard just re-validated (`_heal_src_creds` —
+        # the same parsed object, so no second read can diverge from it).
+        atomic_write_bytes(dest,
+                           json.dumps(_preserve_mcp_oauth(dest, _heal_src_creds, slot=slot, account=account),
+                                      indent=2).encode(),
+                           mode=0o600)
         # Forensics: record the heal, its source, and the restored token's fp so a
         # heal→blank→heal cycle is visible in the audit stream (Fix 3).
         try:
