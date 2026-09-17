@@ -139,9 +139,24 @@ def test_global_reactive_ignores_event_from_prior_account_generation():
     assert not event.get("_retry"), "stale generation is settled rather than replayed"
 
 
-def test_global_reactive_refuses_degraded_target_and_marks_retry():
+def test_global_reactive_takes_degraded_but_unwalled_target():
+    """A 429'd active is at a wall; a DEGRADED target with real headroom (85%,
+    under reactive.max_target_pct) beats holding — upstream PR #198 F-F-1."""
     state = {"active": "hot", "accounts": {
         "hot": _a(95, 20), "also-hot": _a(85, 20),
+    }}
+    event = {"ts": cus.now_iso(), "session_id": "sid", "match": "rate_limit",
+             "source": "stopfailure", "account": "hot"}
+    decision = cus.check_rate_limit_reactive(state, CFG, entries=[event])
+    assert decision is not None and decision.target == "also-hot"
+    assert not event.get("_retry")
+
+
+def test_global_reactive_refuses_walled_target_and_marks_retry():
+    """A target already at/over reactive.max_target_pct would re-trip within
+    minutes (the 2026-07-10 98% replay), so the event is held for retry."""
+    state = {"active": "hot", "accounts": {
+        "hot": _a(95, 20), "walled": _a(97, 20),
     }}
     event = {"ts": cus.now_iso(), "session_id": "sid", "match": "rate_limit",
              "source": "stopfailure", "account": "hot"}

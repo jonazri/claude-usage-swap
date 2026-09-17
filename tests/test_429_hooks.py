@@ -142,3 +142,17 @@ def test_ptuf_logs_event_time_slot_and_account(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_ptuf_sanitizes_comma_in_tool_name(tmp_path):
+    """The tool field is session-controlled; a comma in it must never shift the
+    fixed trailing slot/account fields the daemon binds the event to."""
+    lines = _run(PTUF, {
+        "hook_event_name": "PostToolUseFailure", "session_id": "S7",
+        "tool_name": "mcp__x__do,thing", "tool_input": {},
+        "error": '{"type":"error","error":{"type":"rate_limit_error"}}',
+    }, tmp_path)
+    assert len(lines) == 1
+    parts = lines[0].split(",")
+    assert len(parts) == 6, lines[0]
+    assert parts[3] == "mcp__x__do_thing"

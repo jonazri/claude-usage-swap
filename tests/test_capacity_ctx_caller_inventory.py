@@ -172,9 +172,7 @@ EXPECTED: dict[Fingerprint, str] = {
     ("_premium_target_loss_reason", "_target_would_immediately_re_trip", 1): "ctx",  # L10665 task-5: loss labeller gains ctx param, threads name+ctx (G8/G2)
     ("_try", "pick_swap_target", 1): "ctx",  # L2389 task-5: pick_launch_account shim builder stashes ctx (nested in pick_launch_account)
     ("auto_swap_cmd", "pick_swap_target", 1): "ctx",  # L15085 task-5: auto-swap CLI stashes ctx on a local shim (G8)
-    ("check_rate_limit_reactive", "_target_would_immediately_re_trip", 1): "ctx",  # L13687 task-5: global reactive veto threads name+ctx
     ("check_rate_limit_reactive", "pick_swap_target", 1): "ctx",  # L13674 task-5: global reactive escape stashes ctx on a local shim
-    ("check_rate_limit_reactive_per_session", "_target_would_immediately_re_trip", 1): "ctx",  # L8698 task-5: post-merge unsafe-target veto threads name+ctx
     ("check_rate_limit_reactive_per_session", "pick_swap_target", 1): "ctx",  # L8688 task-5: per_session reactive shim carries claim-aware stashed ctx
     ("decide_slot_swaps", "_target_would_immediately_re_trip", 1): "ctx",  # L8463 task-4/5: fan-out re-pick health check threads name+shim2 ctx (G2)
     ("decide_slot_swaps", "decide_swap", 1): "ctx",  # L8369 task-5: per-group shim carries claim-aware stashed ctx

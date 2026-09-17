@@ -92,6 +92,7 @@ SLOT=${BINDING%%$'\t'*}
 ACCOUNT=${BINDING#*$'\t'}
 
 mkdir -p "$ACCOUNTS_DIR"
+TOOL="${TOOL//,/_}"   # session-controlled field: never let a comma shift slot/account
 echo "$TS,$SESSION_ID,$TOKEN,$TOOL,$SLOT,$ACCOUNT" >> "$LOG"
 
 # wake-on-429: best-effort, unconditional (see comment above). Never fail the

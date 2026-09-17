@@ -193,6 +193,7 @@ def test_reactive_per_session_picks_by_units(monkeypatch):
     would-re-trip in either mode). Built by driving a minimal one-entry 429
     batch through check_rate_limit_reactive_per_session."""
     monkeypatch.setattr(cus, "session_current_slot", lambda sid: None)
+    monkeypatch.setattr(cus, "live_sessions_on_slot", lambda slot: [object()])  # slot-bound event, live lane
     monkeypatch.setattr(cus, "occupied_slot_accounts", lambda s, **k: {})
     monkeypatch.setattr(cus, "_distinct_family_capacity", lambda *a, **k: 99)
     cus._OCCUPIED_SLOTS_CACHE.clear()

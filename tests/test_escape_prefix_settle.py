@@ -158,7 +158,8 @@ def test_resume_pane_waits_out_escape_timeout_before_the_message(monkeypatch):
     events = _recorder(monkeypatch)
     msg = "The quota-limited account was swapped automatically."
     assert cus._resume_pane("%1", None, msg) is True
-    assert ("text", msg) in events, f"message never sent: {events}"
+    sent = f"{cus.REACTIVE_RESUME_TAG} {msg}"  # injected text is tagged as the daemon's
+    assert ("text", sent) in events, f"message never sent: {events}"
     gap = _gap_after_last_escape(events)
     assert gap > cus.ESCAPE_CODE_TIMEOUT_SECONDS, (
         f"only {gap}s between the Escape prefix and the message — the leading "
@@ -169,7 +170,7 @@ def test_resume_pane_sends_the_message_after_the_escapes(monkeypatch):
     """Ordering is still prefix-then-payload (the GH #24 safety property)."""
     events = _recorder(monkeypatch)
     assert cus._resume_pane("%1", "/tmp/tmux-a", "continue please") is True
-    assert _sends(events) == [("keys", ("Escape",)), ("text", "continue please")]
+    assert _sends(events) == [("keys", ("Escape",)), ("text", f"{cus.REACTIVE_RESUME_TAG} continue please")]
 
 
 def test_resume_pane_aborts_without_sending_when_escape_fails(monkeypatch):

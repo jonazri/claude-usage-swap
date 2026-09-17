@@ -235,7 +235,7 @@ def test_escalate_falls_back_when_cmdline_unsafe(monkeypatch):
     cus._reactive_escalate_or_resume(move, state, _config())
 
     assert exited == [], "must never /exit a pane without a claude relaunch command"
-    assert sends == ["continue please"], "expected the gentle resume-message fallback"
+    assert sends == [f"{cus.REACTIVE_RESUME_TAG} continue please"], "expected the gentle resume-message fallback"
     note = state["slots"]["slot-1"].get("escalation_skip_note", "")
     assert "could not recover launch command" in note
     assert "last_escalation_ts" not in state["slots"]["slot-1"]
@@ -351,7 +351,7 @@ def test_non_escalated_reactive_move_uses_plain_resume(monkeypatch):
 
     assert "EXIT" not in events
     assert events[0] == "move"
-    assert ("send", "continue please") in events
+    assert ("send", f"{cus.REACTIVE_RESUME_TAG} continue please") in events
 
 
 # --------------------------------------------------------------------------

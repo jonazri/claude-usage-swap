@@ -1105,6 +1105,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
+        # A reactive escape refuses a target whose extrapolated utilization is
+        # at/over this (it would re-trip within minutes); merely DEGRADED
+        # targets are still taken — a walled hold is worse than the least-bad.
+        "max_target_pct": 95,
+        # A held (no-target / hysteresis) 429 event older than this is dropped
+        # so one unresolvable event cannot own a lane indefinitely.
+        "pending_ttl_seconds": 1800,
         # Fix A1 (user 2026-06-23): a 429 only justifies an account swap when the
         # ACTIVE account is plausibly near its budget cap. The PostToolUseFailure
         # hook substring-matches "rate limit"/"usage limit"/etc. anywhere in a
@@ -6643,6 +6650,11 @@ class SwapTarget:
     name: str
     reason: str
 
+    @property
+    def degraded(self) -> bool:
+        """The picker fell back to a less-safe candidate pool (see _annotate)."""
+        return "[DEGRADED:" in (self.reason or "")
+
 
 def _hard_7d_cap_for_config(config: dict) -> float:
     """Resolve the active strategy's hard_7d_cap_pct, with smart_strategy's
@@ -7035,6 +7047,27 @@ def _subscription_dead_accounts(state: dict, config: dict) -> set:
         return set()
     return {n for n, a in (state.get("accounts") or {}).items()
             if isinstance(a, dict) and a.get("subscription_disabled")}
+
+
+def _reactive_target_unsafe(target: "SwapTarget", acct: dict, config: dict) -> str | None:
+    """Why a reactive-429 escape must NOT land on `target`, or None when it may.
+
+    A 429'd lane is at a wall, so the least-bad target beats holding: a merely
+    DEGRADED pick (over the 7d cap, or every candidate above its ladder step)
+    is still an escape. Refused only when the target itself cannot serve the
+    lane: dead/erroring credentials, or an extrapolated utilization at/over
+    `reactive.max_target_pct` that would re-trip within minutes (2026-07-10: a
+    rescued lane was moved onto an account already at 98%).
+    """
+    if acct.get("token_expired"):
+        return "target token_expired"
+    if acct.get("poll_error"):
+        return "target poll_error"
+    cap = float((config.get("reactive", {}) or {}).get("max_target_pct", 95))
+    est = _account_estimated_effective_pct(acct, config)
+    if est >= cap:
+        return f"target at {est:.0f}% (>= reactive.max_target_pct {cap:.0f}%)"
+    return None
 
 
 def _disabled_accounts(config: dict, state: dict | None = None) -> set:
@@ -15115,7 +15148,8 @@ def _state_excluding_accounts(state: dict, keep: str | None, drop: set) -> dict:
 
 
 def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "AccountUsage"],
-                      traces: dict | None = None, exclude_accounts: set | None = None) -> list[dict]:
+                      traces: dict | None = None, exclude_accounts: set | None = None,
+                      skip_slots: set | None = None) -> list[dict]:
     """Per-slot swap decisions for one cycle (Phase 3.1).
 
     Returns a list of move dicts: {"slot", "from", "to", "gate", "tier",
@@ -15193,10 +15227,14 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     # — dropped here so a group whose slots are all locked never burns a
     # decide_swap and fan-out never counts them.
     groups: dict[tuple[str, str], list[str]] = {}
+    skip = set(skip_slots or ())
     for acct_name, slots in occupied.items():
         for s in slots:
             if s in locked:
                 click.echo(f"  skip {s}: locked (session_locks.locked_slots)")
+                continue
+            if s in skip:
+                click.echo(f"  skip {s}: a reactive-429 move or held event owns it this cycle")
                 continue
             groups.setdefault((acct_name, _slot_pool(state, s, config)), []).append(s)
     for (acct_name, pool), slots in sorted(groups.items()):
@@ -15465,7 +15503,7 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         return []
     owns_entries = entries is None
     if owns_entries:
-        entries = _claim_rate_limit_entries(state)
+        entries = _claim_rate_limit_entries(state, config)
     if not entries:
         return []
     # New hook records bind the failure to the event-time slot + account. The
@@ -15487,6 +15525,11 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         slot_name = event_slot or current_slot
         if not slot_name:
             continue  # bare session or resolvable-to-no-slot → observe-only
+        if current_slot is None and not live_sessions_on_slot(slot_name):
+            # Event-time binding names a slot nobody is running on any more:
+            # moving it would churn a lane with no session left to benefit.
+            click.echo(f"  reactive-429 {e['session_id'][:8]} settled: no live session on {slot_name}")
+            continue
         if slot_name in locked:
             # The user froze this slot; even a real 429 doesn't move it.
             # SOS surfaces the exhausted-account condition instead.
@@ -15504,7 +15547,10 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         # when the event predates the current account's last swap, it cannot
         # safely identify the installed generation, so settle it as stale.
         if not event_account:
-            last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
+            # The slot's own install time; the account-global stamp also moves
+            # when the account is installed on ANOTHER mount.
+            last_swap = ((state.get("slots", {}).get(slot_name, {}) or {}).get("last_swap_ts")
+                         or state.get("accounts", {}).get(acct, {}).get("last_swap_ts"))
             try:
                 if last_swap and datetime.fromisoformat(e["ts"].replace("Z", "+00:00")) <= datetime.fromisoformat(last_swap.replace("Z", "+00:00")):
                     click.echo(f"  reactive-429 on {slot_name} ignored: legacy event predates the "
@@ -15595,19 +15641,11 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
                        "event retained for the next cycle and SOS will surface capacity")
             continue
         target_acct = state.get("accounts", {}).get(target.name, {})
-        # Post-merge (reactive self-heal PR): the picked target is vetted for
-        # immediate re-trip. Thread name+ctx so gate-on this veto is the per-lane
-        # UNITS health line — else reactive refuses a healthy idle 20x@75% by raw
-        # percent and HOLDs the lane on a capped account (capacity-aware 2026-07-10).
-        if (target_acct.get("token_expired") or target_acct.get("poll_error")
-                or _target_would_immediately_re_trip(
-                    target_acct, pool_config,
-                    name=(target.name if _cap_on_ps else None),
-                    ctx=(shim.get("_capacity_ctx") if _cap_on_ps else None))
-                or "[DEGRADED:" in target.reason):
+        unsafe = _reactive_target_unsafe(target, target_acct, pool_config)
+        if unsafe:
             retry_entries.extend(slot_to_entries[slot_name])
             click.echo(f"  reactive-429 on {slot_name}: HOLDING on '{acct}' — refusing unsafe "
-                       f"target '{target.name}' ({target.reason}); event retained for retry")
+                       f"target '{target.name}' ({unsafe}; {target.reason}); event retained for retry")
             continue
         # Authoritative capacity HOLD (fix 2026-07-05, GH #104 reactive over-
         # subscribe): never commit a move that would put more concurrent live
@@ -15649,14 +15687,16 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
             click.echo(f"  reactive-429 on {slot_name}: already escalated within the window — "
                        f"resume-message only this time (SOS note added; a human may be needed)")
         moves.append(move)
+    retry_ids = {id(e) for e in retry_entries}
     if owns_entries:
         _store_pending_rate_limit_entries(state, retry_entries)
     else:
-        retry_ids = {id(e) for e in retry_entries}
         for e in entries:
             if id(e) in retry_ids:
                 e["_retry"] = True
     state["_reactive_retry_pending"] = bool(retry_entries)
+    state["_reactive_retry_slots"] = sorted(
+        s_name for s_name, ents in slot_to_entries.items() if any(id(e) in retry_ids for e in ents))
     return moves
 
 
@@ -15803,6 +15843,9 @@ def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
     """Dismiss Claude's quota modal on one pane (Escape prefix) and submit a
     context-preserving continuation. Best-effort; returns True on a sent
     continuation. Shared by the reactive resume path and the escalation fallback."""
+    if not message.lstrip().startswith(REACTIVE_RESUME_TAG):
+        # Text typed into a pane must read as the daemon's, never as the human's.
+        message = f"{REACTIVE_RESUME_TAG} {message.lstrip()}"
     if not tmux_escape_prefix(pane, tmux_socket=tmux_socket):
         # An Escape may already have landed (the prefix aborts on the first
         # failed send), so don't claim the pane is untouched — only that we are
@@ -15815,6 +15858,9 @@ def _resume_pane(pane: str, tmux_socket: str | None, message: str) -> bool:
         return True
     click.echo(f"    reactive resume: pane {pane} continuation send failed")
     return False
+
+
+REACTIVE_RESUME_TAG = "[automated cus watchdog]"
 
 
 def _resume_reactive_slot_sessions(slot_name: str, config: dict, state: dict | None = None) -> list[str]:
@@ -16223,6 +16269,12 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
             ))
             if move.get("_reactive_entries"):
                 _requeue_rate_limit_entries(move["_reactive_entries"])
+        except Exception:
+            # An unexpected failure (PermissionError, ...) must not eat the 429
+            # event behind the advanced watermark.
+            if move.get("_reactive_entries"):
+                _requeue_rate_limit_entries(move["_reactive_entries"])
+            raise
 
 
 def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_execute: bool) -> None:
@@ -16258,7 +16310,10 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     # Urgent reactive-429 moves preempt ladder moves (same precedence as the
     # global cycle's step 0).
     moves = check_rate_limit_reactive_per_session(state, config, exclude_accounts=exclude_for_slots)
-    reactive_pending = bool(state.pop("_reactive_retry_pending", False))
+    state.pop("_reactive_retry_pending", None)
+    # Only the slots a reactive move or a held 429 owns are withheld from the
+    # ladder; every other lane keeps rotating.
+    reactive_slots = set(state.pop("_reactive_retry_slots", []) or []) | {m["slot"] for m in moves}
 
     # Halted-lane sweep (fix #1a, 2026-07-10 halt incident): after the fresh-event
     # reactive pass, catch lanes parked at the rate-limit modal with no pending
@@ -16269,9 +16324,9 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     _sweep_halted_lanes(state, config, reactive_moves=moves)
 
     traces: dict = {}
-    if not moves and not reactive_pending:
-        moves = decide_slot_swaps(state, config, usage_by_account, traces,
-                                  exclude_accounts=exclude_for_slots)
+    moves = [*moves, *decide_slot_swaps(state, config, usage_by_account, traces,
+                                        exclude_accounts=exclude_for_slots | {m["to"] for m in moves},
+                                        skip_slots=reactive_slots)]
 
     # Persist usage + 429 watermark + gc'd slots BEFORE acting, so a crash
     # mid-move leaves valid state (same ordering as the global path).
@@ -16381,14 +16436,15 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
     slot_moves: list[dict] = []
     bare_decision = None
     if config.get("reactive", {}).get("enabled", True):
-        all_entries = _claim_rate_limit_entries(state)
+        all_entries = _claim_rate_limit_entries(state, config)
         slot_entries, bare_entries = [], []
         for e in all_entries:
             (slot_entries if e.get("slot") or session_current_slot(e["session_id"])
              else bare_entries).append(e)
         slot_moves = check_rate_limit_reactive_per_session(
             state, config, entries=slot_entries, exclude_accounts=exclude_for_slots)
-        reactive_pending = bool(state.pop("_reactive_retry_pending", False))
+        state.pop("_reactive_retry_pending", None)
+        reactive_slots = set(state.pop("_reactive_retry_slots", []) or []) | {m["slot"] for m in slot_moves}
         # Bare reactive escape must avoid accounts slots hold or are moving onto.
         bare_excl = slot_accts | {m["to"] for m in slot_moves}
         bare_decision = check_rate_limit_reactive(
@@ -16396,14 +16452,15 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         bare_pending = any(e.get("_retry") for e in bare_entries)
         _store_pending_rate_limit_entries(state, [e for e in all_entries if e.get("_retry")])
     else:
-        reactive_pending = False
+        reactive_slots = set()
         bare_pending = False
 
-    # Proactive slot moves only when no urgent slot 429 preempts them.
+    # Proactive slot moves for every lane a reactive move or held 429 does not own.
     traces: dict = {}
-    if not slot_moves and not reactive_pending:
-        slot_moves = decide_slot_swaps(state, config, usage_by_account, traces,
-                                       exclude_accounts=exclude_for_slots)
+    slot_moves = [*slot_moves, *decide_slot_swaps(
+        state, config, usage_by_account, traces,
+        exclude_accounts=exclude_for_slots | {m["to"] for m in slot_moves},
+        skip_slots=reactive_slots)]
 
     # Proactive shared-mount swap (for bare sessions) only when no urgent bare
     # 429 preempts it. decide_swap operates on state["active"] = the shared
@@ -23878,12 +23935,20 @@ def _read_rate_limit_log_since(since_ts: str | None) -> list[dict]:
                 if ts <= cutoff:
                     continue
                 entry = {"ts": parts[0], "session_id": parts[1], "match": parts[2]}
-                if len(parts) > 3 and parts[3]:
-                    entry["source"] = parts[3]
-                if len(parts) > 4 and parts[4]:
-                    entry["slot"] = parts[4]
-                if len(parts) > 5 and parts[5]:
-                    entry["account"] = parts[5]
+                if len(parts) >= 6:
+                    # slot/account are the fixed trailing fields, so a comma inside
+                    # the source token can never shift the event-time binding.
+                    source, slot_f, account_f = ",".join(parts[3:-2]), parts[-2], parts[-1]
+                else:
+                    source = parts[3] if len(parts) > 3 else ""
+                    slot_f = parts[4] if len(parts) > 4 else ""
+                    account_f = ""
+                if source:
+                    entry["source"] = source
+                if slot_f:
+                    entry["slot"] = slot_f
+                if account_f:
+                    entry["account"] = account_f
                 out.append(entry)
     except OSError:
         pass
@@ -23900,14 +23965,35 @@ def _clean_rate_limit_entry(entry: dict) -> dict:
     return {k: entry[k] for k in ("ts", "session_id", "match", "source", "slot", "account") if entry.get(k)}
 
 
-def _claim_rate_limit_entries(state: dict) -> list[dict]:
+def _claim_rate_limit_entries(state: dict, config: dict | None = None) -> list[dict]:
     """Claim fresh hook records plus prior deferred records without losing either.
 
     The disk watermark may advance because every unhandled event is first copied
     into state["pending_429_entries"]. This avoids replaying the entire append-only
     log while ensuring hysteresis/no-target holds survive daemon restarts.
+
+    A held event older than `reactive.pending_ttl_seconds` is dropped (logged):
+    one unresolvable 429 must not preempt or churn a lane indefinitely — a lane
+    still walled after that long is the SOS path's problem, not the queue's.
     """
     pending = state.pop("pending_429_entries", []) or []
+    ttl = float(((config or {}).get("reactive", {}) or {}).get("pending_ttl_seconds", 1800))
+    if ttl > 0 and pending:
+        keep: list[dict] = []
+        cutoff = time.time() - ttl
+        for entry in pending:
+            try:
+                age_ok = datetime.fromisoformat(
+                    str(entry.get("ts", "")).replace("Z", "+00:00")).timestamp() > cutoff
+            except ValueError:
+                age_ok = False
+            if age_ok:
+                keep.append(entry)
+            else:
+                click.echo(f"  reactive-429: dropping held event {str(entry.get('session_id', '?'))[:8]} "
+                           f"on {entry.get('slot') or 'bare'} — older than "
+                           f"reactive.pending_ttl_seconds={int(ttl)}")
+        pending = keep
     fresh = _read_rate_limit_log_since(state.get("last_429_check_ts"))
     state["last_429_check_ts"] = now_iso()
     out: list[dict] = []
@@ -23966,7 +24052,7 @@ def check_rate_limit_reactive(state: dict, config: dict, entries: list | None = 
         return None
     owns_entries = entries is None
     if owns_entries:
-        entries = _claim_rate_limit_entries(state)
+        entries = _claim_rate_limit_entries(state, config)
     if not entries:
         return None
 
@@ -24056,14 +24142,10 @@ def check_rate_limit_reactive(state: dict, config: dict, entries: list | None = 
         _finish([matched_session])
         return None
     target_acct = state.get("accounts", {}).get(target.name, {})
-    if (target_acct.get("token_expired") or target_acct.get("poll_error")
-            or _target_would_immediately_re_trip(
-                target_acct, config,
-                name=(target.name if _cap_on_r else None),
-                ctx=_cap_ctx_r)
-            or "[DEGRADED:" in target.reason):
+    unsafe = _reactive_target_unsafe(target, target_acct, config)
+    if unsafe:
         click.echo(f"  429 detected on {active} but refusing unsafe target "
-                   f"'{target.name}' ({target.reason}); event retained for retry")
+                   f"'{target.name}' ({unsafe}; {target.reason}); event retained for retry")
         _finish([matched_session])
         return None
     decision = SwapDecision(
@@ -26216,7 +26298,7 @@ def _release_daemon_singleton() -> None:
 @cli.command()
 @click.option("--once", is_flag=True, help="Run a single poll-decide-act cycle and exit.")
 @click.option("--foreground", is_flag=True, default=True, help="Run in foreground (default; for systemd, tmux pane, etc.).")
-@click.option("--no-execute", is_flag=True, help="Decide but don't actually swap. Useful for dry-run testing.")
+@click.option("--no-execute", is_flag=True, help="Decide but don't actually swap. Useful for dry-run testing. Reactive 429 events claimed during the dry run are re-queued into state.json so they are not lost.")
 def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
     """Run the auto-rotation daemon.
 
@@ -26401,6 +26483,8 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # here would swap ~/.claude/, which per_session NEVER writes and which
         # hybrid handles itself (partitioned from slot 429s).
         reactive_decision = None if (per_session or hybrid) else check_rate_limit_reactive(state, config)
+        if not (per_session or hybrid) and config.get("reactive", {}).get("enabled", True):
+            save_state(state)  # claimed queue + watermark survive the GH #75 reload below
         if reactive_decision is not None:
             click.echo(f"  reactive (429): {reactive_decision.reason}")
             save_state(state)
