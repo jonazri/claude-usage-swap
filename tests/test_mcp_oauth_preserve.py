@@ -18,9 +18,17 @@ helper never raises (degrades to the source payload unchanged). No new
 writers, no new files, no daemon pass (PR #185's canonical store was
 deliberately NOT taken — it raced single-use refresh tokens, #104).
 
-mcpOAuth is account-AGNOSTIC (keyed "serverName|configHash", entries carry
-their own clientId/refreshToken, no Anthropic-account identity) — that is why
-carrying it across an account swap is safe.
+mcpOAuth is account-AGNOSTIC — that is why carrying it across an account swap
+is safe. The basis is exactly two facts (verified 2026-09-17 across every
+account dir on the fleet): (a) no entry carries an Anthropic-account identity
+field (no accountUuid / email / org / oauthAccount / userID), and (b) entries
+are keyed "serverName|configHash", i.e. bound to the MCP SERVER, not to the
+account that authorised them. Correction 2026-09-17 (dual review of PR #227):
+an earlier version of this docstring, like the cus.py block header, implied
+the entries' VALUES were byte-identical across accounts. They are not — each
+account authorised its own grants and the per-account values differ (some
+lack clientId/refreshToken/expiresAt); that divergence is the clobber damage
+under test, not the safety argument.
 
 Run standalone:  python3 tests/test_mcp_oauth_preserve.py
 Or under pytest: pytest tests/test_mcp_oauth_preserve.py
@@ -117,7 +125,12 @@ class _Env:
     stub) and test_auto_heal_blank_live_mount (config `mode`)."""
 
     def __init__(self, accounts: dict[str, dict], active: str,
-                 live_creds: dict | bytes | None, mode: str = "global") -> None:
+                 live_creds: dict | bytes | None, mode: str = "global",
+                 config: dict | None = None) -> None:
+        """`config` (2026-09-17 dual-review tests) is a full config.yaml dict
+        that REPLACES the default `{"mode": mode}` — needed by the pooled-
+        family save-back test, which must turn the independent-logins gate on.
+        Omitting it keeps every earlier test's behaviour byte-identical."""
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.root = root
@@ -149,12 +162,13 @@ class _Env:
             "swap_history": [],
         }))
         self.config_yaml = self.accounts_dir / "config.yaml"
-        cus.write_yaml(self.config_yaml, {"mode": mode})
+        cus.write_yaml(self.config_yaml, config if config is not None else {"mode": mode})
         self.inbox_md = self.accounts_dir / "inbox.md"
 
         self._saved = {k: getattr(cus, k) for k in (
             "HOME", "CLAUDE_DIR", "CREDS_JSON", "CLAUDE_JSON", "ACCOUNTS_DIR",
-            "STATE_JSON", "CONFIG_YAML", "INBOX_MD", "migrate_account_dir", "mount_pids")}
+            "STATE_JSON", "CONFIG_YAML", "INBOX_MD", "migrate_account_dir", "mount_pids",
+            "_oauth_refresh_grant")}
         cus.HOME = root
         cus.CLAUDE_DIR = self.claude_dir
         cus.CREDS_JSON = self.creds_json
@@ -164,7 +178,48 @@ class _Env:
         cus.CONFIG_YAML = self.config_yaml
         cus.INBOX_MD = self.inbox_md
         cus.migrate_account_dir = lambda d: {"action": "already_migrated"}
-        cus.mount_pids = lambda mount: []
+        # /proc mock (same pattern as test_lane_mount_blank_heal / test_login_pool):
+        # a slot mount counts as "in use" iff its name is in live_slots. Empty by
+        # default, so every pre-existing test here still sees no live lanes.
+        self.live_slots: set[str] = set()
+        cus.mount_pids = lambda mount: [1] if Path(mount).name in self.live_slots else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        # Never let a test reach the real OAuth endpoint (#127): "unknown" is the
+        # fail-open verdict, byte-identical to no probe at all. The heal/claim
+        # paths only probe when an access token is EXPIRED, and every fixture here
+        # uses a far-future expiresAt, but a stub costs nothing and makes the
+        # no-network guarantee explicit rather than incidental.
+        cus._oauth_refresh_grant = lambda rt: ("unknown", None)
+
+    def make_slot(self, account: str, live: bool, mount_creds: dict | None,
+                  family_id: str | None = None) -> str:
+        """Create a slot holding `account` with `mount_creds` in its own mount
+        `.credentials.json` (None → no creds file), optionally leasing a pooled
+        family; `live` registers a fake PID on the mount. Mirrors the helper of
+        the same name in test_lane_mount_blank_heal. Returns the slot name."""
+        state = cus.load_state()
+        name, d = cus.create_slot(state)
+        if mount_creds is not None:
+            (d / ".credentials.json").write_text(json.dumps(mount_creds))
+        (d / ".claude.json").write_text(json.dumps(_identity(account)))
+        state["slots"][name]["account"] = account
+        if family_id:
+            state["slots"][name]["login_family"] = f"{account}/{family_id}"
+        cus.save_state(state)
+        if live:
+            self.live_slots.add(name)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        return name
+
+    def plant_family(self, account: str, family_id: str, creds: dict) -> None:
+        """Write a pooled login family's credential store (the #109 lease target)."""
+        d = cus.login_family_dir(account, family_id)
+        d.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path(account, family_id).write_text(json.dumps(creds))
+
+    def slot_creds(self, slot: str) -> dict | None:
+        p = cus.slot_path(slot) / ".credentials.json"
+        return json.loads(p.read_text()) if p.exists() else None
 
     def live(self) -> dict:
         return json.loads(self.creds_json.read_text())
@@ -181,6 +236,7 @@ class _Env:
     def restore(self) -> None:
         for k, v in self._saved.items():
             setattr(cus, k, v)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
         self._tmp.cleanup()
 
 
@@ -481,6 +537,145 @@ def test_crash_recovery_completed_install_keeps_mount_mcp():
         assert live["claudeAiOauth"]["refreshToken"] == "rt-b"
         assert live["mcpOAuth"][KEY]["accessToken"] == "MOUNT-LIVE"
     finally:
+        env.restore()
+
+
+# ---------------------------------------------------------------------------
+# 8. The three write sites the first PR #227 review found uncovered end-to-end
+#    (dual review, 2026-09-17): lane-mount heal, GH #3 owner-heal save-back,
+#    pooled-family save-back. Each proves the same two invariants as the rest of
+#    this file — claudeAiOauth is exactly the validated payload's, and the
+#    destination's live mcpOAuth survives a stub-only / MCP-less source.
+# ---------------------------------------------------------------------------
+
+def test_auto_heal_live_lanes_restores_account_and_keeps_lane_mcp():
+    """`_auto_heal_live_lanes` (the per-slot analogue of the shared-mount heal):
+    a blanked LIVE lane mount that still carries a live MCP token keeps it after
+    the heal, while claudeAiOauth becomes exactly the snapshot source's."""
+    live_tok = _mcp_entry("LANE-LIVE", expires_at=5_000)
+    env = _Env({"rayi": _account_creds("rt-rayi", access="at-snap")}, active="rayi",
+               live_creds=_account_creds("rt-shared"), mode="per_session")
+    try:
+        slot = env.make_slot("rayi", live=True, mount_creds=_blank(mcp={KEY: live_tok}))
+        healed = cus._auto_heal_live_lanes(cus.load_state(), cus.load_config())
+        assert healed == [slot]
+        lane = env.slot_creds(slot)
+        assert cus._live_mount_creds_invalid(lane) is False
+        assert lane["claudeAiOauth"] == env.snapshot("rayi")["claudeAiOauth"]
+        assert lane["claudeAiOauth"]["accessToken"] == "at-snap"
+        assert lane["mcpOAuth"][KEY]["accessToken"] == "LANE-LIVE"
+        # The snapshot is a heal SOURCE only — never written, so it gains no mcpOAuth.
+        assert "mcpOAuth" not in env.snapshot("rayi")
+        # The blanked mount was preserved as a rotated backup → the heal is reversible.
+        assert sorted(cus.slot_path(slot).glob(".credentials.json.bak.*")), "expected a lane backup"
+    finally:
+        env.restore()
+
+
+def test_gh3_foreign_owner_heal_saveback_keeps_owner_snapshot_mcp():
+    """`_execute_swap_locked`'s GH #3 "foreign" branch: c's tokens drifted onto
+    the live mount while a was active and the swap goes a→b. The live file is
+    routed to its TRUE owner c's snapshot (same-lineage owner-heal), and that
+    write must be a merge — c's snapshot keeps its live MCP token even though
+    the drifted mount carries only a stub for that server."""
+    owner_tok = _mcp_entry("OWNER-LIVE", expires_at=5_000)
+    env = _Env({"a": _account_creds("rt-a", access="at-a"),
+                "b": _account_creds("rt-b", access="at-b"),
+                "c": _account_creds("rt-c", access="at-c-old", mcp={KEY: owner_tok})},
+               active="a",
+               live_creds=_account_creds("rt-c", access="at-c-REFRESHED", mcp={KEY: _stub_entry()}))
+    try:
+        cus.execute_swap("b")
+        snap_c = env.snapshot("c")
+        # Owner-heal happened: c's snapshot took the fresher access token from the live file...
+        assert snap_c["claudeAiOauth"]["accessToken"] == "at-c-REFRESHED"
+        assert snap_c["claudeAiOauth"]["refreshToken"] == "rt-c"
+        # ...and its live MCP token was NOT clobbered by the drifted mount's stub.
+        assert snap_c["mcpOAuth"][KEY]["accessToken"] == "OWNER-LIVE"
+        # a's snapshot is untouched (the GH #3 fix itself) and b is installed live.
+        assert env.snapshot("a")["claudeAiOauth"]["refreshToken"] == "rt-a"
+        assert "mcpOAuth" not in env.snapshot("a")
+        assert env.live()["claudeAiOauth"]["refreshToken"] == "rt-b"
+        # GH #79: the owner's pre-heal snapshot survives as a rotated backup.
+        assert len(env.backups("c")) == 1
+        assert json.loads(env.backups("c")[0].read_text())["claudeAiOauth"]["accessToken"] == "at-c-old"
+    finally:
+        env.restore()
+
+
+def test_pooled_family_saveback_keeps_family_store_mcp():
+    """The pooled-family branch of `saveback_mount_credentials` (#109): a leased
+    lane's rotated tokens land in the FAMILY store, not the account snapshot —
+    and the family store's live MCP token survives a stub-only mount."""
+    fam_tok = _mcp_entry("FAM-LIVE", expires_at=5_000)
+    env = _Env({"beta": _account_creds("rt-beta")}, active="beta",
+               live_creds=_account_creds("rt-beta"),
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True}})
+    try:
+        env.plant_family("beta", "family-1", _account_creds("rt-beta-fam1", mcp={KEY: fam_tok}))
+        # The live session rotated its family token (newer expiresAt) and its
+        # on-disk mcpOAuth degraded to a stub — the pre-fix clobber setup.
+        slot = env.make_slot("beta", live=True, family_id="family-1",
+                             mount_creds=_account_creds("rt-beta-fam1-rotated",
+                                                        expires_at=3_000_000_000_000,
+                                                        mcp={KEY: _stub_entry()}))
+        r = cus.saveback_mount_credentials(cus.slot_path(slot), "beta", cus.load_state())
+        assert r["action"] == "saved" and r.get("family") == "family-1", r
+        fam = json.loads(cus.login_family_creds_path("beta", "family-1").read_text())
+        # The rotated account token landed in the family store...
+        assert fam["claudeAiOauth"]["refreshToken"] == "rt-beta-fam1-rotated"
+        assert fam["claudeAiOauth"]["expiresAt"] == 3_000_000_000_000
+        # ...and the store's live MCP token beat the mount's stub.
+        assert fam["mcpOAuth"][KEY]["accessToken"] == "FAM-LIVE"
+        # The account snapshot is untouched (the 2026-07-03 regression this branch fixes).
+        assert env.snapshot("beta")["claudeAiOauth"]["refreshToken"] == "rt-beta"
+        assert "mcpOAuth" not in env.snapshot("beta")
+    finally:
+        env.restore()
+
+
+# ---------------------------------------------------------------------------
+# 9. Guarded source reads (dual review of PR #227, 2026-09-17): the merge has
+#    to PARSE the source where the old atomic_copy only copied bytes, so a
+#    corrupt source must degrade fail-safe — a clear refusal / skip BEFORE any
+#    live write — never an uncaught or wrong-typed exception, and never a write.
+# ---------------------------------------------------------------------------
+
+def test_restore_creds_backup_into_live_refuses_corrupt_backup_before_any_live_write():
+    live_tok = _mcp_entry("MOUNT-LIVE", expires_at=5_000)
+    env = _Env({"a": _blank()}, active="a", live_creds=_blank(mcp={KEY: live_tok}))
+    try:
+        bak = env.accounts_dir / "account-a" / ".credentials.json.bak.20260917T000000.000000Z"
+        bak.write_text("{not json")
+        live_before = env.creds_json.read_bytes()
+        with pytest.raises(RuntimeError, match="unreadable"):
+            cus.restore_creds_backup("a", bak, into_live=True)
+        # Live file byte-identical and no live backup generation was rotated —
+        # the refusal fired before the first live-side write.
+        assert env.creds_json.read_bytes() == live_before
+        assert sorted(env.claude_dir.glob(".credentials.json.bak.*")) == []
+    finally:
+        env.restore()
+
+
+def test_auto_heal_live_mount_skips_corrupt_source_without_writing():
+    """Source picked as usable, then corrupt by the time the heal reads it
+    (the pick and the read are separate file reads): skip the heal, touch
+    nothing, return False so diagnose() still surfaces the blank."""
+    env = _Env({"merkos": _account_creds("rt-merkos", access="at-snap")}, active="merkos",
+               live_creds=_blank(mcp={KEY: _mcp_entry("MOUNT-LIVE")}), mode="global")
+    saved_pick = cus._newest_usable_creds_source
+    try:
+        corrupt = env.accounts_dir / "account-merkos" / ".credentials.json.bak.corrupt"
+        corrupt.write_text("{not json")
+        cus._newest_usable_creds_source = lambda account: corrupt
+        live_before = env.creds_json.read_bytes()
+        assert cus._auto_heal_live_mount(cus.load_state(), cus.load_config()) is False
+        assert env.creds_json.read_bytes() == live_before
+        assert sorted(env.claude_dir.glob(".credentials.json.bak.*")) == []
+    finally:
+        cus._newest_usable_creds_source = saved_pick
         env.restore()
 
 

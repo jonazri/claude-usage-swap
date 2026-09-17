@@ -15,6 +15,7 @@
 - All credential writes are atomic (tempfile + `os.replace`) and every overwrite keeps a rotated timestamped backup (`.credentials.json.bak.*`, newest 5) so a bad write is recoverable via `cus restore-creds`.
 - A swap is serialized by a global lock and journaled, so a crash mid-swap is reconciled rather than left half-applied.
 - **Limits:** `cus` is single-machine and single-user. It does not encrypt the snapshots at rest beyond the filesystem `0600` mode Claude Code itself uses. Anyone with read access to your home directory can read these tokens — same threat model as `~/.claude/` without `cus`.
+- **MCP OAuth grants cross account boundaries (2026-09-17).** `.credentials.json` also holds `mcpOAuth` — OAuth grants for *remote MCP servers* (Atlassian, etc.), keyed by server rather than by Anthropic account. Whenever `cus` installs or saves back credentials it carries those entries across accounts **unconditionally** (merge, never clobber) so a swap does not force MCP re-authentication. This is safe for the supported model — one person rotating their **own** subscriptions, so every MCP grant is that same person's — but it means running `cus` across accounts that belong to **different people** would cross one person's MCP grants into another person's sessions. Do not run `cus` across different people's accounts.
 
 ## Redact before sharing
 
