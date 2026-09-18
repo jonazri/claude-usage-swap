@@ -5296,10 +5296,11 @@ def _max_model_weekly_from_acct(acct: dict, config: dict,
     either way, so unmodified installs see no change.
 
     Cached-100% lower bound (per-model, 7-day window): when the 7d reading is
-    unknown but the cached window is still valid, a cached per-model 100% stays
-    exhausted (usage is monotonic within a window). decide_swap reads this
-    function for the active account when no fresh poll landed this cycle, so the
-    lower bound reaches the swap-AWAY path too, by design.
+    unknown but the cached window is still open (`_cached_7d_usage_valid`), a
+    cached per-model 100% stays exhausted — usage is monotonic within a window.
+    This changes the persisted-dict readers only (target selection, placement
+    fallbacks, the sessions binding label); the swap-AWAY force reads fresh
+    usage through `_max_model_weekly_from_usage` and is unchanged.
     """
     enabled, allow = _per_model_weekly_gate(config)
     pm = acct.get("per_model_weekly_pct")
@@ -17456,7 +17457,13 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # standard-model work). Gate must be enabled in config for this to bind.
     gate_enabled = config.get("per_model_weekly", {}).get("gate_enabled", False)
     pm = acct.get("per_model_weekly_pct") or {}
-    top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
+    # Same allowlist filter as _max_model_weekly_from_acct, so the named model
+    # is the one whose value drives the gate.
+    _allow = {str(m).lower() for m in (config.get("per_model_weekly", {}).get("models") or [])}
+    _tracked = {m: p for m, p in pm.items()
+                if isinstance(p, (int, float)) and not isinstance(p, bool)
+                and (not _allow or (isinstance(m, str) and m.lower() in _allow))}
+    top_model, top_pct = (max(_tracked.items(), key=lambda kv: kv[1]) if _tracked else (None, 0.0))
     model_cap = _model_weekly_cap_for_config(config)
     # A token_stale account passes the blocker-flag checks above (token_stale is
     # NOT among them — its 5h is still last-known-good), so it reaches here with

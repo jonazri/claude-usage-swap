@@ -56,15 +56,12 @@ Already correct, no change:
   read `current_7d_pct` directly without consulting `_pct_is_unknown`, so a cached
   100.0 already fails the `never_swap_to_pct` hard filter.
 
-Also in scope, unavoidably:
-
-- Swap-away when no fresh poll landed. `decide_swap` reads this same function for
-  the active account and force-swaps the lane off on `>= model_cap`. Trigger 1's
-  fresh-usage path is untouched, but the persisted path is reached. Correct under
-  the lower bound — pre-refresh the account really is exhausted — and covered by
-  a test on both sides of the refresh.
-
 Out of scope:
+
+- Swap-away. `decide_swap` returns before Trigger 1 without a fresh
+  `AccountUsage`, and Trigger 1 reads `_max_model_weekly_from_usage`, never the
+  persisted dict — so this change is picker-side only and the swap-away force
+  is untouched.
 
 - The aggregate path's mirror bug: post-rollover it keeps excluding on a cached 100
   that may really be ~0. Returning `0.0` there is not the fix — a possibly-full

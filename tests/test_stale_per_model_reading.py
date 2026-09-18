@@ -263,9 +263,8 @@ def test_max_model_weekly_honors_cached_100_before_the_window_resets():
 
 
 def test_swap_away_trigger1_reads_fresh_usage_not_cached_dict():
-    # Covers Trigger 1 only. decide_swap ALSO force-swaps off the PERSISTED dict
-    # when no fresh poll landed — see
-    # test_decide_swap_force_away_on_cached_exhaustion_respects_the_refresh.
+    # Trigger 1 is the only swap-away force: it reads fresh usage, so the cached
+    # lower bound (a persisted-dict rule) never reaches it.
     """Evidence that the swap-AWAY force was already safe: a token_stale
     account's fresh AccountUsage this cycle is empty, so the swap-away signal
     (_max_model_weekly_from_usage) is 0.0 and can never force a lane off it."""
