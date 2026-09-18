@@ -898,9 +898,8 @@ def test_identity_fields_includes_organization_uuid():
 def test_login_mount_finish_refuses_same_email_different_org():
     """The account-switcher trap: two cus accounts can share an email AND an
     accountUuid while being different Anthropic accounts (different org, separate
-    billing + quota — e.g. a 5x Team seat vs a 20x Max subscription). Verified live
-    2026-07-28: yaz-tefillinconnection-org and -org-max share accountUuid
-    `e2a6eec3…` but sit on orgs `201b0d79…` (team/5x) and `9339c366…` (max/20x).
+    billing + quota — e.g. a 5x Team seat vs a 20x Max subscription under one
+    login; seen live 2026-07-28). Only organizationUuid tells them apart.
 
     Comparing only accountUuid+email makes --finish green-light a login that landed
     on the WRONG org, silently seeding a 20x pool with 5x-quota families."""

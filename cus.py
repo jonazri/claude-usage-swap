@@ -2145,8 +2145,9 @@ def read_login_provenance(account: str, slot: str) -> dict | None:
 
 
 def login_store_identity(account: str, slot: str) -> dict:
-    """Identity facets (email/uuid/userID) recorded by `/login` in the store
-    dir's .claude.json — used to verify the login landed on the right account."""
+    """Identity facets recorded by `/login` in the store dir's .claude.json —
+    the `_identity_fields` set (accountUuid, emailAddress, organizationUuid;
+    never userID) — used to verify the login landed on the right account."""
     path = login_store_cj_path(account, slot)
     if not path.exists():
         return {}
@@ -6769,7 +6770,8 @@ CRED_AUDIT_PREFIX = "CRED-AUDIT"
 def _fmt_audit_identity(ident: dict | None) -> str:
     """Render identity facets compactly for a CRED-AUDIT line as `uuid(short)/email`.
 
-    Only the account-identity facets (accountUuid + emailAddress) — never tokens.
+    Only the account-identity facets (accountUuid, emailAddress, organizationUuid)
+    — never tokens.
     A short uuid prefix keeps the line greppable without dumping the full 36-char
     id; the email disambiguates. Empty/absent identity renders as `none` so the
     field is always present and stable to grep."""
@@ -17538,8 +17540,10 @@ def _account_for_mount_identity(mount: Path, state: dict) -> str | None:
 
     The slot dir's .claude.json oauthAccount is the authoritative account
     identity (the 2026-07-01 duplicate-identity incident proved meta.yaml can
-    lie while oauthAccount holds truth). Matches on accountUuid/emailAddress
-    against each account's canonical snapshot. Returns None when the mount has
+    lie while oauthAccount holds truth). Matches on the `_identity_fields`
+    facets (accountUuid, emailAddress, organizationUuid — the org tells two
+    accounts under one login apart) against each account's canonical snapshot.
+    Returns None when the mount has
     no readable identity or nothing matches (a login family the snapshots don't
     cover — the caller falls back to state.slots)."""
     cj = mount / ".claude.json"
