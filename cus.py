@@ -6770,8 +6770,9 @@ CRED_AUDIT_PREFIX = "CRED-AUDIT"
 def _fmt_audit_identity(ident: dict | None) -> str:
     """Render identity facets compactly for a CRED-AUDIT line as `uuid(short)/email`.
 
-    Only the account-identity facets (accountUuid, emailAddress, organizationUuid)
-    — never tokens.
+    Renders accountUuid (short) and emailAddress only — never tokens. The
+    organizationUuid facet is compared by `_identities_match` but not printed
+    here; two accounts under one login therefore render alike in audit lines.
     A short uuid prefix keeps the line greppable without dumping the full 36-char
     id; the email disambiguates. Empty/absent identity renders as `none` so the
     field is always present and stable to grep."""
