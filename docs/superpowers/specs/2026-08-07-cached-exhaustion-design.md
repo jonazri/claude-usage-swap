@@ -8,8 +8,8 @@ target whenever its last poll failed. `_max_model_weekly_from_acct` returns `0.0
 i.e. `rate_limited`, `token_stale`, `token_expired`, or `poll_error` — so a cached
 `Fable=100%` does not exclude anything.
 
-Observed 2026-08-06: `gabai-tefillinconnection-org` and `yaz-dichalane-com` both
-carried `Fable=100%~` while remaining admissible on the per-model gate.
+Observed 2026-08-06: two accounts both carried `Fable=100%~` while remaining
+admissible on the per-model gate.
 
 The `0.0` is deliberate. It fixes a 2026-07-05 incident where a `token_stale`
 account's cached `Fable=100%` was trusted as current and a live Fable session was

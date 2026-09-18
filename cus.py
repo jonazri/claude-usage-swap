@@ -17472,8 +17472,8 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # that moved a live Fable session off an account which actually had Fable
     # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
     # surface the number marked '~' in the headroom line below instead.
-    # Exception: a cached >=100 the decision layer still honors must bind here
-    # too, or the operator reads headroom on a lane the daemon is evacuating.
+    # Exception: a cached >=100 the picker still honors must bind here too, or
+    # the operator reads headroom on an account the picker refuses as a target.
     # Read through _max_model_weekly_from_acct so this agrees with the daemon on
     # allowlist filtering as well as on the bound. `model_stale` keeps its
     # display meaning ("unconfirmed") and is used for the suffix below.
@@ -17494,7 +17494,7 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
 
     # Headroom on every enforced axis.
     txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
-    if pm:
+    if top_model is not None:
         # _fmt_model_pct marks the number '~' when it's stale (token_stale et
         # al.) so it never reads as an authoritative current value (2026-07-05).
         txt += f", {top_model} {_fmt_model_pct(acct, top_pct)}"
@@ -19342,8 +19342,9 @@ def _model_pct_is_stale(acct: dict) -> bool:
     everywhere they're shown so they can never look current. The DECISION half
     lives in `_max_model_weekly_from_acct`, which returns 0.0 under the same
     condition — except for a cached >=100 taken since the last refresh, which
-    stays a valid lower bound and does refuse a target (and force a live lane
-    off). See that function's lower-bound exception.
+    stays a valid lower bound and still refuses the account as a TARGET (the
+    swap-away force reads fresh usage and is untouched). See that function's
+    lower-bound exception.
     """
     return _pct_is_unknown(acct, "current_7d_pct")
 

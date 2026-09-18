@@ -266,3 +266,9 @@ def test_binding_names_the_allowlisted_model_not_the_highest_untracked_one():
     assert sev == "blocked" and "weekly-Fable 96%" in txt, txt
     sev, txt = cus._session_binding(acct, "standard", cfg)
     assert sev == "ok" and "weekly-Fable" in txt and "Sonnet" not in txt, txt
+
+
+def test_binding_headroom_omits_model_clause_when_allowlist_excludes_every_reading():
+    cfg = cus.deep_merge(_config(), {"per_model_weekly": {"gate_enabled": True, "models": ["Fable"], "cap_pct": 95}})
+    sev, txt = cus._session_binding(_acct(five=10.0, seven=5.0, per_model={"Sonnet": 99.0}), "premium", cfg)
+    assert sev == "ok" and "None" not in txt and "Sonnet" not in txt, txt
